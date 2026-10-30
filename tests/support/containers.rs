@@ -98,3 +98,43 @@ pub async fn hub() -> HubContainer {
         http: format!("http://127.0.0.1:{http}"),
     }
 }
+
+impl MongoDb {
+    /// Connection string for another database on the same container.
+    pub fn uri_for(&self, db: &str) -> String {
+        let base = self.uri.split('/').take(3).collect::<Vec<_>>().join("/");
+        format!("{base}/{db}?directConnection=true")
+    }
+}
+
+/// A free TCP port on the host, for containers that must keep their mapping across restarts.
+pub fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// The hub published on a fixed host port, so `stop`/`start` keeps the address the clients use.
+pub async fn hub_on(port: u16) -> HubContainer {
+    let (name, tag) = hub_image_or_fail();
+    let http_port = free_port();
+    let container = GenericImage::new(name, tag)
+        .with_exposed_port(7000.tcp())
+        .with_exposed_port(7001.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("hub listening"))
+        .with_mapped_port(port, 7000.tcp())
+        .with_mapped_port(http_port, 7001.tcp())
+        .with_env_var("KRAKEN_HUB_HTTP_LISTEN", "0.0.0.0:7001")
+        .with_env_var("KRAKEN_HUB_OTLP_ENDPOINT", "")
+        .with_env_var("KRAKEN_HUB_LOG", "info")
+        .start()
+        .await
+        .expect("hub container");
+    HubContainer {
+        container,
+        address: format!("static://127.0.0.1:{port}"),
+        http: format!("http://127.0.0.1:{http_port}"),
+    }
+}
