@@ -7,6 +7,7 @@ pub mod context;
 pub mod error;
 pub mod hub;
 pub mod identity;
+pub mod kafka;
 pub mod proto;
 pub mod types;
 

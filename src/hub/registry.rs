@@ -114,7 +114,6 @@ impl HandlerRegistry {
         self.queries.get(type_name)
     }
 
-    #[allow(dead_code)] // used by the Kafka consumer
     pub(crate) fn event_handlers(&self, type_name: &str) -> &[EventHandler] {
         self.events.get(type_name).map(Vec::as_slice).unwrap_or(&[])
     }

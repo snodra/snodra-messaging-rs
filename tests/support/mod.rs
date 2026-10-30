@@ -75,3 +75,14 @@ pub fn init_tracing() {
         .with_test_writer()
         .try_init();
 }
+
+/// Integration tests need Docker; they skip (with a notice) when it is absent.
+pub fn docker_available() -> bool {
+    std::process::Command::new("docker")
+        .arg("info")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+pub mod containers;
