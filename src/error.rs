@@ -55,6 +55,7 @@ impl MessagingError {
     /// The code a handler's error becomes inside a `Reply`.
     pub fn to_reply_code(&self) -> ErrorCode {
         match self {
+            Self::NoHandler(_) => ErrorCode::NoHandler,
             Self::Unauthenticated(_) => ErrorCode::Unauthenticated,
             Self::AccessDenied(_) => ErrorCode::PermissionDenied,
             Self::InvalidMessage(_) | Self::Serialization(_) => ErrorCode::InvalidRequest,

@@ -3,5 +3,9 @@
 //! `HubConnection`/`HubBus`.
 
 mod connection;
+mod dispatcher;
+mod registry;
 
 pub use connection::{HubConnection, HubSettings, Inbound};
+pub use dispatcher::Dispatcher;
+pub use registry::{EventContext, HandlerRegistry};

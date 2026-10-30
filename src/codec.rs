@@ -20,3 +20,29 @@ pub fn is_json_object(bytes: &[u8]) -> bool {
         Ok(serde_json::Value::Object(_))
     )
 }
+
+/// Encodes a handler's reply; a unit reply (`()`, which serde writes as `null`) becomes `{}`.
+pub fn encode_reply<T: Serialize>(value: &T) -> Result<Vec<u8>, MessagingError> {
+    let bytes = encode(value)?;
+    Ok(if bytes == b"null" {
+        b"{}".to_vec()
+    } else {
+        bytes
+    })
+}
+
+/// Decodes a reply; an empty object also decodes as the unit type `()`.
+pub fn decode_reply<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, MessagingError> {
+    match decode::<T>(bytes) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let trimmed = String::from_utf8_lossy(bytes);
+            let trimmed = trimmed.trim();
+            if trimmed == "{}" || trimmed.is_empty() {
+                decode::<T>(b"null").map_err(|_| e)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
