@@ -5,7 +5,8 @@ pub fn shout(text: &str) -> String {
     text.to_uppercase()
 }
 
-/// `Reverse`: reverse by character, not by byte, so multi-byte text survives.
+/// `Reverse`: reverse by `char` (Unicode scalar value), not by byte, so multi-byte text survives.
+/// Combining marks are not kept with their base character (no grapheme segmentation), by design.
 pub fn reverse(text: &str) -> String {
     text.chars().rev().collect()
 }

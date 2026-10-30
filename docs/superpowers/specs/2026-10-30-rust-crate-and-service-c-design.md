@@ -155,8 +155,8 @@ Binary crate, no HTTP. Handlers log one `INFO` line each, same style as A and B:
 original text and `TextReversed{text: reversed, at}` keyed likewise, through the outbox. Reads `KRAKEN_SERVICE_NAME`
 (`service-c`), `KRAKEN_HUB_ADDRESS`, `KRAKEN_KAFKA_BOOTSTRAP`, `KRAKEN_MONGODB_URI`; `RUST_LOG` default `info`.
 `examples/service-c/Dockerfile`: `rust:1.99-bookworm` builder with cmake + protoc, workspace build with cargo
-cache mounts; runtime `debian:bookworm-slim` with `ca-certificates` (librdkafka links OpenSSL dynamically from
-the builder image's libssl3, which bookworm-slim provides).
+cache mounts; runtime `debian:bookworm-slim` with `ca-certificates` only (rdkafka is built without `ssl`; mongodb and
+reqwest use rustls).
 
 ## Kotlin side
 
