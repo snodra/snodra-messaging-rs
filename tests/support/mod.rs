@@ -65,3 +65,13 @@ pub fn token_without_realm_access(subject: &str) -> String {
     )
     .unwrap()
 }
+
+pub mod fake_hub;
+
+/// Opt-in logging for debugging a test: `RUST_LOG=debug cargo test -- --nocapture`.
+pub fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+}

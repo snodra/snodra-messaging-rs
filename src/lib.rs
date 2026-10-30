@@ -5,6 +5,7 @@
 pub mod codec;
 pub mod context;
 pub mod error;
+pub mod hub;
 pub mod identity;
 pub mod proto;
 pub mod types;
