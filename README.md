@@ -125,5 +125,5 @@ byte-identical to `../kraken/protocol/hub.proto` whenever the umbrella checkout 
 
 ## Example
 
-`examples/service-c` (plan 2) is a complete service: it handles `Shout` and `Reverse`, publishes
+`examples/service-c` is a complete service: it handles `Shout` and `Reverse`, publishes
 events, consumes `GreetingDelivered`, and runs in the sandbox compose next to the Kotlin examples.

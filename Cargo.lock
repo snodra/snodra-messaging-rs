@@ -3277,6 +3277,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "service-c"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "kraken-messaging-rs",
+ "serde",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sha1"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
