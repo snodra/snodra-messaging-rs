@@ -131,3 +131,59 @@ async fn send_without_stream_is_hub_unavailable() {
         Err(MessagingError::HubUnavailable(_))
     ));
 }
+
+#[tokio::test]
+async fn invalid_argument_is_retried_at_max_backoff() {
+    support::init_tracing();
+    let hub = FakeHub::start().await;
+    hub.reject_next_with_invalid_argument();
+    let (conn, _rx) = connection(settings(hub.address(), 1_000, 50, 300));
+    let started = Instant::now();
+    conn.start();
+    sleep(Duration::from_millis(150)).await;
+    assert!(
+        conn.last_rejection()
+            .is_some_and(|r| r.contains("service_name"))
+    );
+    assert!(
+        hub.registers().await.is_empty(),
+        "retried before backoff_max"
+    );
+    assert!(conn.await_registered(Duration::from_secs(3)).await);
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn hung_handshake_is_abandoned_and_reported() {
+    // A server that accepts TCP but never speaks HTTP/2: the connect must give up after handshake_timeout.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hold = tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            if let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        }
+    });
+    let mut s = settings(format!("static://{addr}"), 1_000, 50, 500);
+    s.handshake_timeout = Duration::from_millis(500);
+    let (conn, mut rx) = connection(s);
+    conn.start();
+    let notified = timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(Inbound::Disconnected) = rx.recv().await {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        notified.is_ok(),
+        "connect loop hung on a server that never answered"
+    );
+    conn.shutdown().await;
+    hold.abort();
+}

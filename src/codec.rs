@@ -21,28 +21,27 @@ pub fn is_json_object(bytes: &[u8]) -> bool {
     )
 }
 
-/// Encodes a handler's reply; a unit reply (`()`, which serde writes as `null`) becomes `{}`.
-pub fn encode_reply<T: Serialize>(value: &T) -> Result<Vec<u8>, MessagingError> {
-    let bytes = encode(value)?;
-    Ok(if bytes == b"null" {
-        b"{}".to_vec()
-    } else {
-        bytes
-    })
+fn is_unit<T: 'static>() -> bool {
+    std::any::TypeId::of::<T>() == std::any::TypeId::of::<()>()
 }
 
-/// Decodes a reply; an empty object also decodes as the unit type `()`.
-pub fn decode_reply<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, MessagingError> {
-    match decode::<T>(bytes) {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            let trimmed = String::from_utf8_lossy(bytes);
-            let trimmed = trimmed.trim();
-            if trimmed == "{}" || trimmed.is_empty() {
-                decode::<T>(b"null").map_err(|_| e)
-            } else {
-                Err(e)
-            }
+/// Encodes a handler's reply; the unit reply `()` (which serde writes as `null`) becomes `{}`, the
+/// empty object Jackson writes for commands without a result. Other `null`s (an `Option::None`) stay `null`.
+pub fn encode_reply<T: Serialize + 'static>(value: &T) -> Result<Vec<u8>, MessagingError> {
+    if is_unit::<T>() {
+        return Ok(b"{}".to_vec());
+    }
+    encode(value)
+}
+
+/// Decodes a reply; for the unit type `()` an empty object (or an empty body) is accepted.
+pub fn decode_reply<T: DeserializeOwned + 'static>(bytes: &[u8]) -> Result<T, MessagingError> {
+    if is_unit::<T>() {
+        let trimmed = String::from_utf8_lossy(bytes);
+        let trimmed = trimmed.trim();
+        if trimmed == "{}" || trimmed.is_empty() {
+            return decode::<T>(b"null");
         }
     }
+    decode::<T>(bytes)
 }

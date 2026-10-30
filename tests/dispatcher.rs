@@ -65,6 +65,20 @@ impl Command for Secret {
 }
 
 #[derive(Serialize, Deserialize)]
+struct Nested {}
+message_type!(Nested, "t.Nested");
+impl Command for Nested {
+    type Reply = ();
+}
+
+#[derive(Serialize, Deserialize)]
+struct Maybe {}
+message_type!(Maybe, "t.Maybe");
+impl Query for Maybe {
+    type Reply = Option<Pong>;
+}
+
+#[derive(Serialize, Deserialize)]
 struct Introspect {}
 #[derive(Serialize, Deserialize, Debug)]
 struct Seen {
@@ -95,6 +109,10 @@ fn registry() -> HandlerRegistry {
     });
     r.command::<Secret, _, _>(|_, _| async move { Ok(()) });
     r.requires::<Secret>(Guard::role("kraken-admin"));
+    r.command::<Nested, _, _>(|_, _| async move {
+        Err(MessagingError::NoHandler("t.Downstream".into()))
+    });
+    r.query::<Maybe, _, _>(|_, _| async move { Ok(None) });
     r.command::<Introspect, _, _>(|_, ctx: MessageContext| async move {
         let current = MessageContext::current().expect("task-local set");
         let user_id = ctx.user_id().map(str::to_string);
@@ -291,6 +309,26 @@ async fn handler_error_maps_to_handler_error_code() {
 }
 
 #[tokio::test]
+async fn handler_propagating_no_handler_is_handler_error() {
+    // A nested call's NO_HANDLER must not masquerade as "no handler for t.Nested" at the original caller.
+    let (code, message) = error_code(
+        &dispatcher()
+            .handle(request(RequestKind::Command, "t.Nested", "{}", &[]))
+            .await,
+    );
+    assert_eq!(code, ErrorCode::HandlerError);
+    assert!(message.contains("t.Downstream"));
+}
+
+#[tokio::test]
+async fn none_option_reply_is_null_not_empty_object() {
+    let reply = dispatcher()
+        .handle(request(RequestKind::Query, "t.Maybe", "{}", &[]))
+        .await;
+    assert_eq!(payload(&reply), serde_json::Value::Null);
+}
+
+#[tokio::test]
 async fn panicking_handler_is_handler_error() {
     let (code, message) = error_code(
         &dispatcher()
@@ -350,12 +388,13 @@ fn registry_lists_types_sorted() {
         vec![
             "t.Boom",
             "t.Introspect",
+            "t.Nested",
             "t.Nop",
             "t.Panicky",
             "t.Ping",
             "t.Secret"
         ]
     );
-    assert_eq!(r.query_types(), vec!["t.Count"]);
+    assert_eq!(r.query_types(), vec!["t.Count", "t.Maybe"]);
     assert!(r.event_types().is_empty());
 }

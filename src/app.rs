@@ -19,6 +19,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::config::Config;
 use crate::context::MessageContext;
@@ -46,8 +47,11 @@ pub struct KrakenMessaging {
     conn: Arc<HubConnection>,
     sender: Arc<Sender>,
     events: EventBus,
+    client: mongodb::Client,
+    db: mongodb::Database,
     cancel: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
+    handlers: TaskTracker,
 }
 
 impl KrakenMessaging {
@@ -110,17 +114,40 @@ impl KrakenMessaging {
         self.conn.instance_id()
     }
 
+    /// The crate's Mongo client; sessions for `events().publish_in` must come from this client.
+    pub fn client(&self) -> mongodb::Client {
+        self.client.clone()
+    }
+
+    /// The service's database (the one named in `mongodb_uri`).
+    pub fn database(&self) -> mongodb::Database {
+        self.db.clone()
+    }
+
     /// True once the hub confirmed this instance's registration.
     pub async fn await_hub(&self, timeout: Duration) -> bool {
         self.conn.await_registered(timeout).await
     }
 
-    /// Stops the hub stream, the outbox publisher and the consumer. Pending requests fail.
+    /// Drains in-flight handlers (bounded), closes the hub stream (the hub drops this instance at once),
+    /// stops the outbox publisher and the consumer. Pending outgoing requests fail with `HubUnavailable`.
     pub async fn shutdown(self) {
+        self.handlers.close();
+        if tokio::time::timeout(Duration::from_secs(10), self.handlers.wait())
+            .await
+            .is_err()
+        {
+            tracing::warn!("handlers still running after 10 s, closing the hub stream anyway");
+        }
         self.cancel.cancel();
         self.conn.shutdown().await;
         for t in self.tasks {
-            let _ = tokio::time::timeout(Duration::from_secs(10), t).await;
+            if tokio::time::timeout(Duration::from_secs(5), t)
+                .await
+                .is_err()
+            {
+                tracing::warn!("background task did not stop in 5 s");
+            }
         }
     }
 }
@@ -172,6 +199,16 @@ impl KrakenMessagingBuilder {
         Arc::clone(&self.sender)
     }
 
+    /// The crate's Mongo client; handlers that write transactionally start their sessions here.
+    pub fn client(&self) -> mongodb::Client {
+        self.client.clone()
+    }
+
+    /// The service's database.
+    pub fn database(&self) -> mongodb::Database {
+        self.db.clone()
+    }
+
     /// Ensures the Mongo indexes, registers with the hub (in the background), starts the outbox
     /// publisher and the consumer. Does not wait for the hub: see [`KrakenMessaging::await_hub`].
     pub async fn start(self) -> Result<KrakenMessaging, MessagingError> {
@@ -197,19 +234,26 @@ impl KrakenMessagingBuilder {
             config.max_concurrent_handlers,
         ));
         let cancel = CancellationToken::new();
+        let handlers = TaskTracker::new();
         let mut tasks = Vec::new();
 
         conn.set_types(registry.command_types(), registry.query_types());
         conn.start();
         let loop_conn = Arc::clone(&conn);
         let loop_sender = Arc::clone(&sender);
+        let loop_cancel = cancel.clone();
+        let loop_handlers = handlers.clone();
         tasks.push(tokio::spawn(async move {
-            while let Some(msg) = inbound.recv().await {
+            loop {
+                let msg = tokio::select! {
+                    _ = loop_cancel.cancelled() => break,
+                    msg = inbound.recv() => match msg { Some(m) => m, None => break },
+                };
                 match msg {
                     Inbound::Request(req) => {
                         let dispatcher = Arc::clone(&dispatcher);
                         let conn = Arc::clone(&loop_conn);
-                        tokio::spawn(async move {
+                        loop_handlers.spawn(async move {
                             let reply = dispatcher.handle(req).await;
                             if let Err(e) = conn
                                 .send(ClientMessage {
@@ -243,8 +287,8 @@ impl KrakenMessagingBuilder {
                 &config.kafka_bootstrap,
                 &config.service_name,
                 &config.kafka_topic,
-                client,
-                db,
+                client.clone(),
+                db.clone(),
                 Arc::clone(&registry),
                 config.consumer_max_attempts,
                 Duration::from_secs(1),
@@ -256,8 +300,11 @@ impl KrakenMessagingBuilder {
             conn,
             sender,
             events,
+            client,
+            db,
             cancel,
             tasks,
+            handlers,
         })
     }
 }

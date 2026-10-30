@@ -13,7 +13,7 @@ pub mod hub_headers {
     pub const TRACESTATE: &str = "tracestate";
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct MessageContext {
     /// `Request.id` on the hub path, the `id` header on the Kafka path.
     pub message_id: String,
@@ -27,8 +27,18 @@ pub struct MessageContext {
 }
 
 impl MessageContext {
+    /// The acting user: from the resolved identity on the hub path, from the `userId` header on
+    /// the Kafka path (events carry no token), as Kotlin's `MessageContext.userId` does.
     pub fn user_id(&self) -> Option<&str> {
-        self.identity.as_ref().and_then(|i| i.user_id.as_deref())
+        self.identity
+            .as_ref()
+            .and_then(|i| i.user_id.as_deref())
+            .or_else(|| {
+                self.headers
+                    .get("userId")
+                    .map(String::as_str)
+                    .filter(|u| !u.is_empty())
+            })
     }
 
     pub fn roles(&self) -> &[String] {
@@ -41,6 +51,37 @@ impl MessageContext {
     /// The context of the handler the current task runs in, if any.
     pub fn current() -> Option<MessageContext> {
         CURRENT.try_with(|c| c.clone()).ok()
+    }
+}
+
+impl std::fmt::Debug for MessageContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Bearer tokens never reach the logs.
+        let headers: Vec<(&str, &str)> = self
+            .headers
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str(),
+                    if k.eq_ignore_ascii_case(hub_headers::AUTHORIZATION) {
+                        "<redacted>"
+                    } else {
+                        v.as_str()
+                    },
+                )
+            })
+            .collect();
+        f.debug_struct("MessageContext")
+            .field("message_id", &self.message_id)
+            .field("type_name", &self.type_name)
+            .field("correlation_id", &self.correlation_id)
+            .field("identity", &self.identity)
+            .field(
+                "authorization",
+                &self.authorization.as_ref().map(|_| "<redacted>"),
+            )
+            .field("headers", &headers)
+            .finish()
     }
 }
 

@@ -140,13 +140,17 @@ async fn consumer_handles_once_and_dedupes() {
     let mongo = support::containers::mongo().await;
     let (client, db) = db(&mongo.uri).await;
     let calls = Arc::new(AtomicUsize::new(0));
+    let seen_user = Arc::new(std::sync::Mutex::new(None::<String>));
     let mut registry = HandlerRegistry::new();
     let seen = Arc::clone(&calls);
+    let seen_user_w = Arc::clone(&seen_user);
     registry.event::<Happened, _, _>(move |e, ctx| {
         let seen = Arc::clone(&seen);
+        let seen_user_w = Arc::clone(&seen_user_w);
         async move {
             assert_eq!(e.id, "dup-1");
             assert_eq!(ctx.message.message_id, "dup-1");
+            *seen_user_w.lock().unwrap() = ctx.message.user_id().map(str::to_string);
             seen.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -183,6 +187,10 @@ async fn consumer_handles_once_and_dedupes() {
             .insert(rdkafka::message::Header {
                 key: headers::ID,
                 value: Some("dup-1"),
+            })
+            .insert(rdkafka::message::Header {
+                key: headers::USER_ID,
+                value: Some("u-1"),
             });
         producer
             .send(
@@ -204,6 +212,11 @@ async fn consumer_handles_once_and_dedupes() {
     .expect("handled within 30s");
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(calls.load(Ordering::SeqCst), 1, "duplicate id handled once");
+    assert_eq!(
+        seen_user.lock().unwrap().as_deref(),
+        Some("u-1"),
+        "userId header reaches the event context like Kotlin's MessageContext.userId"
+    );
     let markers = db
         .collection::<mongodb::bson::Document>("processed_events")
         .count_documents(doc! {})
@@ -339,4 +352,60 @@ async fn failed_send_marks_attempts() {
     assert_eq!(d.get_i32("attempts").unwrap(), 1);
     assert_eq!(d.get("sentAt"), Some(&mongodb::bson::Bson::Null));
     assert_eq!(d.get("failedAt"), Some(&mongodb::bson::Bson::Null));
+}
+
+#[derive(Serialize, Deserialize)]
+struct Huge {
+    blob: String,
+}
+message_type!(Huge, "t.Huge");
+impl Event for Huge {}
+
+#[tokio::test]
+async fn non_retriable_send_marks_failed_immediately() {
+    require_docker!();
+    let mongo = support::containers::mongo().await;
+    let (_client, db) = db(&mongo.uri).await;
+    let bus = EventBus::new(db.clone());
+    // 2 MB payload exceeds the producer's message.max.bytes (1 MB): MessageSizeTooLarge is final, not retriable.
+    bus.publish(
+        &Huge {
+            blob: "x".repeat(2 * 1024 * 1024),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    bus.publish(
+        &Happened {
+            id: "after".into(),
+            at: Utc::now(),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let publisher = OutboxPublisher::new(
+        db.clone(),
+        "127.0.0.1:1",
+        TOPIC,
+        "svc-a",
+        Duration::from_millis(100),
+        100,
+        10,
+    )
+    .unwrap();
+    let _ = publisher.relay_once().await.unwrap();
+    let huge = db
+        .collection::<mongodb::bson::Document>("outbox")
+        .find_one(doc! { "type": "t.Huge" })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        huge.get("failedAt")
+            .is_some_and(|v| !matches!(v, mongodb::bson::Bson::Null)),
+        "oversized document marked failed on the first attempt: {huge:?}"
+    );
+    assert_eq!(huge.get_i32("attempts").unwrap(), 1);
 }

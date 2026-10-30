@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use kraken_messaging::{MessageType, codec, message_type};
+use kraken_messaging::{MessageContext, MessageType, codec, message_type};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -42,4 +42,22 @@ fn is_json_object_rejects_arrays_and_scalars() {
     assert!(!codec::is_json_object(b"[1]"));
     assert!(!codec::is_json_object(b"42"));
     assert!(!codec::is_json_object(b"not json"));
+}
+
+#[test]
+fn debug_output_redacts_bearer_tokens() {
+    let ctx = MessageContext {
+        authorization: Some("Bearer super-secret-token".into()),
+        headers: std::collections::HashMap::from([
+            (
+                "authorization".to_string(),
+                "Bearer super-secret-token".to_string(),
+            ),
+            ("correlationId".to_string(), "c-1".to_string()),
+        ]),
+        ..Default::default()
+    };
+    let printed = format!("{ctx:?}");
+    assert!(!printed.contains("super-secret-token"), "{printed}");
+    assert!(printed.contains("c-1"));
 }

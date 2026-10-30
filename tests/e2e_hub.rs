@@ -397,3 +397,26 @@ fn _assert_send_sync<T: Send + Sync>() {}
 fn _app_is_shareable() {
     _assert_send_sync::<Arc<KrakenMessaging>>();
 }
+
+#[tokio::test]
+async fn shutdown_is_prompt_and_builder_exposes_database() {
+    require_docker!();
+    let hub = support::containers::hub().await;
+    let mongo = support::containers::mongo().await;
+    let mut cfg = config("svc-a", &hub.address, "127.0.0.1:1", &mongo.uri_for("a"));
+    cfg.outbox_enabled = false;
+    cfg.consumer_enabled = false;
+    let builder = KrakenMessaging::builder(cfg).await.unwrap();
+    assert_eq!(builder.database().name(), "a");
+    let _client: mongodb::Client = builder.client();
+    let a = builder.start().await.unwrap();
+    assert!(a.await_hub(Duration::from_secs(15)).await);
+    assert_eq!(a.database().name(), "a");
+    let started = std::time::Instant::now();
+    a.shutdown().await;
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "shutdown took {:?}",
+        started.elapsed()
+    );
+}

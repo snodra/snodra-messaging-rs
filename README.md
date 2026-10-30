@@ -91,14 +91,20 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
   `Err` becomes `HANDLER_ERROR` unless it is `Unauthenticated`/`AccessDenied`/`InvalidMessage`; a panic
   becomes `HANDLER_ERROR "handler panicked"`, never a dropped stream.
 - **Guards** run before the payload is decoded: anonymous → `UNAUTHENTICATED`, refused → `PERMISSION_DENIED`.
-- **Unit replies** travel as `{}`.
+- **Unit replies** travel as `{}`; an `Option::None` reply stays `null`.
 - **Consumer**: one record at a time; marker inserted first (a duplicate id never reaches the handler),
   handlers run, commit, then the offset. A failing or panicking handler is retried `max_attempts`
   times with 1 s backoff, then logged (type, id, topic-partition@offset, never the payload) and skipped.
   Records without `type`, with an unhandled type, or with a non-object payload are skipped.
 - **Outbox**: `publish` inserts; the publisher relays in `createdAt, seq` order, stops the batch on a
-  retriable failure, marks `failedAt` after 10 attempts. `userId` header is `""` when anonymous.
+  retriable failure, marks `failedAt` after 10 attempts, or at once for non-retriable failures (oversized record, invalid or
+  unauthorized topic). Delivery budget per attempt is 30 s, as in the Kotlin producer. `userId` header is `""` when anonymous.
 - **Mongo documents** use the Kotlin field names and BSON types; no `_class` field is written.
+- **Mongo access**: `builder.client()` / `app.client()` and `database()` expose the crate's client; sessions passed to
+  `events.publish_in` must come from it (the driver rejects sessions of another client).
+- **Verified identity** checks signature, `exp`, `nbf` and `iss`; `aud` is not validated (Keycloak sets it, Spring's
+  decoder ignores it too). A JWKS outage is `UNAUTHENTICATED` for the caller, never an internal error with a URL.
+- **Shutdown** drains in-flight handlers (10 s bound), closes the hub stream, stops the publisher and the consumer.
 - **Start** does not wait for the hub. `await_hub(timeout)` tells you when the registration was
   confirmed; sends before that fail with `HubUnavailable`.
 

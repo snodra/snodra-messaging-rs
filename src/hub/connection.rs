@@ -48,13 +48,24 @@ impl Default for HubSettings {
 }
 
 /// What the hub sends us, handed to the owner (dispatcher and sender) in order.
-#[derive(Debug)]
 pub enum Inbound {
     Request(proto::Request),
     Reply(proto::Reply),
     Error(proto::Error),
     /// The stream was lost; every pending request should fail.
     Disconnected,
+}
+
+impl std::fmt::Debug for Inbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print payloads or headers (they may carry a bearer token).
+        match self {
+            Inbound::Request(r) => write!(f, "Request(id={}, type={})", r.id, r.r#type),
+            Inbound::Reply(r) => write!(f, "Reply(request_id={})", r.request_id),
+            Inbound::Error(e) => write!(f, "Error(request_id={}, code={})", e.request_id, e.code),
+            Inbound::Disconnected => f.write_str("Disconnected"),
+        }
+    }
 }
 
 pub struct HubConnection {
@@ -171,8 +182,10 @@ impl HubConnection {
         let mut failures: u32 = 0;
         while !self.cancel.is_cancelled() {
             let outcome = self.run_stream().await;
-            let was_connected = self.connected.swap(false, Ordering::SeqCst);
-            self.registered.send_replace(false);
+            self.connected.store(false, Ordering::SeqCst);
+            // Only a confirmed registration resets the backoff: a hub that accepts the stream and then
+            // rejects it must not be hammered every backoff_min.
+            let was_registered = self.registered.send_replace(false);
             *self.outbound.lock().unwrap() = None;
             let _ = self.inbound.send(Inbound::Disconnected).await;
             if self.cancel.is_cancelled() {
@@ -182,12 +195,12 @@ impl HubConnection {
                 Ok(()) => Status::unavailable("hub closed the stream"),
                 Err(s) => s,
             };
-            if was_connected {
+            if was_registered {
                 backoff = self.settings.backoff_min;
                 failures = 0;
             }
             failures += 1;
-            let wait = if status.code() == Code::AlreadyExists {
+            let wait = if matches!(status.code(), Code::AlreadyExists | Code::InvalidArgument) {
                 *self.last_rejection.lock().unwrap() = Some(status.message().to_string());
                 tracing::error!(service = %self.service_name, instance = %self.instance_id, reason = status.message(), retry_in = ?self.settings.backoff_max, "hub rejected the registration");
                 self.settings.backoff_max
@@ -219,7 +232,16 @@ impl HubConnection {
             .map_err(|e| Status::unavailable(e.to_string()))?;
         let mut client = HubClient::new(channel);
         let (tx, rx) = mpsc::channel::<ClientMessage>(256);
-        let mut stream = client.connect(ReceiverStream::new(rx)).await?.into_inner();
+        // A peer that accepts TCP but never answers the HTTP/2 handshake must not hang the loop.
+        let mut stream = tokio::time::timeout(
+            self.settings.handshake_timeout,
+            client.connect(ReceiverStream::new(rx)),
+        )
+        .await
+        .map_err(|_| {
+            Status::deadline_exceeded("hub did not answer the connect handshake in time")
+        })??
+        .into_inner();
 
         // The Register is the first message of every stream, confirmed by the echo of the heartbeat after it.
         let (commands, queries) = self.types.lock().unwrap().clone();

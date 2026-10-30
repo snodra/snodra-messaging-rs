@@ -39,7 +39,10 @@ impl OutboxPublisher {
     ) -> Result<Arc<OutboxPublisher>, MessagingError> {
         let producer: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", bootstrap_servers)
-            .set("message.timeout.ms", "5000")
+            // Same budget as the Kotlin producer (max.block.ms 10 s + delivery.timeout.ms 30 s): a broker
+            // restart must not exhaust the 10 attempts.
+            .set("message.timeout.ms", "30000")
+            .set("request.timeout.ms", "20000")
             .set("enable.idempotence", "true")
             .create()?;
         Ok(Arc::new(OutboxPublisher {
@@ -105,7 +108,7 @@ impl OutboxPublisher {
             }
             match self
                 .producer
-                .send(record, Timeout::After(Duration::from_secs(10)))
+                .send(record, Timeout::After(Duration::from_secs(40)))
                 .await
             {
                 Ok(_) => {
@@ -118,7 +121,7 @@ impl OutboxPublisher {
                 }
                 Err((e, _)) => {
                     let attempt = d.attempts + 1;
-                    if attempt >= self.max_attempts {
+                    if attempt >= self.max_attempts || !is_retriable(&e) {
                         coll.update_one(doc! { "_id": &d.id }, doc! { "$inc": { "attempts": 1 }, "$set": { "failedAt": DateTime::now() } }).await?;
                         tracing::error!(id = %d.id, r#type = %d.type_name, attempts = attempt, "outbox document marked failed: {e}");
                         continue;
@@ -162,6 +165,24 @@ impl OutboxPublisher {
             headers: all,
         })
     }
+}
+
+/// Delivery failures no retry can fix (Kotlin's NON_RETRIABLE set): oversized or invalid records,
+/// unknown or unauthorized topics.
+fn is_retriable(e: &rdkafka::error::KafkaError) -> bool {
+    use rdkafka::types::RDKafkaErrorCode as Code;
+    !matches!(
+        e.rdkafka_error_code(),
+        Some(
+            Code::MessageSizeTooLarge
+                | Code::InvalidMessage
+                | Code::InvalidMessageSize
+                | Code::InvalidTopic
+                | Code::TopicAuthorizationFailed
+                | Code::ClusterAuthorizationFailed
+                | Code::InvalidRecord
+        )
+    )
 }
 
 struct Prepared {

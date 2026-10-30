@@ -45,6 +45,19 @@ pub fn sign(
     .expect("sign")
 }
 
+/// Signed token with an `aud` claim, as Keycloak issues them.
+pub fn token_with_audience(subject: &str, roles: &[&str], audience: &[&str]) -> String {
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some("k1".into());
+    let claims = json!({"sub": subject, "iss": ISSUER, "exp": now() + 300, "aud": audience, "realm_access": {"roles": roles}});
+    encode(
+        &header,
+        &claims,
+        &EncodingKey::from_rsa_pem(TEST_KEY_PEM).unwrap(),
+    )
+    .unwrap()
+}
+
 /// `alg: none` token: two base64url segments and an empty signature.
 pub fn unsigned_token(subject: &str) -> String {
     let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);

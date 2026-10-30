@@ -9,7 +9,7 @@ use crate::error::MessagingError;
 use crate::identity::IdentityResolver;
 use crate::proto::{self, ErrorCode, Reply, RequestKind, reply};
 
-use super::registry::{HandlerRegistry, RequestHandler};
+use super::registry::{HandlerRegistry, Invocation, RequestHandler};
 
 /// Turns a `Request` into a `Reply`, never into a dropped stream. Every outcome, including a
 /// rejected token, is a reply the hub forwards to the sender.
@@ -100,18 +100,32 @@ impl Dispatcher {
         let payload = req.payload;
         let task =
             tokio::spawn(CURRENT.scope(ctx.clone(), async move { handler(payload, ctx).await }));
+        let handler_error = |message: String| MessagingError::RemoteHandler {
+            type_name: req.r#type.clone(),
+            message,
+            details: vec![],
+        };
         match task.await {
-            Ok(result) => result,
-            Err(join) if join.is_panic() => Err(MessagingError::RemoteHandler {
-                type_name: req.r#type,
-                message: "handler panicked".into(),
-                details: vec![],
+            Ok(Ok(payload)) => Ok(payload),
+            Ok(Err(Invocation::Decode(m))) => Err(MessagingError::InvalidMessage(m)),
+            Ok(Err(Invocation::Encode(m))) => Err(handler_error(m)),
+            // Only authorization outcomes keep their code; anything else a handler returns (including a
+            // nested call's NoHandler or a decode error of its own) is this handler's error.
+            Ok(Err(Invocation::Handler(
+                e @ (MessagingError::Unauthenticated(_) | MessagingError::AccessDenied(_)),
+            ))) => Err(e),
+            Ok(Err(Invocation::Handler(MessagingError::RemoteHandler {
+                message,
+                details,
+                ..
+            }))) => Err(MessagingError::RemoteHandler {
+                type_name: req.r#type.clone(),
+                message,
+                details,
             }),
-            Err(join) => Err(MessagingError::RemoteHandler {
-                type_name: req.r#type,
-                message: format!("handler task failed: {join}"),
-                details: vec![],
-            }),
+            Ok(Err(Invocation::Handler(e))) => Err(handler_error(e.to_string())),
+            Err(join) if join.is_panic() => Err(handler_error("handler panicked".into())),
+            Err(join) => Err(handler_error(format!("handler task failed: {join}"))),
         }
     }
 }

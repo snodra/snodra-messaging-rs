@@ -23,6 +23,7 @@ pub struct State {
     pub requests: Mutex<Vec<proto::Request>>,
     heartbeats: AtomicUsize,
     reject_next: AtomicBool,
+    reject_invalid_next: AtomicBool,
     echo_heartbeats: AtomicBool,
     drop_tx: broadcast::Sender<()>,
     clients: Mutex<Vec<Outbound>>,
@@ -46,6 +47,9 @@ impl Hub for Service {
             return Err(Status::already_exists(
                 "type t.Cmd is owned by other-service",
             ));
+        }
+        if state.reject_invalid_next.swap(false, Ordering::SeqCst) {
+            return Err(Status::invalid_argument("service_name must not be empty"));
         }
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel::<Result<ServerMessage, Status>>(64);
@@ -109,6 +113,7 @@ impl FakeHub {
             requests: Mutex::new(vec![]),
             heartbeats: AtomicUsize::new(0),
             reject_next: AtomicBool::new(false),
+            reject_invalid_next: AtomicBool::new(false),
             echo_heartbeats: AtomicBool::new(true),
             drop_tx,
             clients: Mutex::new(vec![]),
@@ -162,6 +167,10 @@ impl FakeHub {
 
     pub fn reject_next_with_already_exists(&self) {
         self.state.reject_next.store(true, Ordering::SeqCst);
+    }
+
+    pub fn reject_next_with_invalid_argument(&self) {
+        self.state.reject_invalid_next.store(true, Ordering::SeqCst);
     }
 
     pub fn set_echo_heartbeats(&self, echo: bool) {

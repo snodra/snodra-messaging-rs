@@ -20,7 +20,7 @@ pub struct SendOptions {
     pub routing_key: Option<String>,
     /// Overrides the default request timeout.
     pub timeout: Option<Duration>,
-    /// Overrides the token forwarded from the current handler context.
+    /// Full header value (`Bearer <jwt>`) to send instead of the one forwarded from the current handler context.
     pub authorization: Option<String>,
 }
 

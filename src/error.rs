@@ -58,7 +58,7 @@ impl MessagingError {
             Self::NoHandler(_) => ErrorCode::NoHandler,
             Self::Unauthenticated(_) => ErrorCode::Unauthenticated,
             Self::AccessDenied(_) => ErrorCode::PermissionDenied,
-            Self::InvalidMessage(_) | Self::Serialization(_) => ErrorCode::InvalidRequest,
+            Self::InvalidMessage(_) => ErrorCode::InvalidRequest,
             _ => ErrorCode::HandlerError,
         }
     }

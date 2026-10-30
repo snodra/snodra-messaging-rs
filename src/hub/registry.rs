@@ -14,8 +14,17 @@ use crate::identity::Guard;
 use crate::types::{Command, Event, MessageType, Query};
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+/// Why an erased request handler did not produce a payload: the dispatcher maps each case to its
+/// own reply code (decode → INVALID_REQUEST; the handler's error → HANDLER_ERROR unless it is an
+/// authorization outcome).
+pub(crate) enum Invocation {
+    Decode(String),
+    Handler(MessagingError),
+    Encode(String),
+}
+
 pub(crate) type RequestHandler =
-    Arc<dyn Fn(Vec<u8>, MessageContext) -> BoxFut<Result<Vec<u8>, MessagingError>> + Send + Sync>;
+    Arc<dyn Fn(Vec<u8>, MessageContext) -> BoxFut<Result<Vec<u8>, Invocation>> + Send + Sync>;
 pub(crate) type EventHandler =
     Arc<dyn Fn(Vec<u8>, EventContext) -> BoxFut<Result<(), MessagingError>> + Send + Sync>;
 
@@ -147,11 +156,11 @@ where
     Arc::new(move |payload: Vec<u8>, ctx: MessageContext| {
         let handler = Arc::clone(&handler);
         Box::pin(async move {
-            let message: M = codec::decode(&payload).map_err(|e| {
-                MessagingError::InvalidMessage(format!("cannot decode payload: {e}"))
-            })?;
-            let reply = handler(message, ctx).await?;
+            let message: M = codec::decode(&payload)
+                .map_err(|e| Invocation::Decode(format!("cannot decode payload: {e}")))?;
+            let reply = handler(message, ctx).await.map_err(Invocation::Handler)?;
             codec::encode_reply(&reply)
+                .map_err(|e| Invocation::Encode(format!("cannot encode reply: {e}")))
         })
     })
 }

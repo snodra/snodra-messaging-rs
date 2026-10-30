@@ -35,7 +35,10 @@ impl JwksVerifier {
         JwksVerifier {
             jwks_url,
             issuer,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap_or_default(),
             cache: Arc::new(RwLock::new(Cache {
                 fetched_at: None,
                 last_forced_refresh: None,
@@ -65,6 +68,9 @@ impl JwksVerifier {
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&[&self.issuer]);
         validation.validate_exp = true;
+        validation.validate_nbf = true;
+        // Keycloak tokens carry `aud` ("account", client ids); like Spring's JwtDecoder we do not validate it.
+        validation.validate_aud = false;
         validation.set_required_spec_claims(&["exp", "iss"]);
         let data = decode::<Map<String, Value>>(token, &key, &validation).map_err(|e| {
             tracing::debug!(error = %e, "forwarded token rejected");
@@ -86,28 +92,44 @@ impl JwksVerifier {
         }
     }
 
-    /// Fetches the JWKS. A `throttled` refresh (unknown kid) runs at most once per minute.
+    /// Fetches the JWKS outside the lock. A `throttled` refresh (unknown kid) runs at most once per
+    /// minute; a fetch failure is `Unauthenticated` for the caller (the detail is logged, never sent).
     async fn refresh(&self, throttled: bool) -> Result<(), MessagingError> {
-        let mut cache = self.cache.write().await;
-        if throttled {
-            if cache
-                .last_forced_refresh
-                .is_some_and(|t| t.elapsed() < MIN_REFRESH_INTERVAL)
-            {
-                return Ok(());
+        {
+            let mut cache = self.cache.write().await;
+            if throttled {
+                if cache
+                    .last_forced_refresh
+                    .is_some_and(|t| t.elapsed() < MIN_REFRESH_INTERVAL)
+                {
+                    return Ok(());
+                }
+                cache.last_forced_refresh = Some(Instant::now());
+            } else if cache.fetched_at.is_some() {
+                return Ok(()); // another task loaded the keys while we waited for the lock
             }
-            cache.last_forced_refresh = Some(Instant::now());
         }
-        let keys: JwkSet = self
+        let fetched = self
             .http
             .get(&self.jwks_url)
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
-            .map_err(|e| MessagingError::Transport(format!("JWKS fetch failed: {e}")))?
-            .json()
-            .await
-            .map_err(|e| MessagingError::Transport(format!("JWKS parse failed: {e}")))?;
+            .map_err(|e| e.to_string());
+        let keys: JwkSet = match fetched {
+            Ok(response) => match response.json().await {
+                Ok(keys) => keys,
+                Err(e) => {
+                    tracing::warn!("JWKS parse failed: {e}");
+                    return Err(unauthenticated("signing keys unavailable"));
+                }
+            },
+            Err(e) => {
+                tracing::warn!("JWKS fetch failed: {e}");
+                return Err(unauthenticated("signing keys unavailable"));
+            }
+        };
+        let mut cache = self.cache.write().await;
         cache.keys = keys;
         cache.fetched_at = Some(Instant::now());
         Ok(())

@@ -110,6 +110,7 @@ impl EventConsumer {
 
     pub fn start(self: Arc<Self>, cancel: CancellationToken) -> JoinHandle<()> {
         tokio::spawn(async move {
+            let cancel_for_records = cancel.clone();
             if let Err(e) = self.consumer.subscribe(&[self.topic.as_str()]) {
                 tracing::error!("cannot subscribe to {}: {e}", self.topic);
                 return;
@@ -123,7 +124,9 @@ impl EventConsumer {
                             tokio::time::sleep(Duration::from_millis(500)).await;
                         }
                         Ok(msg) => {
-                            self.handle_record(&msg).await;
+                            if !self.handle_record(&msg, &cancel_for_records).await {
+                                break; // shutting down mid-retry: leave the offset uncommitted for the next run
+                            }
                             if let Err(e) = self.consumer.commit_message(&msg, CommitMode::Async) {
                                 tracing::warn!("offset commit failed: {e}");
                             }
@@ -134,7 +137,8 @@ impl EventConsumer {
         })
     }
 
-    async fn handle_record(&self, msg: &BorrowedMessage<'_>) {
+    /// Returns false when cancelled while retrying (the record is redelivered after a restart).
+    async fn handle_record(&self, msg: &BorrowedMessage<'_>, cancel: &CancellationToken) -> bool {
         let hdrs: HashMap<String, String> = msg
             .headers()
             .map(|h| {
@@ -166,7 +170,7 @@ impl EventConsumer {
                         "skipping record: {reason}"
                     );
                 }
-                return;
+                return true;
             }
             RecordDisposition::Handle { type_name, id } => (type_name, id),
         };
@@ -175,21 +179,25 @@ impl EventConsumer {
         }
         for attempt in 1..=self.max_attempts {
             match self.process_once(&type_name, &id, &hdrs, payload).await {
-                Ok(Outcome::Handled) => return,
+                Ok(Outcome::Handled) => return true,
                 Ok(Outcome::Duplicate) => {
                     tracing::debug!(r#type = %type_name, id = %id, "duplicate event skipped");
-                    return;
+                    return true;
                 }
                 Err(e) => {
                     if attempt < self.max_attempts {
                         tracing::warn!(r#type = %type_name, id = %id, attempt, "event handler failed, retrying: {e}");
-                        tokio::time::sleep(self.backoff).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(self.backoff) => {}
+                            _ = cancel.cancelled() => return false,
+                        }
                     } else {
                         tracing::error!(r#type = %type_name, id = %id, topic = msg.topic(), partition = msg.partition(), offset = msg.offset(), attempts = attempt, "event handler failed, record skipped: {e}");
                     }
                 }
             }
         }
+        true
     }
 
     async fn process_once(

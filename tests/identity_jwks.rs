@@ -129,3 +129,36 @@ async fn unknown_kid_refreshes_once_then_fails() {
         Err(MessagingError::Unauthenticated(_))
     ));
 }
+
+#[tokio::test]
+async fn token_with_audience_is_verified() {
+    // Keycloak access tokens carry `aud` ("account", client ids); like Spring's JwtDecoder we do not validate it.
+    let server = server_with(None).await;
+    let token = support::token_with_audience("u-3", &["kraken-user"], &["account", "service-a"]);
+    let id = resolver(&server)
+        .resolve(Some(&format!("Bearer {token}")))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(id.user_id.as_deref(), Some("u-3"));
+    assert!(id.verified);
+}
+
+#[tokio::test]
+async fn jwks_unavailable_is_unauthenticated_not_handler_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/certs"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let token = support::token("u-1", &[], support::ISSUER, support::now() + 300);
+    let err = resolver(&server)
+        .resolve(Some(&format!("Bearer {token}")))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, MessagingError::Unauthenticated(ref m) if !m.contains("http")),
+        "{err:?}"
+    );
+}
