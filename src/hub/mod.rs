@@ -5,7 +5,9 @@
 mod connection;
 mod dispatcher;
 mod registry;
+mod sender;
 
 pub use connection::{HubConnection, HubSettings, Inbound};
 pub use dispatcher::Dispatcher;
 pub use registry::{EventContext, HandlerRegistry};
+pub use sender::{SendOptions, Sender};
