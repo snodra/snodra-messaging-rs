@@ -1,4 +1,20 @@
-# kraken-messaging-rs
+<h1 align="center">kraken-messaging-rs</h1>
+
+<p align="center">
+  The Rust counterpart of kraken-messaging: hub client, Kafka outbox and idempotent consumer, JWT identity, one builder.
+</p>
+
+<p align="center">
+  <a href="https://gitlab.damoreira.ml/kraken-org/kraken-messaging-rs/-/pipelines"><img alt="pipeline" src="https://gitlab.damoreira.ml/kraken-org/kraken-messaging-rs/badges/main/pipeline.svg"></a>
+  <a href="https://gitlab.damoreira.ml/kraken-org/kraken-messaging-rs/-/releases"><img alt="release" src="https://gitlab.damoreira.ml/kraken-org/kraken-messaging-rs/-/badges/release.svg"></a>
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-1.99.1-000000?logo=rust&logoColor=white">
+  <img alt="crate" src="https://img.shields.io/badge/crate-git%20dependency-dea584?logo=rust&logoColor=white">
+  <img alt="Kafka" src="https://img.shields.io/badge/Kafka-rdkafka-231F20?logo=apachekafka&logoColor=white">
+  <a href="https://gitlab.damoreira.ml/kraken-org/kraken/-/tree/main/docs"><img alt="kraken docs" src="https://img.shields.io/badge/kraken-umbrella%20docs-0B5FFF"></a>
+  <img alt="license" src="https://img.shields.io/badge/license-pending-lightgrey">
+</p>
+
+---
 
 The Rust counterpart of the Kotlin `kraken-messaging` starter. A service built on it is
 indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
@@ -13,6 +29,17 @@ indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
 | Consume events idempotently (marker + handler in one transaction) | `kafka::EventConsumer` |
 | Identity from the forwarded JWT: JWKS verification or unverified parsing; handler guards | `identity::{IdentityResolver, JwksVerifier, Guard}` |
 | One builder wiring all of it from `KRAKEN_*` variables | `KrakenMessaging`, `Config` |
+
+## Table of contents
+
+- [Usage](#usage)
+- [Configuration (`Config::from_env`)](#configuration-configfromenv)
+- [Semantics worth knowing](#semantics-worth-knowing)
+- [Build and test](#build-and-test)
+- [Example](#example)
+- [CI/CD pipeline](#cicd-pipeline)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Usage
 
@@ -127,3 +154,33 @@ byte-identical to `../kraken/protocol/hub.proto` whenever the umbrella checkout 
 
 `examples/service-c` is a complete service: it handles `Shout` and `Reverse`, publishes
 events, consumes `GreetingDelivered`, and runs in the sandbox compose next to the Kotlin examples.
+
+
+## CI/CD pipeline
+
+Defined in [`.gitlab-ci.yml`](.gitlab-ci.yml); runs on every push and merge request on a Rust image
+with `protobuf-compiler` installed.
+
+```mermaid
+flowchart LR
+    fmt["fmt<br/>cargo fmt --check"] --> clippy["clippy<br/>--all-targets -D warnings"] --> test["test<br/>cargo test"] --> docker["docker · tag vX.Y.Z<br/>Kaniko → registry"]
+```
+
+| Stage | Job | Runs | Produces |
+|---|---|---|---|
+| fmt | `fmt` | always | formatting check |
+| clippy | `clippy` | always | lint with warnings as errors |
+| test | `test` | always | unit and in-process integration tests |
+| docker | `docker` | only on tags `vX.Y.Z` | `registry.gitlab.damoreira.ml/kraken-org/kraken-messaging-rs:vX.Y.Z` and `:latest` |
+
+The crate is consumed as a git dependency pinned to a tag, so the image job mainly proves the Dockerfile; the sandbox compose builds `examples/service-c` from source.
+
+## Contributing
+
+Branches `feat/<topic>`, `fix/<topic>`, `chore/<topic>` off `main`, merged by merge request with a
+green pipeline; conventional commit messages. Design changes go to the umbrella repo first.
+Conventions: [`../kraken/docs/04-repositories.md`](../kraken/docs/04-repositories.md).
+
+## License
+
+No license has been chosen yet; all rights reserved until a `LICENSE` file lands.
