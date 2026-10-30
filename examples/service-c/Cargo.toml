@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
 description = "kraken example service C: handles Shout and Reverse, publishes text events, logs GreetingDelivered"
-license = "Apache-2.0"
+license = "MIT"
 publish = false
 
 [dependencies]
