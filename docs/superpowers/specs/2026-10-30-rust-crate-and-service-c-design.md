@@ -88,6 +88,13 @@ attempts sets `failedAt` and moves on. Indexes: `(sentAt, createdAt)`, TTL on `s
 `processedAt` (30 d). `publish()` inserts into the outbox inside the caller's Mongo session when one is passed,
 else in its own write.
 
+**Mongo document shapes (the Kotlin code is the authority).** `createdAt`, `sentAt`, `failedAt`, `processedAt`
+are BSON dates; `seq` is Int64; `attempts` Int32; `payload` is an embedded BSON document (the event JSON parsed,
+not a string); `headers.userId` is the empty string when anonymous. Spring Data adds a `_class` field to its
+documents; the Rust crate does not write one and ignores it when present. Every service owns its own database,
+so no service ever reads another's `outbox` or `processed_events`; identical shapes matter for operators and
+tooling, not for correctness.
+
 **JSON shapes.** Field names identical to the Kotlin data classes; `Instant` as RFC 3339 with nanoseconds
 (`2026-10-30T00:49:45.227152891Z`), `chrono::DateTime<Utc>` with serde. Replies to commands without a result:
 `{}`.
@@ -134,8 +141,7 @@ let reply: Shouted = app.commands().send(&Shout { .. }, SendOptions::default()).
 app.shutdown().await;                                            // deregister, drain, stop loops
 ```
 
-Configuration (`Config`, all overridable by env with the sandbox's names): `service_name`, `type_prefix`
-(default = service name, used for types without an explicit name), `hub_address` (`static://` prefix accepted),
+Configuration (`Config`, all overridable by env with the sandbox's names): `service_name`, `hub_address` (`static://` prefix accepted),
 `hub_request_timeout` 5 s, `heartbeat_interval` 10 s, `reconnect_backoff` 500 ms..30 s, `max_concurrent_handlers`
 256, `kafka_bootstrap`, `kafka_topic` `kraken.events`, `consumer_enabled`, `consumer_max_attempts` 5,
 `mongodb_uri`, `outbox_enabled`, `outbox_poll_interval` 200 ms, `outbox_batch_size` 100, `outbox_max_attempts` 10,
@@ -154,6 +160,8 @@ the builder image's libssl3, which bookworm-slim provides).
 
 ## Kotlin side
 
+- Field names on both sides are exactly `text` (replies) and `text`, `at` (events); listeners do not use the
+  record key.
 - `examples-api`: `Shout(text)`: `Command<Shouted>`, `Shouted(text)`, `Reverse(text)`: `Query<Reversed>`,
   `Reversed(text)`, `TextShouted(text, at)`: `Event`, `TextReversed(text, at)`: `Event`; wire names
   `examples.Shout`, `examples.Reverse`, `examples.TextShouted`, `examples.TextReversed`.
@@ -182,20 +190,33 @@ the builder image's libssl3, which bookworm-slim provides).
 - Integration tests (testcontainers, `kraken-hub:dev`, `apache/kafka:4.4.0`, `mongo:8.3.13` replica set): two
   Rust participants through the hub (send and handle, NO_HANDLER, PERMISSION_DENIED with a signed token);
   publish through the outbox and consume with dedupe (same event id twice → handler once); reconnect after the
-  hub container restarts. Skipped automatically when Docker is absent, run in the full suite here.
+  hub container restarts. Skipped with a notice when Docker is absent; when Docker is present but the
+  `kraken-hub:dev` image is missing they **fail** with the build command in the message
+  (`docker build -t kraken-hub:dev .` in `../kraken-hub`), never skip silently. `KRAKEN_HUB_IMAGE` overrides the
+  image name, as in the Kotlin test module. The sandbox MongoDB already runs as the single-node replica set
+  `rs0` (transactions work; `compose.yaml` initiates it in its healthcheck), and the testcontainers Mongo is
+  started the same way.
 - Cross-language proof: the sandbox smoke with A, B and C.
 
 ## Builder calls (my decisions, flagged)
 
-- Proto source: `build.rs` compiles `../kraken/protocol/hub.proto` when the sibling exists, else the vendored
-  `proto/hub.proto`; a test asserts the two are byte-identical when both exist, so drift fails the build.
+- Proto source: the vendored `proto/hub.proto` is what `build.rs` compiles (it is the only copy inside the Docker
+  build context); plan 1 refreshes it from `../kraken/protocol/hub.proto` (currently stale), and a unit test
+  asserts the two files are byte-identical whenever the sibling checkout exists, so drift fails `cargo test` on
+  a developer machine. Same rule as the Kotlin repo's copy.
 - Typed registration uses `const TYPE: &str` on a `MessageType` trait plus a `#[derive]`-free helper macro
-  `message_type!(Shout, "examples.Shout")`; no proc-macro crate for now.
+  `message_type!(Shout, "examples.Shout")`; no proc-macro crate for now. Wire names are always explicit in Rust:
+  there is no `type_prefix` default naming (Kotlin keeps it for unannotated classes; shared api classes are
+  annotated on both sides anyway).
 - Task-local `MessageContext` for forwarding `authorization` and `correlationId` from an incoming handler to
   outgoing sends, mirroring the Kotlin coroutine context.
 - JWKS cache refresh at most once per minute; unknown `kid` triggers one refresh then fails.
-- Mongo sessions: `publish()` accepts an optional `&mut ClientSession`; the consumer runs handler + marker in a
-  transaction and hands the session to the handler through the context so handler writes join it.
+- Mongo sessions: command and query handlers receive `MessageContext`; event handlers receive `EventContext
+  { message: MessageContext, session: Arc<tokio::sync::Mutex<ClientSession>> }` because the driver's operations
+  take `&mut ClientSession`, which is neither `Clone` nor shareable. The consumer opens the transaction, the
+  handler locks the session for its own writes and for `events.publish_in(&event, key, &mut session)`, and the
+  consumer inserts the dedupe marker and commits. `events.publish(&event, key)` without a session does its own
+  write (used by command and query handlers, like service C).
 - Versions: `jsonwebtoken` 11.1.0, `chrono` 0.4.45, `reqwest` 0.13.5 (rustls), `wiremock` 0.6.5, `mongodb` 3.9.1,
   `testcontainers-modules` 0.15.0 (`kafka`, `mongo`); existing pins kept (tonic 0.14.8, prost 0.14.4,
   rdkafka 0.39.0, tokio 1.54.1).
