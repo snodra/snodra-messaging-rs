@@ -1,40 +1,82 @@
-//! Error type shared by the hub client and the Kafka transport. Codes mirror `ErrorCode` in
-//! `proto/hub.proto` and the error table in kraken/docs/02-messaging.md.
+//! Errors seen by callers, mirroring `MessagingExceptions.kt` and the hub `ErrorCode`s.
+
+use crate::proto::ErrorCode;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MessagingError {
-    /// No connected instance handles the message type (hub `NO_HANDLER`).
-    #[error("no handler registered for message type {0}")]
+    #[error("No handler registered for '{0}'")]
     NoHandler(String),
-    /// No reply within the request timeout (hub `TIMEOUT`).
-    #[error("request {0} timed out")]
+    #[error("Timed out waiting for reply to '{0}'")]
     Timeout(String),
-    /// The handling instance disconnected before replying (hub `HANDLER_DISCONNECTED`).
-    #[error("handler disconnected while processing request {0}")]
+    #[error("Handler for '{0}' disconnected")]
     HandlerDisconnected(String),
-    /// The handler returned an application error (hub `HANDLER_ERROR`, `UNAUTHENTICATED`,
-    /// `INVALID_REQUEST`); `code` is the proto enum number.
-    #[error("handler error {code}: {message}")]
-    Handler { code: i32, message: String, details: Vec<u8> },
-    /// gRPC or Kafka transport failure.
-    #[error("transport error: {0}")]
-    Transport(String),
-    /// JSON (de)serialisation failure.
+    #[error("{message}")]
+    RemoteHandler {
+        type_name: String,
+        message: String,
+        details: Vec<u8>,
+    },
+    #[error("{0}")]
+    Unauthenticated(String),
+    #[error("{0}")]
+    AccessDenied(String),
+    #[error("{0}")]
+    InvalidMessage(String),
+    #[error("{0}")]
+    HubUnavailable(String),
+    #[error("{0}")]
+    HubRegistrationRejected(String),
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
-    /// The code path is not written yet. Exists only while this crate is a skeleton.
-    #[error("not implemented: {0}")]
-    NotImplemented(&'static str),
+    #[error("storage error: {0}")]
+    Storage(String),
+    #[error("transport error: {0}")]
+    Transport(String),
+}
+
+impl MessagingError {
+    /// Maps a hub `Error` to the exception a caller gets, exactly as `HubErrors.kt`.
+    pub fn from_hub(type_name: &str, code: i32, message: &str, details: &[u8]) -> Self {
+        match ErrorCode::try_from(code).unwrap_or(ErrorCode::Unspecified) {
+            ErrorCode::NoHandler => Self::NoHandler(type_name.to_string()),
+            ErrorCode::Timeout => Self::Timeout(type_name.to_string()),
+            ErrorCode::HandlerDisconnected => Self::HandlerDisconnected(type_name.to_string()),
+            ErrorCode::Unauthenticated => Self::Unauthenticated(message.to_string()),
+            ErrorCode::InvalidRequest => Self::InvalidMessage(message.to_string()),
+            ErrorCode::PermissionDenied => Self::AccessDenied(message.to_string()),
+            ErrorCode::HandlerError | ErrorCode::Unspecified => Self::RemoteHandler {
+                type_name: type_name.to_string(),
+                message: message.to_string(),
+                details: details.to_vec(),
+            },
+        }
+    }
+
+    /// The code a handler's error becomes inside a `Reply`.
+    pub fn to_reply_code(&self) -> ErrorCode {
+        match self {
+            Self::Unauthenticated(_) => ErrorCode::Unauthenticated,
+            Self::AccessDenied(_) => ErrorCode::PermissionDenied,
+            Self::InvalidMessage(_) | Self::Serialization(_) => ErrorCode::InvalidRequest,
+            _ => ErrorCode::HandlerError,
+        }
+    }
 }
 
 impl From<tonic::Status> for MessagingError {
     fn from(status: tonic::Status) -> Self {
-        MessagingError::Transport(status.to_string())
+        Self::Transport(status.to_string())
+    }
+}
+
+impl From<mongodb::error::Error> for MessagingError {
+    fn from(e: mongodb::error::Error) -> Self {
+        Self::Storage(e.to_string())
     }
 }
 
 impl From<rdkafka::error::KafkaError> for MessagingError {
-    fn from(err: rdkafka::error::KafkaError) -> Self {
-        MessagingError::Transport(err.to_string())
+    fn from(e: rdkafka::error::KafkaError) -> Self {
+        Self::Transport(e.to_string())
     }
 }

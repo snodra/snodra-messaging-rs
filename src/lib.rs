@@ -1,28 +1,15 @@
-//! # kraken_messaging
+//! kraken messaging client for Rust: the counterpart of the Kotlin `kraken-messaging` starter.
 //!
-//! Rust client for the kraken messaging layer (see kraken/docs/02-messaging.md):
-//!
-//! - `HandlerRegistry`: declare `@EventHandler`/`@CommandHandler`/`@QueryHandler` equivalents.
-//! - `HubClient`: commands and queries over the gRPC hub, with JWT forwarding.
-//! - `EventPublisher` / `EventConsumer`: events on the `kraken.events` Kafka topic.
-//! - `Envelope`: the shared JSON envelope and header names.
-//!
-//! Status: skeleton. Public API is stable in shape; transports return
-//! `MessagingError::NotImplemented`.
-
-pub mod envelope;
+//! Wire- and storage-compatible with it: same hub protocol (`proto/hub.proto`), same Kafka record
+//! format on `kraken.events`, same `outbox` and `processed_events` collections. See README.md.
+pub mod codec;
+pub mod context;
 pub mod error;
-pub mod handlers;
-pub mod hub_client;
-pub mod kafka;
+pub mod identity;
+pub mod proto;
+pub mod types;
 
-/// Generated gRPC types for `kraken.hub.v1`.
-pub mod proto {
-    tonic::include_proto!("kraken.hub.v1");
-}
-
-pub use envelope::Envelope;
+pub use context::MessageContext;
 pub use error::MessagingError;
-pub use handlers::{Command, Event, HandlerContext, HandlerRegistry, MessageType, Query};
-pub use hub_client::{HubClient, HubConfig, SendOptions};
-pub use kafka::{EventConsumer, EventPublisher, KafkaConfig};
+pub use identity::Identity;
+pub use types::{Command, Event, MessageType, Query};
