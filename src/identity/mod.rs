@@ -1,4 +1,17 @@
-//! Who is calling: the identity read from the forwarded JWT (filled in by the resolver, Task 2).
+//! Who is calling: the identity read from the forwarded JWT, verification, and handler guards.
+//!
+//! Trusted-by-default model (kraken/docs/06-security.md): an absent token is an anonymous caller and
+//! the request proceeds; whether anonymity is acceptable is the handler's decision through a [`Guard`].
+
+mod guard;
+mod jwks;
+mod resolver;
+
+pub use guard::Guard;
+pub use jwks::JwksVerifier;
+pub use resolver::IdentityResolver;
+
+use serde_json::{Map, Value};
 
 /// The acting user as seen by a handler.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -15,4 +28,32 @@ impl Identity {
     pub fn has_role(&self, role: &str) -> bool {
         self.roles.iter().any(|r| r == role)
     }
+
+    pub(crate) fn from_claims(claims: &Map<String, Value>, verified: bool) -> Identity {
+        Identity {
+            user_id: claims
+                .get("sub")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            roles: realm_roles(claims),
+            verified,
+        }
+    }
+}
+
+/// Keycloak realm roles from `realm_access.roles`; empty when the claim is absent or malformed.
+pub fn realm_roles(claims: &Map<String, Value>) -> Vec<String> {
+    claims
+        .get("realm_access")
+        .and_then(Value::as_object)
+        .and_then(|ra| ra.get("roles"))
+        .and_then(Value::as_array)
+        .map(|roles| {
+            roles
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }

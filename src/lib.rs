@@ -11,5 +11,5 @@ pub mod types;
 
 pub use context::MessageContext;
 pub use error::MessagingError;
-pub use identity::Identity;
+pub use identity::{Guard, Identity};
 pub use types::{Command, Event, MessageType, Query};
