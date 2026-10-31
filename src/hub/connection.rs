@@ -250,6 +250,7 @@ impl HubConnection {
             instance_id: self.instance_id.clone(),
             command_types: commands,
             query_types: queries,
+            ..Register::default()
         };
         tx.send(ClientMessage {
             message: Some(client_message::Message::Register(register)),
@@ -294,6 +295,8 @@ impl HubConnection {
                         server_message::Message::Request(r) => self.forward(Inbound::Request(r)).await?,
                         server_message::Message::Reply(r) => self.forward(Inbound::Reply(r)).await?,
                         server_message::Message::Error(e) => self.forward(Inbound::Error(e)).await?,
+                        // Not sent to v1 clients; handled once this client declares protocol v2.
+                        server_message::Message::RegisterAck(_) => {}
                     },
                 },
             }

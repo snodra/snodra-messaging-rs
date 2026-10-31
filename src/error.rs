@@ -44,11 +44,14 @@ impl MessagingError {
             ErrorCode::Unauthenticated => Self::Unauthenticated(message.to_string()),
             ErrorCode::InvalidRequest => Self::InvalidMessage(message.to_string()),
             ErrorCode::PermissionDenied => Self::AccessDenied(message.to_string()),
-            ErrorCode::HandlerError | ErrorCode::Unspecified => Self::RemoteHandler {
-                type_name: type_name.to_string(),
-                message: message.to_string(),
-                details: details.to_vec(),
-            },
+            // UNSUPPORTED is declared by protocol v2 but not produced yet: read like an unknown code.
+            ErrorCode::HandlerError | ErrorCode::Unsupported | ErrorCode::Unspecified => {
+                Self::RemoteHandler {
+                    type_name: type_name.to_string(),
+                    message: message.to_string(),
+                    details: details.to_vec(),
+                }
+            }
         }
     }
 
