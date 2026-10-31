@@ -24,11 +24,12 @@ pub struct Config {
     pub reconnect_backoff_min: Duration,
     /// Reconnect backoff ceiling (each wait is jittered by ±20 % and never exceeds it).
     pub reconnect_backoff_max: Duration,
-    /// Handlers run concurrently; also the permits granted to a hub with flow control
+    /// Handlers run concurrently, at least 1; also the permits granted to a hub with flow control
     /// (`Register.initial_permits`), which then queues further requests for this instance.
     pub max_concurrent_handlers: usize,
-    /// `Register.load_factor`: this instance's relative capacity (100 = normal). Weights its share
-    /// of keyed commands and its load score for unkeyed requests.
+    /// `Register.load_factor`: this instance's relative capacity (100 = normal; 0 is sent as is and
+    /// read as 100 by the hub). Weights its share of keyed commands and its load score for unkeyed
+    /// requests.
     pub hub_load_factor: u32,
     /// `Register.tags`: unkeyed requests from a sender prefer instances whose tags match more of
     /// the sender's tags (for example `zone=eu-1`).
@@ -217,8 +218,9 @@ impl Config {
         Ok(c)
     }
 
-    /// Rejects what cannot work: an empty service name, `jwks_url` without `issuer`, an invalid
-    /// `hub_retry` policy. Called by `from_env` and by `KrakenMessaging::builder`.
+    /// Rejects what cannot work: an empty service name, `jwks_url` without `issuer`,
+    /// `max_concurrent_handlers` 0, an invalid `hub_retry` policy. Called by `from_env` and by
+    /// `KrakenMessaging::builder`.
     pub fn validate(&self) -> Result<(), MessagingError> {
         if self.service_name.trim().is_empty() {
             return Err(MessagingError::InvalidMessage(
@@ -228,6 +230,12 @@ impl Config {
         if self.jwks_url.is_some() && self.issuer.is_none() {
             return Err(MessagingError::InvalidMessage(
                 "issuer is required when jwks_url is set".into(),
+            ));
+        }
+        if self.max_concurrent_handlers == 0 {
+            return Err(MessagingError::InvalidMessage(
+                "max_concurrent_handlers (KRAKEN_MAX_CONCURRENT_HANDLERS) must be at least 1"
+                    .into(),
             ));
         }
         if let Some(retry) = &self.hub_retry {
@@ -457,6 +465,40 @@ mod tests {
                 Config::from_lookup(|n| vars.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone()));
             assert!(result.is_err(), "{name}={value} accepted");
         }
+    }
+
+    #[test]
+    fn zero_concurrent_handlers_are_rejected() {
+        let result = try_from(&[("KRAKEN_MAX_CONCURRENT_HANDLERS", "0")]);
+        assert!(
+            matches!(result, Err(MessagingError::InvalidMessage(ref m)) if m.contains("max_concurrent_handlers")),
+            "{result:?}"
+        );
+        let in_code = Config {
+            max_concurrent_handlers: 0,
+            ..code_config()
+        };
+        assert!(
+            matches!(in_code.validate(), Err(MessagingError::InvalidMessage(_))),
+            "max_concurrent_handlers 0 accepted"
+        );
+        assert_eq!(
+            from(&[("KRAKEN_MAX_CONCURRENT_HANDLERS", "1")]).max_concurrent_handlers,
+            1
+        );
+    }
+
+    #[test]
+    fn a_negative_load_factor_is_rejected_and_zero_is_kept_for_the_hub() {
+        for value in ["-1", "-100"] {
+            let result = try_from(&[("KRAKEN_HUB_LOAD_FACTOR", value)]);
+            assert!(
+                matches!(result, Err(MessagingError::InvalidMessage(ref m)) if m.contains("KRAKEN_HUB_LOAD_FACTOR")),
+                "{value}: {result:?}"
+            );
+        }
+        // 0 is sent as is; the hub reads it as 100.
+        assert_eq!(from(&[("KRAKEN_HUB_LOAD_FACTOR", "0")]).hub_load_factor, 0);
     }
 
     #[test]
