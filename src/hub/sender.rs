@@ -92,6 +92,22 @@ pub struct SendOptions {
 
 type Pending = oneshot::Sender<Result<Vec<u8>, MessagingError>>;
 
+/// Removes a request's pending entry when the call ends, however it ends: a reply, an error, the
+/// local guard, or the caller dropping the future (while the write is blocked or while it awaits
+/// the answer). Removing an entry that was already taken is a no-op.
+struct ForgetOnDrop<'a> {
+    pending: &'a Mutex<HashMap<String, Entry>>,
+    id: &'a str,
+}
+
+impl Drop for ForgetOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(self.id);
+        }
+    }
+}
+
 struct Entry {
     type_name: String,
     /// The stream the request was written to.
@@ -225,6 +241,10 @@ impl Sender {
         let routing_key = opts.routing_key.unwrap_or_default();
 
         let (tx, rx) = oneshot::channel();
+        let _forget = ForgetOnDrop {
+            pending: &self.pending,
+            id: &id,
+        };
         // The entry is recorded while the stream is still current, tagged with it, so that stream's
         // Disconnected always finds it; a failed write removes it again (never written).
         let sent = self
@@ -270,6 +290,11 @@ impl Sender {
                 Err(MessagingError::Timeout(type_name.to_string()))
             }
         }
+    }
+
+    /// Requests sent and not yet answered, failed or abandoned.
+    pub fn in_flight(&self) -> usize {
+        self.pending.lock().unwrap().len()
     }
 
     fn take(&self, request_id: &str) -> Option<Entry> {

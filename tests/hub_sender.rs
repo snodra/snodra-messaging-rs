@@ -422,3 +422,21 @@ async fn disconnect_of_another_stream_leaves_a_pending_request_alone() {
     conn.shutdown().await;
     hub.stop();
 }
+
+/// Review fix 5: a caller that gives up (drops the future) after the request was recorded must not
+/// leave its pending entry behind until the stream disconnects.
+#[tokio::test]
+async fn dropped_caller_future_leaves_no_pending_entry() {
+    let hub = FakeHub::start().await; // swallows requests: no reply ever comes
+    let (sender, conn) = sender(&hub, Some(Duration::from_secs(10))).await;
+    let gave_up = tokio::time::timeout(
+        Duration::from_millis(200),
+        sender.send_command(&Ping { text: "x".into() }, SendOptions::default()),
+    )
+    .await;
+    assert!(gave_up.is_err(), "the fake hub never answers");
+    assert_eq!(hub.requests().await.len(), 1, "the request was written");
+    assert_eq!(sender.in_flight(), 0, "abandoned request still pending");
+    conn.shutdown().await;
+    hub.stop();
+}
