@@ -11,6 +11,7 @@ pub mod hub;
 pub mod identity;
 pub mod kafka;
 pub mod proto;
+pub mod retry;
 pub mod types;
 
 pub use app::{KrakenMessaging, KrakenMessagingBuilder};
@@ -19,4 +20,5 @@ pub use context::MessageContext;
 pub use error::MessagingError;
 pub use hub::{EventContext, SendOptions};
 pub use identity::{Guard, Identity};
+pub use retry::RetryPolicy;
 pub use types::{Command, Event, MessageType, Query};
