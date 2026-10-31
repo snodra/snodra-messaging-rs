@@ -1,5 +1,7 @@
 //! In-process stand-in for kraken-hub: records registrations, answers a v2 `Register` with a
-//! `RegisterAck` (new-hub behaviour, the default) or not at all (old-hub behaviour, `set_ack(None)`),
+//! `RegisterAck` (new-hub behaviour, the default) or not at all (old-hub behaviour, `set_ack(None)`).
+//! The ack lists "flow-control" when the client declared it, unless `set_flow_control(false)`
+//! (the P0 hub). Permits messages are recorded per stream. It
 //! echoes heartbeats, can drop streams, reject a registration, push requests to clients and answer
 //! their requests.
 
@@ -49,6 +51,9 @@ pub struct State {
     responder: Mutex<Option<Responder>>,
     ack: StdMutex<Option<proto::RegisterAck>>,
     streams: AtomicUsize,
+    flow_control: AtomicBool,
+    /// Permits messages: (stream number, count, when).
+    permits: StdMutex<Vec<(usize, u32, std::time::Instant)>>,
 }
 
 #[derive(Clone)]
@@ -89,9 +94,15 @@ impl Hub for Service {
                         Some(Ok(ClientMessage { message: Some(m) })) => match m {
                             client_message::Message::Register(r) => {
                                 let v2 = r.protocol_version >= 2;
+                                let wants_flow = r.capabilities.iter().any(|c| c == "flow-control");
                                 state.registers.lock().await.push(r);
                                 // Like the real hub: the ack is written before the echo of the next heartbeat.
-                                let ack = state.ack.lock().unwrap().clone();
+                                let ack = state.ack.lock().unwrap().clone().map(|mut ack| {
+                                    if wants_flow && state.flow_control.load(Ordering::SeqCst) {
+                                        ack.capabilities.push("flow-control".to_string());
+                                    }
+                                    ack
+                                });
                                 if let (true, Some(ack)) = (v2, ack) {
                                     let msg = ServerMessage { message: Some(server_message::Message::RegisterAck(ack)) };
                                     if tx.send(Ok(msg)).await.is_err() { break; }
@@ -105,7 +116,7 @@ impl Hub for Service {
                                 }
                             }
                             client_message::Message::Reply(r) => state.replies.lock().await.push((stream_no, r)),
-                            client_message::Message::Permits(_) => {}
+                            client_message::Message::Permits(p) => state.permits.lock().unwrap().push((stream_no, p.count, std::time::Instant::now())),
                             client_message::Message::Request(req) => {
                                 state.requests.lock().await.push(req.clone());
                                 let response = state.responder.lock().await.as_ref().and_then(|f| f(req));
@@ -152,6 +163,8 @@ impl FakeHub {
             responder: Mutex::new(None),
             ack: StdMutex::new(Some(default_ack())),
             streams: AtomicUsize::new(0),
+            flow_control: AtomicBool::new(true),
+            permits: StdMutex::new(vec![]),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -209,6 +222,27 @@ impl FakeHub {
     /// The ack sent for every v2 `Register`; `None` behaves like a hub older than protocol v2.
     pub fn set_ack(&self, ack: Option<proto::RegisterAck>) {
         *self.state.ack.lock().unwrap() = ack;
+    }
+
+    /// Whether the ack shares "flow-control" with clients that declare it (`false`: the P0 hub).
+    pub fn set_flow_control(&self, on: bool) {
+        self.state.flow_control.store(on, Ordering::SeqCst);
+    }
+
+    /// Permits messages received: (1-based stream number, count).
+    pub fn permits(&self) -> Vec<(usize, u32)> {
+        self.state
+            .permits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(s, n, _)| (*s, *n))
+            .collect()
+    }
+
+    /// Permits messages with the instant each arrived.
+    pub fn permits_timed(&self) -> Vec<(usize, u32, std::time::Instant)> {
+        self.state.permits.lock().unwrap().clone()
     }
 
     pub async fn requests(&self) -> Vec<proto::Request> {

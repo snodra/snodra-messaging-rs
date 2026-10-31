@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use kraken_messaging::MessagingError;
 use kraken_messaging::hub::{
-    CLIENT_VERSION, Handshake, HubConnection, HubSettings, Inbound, PROTOCOL_VERSION,
+    CAPABILITIES, CLIENT_VERSION, Handshake, HubConnection, HubSettings, Inbound, PROTOCOL_VERSION,
 };
 use kraken_messaging::proto::{
     self, ClientMessage, Heartbeat, Reply, ServerMessage, client_message, reply, server_message,
@@ -27,6 +27,7 @@ fn settings(
         backoff_max: Duration::from_millis(backoff_max_ms),
         handshake_timeout: Duration::from_secs(5),
         max_concurrent_handlers: 4,
+        ..HubSettings::default()
     }
 }
 
@@ -204,7 +205,7 @@ async fn register_declares_protocol_v2_and_client_version() {
     let r = &hub.registers().await[0];
     assert_eq!(r.protocol_version, PROTOCOL_VERSION);
     assert_eq!(r.protocol_version, 2);
-    assert!(r.capabilities.is_empty());
+    assert_eq!(r.capabilities, ["flow-control"]);
     assert_eq!(r.client_version, CLIENT_VERSION);
     assert!(r.client_version.starts_with("kraken-messaging-rs/"));
     assert!(r.credentials.is_none());
@@ -225,7 +226,11 @@ async fn ack_completes_the_handshake_and_its_interval_replaces_the_fallback() {
     assert_eq!(conn.handshake(), None);
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);
-    assert_eq!(conn.handshake(), Some(Handshake::V2(ack)));
+    let shared = proto::RegisterAck {
+        capabilities: vec!["flow-control".into()], // we declared it, the hub shares it
+        ..ack
+    };
+    assert_eq!(conn.handshake(), Some(Handshake::V2(shared)));
     let before = hub.heartbeats();
     sleep(Duration::from_secs(1)).await;
     let sent = hub.heartbeats() - before;
@@ -402,6 +407,137 @@ async fn backoff_restarts_from_the_floor_after_a_handshaken_stream() {
             "round {round}: reconnect took {took:?}"
         );
     }
+    conn.shutdown().await;
+    hub.stop();
+}
+
+// ---- flow control (P1) ----
+
+#[tokio::test]
+async fn register_offers_permits_load_factor_and_tags() {
+    let hub = FakeHub::start().await;
+    let mut s = settings(hub.address(), 1_000, 50, 500);
+    s.load_factor = 250;
+    s.tags = [("zone".to_string(), "eu-1".to_string())].into();
+    let (conn, _rx) = connection(s);
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    let r = &hub.registers().await[0];
+    assert!(CAPABILITIES.contains(&"flow-control"));
+    assert_eq!(
+        r.initial_permits, 4,
+        "max_concurrent_handlers permits up front"
+    );
+    assert_eq!(r.load_factor, 250);
+    assert_eq!(r.tags.get("zone").map(String::as_str), Some("eu-1"));
+    assert!(conn.handshake().unwrap().flow_control());
+    conn.shutdown().await;
+    hub.stop();
+}
+
+/// Pushes `n` requests and hands back their reply handles, in order.
+async fn requests_in(
+    hub: &FakeHub,
+    rx: &mut mpsc::Receiver<Inbound>,
+    n: usize,
+) -> Vec<kraken_messaging::hub::ReplyTo> {
+    let mut handles = Vec::new();
+    for i in 0..n {
+        hub.send_to_clients(request(&format!("r{i}"))).await;
+        handles.push(next_request(rx).await.1);
+    }
+    handles
+}
+
+#[tokio::test]
+async fn permits_are_granted_in_batches_of_16_or_after_50_ms() {
+    let hub = FakeHub::start().await;
+    let (conn, mut rx) = connection(settings(hub.address(), 1_000, 50, 500));
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    let handles = requests_in(&hub, &mut rx, 20).await;
+
+    let started = std::time::Instant::now();
+    for h in &handles[..16] {
+        h.grant().await;
+    }
+    // The 16th grant flushes at once.
+    timeout(Duration::from_millis(30), async {
+        while hub.permits().is_empty() {
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("a batch of 16 was not flushed at once");
+    assert_eq!(hub.permits(), [(1, 16)]);
+
+    for h in &handles[16..] {
+        h.grant().await;
+    }
+    sleep(Duration::from_millis(20)).await;
+    assert_eq!(hub.permits(), [(1, 16)], "4 grants must wait for the timer");
+    sleep(Duration::from_millis(80)).await;
+    assert_eq!(hub.permits(), [(1, 16), (1, 4)]);
+    let (_, _, at) = hub.permits_timed()[1];
+    assert!(
+        at.duration_since(started) >= Duration::from_millis(45),
+        "flushed too early"
+    );
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn no_permits_to_a_hub_without_flow_control() {
+    for p0_hub in [true, false] {
+        let hub = FakeHub::start().await;
+        if p0_hub {
+            hub.set_flow_control(false); // the merged P0 hub: ack without the capability
+        } else {
+            hub.set_ack(None); // a v1 hub: no ack at all
+        }
+        let (conn, mut rx) = connection(settings(hub.address(), 1_000, 50, 500));
+        conn.start();
+        assert!(conn.await_registered(Duration::from_secs(5)).await);
+        assert!(!conn.handshake().unwrap().flow_control());
+        for h in requests_in(&hub, &mut rx, 20).await {
+            h.grant().await;
+        }
+        sleep(Duration::from_millis(120)).await;
+        assert!(
+            hub.permits().is_empty(),
+            "permits sent to a hub without flow control"
+        );
+        conn.shutdown().await;
+        hub.stop();
+    }
+}
+
+#[tokio::test]
+async fn permits_go_only_to_the_arrival_stream() {
+    support::init_tracing();
+    let hub = FakeHub::start().await;
+    let (conn, mut rx) = connection(settings(hub.address(), 1_000, 50, 500));
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    let old = requests_in(&hub, &mut rx, 1).await.remove(0);
+
+    hub.drop_streams();
+    timeout(Duration::from_secs(3), async {
+        while hub.streams() < 2
+            || conn.current_stream() == Some(old.stream())
+            || conn.handshake().is_none()
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("no reconnect");
+    let new = requests_in(&hub, &mut rx, 1).await.remove(0);
+    old.grant().await; // the old stream is gone: nothing is sent, not even on the new one
+    new.grant().await;
+    sleep(Duration::from_millis(120)).await;
+    assert_eq!(hub.permits(), [(2, 1)]);
     conn.shutdown().await;
     hub.stop();
 }

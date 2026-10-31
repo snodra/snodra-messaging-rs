@@ -48,6 +48,8 @@ async fn reply_on_arrival_stream(
     {
         tracing::warn!(request = %request_id, stream = reply_to.stream(), "reply dropped: {e}");
     }
+    // The request is finished either way: one permit back to the hub it came from.
+    reply_to.grant().await;
 }
 use crate::types::{Command, Event, MessageType, Query};
 
@@ -90,6 +92,8 @@ impl KrakenMessaging {
             backoff_max: config.reconnect_backoff_max,
             handshake_timeout: Duration::from_secs(10),
             max_concurrent_handlers: config.max_concurrent_handlers,
+            load_factor: config.hub_load_factor,
+            tags: config.hub_tags.clone(),
         };
         let conn = HubConnection::new(
             settings,

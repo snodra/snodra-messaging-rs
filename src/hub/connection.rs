@@ -19,9 +19,17 @@
 //! reached the handshake. An `ALREADY_EXISTS` or `INVALID_ARGUMENT` rejection is kept in
 //! [`HubConnection::last_rejection`] and retried at `backoff_max`.
 //!
+//! Flow control (capability `flow-control`): the `Register` offers `max_concurrent_handlers`
+//! permits; a hub whose ack shares the capability forwards only that many requests and queues the
+//! rest. Each completed inbound request gives one permit back ([`ReplyTo::grant`]), on the stream
+//! it arrived on, batched: a `Permits` message goes out once [`PERMIT_BATCH`] grants are pending or
+//! [`PERMIT_FLUSH_AFTER`] after the first unflushed grant. To a hub without the capability (P0 or
+//! v1) nothing is sent.
+//!
 //! The channel sends HTTP/2 keepalive pings (every 10 s, 5 s to answer, also while idle) so a
 //! one-way partition is noticed by the transport too, not only by the missing heartbeat echoes.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -36,13 +44,19 @@ use tonic::{Code, Status};
 use crate::error::MessagingError;
 use crate::proto::hub_client::HubClient;
 use crate::proto::{
-    self, ClientMessage, Heartbeat, Register, RegisterAck, client_message, server_message,
+    self, ClientMessage, Heartbeat, Permits, Register, RegisterAck, client_message, server_message,
 };
 
 /// The hub protocol version this client speaks (`Register.protocol_version`).
 pub const PROTOCOL_VERSION: u32 = 2;
-/// Optional protocol features this client declares (`Register.capabilities`); none yet.
-pub const CAPABILITIES: &[&str] = &[];
+/// The flow-control capability: permits, per-instance queues at the hub, RESOURCE_EXHAUSTED.
+pub const FLOW_CONTROL: &str = "flow-control";
+/// Optional protocol features this client declares (`Register.capabilities`).
+pub const CAPABILITIES: &[&str] = &[FLOW_CONTROL];
+/// A `Permits` message is sent as soon as this many grants are pending...
+pub const PERMIT_BATCH: u32 = 16;
+/// ... or this long after the first grant not sent yet.
+pub const PERMIT_FLUSH_AFTER: Duration = Duration::from_millis(50);
 /// `Register.client_version`, shown in the hub's topology view.
 pub const CLIENT_VERSION: &str = concat!("kraken-messaging-rs/", env!("CARGO_PKG_VERSION"));
 
@@ -65,7 +79,13 @@ pub struct HubSettings {
     pub backoff_max: Duration,
     /// How long a new stream may take to complete the handshake (ack or first echo).
     pub handshake_timeout: Duration,
+    /// Also `Register.initial_permits` (the hub forwards at most this many requests at once to a
+    /// flow-controlled instance).
     pub max_concurrent_handlers: usize,
+    /// `Register.load_factor` (100 = normal capacity).
+    pub load_factor: u32,
+    /// `Register.tags`.
+    pub tags: HashMap<String, String>,
 }
 
 impl Default for HubSettings {
@@ -77,6 +97,8 @@ impl Default for HubSettings {
             backoff_max: Duration::from_secs(5),
             handshake_timeout: Duration::from_secs(10),
             max_concurrent_handlers: 256,
+            load_factor: 100,
+            tags: HashMap::new(),
         }
     }
 }
@@ -101,6 +123,120 @@ impl Handshake {
             Handshake::Legacy => None,
         }
     }
+
+    /// True when the hub shares `flow-control`: it forwards only with permits.
+    pub fn flow_control(&self) -> bool {
+        self.ack()
+            .is_some_and(|a| a.capabilities.iter().any(|c| c == FLOW_CONTROL))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrantMode {
+    /// Before the handshake: grants are held until the hub says whether it wants them.
+    Undecided,
+    On,
+    Off,
+}
+
+#[derive(Debug)]
+struct GrantState {
+    mode: GrantMode,
+    pending: u32,
+    timer: bool,
+}
+
+/// Permit grants of one stream, batched.
+#[derive(Debug)]
+pub(crate) struct Grants {
+    tx: mpsc::WeakSender<ClientMessage>,
+    state: Mutex<GrantState>,
+}
+
+impl Grants {
+    fn new(tx: mpsc::WeakSender<ClientMessage>) -> Arc<Grants> {
+        Arc::new(Grants {
+            tx,
+            state: Mutex::new(GrantState {
+                mode: GrantMode::Undecided,
+                pending: 0,
+                timer: false,
+            }),
+        })
+    }
+
+    /// The hub decided (handshake): with flow control, grants held so far are sent; without, they
+    /// are dropped and later grants are no-ops.
+    fn decide(self: &Arc<Self>, flow_control: bool) {
+        let held = {
+            let mut s = self.state.lock().unwrap();
+            if s.mode != GrantMode::Undecided {
+                return;
+            }
+            s.mode = if flow_control {
+                GrantMode::On
+            } else {
+                GrantMode::Off
+            };
+            std::mem::take(&mut s.pending)
+        };
+        if flow_control && held > 0 {
+            let me = Arc::clone(self);
+            tokio::spawn(async move { me.send(held).await });
+        }
+    }
+
+    async fn grant(self: &Arc<Self>) {
+        let flush = {
+            let mut s = self.state.lock().unwrap();
+            match s.mode {
+                GrantMode::Off => return,
+                GrantMode::Undecided => {
+                    s.pending += 1;
+                    return;
+                }
+                GrantMode::On => {
+                    s.pending += 1;
+                    if s.pending >= PERMIT_BATCH {
+                        Some(std::mem::take(&mut s.pending))
+                    } else {
+                        if !s.timer {
+                            s.timer = true;
+                            let me = Arc::clone(self);
+                            tokio::spawn(async move { me.flush_later().await });
+                        }
+                        None
+                    }
+                }
+            }
+        };
+        if let Some(n) = flush {
+            self.send(n).await;
+        }
+    }
+
+    async fn flush_later(self: Arc<Self>) {
+        tokio::time::sleep(PERMIT_FLUSH_AFTER).await;
+        let n = {
+            let mut s = self.state.lock().unwrap();
+            s.timer = false;
+            std::mem::take(&mut s.pending)
+        };
+        if n > 0 {
+            self.send(n).await;
+        }
+    }
+
+    /// Best effort: a stream that is gone takes its permits with it (the hub resets them).
+    async fn send(&self, count: u32) {
+        if let Some(tx) = self.tx.upgrade() {
+            let _ = tx
+                .send(ClientMessage {
+                    message: Some(client_message::Message::Permits(Permits { count })),
+                })
+                .await;
+        }
+    }
 }
 
 /// The stream an inbound request arrived on. Holds only a weak handle, so an in-flight handler
@@ -109,6 +245,7 @@ impl Handshake {
 pub struct ReplyTo {
     stream: StreamId,
     tx: mpsc::WeakSender<ClientMessage>,
+    grants: Arc<Grants>,
 }
 
 impl ReplyTo {
@@ -124,6 +261,13 @@ impl ReplyTo {
         tx.send(msg).await.map_err(|_| {
             MessagingError::HubUnavailable(format!("hub stream {} closed", self.stream))
         })
+    }
+
+    /// One permit back to the arrival stream's hub, once the request is finished (its reply
+    /// written or dropped). Batched; a no-op when that hub has no flow control or the stream is
+    /// gone.
+    pub async fn grant(&self) {
+        self.grants.grant().await;
     }
 }
 
@@ -391,9 +535,9 @@ impl HubConnection {
             capabilities: CAPABILITIES.iter().map(|c| c.to_string()).collect(),
             credentials: None,
             client_version: CLIENT_VERSION.to_string(),
-            initial_permits: 0,
-            load_factor: 0,
-            tags: Default::default(),
+            initial_permits: self.settings.max_concurrent_handlers.min(u32::MAX as usize) as u32,
+            load_factor: self.settings.load_factor,
+            tags: self.settings.tags.clone(),
         };
         tx.send(ClientMessage {
             message: Some(client_message::Message::Register(register)),
@@ -404,9 +548,11 @@ impl HubConnection {
             .await
             .map_err(|_| Status::unavailable("stream closed before first heartbeat"))?;
         self.connected.store(true, Ordering::SeqCst);
+        let grants = Grants::new(tx.downgrade());
         let reply_to = ReplyTo {
             stream: stream_id,
             tx: tx.downgrade(),
+            grants: Arc::clone(&grants),
         };
 
         let mut interval = self.settings.heartbeat_interval;
@@ -437,8 +583,10 @@ impl HubConnection {
                                     interval = Duration::from_millis(ack.heartbeat_interval_ms.into());
                                     ticker = self::ticker(interval);
                                 }
-                                tracing::info!(service = %self.service_name, instance = %self.instance_id, hub = %ack.hub_id, protocol = ack.protocol_version, heartbeat = ?interval, "registered with the hub");
                                 let h = Handshake::V2(ack);
+                                grants.decide(h.flow_control());
+                                let ack = h.ack().expect("v2");
+                                tracing::info!(service = %self.service_name, instance = %self.instance_id, hub = %ack.hub_id, protocol = ack.protocol_version, heartbeat = ?interval, flow_control = h.flow_control(), "registered with the hub");
                                 self.go_live(stream_id, &tx, &h);
                                 handshake = Some(h);
                             }
@@ -457,6 +605,7 @@ impl HubConnection {
                             if handshake.is_none() {
                                 tracing::info!(service = %self.service_name, instance = %self.instance_id, heartbeat = ?interval, "registered with the hub (legacy hub without protocol v2)");
                                 let h = Handshake::Legacy;
+                                grants.decide(false);
                                 self.go_live(stream_id, &tx, &h);
                                 handshake = Some(h);
                             }
@@ -585,10 +734,49 @@ mod tests {
         assert!(distinct.len() > 190);
     }
 
+    fn permits_in(rx: &mut mpsc::Receiver<ClientMessage>) -> Vec<u32> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let Some(client_message::Message::Permits(p)) = m.message {
+                out.push(p.count);
+            }
+        }
+        out
+    }
+
+    /// Requests can arrive before the ack; their grants are held until the hub's answer says
+    /// whether it wants permits (the hub already counted those forwards against our permits).
+    #[tokio::test]
+    async fn grants_before_the_handshake_are_held_then_sent_or_dropped() {
+        for flow_control in [true, false] {
+            let (tx, mut rx) = mpsc::channel(8);
+            let grants = Grants::new(tx.downgrade());
+            grants.grant().await;
+            grants.grant().await;
+            assert!(
+                permits_in(&mut rx).is_empty(),
+                "nothing before the handshake"
+            );
+            grants.decide(flow_control);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let want: Vec<u32> = if flow_control { vec![2] } else { vec![] };
+            assert_eq!(permits_in(&mut rx), want, "flow_control={flow_control}");
+            grants.grant().await;
+            tokio::time::sleep(PERMIT_FLUSH_AFTER + Duration::from_millis(30)).await;
+            let want: Vec<u32> = if flow_control { vec![1] } else { vec![] };
+            assert_eq!(
+                permits_in(&mut rx),
+                want,
+                "after the handshake, flow_control={flow_control}"
+            );
+            drop(tx);
+        }
+    }
+
     #[test]
     fn client_identity_constants() {
         assert_eq!(PROTOCOL_VERSION, 2);
-        assert!(CAPABILITIES.is_empty());
+        assert_eq!(CAPABILITIES, ["flow-control"]);
         assert!(CLIENT_VERSION.starts_with("kraken-messaging-rs/"));
         assert_eq!(
             HubSettings::default().backoff_max,

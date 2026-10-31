@@ -8,8 +8,8 @@ mod registry;
 mod sender;
 
 pub use connection::{
-    CAPABILITIES, CLIENT_VERSION, Handshake, HubConnection, HubSettings, Inbound, PROTOCOL_VERSION,
-    ReplyTo, StreamId,
+    CAPABILITIES, CLIENT_VERSION, FLOW_CONTROL, Handshake, HubConnection, HubSettings, Inbound,
+    PERMIT_BATCH, PERMIT_FLUSH_AFTER, PROTOCOL_VERSION, ReplyTo, StreamId,
 };
 pub use dispatcher::Dispatcher;
 pub use registry::{EventContext, HandlerRegistry};
