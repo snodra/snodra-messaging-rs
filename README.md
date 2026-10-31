@@ -121,8 +121,8 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 
 - **Errors** map exactly as `HubErrors.kt`: `NoHandler`, `Timeout`, `HandlerDisconnected`,
   `RemoteHandler`, `Unauthenticated`, `AccessDenied`, `InvalidMessage`, `HubUnavailable`,
-  `HubConnectionLost`, `HandlerBusy`. `HandlerBusy` (hub code `RESOURCE_EXHAUSTED`): the target
-  instance's queue at the hub is full; the handler never saw the request. A hub only sends it to
+  `HubConnectionLost`, `HandlerBusy`. `HandlerBusy` (hub code `RESOURCE_EXHAUSTED`): the hub's
+  queue or session buffer for the target instance is full; the handler never saw the request. A hub only sends it to
   clients that declared flow control; others get `RemoteHandler` "handler busy" as before. `HubUnavailable`: the request was never written to a live hub stream (no
   stream, or the write failed), so a retry is safe. `HubConnectionLost`: the request was accepted by
   a stream's outbound queue and that stream broke before the answer, so the outcome is unknown (treat

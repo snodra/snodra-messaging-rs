@@ -14,7 +14,7 @@
 //! |---|---|---|
 //! | `HubUnavailable` (never written) | retry | retry |
 //! | `NoHandler` (the handler never ran) | retry | retry |
-//! | `HandlerBusy` (hub queue full, the handler never ran) | retry | retry |
+//! | `HandlerBusy` (hub queue or session buffer full, the handler never ran) | retry | retry |
 //! | `HandlerDisconnected` (outcome unknown) | no | retry |
 //! | `Timeout` (outcome unknown) | no | retry |
 //! | `HubConnectionLost` (outcome unknown) | no | retry |

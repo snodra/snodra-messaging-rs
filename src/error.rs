@@ -10,8 +10,8 @@ pub enum MessagingError {
     Timeout(String),
     #[error("Handler for '{0}' disconnected")]
     HandlerDisconnected(String),
-    /// Hub code RESOURCE_EXHAUSTED: the target instance's queue at the hub is full (flow control).
-    /// The handler never saw the request; a retry after a backoff is safe.
+    /// Hub code RESOURCE_EXHAUSTED: the hub's queue or session buffer for the target instance is
+    /// full (flow control). The handler never saw the request; a retry after a backoff is safe.
     #[error("Handler for '{0}' is busy")]
     HandlerBusy(String),
     #[error("{message}")]
