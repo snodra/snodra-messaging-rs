@@ -22,9 +22,14 @@
 //! Flow control (capability `flow-control`): the `Register` offers `max_concurrent_handlers`
 //! permits; a hub whose ack shares the capability forwards only that many requests and queues the
 //! rest. Each completed inbound request gives one permit back ([`ReplyTo::grant`]), on the stream
-//! it arrived on, batched: a `Permits` message goes out once [`PERMIT_BATCH`] grants are pending or
-//! [`PERMIT_FLUSH_AFTER`] after the first unflushed grant. To a hub without the capability (P0 or
-//! v1) nothing is sent.
+//! it arrived on. Per stream the client counts `initial` (the permits its `Register` offered),
+//! `received` (requests that arrived), `returned` (permits written) and `pending` (completed, not
+//! written yet); the hub still holds `initial - received + returned` permits for it. A completion
+//! writes the pending grants in one `Permits` message at once when that count is at or below the
+//! low-water mark `min(PERMIT_BATCH, initial / 2)` (with one permit: every completion) or when
+//! [`PERMIT_BATCH`] grants are pending; otherwise they go [`PERMIT_FLUSH_AFTER`] after the first
+//! one not sent yet. Grants of requests completed before the handshake follow the same rule once
+//! the ack shares the capability. To a hub without the capability (P0 or v1) nothing is sent.
 //!
 //! The channel sends HTTP/2 keepalive pings (every 10 s, 5 s to answer, also while idle) so a
 //! one-way partition is noticed by the transport too, not only by the missing heartbeat echoes.
@@ -53,9 +58,10 @@ pub const PROTOCOL_VERSION: u32 = 2;
 pub const FLOW_CONTROL: &str = "flow-control";
 /// Optional protocol features this client declares (`Register.capabilities`).
 pub const CAPABILITIES: &[&str] = &[FLOW_CONTROL];
-/// A `Permits` message is sent as soon as this many grants are pending...
+/// A `Permits` message is sent as soon as this many grants are pending, or as soon as the hub holds
+/// no more than `min(PERMIT_BATCH, initial_permits / 2)` permits for the stream (the low-water mark)...
 pub const PERMIT_BATCH: u32 = 16;
-/// ... or this long after the first grant not sent yet.
+/// ... else this long after the first grant not sent yet.
 pub const PERMIT_FLUSH_AFTER: Duration = Duration::from_millis(50);
 /// `Register.client_version`, shown in the hub's topology view.
 pub const CLIENT_VERSION: &str = concat!("kraken-messaging-rs/", env!("CARGO_PKG_VERSION"));
@@ -139,14 +145,64 @@ enum GrantMode {
     Off,
 }
 
+/// The permit accounting of one stream.
 #[derive(Debug)]
 struct GrantState {
     mode: GrantMode,
+    /// `Register.initial_permits` sent on this stream.
+    initial: u32,
+    /// Requests that arrived on this stream (whatever the mode).
+    received: u64,
+    /// Permits written in `Permits` messages on this stream.
+    returned: u64,
+    /// Requests completed whose permit is not written yet.
     pending: u32,
+    /// The flush timer is armed.
     timer: bool,
 }
 
-/// Permit grants of one stream, batched.
+/// What a grant (or the handshake) leaves to do once the lock is released.
+enum Flush {
+    /// Write a `Permits` message with this count now.
+    Now(u32),
+    /// Spawn the flush timer.
+    Arm,
+    Nothing,
+}
+
+impl GrantState {
+    /// Permits the hub still holds for this stream: `initial - received + returned`.
+    fn hub_held(&self) -> i128 {
+        i128::from(self.initial) - i128::from(self.received) + i128::from(self.returned)
+    }
+
+    /// The flush rule for pending grants: at once when the hub is down to the low-water mark
+    /// (`min(PERMIT_BATCH, initial / 2)` permits) or [`PERMIT_BATCH`] grants are pending, else
+    /// with the timer (armed once).
+    fn next(&mut self) -> Flush {
+        if self.pending == 0 {
+            return Flush::Nothing;
+        }
+        let low_water = i128::from(PERMIT_BATCH.min(self.initial / 2));
+        if self.hub_held() <= low_water || self.pending >= PERMIT_BATCH {
+            Flush::Now(self.take())
+        } else if !self.timer {
+            self.timer = true;
+            Flush::Arm
+        } else {
+            Flush::Nothing
+        }
+    }
+
+    /// Takes the pending grants for one `Permits` message.
+    fn take(&mut self) -> u32 {
+        let count = std::mem::take(&mut self.pending);
+        self.returned += u64::from(count);
+        count
+    }
+}
+
+/// Permit grants of one stream: returned at once when the hub runs low, else batched.
 #[derive(Debug)]
 pub(crate) struct Grants {
     tx: mpsc::WeakSender<ClientMessage>,
@@ -154,40 +210,47 @@ pub(crate) struct Grants {
 }
 
 impl Grants {
-    fn new(tx: mpsc::WeakSender<ClientMessage>) -> Arc<Grants> {
+    fn new(tx: mpsc::WeakSender<ClientMessage>, initial: u32) -> Arc<Grants> {
         Arc::new(Grants {
             tx,
             state: Mutex::new(GrantState {
                 mode: GrantMode::Undecided,
+                initial,
+                received: 0,
+                returned: 0,
                 pending: 0,
                 timer: false,
             }),
         })
     }
 
-    /// The hub decided (handshake): with flow control, grants held so far are sent; without, they
-    /// are dropped and later grants are no-ops.
-    fn decide(self: &Arc<Self>, flow_control: bool) {
-        let held = {
+    /// A request arrived on this stream (the hub spent one of our permits on it).
+    fn received(&self) {
+        self.state.lock().unwrap().received += 1;
+    }
+
+    /// The hub decided (handshake): with flow control, grants held so far follow the flush rule;
+    /// without, they are dropped and later grants are no-ops.
+    async fn decide(self: &Arc<Self>, flow_control: bool) {
+        let next = {
             let mut s = self.state.lock().unwrap();
             if s.mode != GrantMode::Undecided {
                 return;
             }
-            s.mode = if flow_control {
-                GrantMode::On
+            if flow_control {
+                s.mode = GrantMode::On;
+                s.next()
             } else {
-                GrantMode::Off
-            };
-            std::mem::take(&mut s.pending)
+                s.mode = GrantMode::Off;
+                s.pending = 0;
+                Flush::Nothing
+            }
         };
-        if flow_control && held > 0 {
-            let me = Arc::clone(self);
-            tokio::spawn(async move { me.send(held).await });
-        }
+        self.run(next).await;
     }
 
     async fn grant(self: &Arc<Self>) {
-        let flush = {
+        let next = {
             let mut s = self.state.lock().unwrap();
             match s.mode {
                 GrantMode::Off => return,
@@ -197,33 +260,33 @@ impl Grants {
                 }
                 GrantMode::On => {
                     s.pending += 1;
-                    if s.pending >= PERMIT_BATCH {
-                        Some(std::mem::take(&mut s.pending))
-                    } else {
-                        if !s.timer {
-                            s.timer = true;
-                            let me = Arc::clone(self);
-                            tokio::spawn(async move { me.flush_later().await });
-                        }
-                        None
-                    }
+                    s.next()
                 }
             }
         };
-        if let Some(n) = flush {
-            self.send(n).await;
+        self.run(next).await;
+    }
+
+    async fn run(self: &Arc<Self>, next: Flush) {
+        match next {
+            Flush::Now(count) => self.send(count).await,
+            Flush::Arm => {
+                let me = Arc::clone(self);
+                tokio::spawn(async move { me.flush_later().await });
+            }
+            Flush::Nothing => {}
         }
     }
 
     async fn flush_later(self: Arc<Self>) {
         tokio::time::sleep(PERMIT_FLUSH_AFTER).await;
-        let n = {
+        let count = {
             let mut s = self.state.lock().unwrap();
             s.timer = false;
-            std::mem::take(&mut s.pending)
+            s.take()
         };
-        if n > 0 {
-            self.send(n).await;
+        if count > 0 {
+            self.send(count).await;
         }
     }
 
@@ -264,8 +327,8 @@ impl ReplyTo {
     }
 
     /// One permit back to the arrival stream's hub, once the request is finished (its reply
-    /// written or dropped). Batched; a no-op when that hub has no flow control or the stream is
-    /// gone.
+    /// written or dropped). Written at once when the hub runs low on our permits, else batched
+    /// (see the module docs); a no-op when that hub has no flow control or the stream is gone.
     pub async fn grant(&self) {
         self.grants.grant().await;
     }
@@ -526,6 +589,7 @@ impl HubConnection {
         // The Register is the first message of every stream; the ack or the echo of the heartbeat
         // after it completes the handshake.
         let (commands, queries) = self.types.lock().unwrap().clone();
+        let initial_permits = self.settings.max_concurrent_handlers.min(u32::MAX as usize) as u32;
         let register = Register {
             service_name: self.service_name.clone(),
             instance_id: self.instance_id.clone(),
@@ -535,7 +599,7 @@ impl HubConnection {
             capabilities: CAPABILITIES.iter().map(|c| c.to_string()).collect(),
             credentials: None,
             client_version: CLIENT_VERSION.to_string(),
-            initial_permits: self.settings.max_concurrent_handlers.min(u32::MAX as usize) as u32,
+            initial_permits,
             load_factor: self.settings.load_factor,
             tags: self.settings.tags.clone(),
         };
@@ -548,7 +612,7 @@ impl HubConnection {
             .await
             .map_err(|_| Status::unavailable("stream closed before first heartbeat"))?;
         self.connected.store(true, Ordering::SeqCst);
-        let grants = Grants::new(tx.downgrade());
+        let grants = Grants::new(tx.downgrade(), initial_permits);
         let reply_to = ReplyTo {
             stream: stream_id,
             tx: tx.downgrade(),
@@ -584,7 +648,7 @@ impl HubConnection {
                                     ticker = self::ticker(interval);
                                 }
                                 let h = Handshake::V2(ack);
-                                grants.decide(h.flow_control());
+                                grants.decide(h.flow_control()).await;
                                 let ack = h.ack().expect("v2");
                                 tracing::info!(service = %self.service_name, instance = %self.instance_id, hub = %ack.hub_id, protocol = ack.protocol_version, heartbeat = ?interval, flow_control = h.flow_control(), "registered with the hub");
                                 self.go_live(stream_id, &tx, &h);
@@ -605,12 +669,13 @@ impl HubConnection {
                             if handshake.is_none() {
                                 tracing::info!(service = %self.service_name, instance = %self.instance_id, heartbeat = ?interval, "registered with the hub (legacy hub without protocol v2)");
                                 let h = Handshake::Legacy;
-                                grants.decide(false);
+                                grants.decide(false).await;
                                 self.go_live(stream_id, &tx, &h);
                                 handshake = Some(h);
                             }
                         }
                         server_message::Message::Request(request) => {
+                            grants.received();
                             self.forward(Inbound::Request { request, reply_to: reply_to.clone() }).await?
                         }
                         server_message::Message::Reply(r) => self.forward(Inbound::Reply(r)).await?,
@@ -744,31 +809,119 @@ mod tests {
         out
     }
 
+    /// Just past the flush timer.
+    const AFTER_TIMER: Duration = PERMIT_FLUSH_AFTER.saturating_add(Duration::from_millis(1));
+
+    /// Grants of a handshaken flow-controlled stream that offered `initial` permits and on which
+    /// `received` requests arrived. The sender keeps the stream open.
+    async fn decided(
+        initial: u32,
+        received: u32,
+    ) -> (
+        Arc<Grants>,
+        mpsc::Sender<ClientMessage>,
+        mpsc::Receiver<ClientMessage>,
+    ) {
+        let (tx, rx) = mpsc::channel(64);
+        let grants = Grants::new(tx.downgrade(), initial);
+        grants.decide(true).await;
+        for _ in 0..received {
+            grants.received();
+        }
+        (grants, tx, rx)
+    }
+
+    /// One permit: while the request runs the hub holds none for us, so the permit goes back on
+    /// completion, not after the flush timer (which would pace the instance at ~20 requests/s).
+    #[tokio::test(start_paused = true)]
+    async fn with_one_initial_permit_every_completion_is_returned_at_once() {
+        let (grants, _tx, mut rx) = decided(1, 0).await;
+        for round in 0..3 {
+            grants.received();
+            grants.grant().await;
+            assert_eq!(permits_in(&mut rx), [1], "round {round}: not sent at once");
+        }
+    }
+
+    /// 64 permits, low-water mark min(16, 64 / 2) = 16: grants are batched while the hub still
+    /// holds more than 16 permits for us; 16 pending go at once; once the hub is down to the mark a
+    /// completion goes back at once; what the rule leaves pending goes with the timer.
+    #[tokio::test(start_paused = true)]
+    async fn a_larger_initial_batches_until_the_hub_runs_low_or_16_are_pending() {
+        let (grants, _tx, mut rx) = decided(64, 20).await; // the hub holds 44
+        for _ in 0..15 {
+            grants.grant().await;
+        }
+        assert!(
+            permits_in(&mut rx).is_empty(),
+            "15 pending while the hub holds 44: batched"
+        );
+        grants.grant().await;
+        assert_eq!(permits_in(&mut rx), [16], "16 pending go at once");
+        // The hub holds 60 again; 44 more requests arrive: it holds 16, the mark.
+        for _ in 0..44 {
+            grants.received();
+        }
+        grants.grant().await;
+        assert_eq!(permits_in(&mut rx), [1], "at the mark: at once");
+        // That permit put the hub at 17, above the mark: batched again, the timer sends it.
+        grants.grant().await;
+        assert!(permits_in(&mut rx).is_empty(), "above the mark: batched");
+        tokio::time::sleep(AFTER_TIMER).await;
+        assert_eq!(permits_in(&mut rx), [1], "the timer flushes the rest");
+    }
+
+    /// Below 32 permits the mark is half of them: 8 permits, mark 4.
+    #[tokio::test(start_paused = true)]
+    async fn the_low_water_mark_is_half_of_a_small_initial() {
+        let (grants, _tx, mut rx) = decided(8, 3).await; // the hub holds 5
+        grants.grant().await;
+        assert!(permits_in(&mut rx).is_empty(), "the hub holds 5, above 4");
+        grants.received(); // the hub holds 4
+        grants.grant().await;
+        assert_eq!(
+            permits_in(&mut rx),
+            [2],
+            "both pending go once the hub is at the mark"
+        );
+    }
+
     /// Requests can arrive before the ack; their grants are held until the hub's answer says
-    /// whether it wants permits (the hub already counted those forwards against our permits).
-    #[tokio::test]
+    /// whether it wants permits (the hub already counted those forwards against our permits). With
+    /// flow control the held grants follow the same rule as later ones; without, they are dropped
+    /// and later grants are no-ops.
+    #[tokio::test(start_paused = true)]
     async fn grants_before_the_handshake_are_held_then_sent_or_dropped() {
-        for flow_control in [true, false] {
+        /// (initial, requests completed before the ack, flow control, sent at the ack, by the timer)
+        type Case = (u32, u32, bool, &'static [u32], &'static [u32]);
+        let cases: [Case; 5] = [
+            (1, 1, true, &[1], &[]),    // the hub holds none: at once
+            (64, 2, true, &[], &[2]),   // the hub holds 62: the timer
+            (64, 20, true, &[20], &[]), // 16 or more pending: at once
+            (1, 1, false, &[], &[]),    // no flow control: dropped
+            (64, 20, false, &[], &[]),
+        ];
+        for (initial, held, flow_control, at_once, by_timer) in cases {
+            let case = format!("initial={initial} held={held} flow_control={flow_control}");
             let (tx, mut rx) = mpsc::channel(8);
-            let grants = Grants::new(tx.downgrade());
-            grants.grant().await;
-            grants.grant().await;
+            let grants = Grants::new(tx.downgrade(), initial);
+            for _ in 0..held {
+                grants.received();
+                grants.grant().await;
+            }
             assert!(
                 permits_in(&mut rx).is_empty(),
-                "nothing before the handshake"
+                "{case}: nothing before the handshake"
             );
-            grants.decide(flow_control);
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            let want: Vec<u32> = if flow_control { vec![2] } else { vec![] };
-            assert_eq!(permits_in(&mut rx), want, "flow_control={flow_control}");
+            grants.decide(flow_control).await;
+            assert_eq!(permits_in(&mut rx), at_once, "{case}: at the ack");
+            tokio::time::sleep(AFTER_TIMER).await;
+            assert_eq!(permits_in(&mut rx), by_timer, "{case}: by the timer");
+            grants.received();
             grants.grant().await;
-            tokio::time::sleep(PERMIT_FLUSH_AFTER + Duration::from_millis(30)).await;
-            let want: Vec<u32> = if flow_control { vec![1] } else { vec![] };
-            assert_eq!(
-                permits_in(&mut rx),
-                want,
-                "after the handshake, flow_control={flow_control}"
-            );
+            tokio::time::sleep(AFTER_TIMER).await;
+            let want: &[u32] = if flow_control { &[1] } else { &[] };
+            assert_eq!(permits_in(&mut rx), want, "{case}: after the handshake");
             drop(tx);
         }
     }

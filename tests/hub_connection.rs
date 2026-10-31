@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use kraken_messaging::MessagingError;
 use kraken_messaging::hub::{
-    CAPABILITIES, CLIENT_VERSION, Handshake, HubConnection, HubSettings, Inbound, PROTOCOL_VERSION,
+    CAPABILITIES, CLIENT_VERSION, Handshake, HubConnection, HubSettings, Inbound,
+    PERMIT_FLUSH_AFTER, PROTOCOL_VERSION,
 };
 use kraken_messaging::proto::{
     self, ClientMessage, Heartbeat, Reply, ServerMessage, client_message, reply, server_message,
@@ -449,10 +450,15 @@ async fn requests_in(
     handles
 }
 
+/// While the hub still holds more than the low-water mark (min(16, initial / 2)) of our permits,
+/// grants are batched: 16 pending go at once, fewer wait for the 50 ms timer. 64 permits and 20
+/// requests leave the hub 44, so the mark (16) is never reached here.
 #[tokio::test]
 async fn permits_are_granted_in_batches_of_16_or_after_50_ms() {
     let hub = FakeHub::start().await;
-    let (conn, mut rx) = connection(settings(hub.address(), 1_000, 50, 500));
+    let mut s = settings(hub.address(), 1_000, 50, 500);
+    s.max_concurrent_handlers = 64;
+    let (conn, mut rx) = connection(s);
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);
     let handles = requests_in(&hub, &mut rx, 20).await;
@@ -483,6 +489,36 @@ async fn permits_are_granted_in_batches_of_16_or_after_50_ms() {
         at.duration_since(started) >= Duration::from_millis(45),
         "flushed too early"
     );
+    conn.shutdown().await;
+    hub.stop();
+}
+
+/// One permit: while the request runs the hub holds none for us, so the permit goes back as soon
+/// as the request is finished, not after the flush timer (one permit would mean ~20 requests/s).
+#[tokio::test]
+async fn a_single_permit_goes_back_at_once() {
+    let hub = FakeHub::start().await;
+    let mut s = settings(hub.address(), 1_000, 50, 500);
+    s.max_concurrent_handlers = 1;
+    let (conn, mut rx) = connection(s);
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    assert_eq!(hub.registers().await[0].initial_permits, 1);
+    for round in 1..=3 {
+        let handle = requests_in(&hub, &mut rx, 1).await.remove(0);
+        let finished = std::time::Instant::now();
+        handle.grant().await;
+        timeout(PERMIT_FLUSH_AFTER / 2, async {
+            while hub.permits().len() < round {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: the permit waited for the flush timer"));
+        let (stream, count, at) = hub.permits_timed()[round - 1];
+        assert_eq!((stream, count), (1, 1));
+        assert!(at.duration_since(finished) < PERMIT_FLUSH_AFTER / 2);
+    }
     conn.shutdown().await;
     hub.stop();
 }

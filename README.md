@@ -159,9 +159,12 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
   offers `max_concurrent_handlers` permits, `load_factor` and `tags`. A hub whose ack shares the
   capability forwards only while this instance has permits and queues the rest (by priority, then
   age; queued requests keep their own deadline). Every finished request gives its permit back on
-  the stream it arrived on, batched: one `Permits` message at 16 pending grants or 50 ms after the
-  first unflushed one. A hub without the capability (P0 or v1) gets no `Permits` and forwards
-  without limit, as before.
+  the stream it arrived on. The hub still holds `initial − received + returned` of this stream's
+  permits (offered, minus requests that arrived, plus permits written back); once that is at or
+  below the low-water mark `min(16, initial / 2)` the pending grants go back at once (with one
+  permit, every completion does), otherwise they are batched: one `Permits` message at 16 pending
+  grants or 50 ms after the first unsent one. A hub without the capability (P0 or v1) gets no
+  `Permits` and forwards without limit, as before.
 - **SendOptions**: `routing_key`, `timeout`, `authorization`, `priority` (else
   `KRAKEN_HUB_PRIORITIES` for the type, else 0) and `retry` (else `KRAKEN_HUB_RETRY_*`;
   `RetryPolicy::disabled()` switches it off for one call).

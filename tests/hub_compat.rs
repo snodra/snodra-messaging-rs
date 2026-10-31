@@ -6,9 +6,10 @@
 //!   with `timeout_ms` 0, a request lost with the stream is `HubConnectionLost`, one never written is
 //!   `HubUnavailable`, and the client is back within the 5 s backoff cap after a hub restart. Flow
 //!   control (P1): a slow handler with one permit turns a burst into latency (the topology shows the
-//!   instance flow-controlled with a queue), a full queue answers `HandlerBusy` and a retried command
-//!   gets through once it drains, retry never repeats a handler error or a timed-out command, and
-//!   queued requests are served by priority.
+//!   instance flow-controlled with a queue), a single permit goes back at once so a burst to a fast
+//!   handler is not paced by the flush timer, a full queue answers `HandlerBusy` and a retried
+//!   command gets through once it drains, retry never repeats a handler error or a timed-out
+//!   command, and queued requests are served by priority.
 //! - `kraken-hub:p0` (`KRAKEN_HUB_P0_IMAGE`): protocol v2 without flow control. The ack lists no
 //!   capability, no `Permits` are sent, the hub forwards without waiting and everything works as in
 //!   P0, reconnect included.
@@ -460,6 +461,13 @@ impl Command for FlowHang {
 }
 
 #[derive(Serialize, Deserialize)]
+struct FlowZero {}
+message_type!(FlowZero, "flow.Zero");
+impl Command for FlowZero {
+    type Reply = ();
+}
+
+#[derive(Serialize, Deserialize)]
 struct FlowHangQuery {}
 message_type!(FlowHangQuery, "flow.HangQuery");
 impl Query for FlowHangQuery {
@@ -472,6 +480,7 @@ const FLOW_COMMANDS: &[&str] = &[
     "flow.Rec",
     "flow.Fail",
     "flow.Hang",
+    "flow.Zero",
 ];
 const FLOW_QUERIES: &[&str] = &["flow.HangQuery"];
 
@@ -490,8 +499,9 @@ struct FlowPeer {
 /// A participant offering `permits` concurrent handlers (`max_concurrent_handlers`, which is also
 /// `Register.initial_permits`). As a handler (`handles`) it registers the `flow.*` types:
 /// `flow.Slow` takes 300 ms, `flow.Gate` waits for a permit of `gate`, `flow.Rec` 20 ms,
-/// `flow.Fail` answers `HANDLER_ERROR "handler busy"` (the v1 text of a full hub), `flow.Hang` and
-/// `flow.HangQuery` 30 s. Every finished request grants its permit back, like the library does.
+/// `flow.Fail` answers `HANDLER_ERROR "handler busy"` (the v1 text of a full hub), `flow.Zero` at
+/// once, `flow.Hang` and `flow.HangQuery` 30 s. Every finished request grants its permit back, like
+/// the library does.
 /// `retry` is the sender's configured default.
 async fn flow_peer(
     address: &str,
@@ -567,6 +577,7 @@ async fn flow_peer(
                                 tokio::time::sleep(Duration::from_millis(20)).await;
                                 reply::Result::Payload(b"{}".to_vec())
                             }
+                            "flow.Zero" => reply::Result::Payload(b"{}".to_vec()),
                             "flow.Fail" => reply::Result::Error(proto::Error {
                                 request_id: request.id.clone(),
                                 code: proto::ErrorCode::HandlerError as i32,
@@ -778,12 +789,45 @@ async fn new_hub_turns_a_slow_handler_with_one_permit_into_latency_not_timeouts(
         "five 300 ms requests with one permit finished in {elapsed:?}"
     );
     assert_eq!(b.max_in_flight.load(Ordering::SeqCst), 1, "one at a time");
-    // The last grant leaves in its batch, up to PERMIT_FLUSH_AFTER after the last reply.
+    // With one permit every grant is written at once; give the last one time to pass the tap.
     tokio::time::sleep(PERMIT_FLUSH_AFTER * 3).await;
     assert!(
         tap.permits() >= 5,
         "one permit back per request, got {}",
         tap.permits()
+    );
+    a.peer.shutdown().await;
+    b.peer.shutdown().await;
+}
+
+/// One permit and a handler that takes no time: while a request runs the hub holds no permit for
+/// the instance, so each completion returns its permit at once. Waiting for the 50 ms flush timer
+/// instead would pace the instance at ~20 requests/s (100 calls in ~5 s).
+#[tokio::test]
+async fn new_hub_gets_a_single_permit_back_at_once_so_a_burst_is_not_paced_by_the_timer() {
+    require_docker!();
+    let hub = hub_with(HubOptions::new(HubImage::Current)).await;
+    let b = flow_peer(&hub.address, "flow-b", true, 1, no_retry()).await;
+    let a = flow_peer(&hub.address, "flow-a", false, 256, no_retry()).await;
+    assert!(b.peer.conn.handshake().unwrap().flow_control());
+
+    let started = Instant::now();
+    let calls: Vec<_> = (0..100)
+        .map(|_| {
+            let s = Arc::clone(&a.peer.sender);
+            tokio::spawn(async move { s.send_command(&FlowZero {}, SendOptions::default()).await })
+        })
+        .collect();
+    for c in calls {
+        c.await.unwrap().expect("queued, then served");
+    }
+    let elapsed = started.elapsed();
+    eprintln!("100 calls to a zero-time handler with one permit took {elapsed:?}");
+    assert_eq!(b.count("flow.Zero"), 100);
+    assert_eq!(b.max_in_flight.load(Ordering::SeqCst), 1, "one at a time");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "100 calls through one permit took {elapsed:?}"
     );
     a.peer.shutdown().await;
     b.peer.shutdown().await;
