@@ -103,9 +103,9 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 | `KRAKEN_KAFKA_BOOTSTRAP` | `kafka:19092` | |
 | `KRAKEN_KAFKA_TOPIC` | `kraken.events` | |
 | `KRAKEN_JWKS_URL`, `KRAKEN_ISSUER` | unset | set both to verify forwarded tokens (RS256, `exp`, `iss`); unset = read signed tokens unverified, warned once |
-| `KRAKEN_HUB_REQUEST_TIMEOUT_MS` | 5000 | per request, sent as `timeout_ms` |
-| `KRAKEN_HEARTBEAT_INTERVAL_MS` | 10000 | |
-| `KRAKEN_RECONNECT_BACKOFF_MIN_MS` / `_MAX_MS` | 500 / 30000 | exponential |
+| `KRAKEN_HUB_REQUEST_TIMEOUT_MS` | unset | default request timeout, sent as `timeout_ms` (`SendOptions.timeout` wins per call). Unset: a v2 hub gets `timeout_ms = 0` and applies its per-type override or its default (5 s); a legacy hub gets 5000 as before |
+| `KRAKEN_HEARTBEAT_INTERVAL_MS` | 10000 | fallback only: a v2 hub announces its interval (3 s by default) in `RegisterAck`; this value applies to legacy hubs |
+| `KRAKEN_RECONNECT_BACKOFF_MIN_MS` / `_MAX_MS` | 500 / 5000 | exponential, each wait ±20 % jitter and never above the max; back to the min once a connect reached the handshake |
 | `KRAKEN_MAX_CONCURRENT_HANDLERS` | 256 | |
 | `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS` | true, 5 | consumer starts only when event handlers are registered |
 | `KRAKEN_OUTBOX_ENABLED`, `KRAKEN_OUTBOX_POLL_INTERVAL_MS`, `KRAKEN_OUTBOX_BATCH_SIZE`, `KRAKEN_OUTBOX_MAX_ATTEMPTS` | true, 200, 100, 10 | |
@@ -114,7 +114,12 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 ## Semantics worth knowing
 
 - **Errors** map exactly as `HubErrors.kt`: `NoHandler`, `Timeout`, `HandlerDisconnected`,
-  `RemoteHandler`, `Unauthenticated`, `AccessDenied`, `InvalidMessage`, `HubUnavailable`. A handler's
+  `RemoteHandler`, `Unauthenticated`, `AccessDenied`, `InvalidMessage`, `HubUnavailable`,
+  `HubConnectionLost`. `HubUnavailable`: the request was never written to a live hub stream (no
+  stream, or the write failed), so a retry is safe. `HubConnectionLost`: the request was accepted by
+  a stream's outbound queue and that stream broke before the answer, so the outcome is unknown (treat
+  it like `Timeout`). An unknown code (including `UNSUPPORTED`, declared but not produced yet) reads
+  as `RemoteHandler`. A handler's
   `Err` becomes `HANDLER_ERROR` unless it is `Unauthenticated`/`AccessDenied`/`InvalidMessage`; a panic
   becomes `HANDLER_ERROR "handler panicked"`, never a dropped stream.
 - **Guards** run before the payload is decoded: anonymous → `UNAUTHENTICATED`, refused → `PERMISSION_DENIED`.
@@ -134,6 +139,18 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 - **Shutdown** drains in-flight handlers (10 s bound), closes the hub stream, stops the publisher and the consumer.
 - **Start** does not wait for the hub. `await_hub(timeout)` tells you when the registration was
   confirmed; sends before that fail with `HubUnavailable`.
+- **Handshake** (hub protocol v2, ADR 0013): `Register` carries `protocol_version = 2`, an empty
+  capability list and `client_version = kraken-messaging-rs/<version>`. A v2 hub answers with a
+  `RegisterAck` before it echoes the first heartbeat; the client then heartbeats at the announced
+  interval (3 s; the hub evicts after 10 s) and sends `timeout_ms = 0` unless a timeout was chosen,
+  guarding locally with the ack's per-type or maximum timeout plus 1 s. When the echo arrives without
+  an ack the hub predates v2 and the client runs in legacy mode: configured heartbeat interval,
+  `timeout_ms` = the chosen timeout or 5 s, guard = that plus 1 s. `HubConnection::handshake()`
+  tells which (`Handshake::V2(ack)` / `Handshake::Legacy`).
+- **Liveness**: a stream with no heartbeat echo for three intervals is dropped and reconnected; the
+  channel also sends HTTP/2 keepalive pings every 10 s (5 s to answer, also while idle).
+- **Replies** go back on the stream the request arrived on; when that stream is gone the reply is
+  dropped (the hub already failed the request with `HANDLER_DISCONNECTED`), never sent on a newer one.
 
 ## Build and test
 
@@ -145,10 +162,13 @@ cargo test                            # unit tests + integration tests (Docker r
 
 Integration tests start Kafka (`apache/kafka`), MongoDB (replica set) and `kraken-hub:dev` with
 testcontainers. The hub image is built from the sibling repo: `docker build -t kraken-hub:dev .` in
-`../kraken-hub` (override with `KRAKEN_HUB_IMAGE`). Without Docker the integration tests print a
-notice and skip; with Docker but no hub image they fail with that command. On Rancher Desktop export
-`DOCKER_HOST=unix://$HOME/.rd/docker.sock` first. A unit test checks that `proto/hub.proto` is
-byte-identical to `../kraken/protocol/hub.proto` whenever the umbrella checkout exists.
+`../kraken-hub` (override with `KRAKEN_HUB_IMAGE`). `tests/hub_compat.rs` also runs against the
+previous hub release, `kraken-hub:v1-baseline` (override with `KRAKEN_HUB_BASELINE_IMAGE`), to prove
+legacy mode. Without Docker the integration tests print a notice and skip; with Docker but no hub
+image they fail with the build command. On Rancher Desktop export
+`DOCKER_HOST=unix://$HOME/.rd/docker.sock` first. A unit test and `scripts/check-proto-sync.sh` (CI
+job `proto-sync`) check that `proto/hub.proto` is byte-identical to `../kraken/protocol/hub.proto`
+whenever the umbrella checkout exists.
 
 ## Example
 

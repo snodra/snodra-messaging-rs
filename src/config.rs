@@ -174,3 +174,20 @@ fn flag(name: &str, v: &str) -> Result<bool, MessagingError> {
         ))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hub_defaults_follow_protocol_v2() {
+        let c = Config::new("svc", "static://hub:7000", "kafka:19092", "mongodb://m/db");
+        // No chosen timeout: the hub decides (per-type override or its default).
+        assert_eq!(c.hub_request_timeout, None);
+        // F2: the backoff is capped at 5 s.
+        assert_eq!(c.reconnect_backoff_min, Duration::from_millis(500));
+        assert_eq!(c.reconnect_backoff_max, Duration::from_secs(5));
+        // Fallback for hubs that announce no interval (legacy hubs evict after 30 s).
+        assert_eq!(c.heartbeat_interval, Duration::from_secs(10));
+    }
+}
