@@ -337,7 +337,7 @@ impl Sender {
             if attempt >= attempts || !retry::is_retryable(kind, &error) {
                 return Err(error);
             }
-            let wait = policy.backoff(attempt);
+            let wait = policy.jittered_backoff(attempt);
             // What the next attempt would have, from the moment its wait is over.
             remaining = match budget.checked_sub(started.elapsed() + wait) {
                 Some(left) if left >= min_remaining => left,

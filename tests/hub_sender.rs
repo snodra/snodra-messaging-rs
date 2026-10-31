@@ -673,7 +673,7 @@ async fn all_attempts_stay_within_the_callers_budget() {
         .send_command(
             &Ping { text: "x".into() },
             SendOptions {
-                timeout: Some(Duration::from_millis(500)),
+                timeout: Some(Duration::from_millis(600)),
                 ..Default::default()
             },
         )
@@ -685,20 +685,21 @@ async fn all_attempts_stay_within_the_callers_budget() {
         "the last error is returned: {err:?}"
     );
     assert!(
-        elapsed < Duration::from_millis(500),
+        elapsed < Duration::from_millis(600),
         "overran the budget: {elapsed:?}"
     );
-    // Attempts at ~0 and ~200 ms; after the next wait (400 ms) nothing would be left of the 500 ms.
+    // Attempts at ~0 and ~200 ms (waits jittered by ±20 %); after the next wait (400 ms ± 20 %)
+    // less than 250 ms would be left of the 600 ms.
     let sent = hub.requests().await;
     assert_eq!(sent.len(), 2, "{sent:?}");
     // Each attempt carries what is left of the budget.
     assert!(
-        sent[0].timeout_ms <= 500 && sent[0].timeout_ms > 450,
+        sent[0].timeout_ms <= 600 && sent[0].timeout_ms > 550,
         "{}",
         sent[0].timeout_ms
     );
     assert!(
-        sent[1].timeout_ms <= 300 && sent[1].timeout_ms > 200,
+        sent[1].timeout_ms <= 440 && sent[1].timeout_ms >= 250,
         "{}",
         sent[1].timeout_ms
     );
@@ -732,8 +733,8 @@ async fn without_a_chosen_timeout_the_budget_is_the_hubs_bound_for_the_type() {
         .await
         .unwrap_err();
     let sent = hub.requests().await;
-    // The budget is the 1 s override. Attempts at ~0 and ~300 ms; after the next wait (600 ms)
-    // less than the 300 ms minimum (the initial backoff) would be left of it.
+    // The budget is the 1 s override. Attempts at ~0 and ~300 ms; after the next wait (600 ms;
+    // both ±20 %) less than the 300 ms minimum (the initial backoff) would be left of it.
     assert_eq!(sent.len(), 2, "{sent:?}");
     assert!(
         sent[0].timeout_ms <= 1_000 && sent[0].timeout_ms > 950,
@@ -741,7 +742,7 @@ async fn without_a_chosen_timeout_the_budget_is_the_hubs_bound_for_the_type() {
         sent[0].timeout_ms
     );
     assert!(
-        sent[1].timeout_ms <= 700 && sent[1].timeout_ms >= 300,
+        sent[1].timeout_ms <= 760 && sent[1].timeout_ms >= 300,
         "{}",
         sent[1].timeout_ms
     );

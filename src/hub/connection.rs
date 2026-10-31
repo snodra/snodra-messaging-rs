@@ -51,6 +51,7 @@ use crate::proto::hub_client::HubClient;
 use crate::proto::{
     self, ClientMessage, Heartbeat, Permits, Register, RegisterAck, client_message, server_message,
 };
+use crate::retry::{jittered, random_unit};
 
 /// The hub protocol version this client speaks (`Register.protocol_version`).
 pub const PROTOCOL_VERSION: u32 = 2;
@@ -711,24 +712,6 @@ fn ticker(period: Duration) -> tokio::time::Interval {
     t
 }
 
-/// `base` scaled by a factor in [0.8, 1.2) chosen by `unit` (in [0, 1)), never above `max`.
-pub(crate) fn jittered(base: Duration, max: Duration, unit: f64) -> Duration {
-    let unit = unit.clamp(0.0, 1.0);
-    if base >= max {
-        // At the cap jitter downward only, over [0.8, 1.0] x max: clamping a ±20 % wait would put
-        // about half of a reconnecting fleet on exactly the maximum.
-        max.mul_f64(0.8 + 0.2 * unit)
-    } else {
-        base.mul_f64(0.8 + 0.4 * unit).min(max)
-    }
-}
-
-/// A uniformly distributed value in [0, 1) from the v4 UUID generator (no extra dependency).
-fn random_unit() -> f64 {
-    let bits = (uuid::Uuid::new_v4().as_u128() >> 64) as u64;
-    (bits >> 11) as f64 / (1u64 << 53) as f64
-}
-
 /// `static://host:port` or `host:port` → `http://host:port`; explicit `http(s)://` kept.
 pub(crate) fn grpc_target(address: &str) -> String {
     let stripped = address.strip_prefix("static://").unwrap_or(address);
@@ -771,32 +754,6 @@ mod tests {
             grpc_target("http://localhost:7002"),
             "http://localhost:7002"
         );
-    }
-
-    #[test]
-    fn jitter_stays_within_twenty_percent_and_never_exceeds_max() {
-        let max = Duration::from_secs(5);
-        let base = Duration::from_secs(1);
-        assert_eq!(jittered(base, max, 0.0), Duration::from_millis(800));
-        assert_eq!(jittered(base, max, 0.5), Duration::from_millis(1000));
-        assert!(jittered(base, max, 0.999_999) < Duration::from_millis(1200));
-        assert!(jittered(base, max, 0.999_999) > Duration::from_millis(1199));
-        // At the cap the wait is jittered downward over [0.8, 1.0] x max, so a fleet does not all
-        // land on exactly the maximum.
-        assert_eq!(jittered(max, max, 0.0), Duration::from_secs(4));
-        assert_eq!(jittered(max, max, 0.5), Duration::from_millis(4500));
-        let top = jittered(max, max, 0.999_999);
-        assert!(top < max && top > Duration::from_millis(4999), "{top:?}");
-        // Below the cap the ±20 % never exceeds the maximum either.
-        assert!(jittered(Duration::from_millis(4500), max, 0.999) <= max);
-    }
-
-    #[test]
-    fn random_unit_is_in_range_and_varies() {
-        let values: Vec<f64> = (0..200).map(|_| random_unit()).collect();
-        assert!(values.iter().all(|v| (0.0..1.0).contains(v)));
-        let distinct: std::collections::HashSet<u64> = values.iter().map(|v| v.to_bits()).collect();
-        assert!(distinct.len() > 190);
     }
 
     fn permits_in(rx: &mut mpsc::Receiver<ClientMessage>) -> Vec<u32> {
