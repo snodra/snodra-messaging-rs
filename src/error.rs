@@ -10,6 +10,10 @@ pub enum MessagingError {
     Timeout(String),
     #[error("Handler for '{0}' disconnected")]
     HandlerDisconnected(String),
+    /// Hub code RESOURCE_EXHAUSTED: the target instance's queue at the hub is full (flow control).
+    /// The handler never saw the request; a retry after a backoff is safe.
+    #[error("Handler for '{0}' is busy")]
+    HandlerBusy(String),
     #[error("{message}")]
     RemoteHandler {
         type_name: String,
@@ -51,14 +55,14 @@ impl MessagingError {
             ErrorCode::InvalidRequest => Self::InvalidMessage(message.to_string()),
             ErrorCode::PermissionDenied => Self::AccessDenied(message.to_string()),
             // UNSUPPORTED is declared by protocol v2 but not produced yet: read like an unknown code.
-            ErrorCode::HandlerError
-            | ErrorCode::Unsupported
-            | ErrorCode::ResourceExhausted
-            | ErrorCode::Unspecified => Self::RemoteHandler {
-                type_name: type_name.to_string(),
-                message: message.to_string(),
-                details: details.to_vec(),
-            },
+            ErrorCode::ResourceExhausted => Self::HandlerBusy(type_name.to_string()),
+            ErrorCode::HandlerError | ErrorCode::Unsupported | ErrorCode::Unspecified => {
+                Self::RemoteHandler {
+                    type_name: type_name.to_string(),
+                    message: message.to_string(),
+                    details: details.to_vec(),
+                }
+            }
         }
     }
 
@@ -89,5 +93,34 @@ impl From<mongodb::error::Error> for MessagingError {
 impl From<rdkafka::error::KafkaError> for MessagingError {
     fn from(e: rdkafka::error::KafkaError) -> Self {
         Self::Transport(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_exhausted_is_handler_busy() {
+        let e = MessagingError::from_hub(
+            "t.X",
+            ErrorCode::ResourceExhausted as i32,
+            "queue full",
+            b"",
+        );
+        assert!(
+            matches!(e, MessagingError::HandlerBusy(ref t) if t == "t.X"),
+            "{e:?}"
+        );
+        assert_eq!(e.to_string(), "Handler for 't.X' is busy");
+        // A handler that returns it itself answers HANDLER_ERROR like any other failure.
+        assert_eq!(e.to_reply_code(), ErrorCode::HandlerError);
+    }
+
+    #[test]
+    fn handler_error_busy_from_an_old_hub_stays_remote_handler() {
+        let e =
+            MessagingError::from_hub("t.X", ErrorCode::HandlerError as i32, "handler busy", b"");
+        assert!(matches!(e, MessagingError::RemoteHandler { .. }), "{e:?}");
     }
 }
