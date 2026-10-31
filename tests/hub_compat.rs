@@ -119,6 +119,38 @@ async fn peer(address: &str, service: &str, commands: &[&str]) -> Peer {
     Peer { conn, sender }
 }
 
+/// Returns once a `Topology` RPC on `address` succeeds (bounded by 30 s).
+async fn wait_until_reachable(address: &str) {
+    let target = address.replace("static://", "http://");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let attempt = async {
+            let channel = tonic::transport::Endpoint::from_shared(target.clone())
+                .ok()?
+                .connect()
+                .await
+                .ok()?;
+            proto::hub_client::HubClient::new(channel)
+                .topology(proto::TopologyRequest {})
+                .await
+                .ok()
+        };
+        if tokio::time::timeout(Duration::from_millis(500), attempt)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "hub at {address} never became reachable"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn topology(hub: &HubContainer) -> serde_json::Value {
     reqwest::get(format!("{}/topology", hub.http))
         .await
@@ -198,8 +230,8 @@ async fn new_hub_acks_with_its_configured_values_and_applies_type_overrides() {
     b.shutdown().await;
 }
 
-/// A request in flight when the hub goes away is `HubConnectionLost`; one sent while no stream
-/// is up is `HubUnavailable`.
+/// A request in flight when the hub dies (SIGKILL) is `HubConnectionLost`; one sent while no
+/// stream is up is `HubUnavailable`.
 async fn connection_lost_vs_unavailable(image: HubImage) {
     let hub = hub_with(HubOptions::new(image)).await;
     let b = peer(&hub.address, "compat-b", &["compat.Hang"]).await;
@@ -220,7 +252,12 @@ async fn connection_lost_vs_unavailable(image: HubImage) {
         }
     });
     tokio::time::sleep(Duration::from_millis(500)).await;
-    hub.container.stop_with_timeout(Some(0)).await.unwrap();
+    // SIGKILL: a graceful stop would let the hub answer the request (HANDLER_DISCONNECTED) first.
+    let killed = std::process::Command::new("docker")
+        .args(["kill", hub.container.id()])
+        .output()
+        .expect("docker kill");
+    assert!(killed.status.success(), "docker kill failed: {killed:?}");
     let lost = tokio::time::timeout(Duration::from_secs(15), in_flight)
         .await
         .expect("in-flight request not failed after the hub stopped")
@@ -305,6 +342,7 @@ async fn baseline_hub_runs_in_legacy_mode_without_regression() {
 #[tokio::test]
 async fn reconnects_within_the_backoff_cap_after_a_hub_restart() {
     require_docker!();
+    support::init_tracing();
     let port = free_port();
     let hub = hub_with(HubOptions::new(HubImage::Current).port(port)).await;
     let b = peer(&hub.address, "compat-b", &["compat.Fast"]).await;
@@ -315,14 +353,19 @@ async fn reconnects_within_the_backoff_cap_after_a_hub_restart() {
     tokio::time::sleep(Duration::from_secs(8)).await;
     assert!(a.conn.handshake().is_none() && b.conn.handshake().is_none());
     hub.container.start().await.unwrap();
+    // `start` returns before the host port forwarding works again (Rancher Desktop takes seconds):
+    // measure from the first gRPC call that reaches the restarted hub from the host.
+    let started = Instant::now();
+    wait_until_reachable(&hub.address).await;
     let ready = Instant::now();
+    eprintln!("hub reachable {:?} after start returned", ready - started);
     let (ra, rb) = tokio::join!(
         a.conn.await_registered(Duration::from_secs(15)),
         b.conn.await_registered(Duration::from_secs(15)),
     );
     let took = ready.elapsed();
     assert!(ra && rb, "did not re-register after the hub restart");
-    eprintln!("re-registered {took:?} after the restarted hub was ready");
+    eprintln!("re-registered {took:?} after the restarted hub was reachable");
     // Cap 5 s (jitter never exceeds it) plus connect and handshake time.
     assert!(
         took <= Duration::from_millis(5_500),
