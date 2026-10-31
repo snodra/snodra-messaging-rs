@@ -15,7 +15,7 @@
 //!
 //! Any failure closes the stream, notifies the owner with [`Inbound::Disconnected`] (carrying the
 //! stream id) and reconnects with exponential backoff (`backoff_min` doubling up to `backoff_max`,
-//! each wait jittered by ±20 % and clamped to `backoff_max`), reset to `backoff_min` once an attempt
+//! each wait jittered by ±20 % and clamped to `backoff_max`; at the cap 80-100 % of it), reset to `backoff_min` once an attempt
 //! reached the handshake. An `ALREADY_EXISTS` or `INVALID_ARGUMENT` rejection is kept in
 //! [`HubConnection::last_rejection`] and retried at `backoff_max`.
 //!
@@ -496,7 +496,14 @@ fn ticker(period: Duration) -> tokio::time::Interval {
 
 /// `base` scaled by a factor in [0.8, 1.2) chosen by `unit` (in [0, 1)), never above `max`.
 pub(crate) fn jittered(base: Duration, max: Duration, unit: f64) -> Duration {
-    base.mul_f64(0.8 + 0.4 * unit.clamp(0.0, 1.0)).min(max)
+    let unit = unit.clamp(0.0, 1.0);
+    if base >= max {
+        // At the cap jitter downward only, over [0.8, 1.0] x max: clamping a ±20 % wait would put
+        // about half of a reconnecting fleet on exactly the maximum.
+        max.mul_f64(0.8 + 0.2 * unit)
+    } else {
+        base.mul_f64(0.8 + 0.4 * unit).min(max)
+    }
 }
 
 /// A uniformly distributed value in [0, 1) from the v4 UUID generator (no extra dependency).
@@ -557,9 +564,14 @@ mod tests {
         assert_eq!(jittered(base, max, 0.5), Duration::from_millis(1000));
         assert!(jittered(base, max, 0.999_999) < Duration::from_millis(1200));
         assert!(jittered(base, max, 0.999_999) > Duration::from_millis(1199));
-        // At the cap the jitter can only shorten the wait.
-        assert_eq!(jittered(max, max, 0.999), max);
+        // At the cap the wait is jittered downward over [0.8, 1.0] x max, so a fleet does not all
+        // land on exactly the maximum.
         assert_eq!(jittered(max, max, 0.0), Duration::from_secs(4));
+        assert_eq!(jittered(max, max, 0.5), Duration::from_millis(4500));
+        let top = jittered(max, max, 0.999_999);
+        assert!(top < max && top > Duration::from_millis(4999), "{top:?}");
+        // Below the cap the ±20 % never exceeds the maximum either.
+        assert!(jittered(Duration::from_millis(4500), max, 0.999) <= max);
     }
 
     #[test]
