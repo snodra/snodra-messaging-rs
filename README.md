@@ -150,7 +150,10 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 - **Liveness**: a stream with no heartbeat echo for three intervals is dropped and reconnected; the
   channel also sends HTTP/2 keepalive pings every 10 s (5 s to answer, also while idle).
 - **Replies** go back on the stream the request arrived on; when that stream is gone the reply is
-  dropped (the hub already failed the request with `HANDLER_DISCONNECTED`), never sent on a newer one.
+  dropped, never sent on a newer one. The hub has already failed the request with
+  `HANDLER_DISCONNECTED`, including when this instance reconnected with the same instance id while
+  the old stream was still registered. A hub from before that fix leaves such a request to its
+  `TIMEOUT` instead.
 
 ## Build and test
 
