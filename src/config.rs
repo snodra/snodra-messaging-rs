@@ -1,9 +1,11 @@
 //! Runtime configuration, from code or from `KRAKEN_*` environment variables (the names the
 //! compose files use).
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::error::MessagingError;
+use crate::retry::RetryPolicy;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -22,7 +24,20 @@ pub struct Config {
     pub reconnect_backoff_min: Duration,
     /// Reconnect backoff ceiling (each wait is jittered by ±20 % and never exceeds it).
     pub reconnect_backoff_max: Duration,
+    /// Handlers run concurrently; also the permits granted to a hub with flow control
+    /// (`Register.initial_permits`), which then queues further requests for this instance.
     pub max_concurrent_handlers: usize,
+    /// `Register.load_factor`: this instance's relative capacity (100 = normal). Weights its share
+    /// of keyed commands and its load score for unkeyed requests.
+    pub hub_load_factor: u32,
+    /// `Register.tags`: unkeyed requests from a sender prefer instances whose tags match more of
+    /// the sender's tags (for example `zone=eu-1`).
+    pub hub_tags: HashMap<String, String>,
+    /// Default `Request.priority` per outgoing type (higher is served first when the target's hub
+    /// queue is not empty); `SendOptions.priority` wins. Unlisted types send 0.
+    pub hub_priorities: HashMap<String, i32>,
+    /// Caller-side retry for transient failures (off by default); `SendOptions.retry` wins.
+    pub hub_retry: RetryPolicy,
     pub kafka_bootstrap: String,
     pub kafka_topic: String,
     pub consumer_enabled: bool,
@@ -57,6 +72,10 @@ impl Config {
             reconnect_backoff_min: Duration::from_millis(500),
             reconnect_backoff_max: Duration::from_secs(5),
             max_concurrent_handlers: 256,
+            hub_load_factor: 100,
+            hub_tags: HashMap::new(),
+            hub_priorities: HashMap::new(),
+            hub_retry: RetryPolicy::default(),
             kafka_bootstrap: kafka_bootstrap.to_string(),
             kafka_topic: crate::kafka::EVENTS_TOPIC.to_string(),
             consumer_enabled: true,
@@ -80,7 +99,11 @@ impl Config {
     /// `KRAKEN_HEARTBEAT_INTERVAL_MS`, `KRAKEN_RECONNECT_BACKOFF_MIN_MS`, `KRAKEN_RECONNECT_BACKOFF_MAX_MS`,
     /// `KRAKEN_MAX_CONCURRENT_HANDLERS`, `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS`,
     /// `KRAKEN_OUTBOX_ENABLED`, `KRAKEN_OUTBOX_POLL_INTERVAL_MS`, `KRAKEN_OUTBOX_BATCH_SIZE`,
-    /// `KRAKEN_OUTBOX_MAX_ATTEMPTS`, `KRAKEN_FORWARD_JWT`.
+    /// `KRAKEN_OUTBOX_MAX_ATTEMPTS`, `KRAKEN_FORWARD_JWT`, `KRAKEN_HUB_LOAD_FACTOR`,
+    /// `KRAKEN_HUB_TAGS` (`k=v,k=v`), `KRAKEN_HUB_PRIORITIES` (`type=n,type=n`),
+    /// `KRAKEN_HUB_RETRY_ENABLED`, `KRAKEN_HUB_RETRY_MAX_ATTEMPTS`,
+    /// `KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS`, `KRAKEN_HUB_RETRY_MULTIPLIER`,
+    /// `KRAKEN_HUB_RETRY_MAX_BACKOFF_MS`.
     pub fn from_env() -> Result<Config, MessagingError> {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
@@ -120,6 +143,40 @@ impl Config {
         }
         if let Some(v) = optional("KRAKEN_MAX_CONCURRENT_HANDLERS") {
             c.max_concurrent_handlers = number("KRAKEN_MAX_CONCURRENT_HANDLERS", &v)? as usize;
+        }
+        if let Some(v) = optional("KRAKEN_HUB_LOAD_FACTOR") {
+            c.hub_load_factor = number("KRAKEN_HUB_LOAD_FACTOR", &v)?.min(u32::MAX as u64) as u32;
+        }
+        if let Some(v) = optional("KRAKEN_HUB_TAGS") {
+            c.hub_tags = pairs("KRAKEN_HUB_TAGS", &v, |s| Some(s.to_string()))?;
+        }
+        if let Some(v) = optional("KRAKEN_HUB_PRIORITIES") {
+            c.hub_priorities = pairs("KRAKEN_HUB_PRIORITIES", &v, |s| s.parse::<i32>().ok())?;
+        }
+        if let Some(v) = optional("KRAKEN_HUB_RETRY_ENABLED") {
+            c.hub_retry.enabled = flag("KRAKEN_HUB_RETRY_ENABLED", &v)?;
+        }
+        if let Some(v) = optional("KRAKEN_HUB_RETRY_MAX_ATTEMPTS") {
+            c.hub_retry.max_attempts =
+                number("KRAKEN_HUB_RETRY_MAX_ATTEMPTS", &v)?.min(u32::MAX as u64) as u32;
+        }
+        if let Some(v) = optional("KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS") {
+            c.hub_retry.initial_backoff = millis("KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS", &v)?;
+        }
+        if let Some(v) = optional("KRAKEN_HUB_RETRY_MULTIPLIER") {
+            c.hub_retry.multiplier = v
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|m| m.is_finite() && *m >= 1.0)
+                .ok_or_else(|| {
+                    MessagingError::InvalidMessage(format!(
+                        "KRAKEN_HUB_RETRY_MULTIPLIER must be a number >= 1, got '{v}'"
+                    ))
+                })?;
+        }
+        if let Some(v) = optional("KRAKEN_HUB_RETRY_MAX_BACKOFF_MS") {
+            c.hub_retry.max_backoff = millis("KRAKEN_HUB_RETRY_MAX_BACKOFF_MS", &v)?;
         }
         if let Some(v) = optional("KRAKEN_CONSUMER_ENABLED") {
             c.consumer_enabled = flag("KRAKEN_CONSUMER_ENABLED", &v)?;
@@ -171,6 +228,27 @@ fn millis(name: &str, v: &str) -> Result<Duration, MessagingError> {
     number(name, v).map(Duration::from_millis)
 }
 
+/// `k=v,k=v` (blanks around entries and a trailing comma ignored); `value` parses each value.
+fn pairs<T>(
+    name: &str,
+    v: &str,
+    value: impl Fn(&str) -> Option<T>,
+) -> Result<HashMap<String, T>, MessagingError> {
+    let bad = |entry: &str| {
+        MessagingError::InvalidMessage(format!("{name}: entry '{entry}' is not key=value"))
+    };
+    let mut out = HashMap::new();
+    for entry in v.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let (k, val) = entry.split_once('=').ok_or_else(|| bad(entry))?;
+        let (k, val) = (k.trim(), val.trim());
+        if k.is_empty() {
+            return Err(bad(entry));
+        }
+        out.insert(k.to_string(), value(val).ok_or_else(|| bad(entry))?);
+    }
+    Ok(out)
+}
+
 fn flag(name: &str, v: &str) -> Result<bool, MessagingError> {
     match v.trim().to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" => Ok(true),
@@ -184,6 +262,7 @@ fn flag(name: &str, v: &str) -> Result<bool, MessagingError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn from(vars: &[(&str, &str)]) -> Config {
         let vars: Vec<(String, String)> = [
@@ -214,6 +293,77 @@ mod tests {
             from(&[("KRAKEN_HUB_REQUEST_TIMEOUT_MS", "2500")]).hub_request_timeout,
             Some(Duration::from_millis(2500))
         );
+    }
+
+    #[test]
+    fn flow_control_routing_and_retry_defaults() {
+        let c = Config::new("svc", "static://hub:7000", "kafka:19092", "mongodb://m/db");
+        assert_eq!(c.hub_load_factor, 100);
+        assert!(c.hub_tags.is_empty());
+        assert!(c.hub_priorities.is_empty());
+        assert_eq!(c.hub_retry, crate::retry::RetryPolicy::default());
+        assert!(!c.hub_retry.enabled);
+    }
+
+    #[test]
+    fn flow_control_routing_and_retry_from_env() {
+        let c = from(&[
+            ("KRAKEN_HUB_LOAD_FACTOR", "250"),
+            ("KRAKEN_HUB_TAGS", " zone=eu-1 , tier = gold,"),
+            ("KRAKEN_HUB_PRIORITIES", "orders.Cancel=10,reports.Build=-5"),
+            ("KRAKEN_HUB_RETRY_ENABLED", "true"),
+            ("KRAKEN_HUB_RETRY_MAX_ATTEMPTS", "5"),
+            ("KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS", "50"),
+            ("KRAKEN_HUB_RETRY_MULTIPLIER", "1.5"),
+            ("KRAKEN_HUB_RETRY_MAX_BACKOFF_MS", "800"),
+        ]);
+        assert_eq!(c.hub_load_factor, 250);
+        assert_eq!(
+            c.hub_tags,
+            HashMap::from([
+                ("zone".to_string(), "eu-1".to_string()),
+                ("tier".to_string(), "gold".to_string())
+            ])
+        );
+        assert_eq!(
+            c.hub_priorities,
+            HashMap::from([
+                ("orders.Cancel".to_string(), 10),
+                ("reports.Build".to_string(), -5)
+            ])
+        );
+        assert_eq!(
+            c.hub_retry,
+            crate::retry::RetryPolicy {
+                enabled: true,
+                max_attempts: 5,
+                initial_backoff: Duration::from_millis(50),
+                multiplier: 1.5,
+                max_backoff: Duration::from_millis(800),
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_maps_are_rejected() {
+        for (name, value) in [
+            ("KRAKEN_HUB_TAGS", "zone"),
+            ("KRAKEN_HUB_TAGS", "=x"),
+            ("KRAKEN_HUB_PRIORITIES", "t.X=high"),
+            ("KRAKEN_HUB_RETRY_MULTIPLIER", "fast"),
+        ] {
+            let vars = [
+                ("KRAKEN_SERVICE_NAME".to_string(), "svc".to_string()),
+                (
+                    "KRAKEN_MONGODB_URI".to_string(),
+                    "mongodb://m/db".to_string(),
+                ),
+                (name.to_string(), value.to_string()),
+            ];
+            let result =
+                Config::from_lookup(|n| vars.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone()));
+            assert!(result.is_err(), "{name}={value} accepted");
+        }
     }
 
     #[test]
