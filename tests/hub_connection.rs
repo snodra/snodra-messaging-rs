@@ -4,9 +4,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kraken_messaging::MessagingError;
-use kraken_messaging::hub::{HubConnection, HubSettings, Inbound};
-use kraken_messaging::proto::{ClientMessage, Heartbeat, client_message};
-use support::fake_hub::FakeHub;
+use kraken_messaging::hub::{
+    CLIENT_VERSION, Handshake, HubConnection, HubSettings, Inbound, PROTOCOL_VERSION,
+};
+use kraken_messaging::proto::{
+    self, ClientMessage, Heartbeat, Reply, ServerMessage, client_message, reply, server_message,
+};
+use support::fake_hub::{FakeHub, default_ack};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep, timeout};
 
@@ -60,8 +64,9 @@ async fn registers_with_declared_types() {
 }
 
 #[tokio::test]
-async fn heartbeats_are_sent_at_interval() {
+async fn legacy_hub_heartbeats_at_the_configured_interval() {
     let hub = FakeHub::start().await;
+    hub.set_ack(None); // a hub older than protocol v2 announces no interval
     let (conn, _rx) = connection(settings(hub.address(), 100, 50, 500));
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);
@@ -82,7 +87,7 @@ async fn reconnects_after_server_restart() {
     hub.drop_streams();
     let disconnected = timeout(Duration::from_secs(2), async {
         loop {
-            if let Some(Inbound::Disconnected) = rx.recv().await {
+            if let Some(Inbound::Disconnected { .. }) = rx.recv().await {
                 break;
             }
         }
@@ -107,7 +112,7 @@ async fn already_exists_is_reported_and_retried_at_max_backoff() {
     let started = Instant::now();
     conn.start();
 
-    sleep(Duration::from_millis(150)).await;
+    sleep(Duration::from_millis(120)).await;
     assert!(
         conn.last_rejection()
             .is_some_and(|r| r.contains("owned by other-service"))
@@ -117,7 +122,8 @@ async fn already_exists_is_reported_and_retried_at_max_backoff() {
         "retried before backoff_max"
     );
     assert!(conn.await_registered(Duration::from_secs(3)).await);
-    assert!(started.elapsed() >= Duration::from_millis(300));
+    // The rejection wait is backoff_max jittered down by at most 20 %.
+    assert!(started.elapsed() >= Duration::from_millis(240));
     assert_eq!(hub.registers().await.len(), 1);
     conn.shutdown().await;
     hub.stop();
@@ -140,7 +146,7 @@ async fn invalid_argument_is_retried_at_max_backoff() {
     let (conn, _rx) = connection(settings(hub.address(), 1_000, 50, 300));
     let started = Instant::now();
     conn.start();
-    sleep(Duration::from_millis(150)).await;
+    sleep(Duration::from_millis(120)).await;
     assert!(
         conn.last_rejection()
             .is_some_and(|r| r.contains("service_name"))
@@ -150,7 +156,8 @@ async fn invalid_argument_is_retried_at_max_backoff() {
         "retried before backoff_max"
     );
     assert!(conn.await_registered(Duration::from_secs(3)).await);
-    assert!(started.elapsed() >= Duration::from_millis(300));
+    // The rejection wait is backoff_max jittered down by at most 20 %.
+    assert!(started.elapsed() >= Duration::from_millis(240));
     conn.shutdown().await;
     hub.stop();
 }
@@ -174,7 +181,7 @@ async fn hung_handshake_is_abandoned_and_reported() {
     conn.start();
     let notified = timeout(Duration::from_secs(3), async {
         loop {
-            if let Some(Inbound::Disconnected) = rx.recv().await {
+            if let Some(Inbound::Disconnected { .. }) = rx.recv().await {
                 break;
             }
         }
@@ -186,4 +193,215 @@ async fn hung_handshake_is_abandoned_and_reported() {
     );
     conn.shutdown().await;
     hold.abort();
+}
+
+#[tokio::test]
+async fn register_declares_protocol_v2_and_client_version() {
+    let hub = FakeHub::start().await;
+    let (conn, _rx) = connection(settings(hub.address(), 1_000, 50, 500));
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    let r = &hub.registers().await[0];
+    assert_eq!(r.protocol_version, PROTOCOL_VERSION);
+    assert_eq!(r.protocol_version, 2);
+    assert!(r.capabilities.is_empty());
+    assert_eq!(r.client_version, CLIENT_VERSION);
+    assert!(r.client_version.starts_with("kraken-messaging-rs/"));
+    assert!(r.credentials.is_none());
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn ack_completes_the_handshake_and_its_interval_replaces_the_fallback() {
+    let hub = FakeHub::start().await;
+    let ack = proto::RegisterAck {
+        heartbeat_interval_ms: 100,
+        ..default_ack()
+    };
+    hub.set_ack(Some(ack.clone()));
+    // Fallback 10 s: only the announced 100 ms explains several heartbeats within a second.
+    let (conn, _rx) = connection(settings(hub.address(), 10_000, 50, 500));
+    assert_eq!(conn.handshake(), None);
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    assert_eq!(conn.handshake(), Some(Handshake::V2(ack)));
+    let before = hub.heartbeats();
+    sleep(Duration::from_secs(1)).await;
+    let sent = hub.heartbeats() - before;
+    assert!(sent >= 5, "{sent} heartbeats in 1 s at a 100 ms interval");
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn echo_without_ack_is_legacy_mode() {
+    let hub = FakeHub::start().await;
+    hub.set_ack(None);
+    let (conn, _rx) = connection(settings(hub.address(), 1_000, 50, 500));
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    assert_eq!(conn.handshake(), Some(Handshake::Legacy));
+    assert!(conn.handshake().unwrap().is_legacy());
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn no_ack_and_no_echo_fails_the_handshake_and_reconnects() {
+    let hub = FakeHub::start().await;
+    hub.set_ack(None);
+    hub.set_echo_heartbeats(false);
+    let mut s = settings(hub.address(), 1_000, 50, 100);
+    s.handshake_timeout = Duration::from_millis(300);
+    let (conn, mut rx) = connection(s);
+    conn.start();
+    let lost = timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(Inbound::Disconnected { .. }) = rx.recv().await {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(lost.is_ok(), "an unconfirmed stream must be abandoned");
+    assert!(!conn.await_registered(Duration::from_millis(10)).await);
+    hub.set_echo_heartbeats(true);
+    assert!(conn.await_registered(Duration::from_secs(3)).await);
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn send_returns_the_stream_it_wrote_to() {
+    let hub = FakeHub::start().await;
+    let (conn, _rx) = connection(settings(hub.address(), 1_000, 50, 500));
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    let stream = conn.send(heartbeat()).await.unwrap();
+    assert_eq!(Some(stream), conn.current_stream());
+    conn.shutdown().await;
+    hub.stop();
+}
+
+fn request(id: &str) -> ServerMessage {
+    ServerMessage {
+        message: Some(server_message::Message::Request(proto::Request {
+            id: id.into(),
+            kind: proto::RequestKind::Command as i32,
+            r#type: "t.Cmd".into(),
+            ..Default::default()
+        })),
+    }
+}
+
+fn reply_msg(id: &str) -> ClientMessage {
+    ClientMessage {
+        message: Some(client_message::Message::Reply(Reply {
+            request_id: id.into(),
+            result: Some(reply::Result::Payload(b"{}".to_vec())),
+        })),
+    }
+}
+
+async fn next_request(
+    rx: &mut mpsc::Receiver<Inbound>,
+) -> (proto::Request, kraken_messaging::hub::ReplyTo) {
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(Inbound::Request { request, reply_to }) = rx.recv().await {
+                return (request, reply_to);
+            }
+        }
+    })
+    .await
+    .expect("no request delivered")
+}
+
+#[tokio::test]
+async fn reply_goes_to_the_arrival_stream_and_never_to_a_newer_one() {
+    let hub = FakeHub::start().await;
+    let (conn, mut rx) = connection(settings(hub.address(), 1_000, 50, 500));
+    conn.set_types(vec!["t.Cmd".into()], vec![]);
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+
+    // A request on stream 1 whose handler is still running when stream 1 breaks.
+    hub.send_to_clients(request("r1")).await;
+    let (r1, reply_to_1) = next_request(&mut rx).await;
+    assert_eq!(r1.id, "r1");
+    let first = reply_to_1.stream();
+    assert_eq!(Some(first), conn.current_stream());
+    hub.drop_streams();
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(Inbound::Disconnected { stream }) = rx.recv().await {
+                assert_eq!(stream, first);
+                break;
+            }
+        }
+    })
+    .await
+    .expect("no Disconnected for stream 1");
+    assert!(conn.await_registered(Duration::from_secs(3)).await);
+    let second = conn.current_stream().unwrap();
+    assert_ne!(first, second);
+
+    // The late reply is dropped: it must not travel on the new stream.
+    let late = reply_to_1.send(reply_msg("r1")).await;
+    assert!(
+        matches!(late, Err(MessagingError::HubUnavailable(_))),
+        "{late:?}"
+    );
+
+    // A request on stream 2 is answered on stream 2.
+    hub.send_to_clients(request("r2")).await;
+    let (r2, reply_to_2) = next_request(&mut rx).await;
+    assert_eq!((r2.id.as_str(), reply_to_2.stream()), ("r2", second));
+    reply_to_2.send(reply_msg("r2")).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while hub.replies().await.is_empty() && Instant::now() < deadline {
+        sleep(Duration::from_millis(20)).await;
+    }
+    let replies = hub.replies_by_stream().await;
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    assert_eq!(
+        replies[0].0, 2,
+        "reply arrived on hub stream {}",
+        replies[0].0
+    );
+    assert_eq!(replies[0].1.request_id, "r2");
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn backoff_restarts_from_the_floor_after_a_handshaken_stream() {
+    // backoff_max 2 s: three drops of a handshaken stream must each reconnect within the floor's
+    // jittered 120 ms (plus connect time), never at the doubled or capped value.
+    let hub = FakeHub::start().await;
+    let (conn, mut rx) = connection(settings(hub.address(), 1_000, 100, 2_000));
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    for round in 0..3 {
+        hub.drop_streams();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(Inbound::Disconnected { .. }) = rx.recv().await {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("no Disconnected");
+        let started = Instant::now();
+        assert!(conn.await_registered(Duration::from_secs(3)).await);
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(800),
+            "round {round}: reconnect took {took:?}"
+        );
+    }
+    conn.shutdown().await;
+    hub.stop();
 }

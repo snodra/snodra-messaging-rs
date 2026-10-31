@@ -62,7 +62,6 @@ fn config(service: &str, hub: &str, kafka: &str, mongo: &str) -> Config {
     c.outbox_poll_interval = Duration::from_millis(100);
     c.reconnect_backoff_min = Duration::from_millis(100);
     c.reconnect_backoff_max = Duration::from_secs(2);
-    c.hub_request_timeout = Duration::from_secs(5);
     c
 }
 

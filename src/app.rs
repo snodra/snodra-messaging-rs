@@ -30,6 +30,25 @@ use crate::hub::{
 use crate::identity::{Guard, IdentityResolver, JwksVerifier};
 use crate::kafka::{EventBus, EventConsumer, OutboxPublisher, ensure_indexes};
 use crate::proto::{ClientMessage, client_message};
+
+/// Replies go back on the stream the request arrived on, never on whatever stream is current: a
+/// reply on another stream (after a reconnect, or to another hub later) would be ignored by the hub.
+async fn reply_on_arrival_stream(
+    dispatcher: Arc<Dispatcher>,
+    request: crate::proto::Request,
+    reply_to: crate::hub::ReplyTo,
+) {
+    let reply = dispatcher.handle(request).await;
+    let request_id = reply.request_id.clone();
+    if let Err(e) = reply_to
+        .send(ClientMessage {
+            message: Some(client_message::Message::Reply(reply)),
+        })
+        .await
+    {
+        tracing::warn!(request = %request_id, stream = reply_to.stream(), "reply dropped: {e}");
+    }
+}
 use crate::types::{Command, Event, MessageType, Query};
 
 pub struct KrakenMessagingBuilder {
@@ -130,7 +149,7 @@ impl KrakenMessaging {
     }
 
     /// Drains in-flight handlers (bounded), closes the hub stream (the hub drops this instance at once),
-    /// stops the outbox publisher and the consumer. Pending outgoing requests fail with `HubUnavailable`.
+    /// stops the outbox publisher and the consumer. Pending outgoing requests fail with `HubConnectionLost`.
     pub async fn shutdown(self) {
         self.handlers.close();
         if tokio::time::timeout(Duration::from_secs(10), self.handlers.wait())
@@ -239,7 +258,6 @@ impl KrakenMessagingBuilder {
 
         conn.set_types(registry.command_types(), registry.query_types());
         conn.start();
-        let loop_conn = Arc::clone(&conn);
         let loop_sender = Arc::clone(&sender);
         let loop_cancel = cancel.clone();
         let loop_handlers = handlers.clone();
@@ -250,20 +268,12 @@ impl KrakenMessagingBuilder {
                     msg = inbound.recv() => match msg { Some(m) => m, None => break },
                 };
                 match msg {
-                    Inbound::Request(req) => {
-                        let dispatcher = Arc::clone(&dispatcher);
-                        let conn = Arc::clone(&loop_conn);
-                        loop_handlers.spawn(async move {
-                            let reply = dispatcher.handle(req).await;
-                            if let Err(e) = conn
-                                .send(ClientMessage {
-                                    message: Some(client_message::Message::Reply(reply)),
-                                })
-                                .await
-                            {
-                                tracing::warn!("reply dropped, hub stream gone: {e}");
-                            }
-                        });
+                    Inbound::Request { request, reply_to } => {
+                        loop_handlers.spawn(reply_on_arrival_stream(
+                            Arc::clone(&dispatcher),
+                            request,
+                            reply_to,
+                        ));
                     }
                     other => loop_sender.on_inbound(other),
                 }

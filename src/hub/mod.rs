@@ -7,7 +7,10 @@ mod dispatcher;
 mod registry;
 mod sender;
 
-pub use connection::{HubConnection, HubSettings, Inbound};
+pub use connection::{
+    CAPABILITIES, CLIENT_VERSION, Handshake, HubConnection, HubSettings, Inbound, PROTOCOL_VERSION,
+    ReplyTo, StreamId,
+};
 pub use dispatcher::Dispatcher;
 pub use registry::{EventContext, HandlerRegistry};
-pub use sender::{SendOptions, Sender};
+pub use sender::{LEGACY_REQUEST_TIMEOUT, LOCAL_GUARD_MARGIN, SendOptions, Sender, request_timing};

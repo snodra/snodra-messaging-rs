@@ -8,7 +8,7 @@ use kraken_messaging::hub::{HubConnection, HubSettings, Inbound, SendOptions, Se
 use kraken_messaging::proto::{self, ErrorCode, ServerMessage, reply, server_message};
 use kraken_messaging::{Command, MessageContext, MessagingError, Query, message_type};
 use serde::{Deserialize, Serialize};
-use support::fake_hub::FakeHub;
+use support::fake_hub::{FakeHub, default_ack};
 use tokio::sync::mpsc;
 
 #[derive(Serialize, Deserialize)]
@@ -78,7 +78,10 @@ fn hub_error(req: &proto::Request, code: ErrorCode, message: &str) -> ServerMess
     }
 }
 
-async fn sender(hub: &FakeHub, default_timeout: Duration) -> (Arc<Sender>, Arc<HubConnection>) {
+async fn sender(
+    hub: &FakeHub,
+    default_timeout: Option<Duration>,
+) -> (Arc<Sender>, Arc<HubConnection>) {
     let (tx, mut rx) = mpsc::channel::<Inbound>(64);
     let settings = HubSettings {
         address: hub.address(),
@@ -105,7 +108,7 @@ async fn send_command_round_trips_reply() {
     let hub = FakeHub::start().await;
     hub.set_responder(|req| Some(reply_with(&req, r#"{"echoed":"x"}"#)))
         .await;
-    let (sender, conn) = sender(&hub, Duration::from_secs(2)).await;
+    let (sender, conn) = sender(&hub, Some(Duration::from_secs(2))).await;
     let pong = sender
         .send_command(&Ping { text: "x".into() }, SendOptions::default())
         .await
@@ -126,7 +129,7 @@ async fn send_query_round_trips_reply_with_routing_key() {
     let hub = FakeHub::start().await;
     hub.set_responder(|req| Some(reply_with(&req, r#"{"n":3}"#)))
         .await;
-    let (sender, conn) = sender(&hub, Duration::from_secs(2)).await;
+    let (sender, conn) = sender(&hub, Some(Duration::from_secs(2))).await;
     let total = sender
         .send_query(
             &Count { name: "abc".into() },
@@ -150,7 +153,7 @@ async fn hub_error_no_handler_maps_to_no_handler() {
     let hub = FakeHub::start().await;
     hub.set_responder(|req| Some(hub_error(&req, ErrorCode::NoHandler, "no handler")))
         .await;
-    let (sender, conn) = sender(&hub, Duration::from_secs(2)).await;
+    let (sender, conn) = sender(&hub, Some(Duration::from_secs(2))).await;
     let err = sender
         .send_command(&Ping { text: "x".into() }, SendOptions::default())
         .await
@@ -174,7 +177,7 @@ async fn hub_error_permission_denied_maps_to_access_denied() {
         ))
     })
     .await;
-    let (sender, conn) = sender(&hub, Duration::from_secs(2)).await;
+    let (sender, conn) = sender(&hub, Some(Duration::from_secs(2))).await;
     let err = sender
         .send_command(&Ping { text: "x".into() }, SendOptions::default())
         .await
@@ -191,7 +194,7 @@ async fn hub_error_permission_denied_maps_to_access_denied() {
 async fn send_decodes_unit_from_empty_object() {
     let hub = FakeHub::start().await;
     hub.set_responder(|req| Some(reply_with(&req, "{}"))).await;
-    let (sender, conn) = sender(&hub, Duration::from_secs(2)).await;
+    let (sender, conn) = sender(&hub, Some(Duration::from_secs(2))).await;
     sender
         .send_command(&Nop {}, SendOptions::default())
         .await
@@ -205,7 +208,7 @@ async fn request_carries_correlation_and_forwarded_authorization() {
     let hub = FakeHub::start().await;
     hub.set_responder(|req| Some(reply_with(&req, r#"{"echoed":"x"}"#)))
         .await;
-    let (sender, conn) = sender(&hub, Duration::from_secs(2)).await;
+    let (sender, conn) = sender(&hub, Some(Duration::from_secs(2))).await;
     let ctx = MessageContext {
         correlation_id: "c-9".into(),
         authorization: Some("Bearer t".into()),
@@ -246,9 +249,9 @@ async fn request_carries_correlation_and_forwarded_authorization() {
 }
 
 #[tokio::test]
-async fn disconnect_fails_pending_with_hub_unavailable() {
+async fn disconnect_fails_written_request_with_hub_connection_lost() {
     let hub = FakeHub::start().await;
-    let (sender, conn) = sender(&hub, Duration::from_secs(10)).await;
+    let (sender, conn) = sender(&hub, Some(Duration::from_secs(10))).await;
     let pending = tokio::spawn({
         let sender = Arc::clone(&sender);
         async move {
@@ -264,7 +267,10 @@ async fn disconnect_fails_pending_with_hub_unavailable() {
         .expect("not failed on disconnect")
         .unwrap()
         .unwrap_err();
-    assert!(matches!(err, MessagingError::HubUnavailable(_)), "{err:?}");
+    assert!(
+        matches!(err, MessagingError::HubConnectionLost(_)),
+        "{err:?}"
+    );
     conn.shutdown().await;
     hub.stop();
 }
@@ -272,7 +278,7 @@ async fn disconnect_fails_pending_with_hub_unavailable() {
 #[tokio::test]
 async fn no_reply_times_out() {
     let hub = FakeHub::start().await;
-    let (sender, conn) = sender(&hub, Duration::from_secs(10)).await;
+    let (sender, conn) = sender(&hub, Some(Duration::from_secs(10))).await;
     let started = std::time::Instant::now();
     let err = sender
         .send_command(
@@ -290,6 +296,129 @@ async fn no_reply_times_out() {
     );
     assert!(started.elapsed() < Duration::from_secs(3));
     assert_eq!(hub.requests().await[0].timeout_ms, 200);
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn v2_hub_gets_zero_unless_a_timeout_was_chosen() {
+    let hub = FakeHub::start().await;
+    hub.set_responder(|req| Some(reply_with(&req, "{}"))).await;
+    let (sender, conn) = sender(&hub, None).await;
+    sender
+        .send_command(&Nop {}, SendOptions::default())
+        .await
+        .unwrap();
+    sender
+        .send_command(
+            &Nop {},
+            SendOptions {
+                timeout: Some(Duration::from_millis(1_234)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let sent = hub.requests().await;
+    assert_eq!(
+        sent[0].timeout_ms, 0,
+        "the hub decides (override or default)"
+    );
+    assert_eq!(sent[1].timeout_ms, 1_234, "the caller's choice is sent");
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn legacy_hub_gets_todays_five_seconds() {
+    let hub = FakeHub::start().await;
+    hub.set_ack(None);
+    hub.set_responder(|req| Some(reply_with(&req, "{}"))).await;
+    let (sender, conn) = sender(&hub, None).await;
+    sender
+        .send_command(&Nop {}, SendOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(hub.requests().await[0].timeout_ms, 5_000);
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn local_guard_uses_the_acks_per_type_timeout() {
+    // The hub never answers; the guard is the announced t.Nop override (300 ms) plus 1 s.
+    let hub = FakeHub::start().await;
+    let mut ack = default_ack();
+    ack.type_timeouts_ms.insert("t.Nop".into(), 300);
+    hub.set_ack(Some(ack));
+    let (sender, conn) = sender(&hub, None).await;
+    let started = std::time::Instant::now();
+    let err = sender
+        .send_command(&Nop {}, SendOptions::default())
+        .await
+        .unwrap_err();
+    let took = started.elapsed();
+    assert!(
+        matches!(err, MessagingError::Timeout(ref t) if t == "t.Nop"),
+        "{err:?}"
+    );
+    assert!(
+        took >= Duration::from_millis(1_250) && took < Duration::from_millis(2_500),
+        "guard fired after {took:?}"
+    );
+    assert_eq!(hub.requests().await[0].timeout_ms, 0);
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn send_with_no_stream_is_hub_unavailable() {
+    let hub = FakeHub::start().await;
+    let (sender, conn) = sender(&hub, None).await;
+    conn.shutdown().await; // no live stream any more: nothing can be written
+    let err = sender
+        .send_command(&Nop {}, SendOptions::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MessagingError::HubUnavailable(_)), "{err:?}");
+    assert!(hub.requests().await.is_empty());
+    hub.stop();
+}
+
+#[tokio::test]
+async fn disconnect_of_another_stream_leaves_a_pending_request_alone() {
+    let hub = FakeHub::start().await;
+    let (sender, conn) = sender(&hub, Some(Duration::from_secs(10))).await;
+    let stream = conn.current_stream().unwrap();
+    let pending = tokio::spawn({
+        let sender = Arc::clone(&sender);
+        async move {
+            sender
+                .send_command(&Ping { text: "x".into() }, SendOptions::default())
+                .await
+        }
+    });
+    while hub.requests().await.is_empty() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // A late notification about an older stream must not fail a request written to the current one.
+    sender.on_inbound(Inbound::Disconnected { stream: stream - 1 });
+    sender.on_inbound(Inbound::Disconnected { stream: stream + 7 });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !pending.is_finished(),
+        "failed by another stream's Disconnected"
+    );
+    sender.on_inbound(Inbound::Disconnected { stream });
+    let err = tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .expect("not failed by its own stream's Disconnected")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(err, MessagingError::HubConnectionLost(_)),
+        "{err:?}"
+    );
     conn.shutdown().await;
     hub.stop();
 }

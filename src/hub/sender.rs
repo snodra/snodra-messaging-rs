@@ -1,4 +1,9 @@
 //! Outgoing commands and queries: one `Request` per call, correlated reply, timeout, error mapping.
+//!
+//! Failure split: a request that was never accepted by a handshaken stream fails with
+//! `HubUnavailable` (the hub never saw it, a retry is always safe); one that was accepted by a
+//! stream's outbound queue and whose stream then broke fails with `HubConnectionLost` (outcome
+//! unknown, the handler may have run).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -12,13 +17,57 @@ use crate::error::MessagingError;
 use crate::proto::{self, ClientMessage, RequestKind, client_message, reply};
 use crate::types::{Command, Query};
 
-use super::connection::{HubConnection, Inbound};
+use super::connection::{Handshake, HubConnection, Inbound, StreamId};
+
+/// The timeout sent to a hub older than protocol v2 when the caller chose none (today's default).
+pub const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Added to the hub's own deadline for the local guard, which only catches a hub that never answers.
+pub const LOCAL_GUARD_MARGIN: Duration = Duration::from_secs(1);
+/// Used for the guard when a v2 ack carries no maximum (never sent by the hub; defensive).
+const FALLBACK_MAX_TIMEOUT_MS: u32 = 60_000;
+
+/// `Request.timeout_ms` and the local guard for a request of `type_name` on a stream with
+/// `handshake`, when the caller chose `chosen` (per call, or the configured default).
+///
+/// - Protocol v2: send the chosen timeout or 0 (the hub then applies its per-type override or its
+///   default); guard with the hub's upper bound for the request, i.e. `min(chosen, override or
+///   max)` or, when 0 was sent, `override or max`, plus [`LOCAL_GUARD_MARGIN`].
+/// - Legacy hub: send the chosen timeout or [`LEGACY_REQUEST_TIMEOUT`]; guard with that plus the margin.
+pub fn request_timing(
+    handshake: &Handshake,
+    type_name: &str,
+    chosen: Option<Duration>,
+) -> (u32, Duration) {
+    let ms = |d: Duration| d.as_millis().min(u32::MAX as u128) as u32;
+    match handshake {
+        Handshake::V2(ack) => {
+            let sent = chosen.map(ms).unwrap_or(0);
+            let max = if ack.max_timeout_ms == 0 {
+                FALLBACK_MAX_TIMEOUT_MS
+            } else {
+                ack.max_timeout_ms
+            };
+            let limit = ack.type_timeouts_ms.get(type_name).copied().unwrap_or(max);
+            let bound = if sent > 0 { sent.min(limit) } else { limit };
+            (
+                sent,
+                Duration::from_millis(bound.into()) + LOCAL_GUARD_MARGIN,
+            )
+        }
+        Handshake::Legacy => {
+            let timeout = chosen.unwrap_or(LEGACY_REQUEST_TIMEOUT);
+            (ms(timeout), timeout + LOCAL_GUARD_MARGIN)
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct SendOptions {
     /// Same key, same owning instance (consistent hashing on the hub); typically the aggregate id.
     pub routing_key: Option<String>,
-    /// Overrides the default request timeout.
+    /// The request timeout for this call; sent to the hub as `timeout_ms`. Without one (and
+    /// without `Config.hub_request_timeout`) a protocol v2 hub applies its per-type override or
+    /// its default.
     pub timeout: Option<Duration>,
     /// Full header value (`Bearer <jwt>`) to send instead of the one forwarded from the current handler context.
     pub authorization: Option<String>,
@@ -26,18 +75,25 @@ pub struct SendOptions {
 
 type Pending = oneshot::Sender<Result<Vec<u8>, MessagingError>>;
 
+struct Entry {
+    type_name: String,
+    /// The stream the request was written to.
+    stream: StreamId,
+    tx: Pending,
+}
+
 /// The `CommandBus`/`QueryBus` of the Rust side. Replies arrive through [`Sender::on_inbound`].
 pub struct Sender {
     conn: Arc<HubConnection>,
-    pending: Mutex<HashMap<String, (String, Pending)>>,
-    default_timeout: Duration,
+    pending: Mutex<HashMap<String, Entry>>,
+    default_timeout: Option<Duration>,
     forward_jwt: bool,
 }
 
 impl Sender {
     pub fn new(
         conn: Arc<HubConnection>,
-        default_timeout: Duration,
+        default_timeout: Option<Duration>,
         forward_jwt: bool,
     ) -> Arc<Sender> {
         Arc::new(Sender {
@@ -70,11 +126,12 @@ impl Sender {
         codec::decode_reply(&bytes)
     }
 
-    /// Completes the pending request a `Reply`/`Error` refers to; a `Disconnected` fails them all.
+    /// Completes the pending request a `Reply`/`Error` refers to; a `Disconnected` fails the requests
+    /// written to that stream with `HubConnectionLost`.
     pub fn on_inbound(&self, msg: Inbound) {
         match msg {
             Inbound::Reply(r) => {
-                if let Some((type_name, tx)) = self.take(&r.request_id) {
+                if let Some(Entry { type_name, tx, .. }) = self.take(&r.request_id) {
                     let result = match r.result {
                         Some(reply::Result::Payload(p)) => Ok(p),
                         Some(reply::Result::Error(e)) => Err(MessagingError::from_hub(
@@ -86,22 +143,30 @@ impl Sender {
                 }
             }
             Inbound::Error(e) => {
-                if let Some((type_name, tx)) = self.take(&e.request_id) {
+                if let Some(Entry { type_name, tx, .. }) = self.take(&e.request_id) {
                     let _ = tx.send(Err(MessagingError::from_hub(
                         &type_name, e.code, &e.message, &e.details,
                     )));
                 }
             }
-            Inbound::Disconnected => {
-                let all: Vec<(String, (String, Pending))> =
-                    self.pending.lock().unwrap().drain().collect();
-                for (_, (_, tx)) in all {
-                    let _ = tx.send(Err(MessagingError::HubUnavailable(
-                        "hub stream closed".into(),
-                    )));
+            Inbound::Disconnected { stream } => {
+                let lost: Vec<Entry> = {
+                    let mut pending = self.pending.lock().unwrap();
+                    let ids: Vec<String> = pending
+                        .iter()
+                        .filter(|(_, e)| e.stream == stream)
+                        .map(|(id, _)| id.clone())
+                        .collect();
+                    ids.iter().filter_map(|id| pending.remove(id)).collect()
+                };
+                for e in lost {
+                    let _ = e.tx.send(Err(MessagingError::HubConnectionLost(format!(
+                        "hub stream closed before the reply to '{}'; the outcome is unknown",
+                        e.type_name
+                    ))));
                 }
             }
-            Inbound::Request(_) => {} // the dispatcher's business
+            Inbound::Request { .. } => {} // the dispatcher's business
         }
     }
 
@@ -139,34 +204,48 @@ impl Sender {
         {
             headers.insert(hub_headers::TRACEPARENT.to_string(), tp.clone());
         }
-        let timeout = opts.timeout.unwrap_or(self.default_timeout);
-        let request = proto::Request {
-            id: id.clone(),
-            kind: kind as i32,
-            r#type: type_name.to_string(),
-            routing_key: opts.routing_key.unwrap_or_default(),
-            payload,
-            headers,
-            timeout_ms: timeout.as_millis().min(u32::MAX as u128) as u32,
-        };
+        let chosen = opts.timeout.or(self.default_timeout);
+        let routing_key = opts.routing_key.unwrap_or_default();
 
         let (tx, rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .unwrap()
-            .insert(id.clone(), (type_name.to_string(), tx));
-        if let Err(e) = self
+        // The entry is recorded while the stream is still current, tagged with it, so that stream's
+        // Disconnected always finds it; a failed write removes it again (never written).
+        let sent = self
             .conn
-            .send(ClientMessage {
-                message: Some(client_message::Message::Request(request)),
+            .send_with(|stream, handshake| {
+                let (timeout_ms, guard) = request_timing(handshake, type_name, chosen);
+                self.pending.lock().unwrap().insert(
+                    id.clone(),
+                    Entry {
+                        type_name: type_name.to_string(),
+                        stream,
+                        tx,
+                    },
+                );
+                let request = proto::Request {
+                    id: id.clone(),
+                    kind: kind as i32,
+                    r#type: type_name.to_string(),
+                    routing_key,
+                    payload,
+                    headers,
+                    timeout_ms,
+                };
+                let msg = ClientMessage {
+                    message: Some(client_message::Message::Request(request)),
+                };
+                (msg, guard)
             })
-            .await
-        {
-            self.take(&id);
-            return Err(e);
-        }
-        // The hub emits TIMEOUT itself; the extra second covers a hub that never answers at all.
-        match tokio::time::timeout(timeout + Duration::from_secs(1), rx).await {
+            .await;
+        let guard = match sent {
+            Ok((_, guard)) => guard,
+            Err(e) => {
+                self.take(&id);
+                return Err(e);
+            }
+        };
+        // The hub emits TIMEOUT itself; the guard covers a hub that never answers at all.
+        match tokio::time::timeout(guard, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(MessagingError::HubUnavailable("sender closed".into())),
             Err(_) => {
@@ -176,7 +255,57 @@ impl Sender {
         }
     }
 
-    fn take(&self, request_id: &str) -> Option<(String, Pending)> {
+    fn take(&self, request_id: &str) -> Option<Entry> {
         self.pending.lock().unwrap().remove(request_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::RegisterAck;
+
+    fn ack(overrides: &[(&str, u32)]) -> Handshake {
+        Handshake::V2(RegisterAck {
+            hub_id: "h".into(),
+            protocol_version: 2,
+            heartbeat_interval_ms: 3_000,
+            heartbeat_timeout_ms: 10_000,
+            default_timeout_ms: 5_000,
+            max_timeout_ms: 60_000,
+            context: "default".into(),
+            type_timeouts_ms: overrides
+                .iter()
+                .map(|(t, ms)| (t.to_string(), *ms))
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    const S: fn(u64) -> Duration = Duration::from_secs;
+    const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    #[test]
+    fn v2_sends_zero_unless_chosen_and_guards_with_the_hub_bound() {
+        let h = ack(&[("t.Slow", 120_000), ("t.Quick", 1_500)]);
+        // Nothing chosen: 0 on the wire, guard = override or max, plus the margin.
+        assert_eq!(request_timing(&h, "t.Other", None), (0, S(61)));
+        assert_eq!(request_timing(&h, "t.Slow", None), (0, S(121)));
+        assert_eq!(request_timing(&h, "t.Quick", None), (0, MS(2_500)));
+        // Chosen: sent as is, guard = min(chosen, override or max) plus the margin.
+        assert_eq!(request_timing(&h, "t.Other", Some(S(2))), (2_000, S(3)));
+        assert_eq!(request_timing(&h, "t.Other", Some(S(90))), (90_000, S(61)));
+        assert_eq!(request_timing(&h, "t.Slow", Some(S(90))), (90_000, S(91)));
+        assert_eq!(
+            request_timing(&h, "t.Quick", Some(S(4))),
+            (4_000, MS(2_500))
+        );
+    }
+
+    #[test]
+    fn legacy_keeps_todays_timeout_and_guard() {
+        let h = Handshake::Legacy;
+        assert_eq!(request_timing(&h, "t.X", None), (5_000, S(6)));
+        assert_eq!(request_timing(&h, "t.X", Some(MS(200))), (200, MS(1_200)));
     }
 }

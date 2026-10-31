@@ -1,9 +1,12 @@
-//! In-process stand-in for kraken-hub: records registrations, echoes heartbeats, can drop streams,
-//! reject a registration, push requests to clients and answer their requests.
+//! In-process stand-in for kraken-hub: records registrations, answers a v2 `Register` with a
+//! `RegisterAck` (new-hub behaviour, the default) or not at all (old-hub behaviour, `set_ack(None)`),
+//! echoes heartbeats, can drop streams, reject a registration, push requests to clients and answer
+//! their requests.
 
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use kraken_messaging::proto::hub_server::{Hub, HubServer};
@@ -17,9 +20,25 @@ use tonic::{Request, Response, Status, Streaming};
 type Responder = Box<dyn Fn(proto::Request) -> Option<ServerMessage> + Send + Sync>;
 type Outbound = mpsc::Sender<Result<ServerMessage, Status>>;
 
+/// The ack a default kraken-hub sends.
+pub fn default_ack() -> proto::RegisterAck {
+    proto::RegisterAck {
+        hub_id: "fake-hub".into(),
+        protocol_version: 2,
+        capabilities: vec![],
+        heartbeat_interval_ms: 3_000,
+        heartbeat_timeout_ms: 10_000,
+        default_timeout_ms: 5_000,
+        max_timeout_ms: 60_000,
+        context: "default".into(),
+        type_timeouts_ms: Default::default(),
+    }
+}
+
 pub struct State {
     pub registers: Mutex<Vec<proto::Register>>,
-    pub replies: Mutex<Vec<proto::Reply>>,
+    /// Replies with the number of the stream (1-based, in accept order) they arrived on.
+    pub replies: Mutex<Vec<(usize, proto::Reply)>>,
     pub requests: Mutex<Vec<proto::Request>>,
     heartbeats: AtomicUsize,
     reject_next: AtomicBool,
@@ -28,6 +47,8 @@ pub struct State {
     drop_tx: broadcast::Sender<()>,
     clients: Mutex<Vec<Outbound>>,
     responder: Mutex<Option<Responder>>,
+    ack: StdMutex<Option<proto::RegisterAck>>,
+    streams: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -52,6 +73,7 @@ impl Hub for Service {
             return Err(Status::invalid_argument("service_name must not be empty"));
         }
         let mut inbound = request.into_inner();
+        let stream_no = state.streams.fetch_add(1, Ordering::SeqCst) + 1;
         let (tx, rx) = mpsc::channel::<Result<ServerMessage, Status>>(64);
         state.clients.lock().await.push(tx.clone());
         let mut drop_rx = state.drop_tx.subscribe();
@@ -65,7 +87,16 @@ impl Hub for Service {
                     msg = inbound.next() => match msg {
                         None | Some(Err(_)) => break,
                         Some(Ok(ClientMessage { message: Some(m) })) => match m {
-                            client_message::Message::Register(r) => state.registers.lock().await.push(r),
+                            client_message::Message::Register(r) => {
+                                let v2 = r.protocol_version >= 2;
+                                state.registers.lock().await.push(r);
+                                // Like the real hub: the ack is written before the echo of the next heartbeat.
+                                let ack = state.ack.lock().unwrap().clone();
+                                if let (true, Some(ack)) = (v2, ack) {
+                                    let msg = ServerMessage { message: Some(server_message::Message::RegisterAck(ack)) };
+                                    if tx.send(Ok(msg)).await.is_err() { break; }
+                                }
+                            }
                             client_message::Message::Heartbeat(h) => {
                                 state.heartbeats.fetch_add(1, Ordering::SeqCst);
                                 if state.echo_heartbeats.load(Ordering::SeqCst) {
@@ -73,7 +104,7 @@ impl Hub for Service {
                                     if tx.send(Ok(echo)).await.is_err() { break; }
                                 }
                             }
-                            client_message::Message::Reply(r) => state.replies.lock().await.push(r),
+                            client_message::Message::Reply(r) => state.replies.lock().await.push((stream_no, r)),
                             client_message::Message::Request(req) => {
                                 state.requests.lock().await.push(req.clone());
                                 let response = state.responder.lock().await.as_ref().and_then(|f| f(req));
@@ -118,6 +149,8 @@ impl FakeHub {
             drop_tx,
             clients: Mutex::new(vec![]),
             responder: Mutex::new(None),
+            ack: StdMutex::new(Some(default_ack())),
+            streams: AtomicUsize::new(0),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -153,7 +186,28 @@ impl FakeHub {
     }
 
     pub async fn replies(&self) -> Vec<proto::Reply> {
+        self.state
+            .replies
+            .lock()
+            .await
+            .iter()
+            .map(|(_, r)| r.clone())
+            .collect()
+    }
+
+    /// Replies with the 1-based number of the stream they arrived on.
+    pub async fn replies_by_stream(&self) -> Vec<(usize, proto::Reply)> {
         self.state.replies.lock().await.clone()
+    }
+
+    /// Streams accepted so far.
+    pub fn streams(&self) -> usize {
+        self.state.streams.load(Ordering::SeqCst)
+    }
+
+    /// The ack sent for every v2 `Register`; `None` behaves like a hub older than protocol v2.
+    pub fn set_ack(&self, ack: Option<proto::RegisterAck>) {
+        *self.state.ack.lock().unwrap() = ack;
     }
 
     pub async fn requests(&self) -> Vec<proto::Request> {

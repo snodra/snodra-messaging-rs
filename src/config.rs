@@ -11,9 +11,16 @@ pub struct Config {
     pub service_name: String,
     /// `static://host:port` (prefix optional).
     pub hub_address: String,
-    pub hub_request_timeout: Duration,
+    /// Request timeout sent as `timeout_ms` when a call sets none (`SendOptions.timeout` wins).
+    /// `None` (default): a protocol v2 hub decides (its per-type override or its default, 5 s);
+    /// a legacy hub gets 5 s as before.
+    pub hub_request_timeout: Option<Duration>,
+    /// Heartbeat period when the hub does not announce one (hubs older than protocol v2; a v2 hub
+    /// announces its own, 3 s by default, in `RegisterAck`).
     pub heartbeat_interval: Duration,
+    /// Reconnect backoff floor; also where the backoff restarts once a connect reached the handshake.
     pub reconnect_backoff_min: Duration,
+    /// Reconnect backoff ceiling (each wait is jittered by ±20 % and never exceeds it).
     pub reconnect_backoff_max: Duration,
     pub max_concurrent_handlers: usize,
     pub kafka_bootstrap: String,
@@ -45,10 +52,10 @@ impl Config {
         Config {
             service_name: service_name.to_string(),
             hub_address: hub_address.to_string(),
-            hub_request_timeout: Duration::from_secs(5),
+            hub_request_timeout: None,
             heartbeat_interval: Duration::from_secs(10),
             reconnect_backoff_min: Duration::from_millis(500),
-            reconnect_backoff_max: Duration::from_secs(30),
+            reconnect_backoff_max: Duration::from_secs(5),
             max_concurrent_handlers: 256,
             kafka_bootstrap: kafka_bootstrap.to_string(),
             kafka_topic: crate::kafka::EVENTS_TOPIC.to_string(),
@@ -94,7 +101,7 @@ impl Config {
         c.jwks_url = optional("KRAKEN_JWKS_URL");
         c.issuer = optional("KRAKEN_ISSUER");
         if let Some(v) = optional("KRAKEN_HUB_REQUEST_TIMEOUT_MS") {
-            c.hub_request_timeout = millis("KRAKEN_HUB_REQUEST_TIMEOUT_MS", &v)?;
+            c.hub_request_timeout = Some(millis("KRAKEN_HUB_REQUEST_TIMEOUT_MS", &v)?);
         }
         if let Some(v) = optional("KRAKEN_HEARTBEAT_INTERVAL_MS") {
             c.heartbeat_interval = millis("KRAKEN_HEARTBEAT_INTERVAL_MS", &v)?;
