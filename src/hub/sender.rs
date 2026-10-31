@@ -99,8 +99,9 @@ pub struct SendOptions {
     /// `Request.priority` for this call (higher is served first while the target's queue at the
     /// hub is not empty). Without one, `Config.hub_priorities` for the type, else 0.
     pub priority: Option<i32>,
-    /// Retry policy for this call (`RetryPolicy::disabled()` switches retries off). Without one,
-    /// `Config.hub_retry` applies.
+    /// Retry policy for this call, in force as written (`Some(RetryPolicy::NONE)` switches a
+    /// configured policy off). Without one, `Config.hub_retry` applies (no retry unless set). A
+    /// policy with `max_attempts == 0` fails the call with `InvalidMessage` before anything is sent.
     pub retry: Option<RetryPolicy>,
 }
 
@@ -113,8 +114,8 @@ pub struct SenderSettings {
     pub forward_jwt: bool,
     /// Default priority per type (`Config.hub_priorities`).
     pub priorities: HashMap<String, i32>,
-    /// Default retry policy (`Config.hub_retry`, off by default).
-    pub retry: RetryPolicy,
+    /// Default retry policy (`Config.hub_retry`); `None` (the default): no retry.
+    pub retry: Option<RetryPolicy>,
 }
 
 impl Default for SenderSettings {
@@ -123,7 +124,7 @@ impl Default for SenderSettings {
             default_timeout: None,
             forward_jwt: true,
             priorities: HashMap::new(),
-            retry: RetryPolicy::default(),
+            retry: None,
         }
     }
 }
@@ -193,7 +194,7 @@ pub struct Sender {
     default_timeout: Option<Duration>,
     forward_jwt: bool,
     priorities: HashMap<String, i32>,
-    retry: RetryPolicy,
+    retry: Option<RetryPolicy>,
 }
 
 impl Sender {
@@ -301,6 +302,12 @@ impl Sender {
         payload: Vec<u8>,
         opts: SendOptions,
     ) -> Result<Vec<u8>, MessagingError> {
+        let policy = opts.retry.or_else(|| self.retry.clone());
+        if policy.as_ref().is_some_and(|p| p.max_attempts == 0) {
+            return Err(MessagingError::InvalidMessage(format!(
+                "retry policy for '{type_name}' has max_attempts 0; it must be at least 1 (1 = no retry)"
+            )));
+        }
         let headers = self.headers(opts.authorization.clone());
         let priority = opts
             .priority
@@ -308,7 +315,6 @@ impl Sender {
             .unwrap_or(0);
         let chosen = chosen_timeout(opts.timeout, self.default_timeout);
         let routing_key = opts.routing_key.unwrap_or_default();
-        let policy = opts.retry.unwrap_or_else(|| self.retry.clone());
         let call = Attempt {
             kind,
             type_name,
@@ -316,10 +322,11 @@ impl Sender {
             headers: &headers,
             priority,
         };
-        let attempts = policy.attempts();
-        if attempts == 1 {
-            return self.attempt(&call, payload, chosen).await;
-        }
+        let policy = match policy {
+            Some(p) if p.max_attempts > 1 => p,
+            _ => return self.attempt(&call, payload, chosen).await,
+        };
+        let attempts = policy.max_attempts;
 
         let budget = retry_budget(self.conn.handshake().as_ref(), type_name, chosen);
         let started = tokio::time::Instant::now();

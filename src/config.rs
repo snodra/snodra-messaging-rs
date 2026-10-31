@@ -36,8 +36,10 @@ pub struct Config {
     /// Default `Request.priority` per outgoing type (higher is served first when the target's hub
     /// queue is not empty); `SendOptions.priority` wins. Unlisted types send 0.
     pub hub_priorities: HashMap<String, i32>,
-    /// Caller-side retry for transient failures (off by default); `SendOptions.retry` wins.
-    pub hub_retry: RetryPolicy,
+    /// Caller-side retry for transient failures: `None` (the default) is no retry, a policy is in
+    /// force as written; `SendOptions.retry` wins per call. Its `max_attempts` must be at least 1
+    /// and its multiplier a finite number >= 1 ([`Config::validate`]).
+    pub hub_retry: Option<RetryPolicy>,
     pub kafka_bootstrap: String,
     pub kafka_topic: String,
     pub consumer_enabled: bool,
@@ -75,7 +77,7 @@ impl Config {
             hub_load_factor: 100,
             hub_tags: HashMap::new(),
             hub_priorities: HashMap::new(),
-            hub_retry: RetryPolicy::default(),
+            hub_retry: None,
             kafka_bootstrap: kafka_bootstrap.to_string(),
             kafka_topic: crate::kafka::EVENTS_TOPIC.to_string(),
             consumer_enabled: true,
@@ -103,7 +105,9 @@ impl Config {
     /// `KRAKEN_HUB_TAGS` (`k=v,k=v`), `KRAKEN_HUB_PRIORITIES` (`type=n,type=n`),
     /// `KRAKEN_HUB_RETRY_ENABLED`, `KRAKEN_HUB_RETRY_MAX_ATTEMPTS`,
     /// `KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS`, `KRAKEN_HUB_RETRY_MULTIPLIER`,
-    /// `KRAKEN_HUB_RETRY_MAX_BACKOFF_MS`.
+    /// `KRAKEN_HUB_RETRY_MAX_BACKOFF_MS`. `KRAKEN_HUB_RETRY_ENABLED=true` sets `hub_retry` to the
+    /// policy the other `KRAKEN_HUB_RETRY_*` variables describe (defaults: 3 attempts, 100 ms
+    /// doubling to 2 s); those are validated whether or not retry is enabled.
     pub fn from_env() -> Result<Config, MessagingError> {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
@@ -153,18 +157,26 @@ impl Config {
         if let Some(v) = optional("KRAKEN_HUB_PRIORITIES") {
             c.hub_priorities = pairs("KRAKEN_HUB_PRIORITIES", &v, |s| s.parse::<i32>().ok())?;
         }
-        if let Some(v) = optional("KRAKEN_HUB_RETRY_ENABLED") {
-            c.hub_retry.enabled = flag("KRAKEN_HUB_RETRY_ENABLED", &v)?;
-        }
+        let retry_enabled = match optional("KRAKEN_HUB_RETRY_ENABLED") {
+            Some(v) => flag("KRAKEN_HUB_RETRY_ENABLED", &v)?,
+            None => false,
+        };
+        let mut retry = RetryPolicy::default();
         if let Some(v) = optional("KRAKEN_HUB_RETRY_MAX_ATTEMPTS") {
-            c.hub_retry.max_attempts =
-                number("KRAKEN_HUB_RETRY_MAX_ATTEMPTS", &v)?.min(u32::MAX as u64) as u32;
+            retry.max_attempts = Some(number("KRAKEN_HUB_RETRY_MAX_ATTEMPTS", &v)?)
+                .filter(|&n| n >= 1)
+                .ok_or_else(|| {
+                    MessagingError::InvalidMessage(format!(
+                        "KRAKEN_HUB_RETRY_MAX_ATTEMPTS must be at least 1 (1 = no retry), got '{v}'"
+                    ))
+                })?
+                .min(u32::MAX as u64) as u32;
         }
         if let Some(v) = optional("KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS") {
-            c.hub_retry.initial_backoff = millis("KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS", &v)?;
+            retry.initial_backoff = millis("KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS", &v)?;
         }
         if let Some(v) = optional("KRAKEN_HUB_RETRY_MULTIPLIER") {
-            c.hub_retry.multiplier = v
+            retry.multiplier = v
                 .trim()
                 .parse::<f64>()
                 .ok()
@@ -176,8 +188,10 @@ impl Config {
                 })?;
         }
         if let Some(v) = optional("KRAKEN_HUB_RETRY_MAX_BACKOFF_MS") {
-            c.hub_retry.max_backoff = millis("KRAKEN_HUB_RETRY_MAX_BACKOFF_MS", &v)?;
+            retry.max_backoff = millis("KRAKEN_HUB_RETRY_MAX_BACKOFF_MS", &v)?;
         }
+        retry.validate()?;
+        c.hub_retry = retry_enabled.then_some(retry);
         if let Some(v) = optional("KRAKEN_CONSUMER_ENABLED") {
             c.consumer_enabled = flag("KRAKEN_CONSUMER_ENABLED", &v)?;
         }
@@ -203,7 +217,9 @@ impl Config {
         Ok(c)
     }
 
-    pub(crate) fn validate(&self) -> Result<(), MessagingError> {
+    /// Rejects what cannot work: an empty service name, `jwks_url` without `issuer`, an invalid
+    /// `hub_retry` policy. Called by `from_env` and by `KrakenMessaging::builder`.
+    pub fn validate(&self) -> Result<(), MessagingError> {
         if self.service_name.trim().is_empty() {
             return Err(MessagingError::InvalidMessage(
                 "service_name must not be empty".into(),
@@ -213,6 +229,9 @@ impl Config {
             return Err(MessagingError::InvalidMessage(
                 "issuer is required when jwks_url is set".into(),
             ));
+        }
+        if let Some(retry) = &self.hub_retry {
+            retry.validate()?;
         }
         Ok(())
     }
@@ -265,6 +284,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn from(vars: &[(&str, &str)]) -> Config {
+        try_from(vars).unwrap()
+    }
+
+    fn try_from(vars: &[(&str, &str)]) -> Result<Config, MessagingError> {
         let vars: Vec<(String, String)> = [
             ("KRAKEN_SERVICE_NAME", "svc"),
             ("KRAKEN_MONGODB_URI", "mongodb://m/db"),
@@ -279,7 +302,10 @@ mod tests {
                 .find(|(k, _)| k == n)
                 .map(|(_, v)| v.clone())
         })
-        .unwrap()
+    }
+
+    fn code_config() -> Config {
+        Config::new("svc", "static://hub:7000", "kafka:19092", "mongodb://m/db")
     }
 
     #[test]
@@ -301,8 +327,17 @@ mod tests {
         assert_eq!(c.hub_load_factor, 100);
         assert!(c.hub_tags.is_empty());
         assert!(c.hub_priorities.is_empty());
-        assert_eq!(c.hub_retry, crate::retry::RetryPolicy::default());
-        assert!(!c.hub_retry.enabled);
+        assert_eq!(c.hub_retry, None, "no retry unless configured");
+        assert_eq!(from(&[]).hub_retry, None);
+        assert_eq!(
+            from(&[("KRAKEN_HUB_RETRY_ENABLED", "false")]).hub_retry,
+            None
+        );
+        assert_eq!(
+            from(&[("KRAKEN_HUB_RETRY_ENABLED", "true")]).hub_retry,
+            Some(RetryPolicy::default()),
+            "enabled alone: 3 attempts, 100 ms doubling to 2 s"
+        );
     }
 
     #[test]
@@ -334,14 +369,72 @@ mod tests {
         );
         assert_eq!(
             c.hub_retry,
-            crate::retry::RetryPolicy {
-                enabled: true,
+            Some(RetryPolicy {
                 max_attempts: 5,
                 initial_backoff: Duration::from_millis(50),
                 multiplier: 1.5,
                 max_backoff: Duration::from_millis(800),
-            }
+            })
         );
+    }
+
+    #[test]
+    fn zero_retry_attempts_or_a_bad_multiplier_are_rejected_enabled_or_not() {
+        for enabled in [None, Some("false"), Some("true")] {
+            for (name, value) in [
+                ("KRAKEN_HUB_RETRY_MAX_ATTEMPTS", "0"),
+                ("KRAKEN_HUB_RETRY_MULTIPLIER", "0.5"),
+                ("KRAKEN_HUB_RETRY_MULTIPLIER", "NaN"),
+                ("KRAKEN_HUB_RETRY_MULTIPLIER", "inf"),
+                ("KRAKEN_HUB_RETRY_MULTIPLIER", "-2"),
+            ] {
+                let mut vars = vec![(name, value)];
+                vars.extend(enabled.map(|e| ("KRAKEN_HUB_RETRY_ENABLED", e)));
+                let result = try_from(&vars);
+                assert!(
+                    matches!(result, Err(MessagingError::InvalidMessage(ref m)) if m.contains(name)),
+                    "{name}={value} with KRAKEN_HUB_RETRY_ENABLED={enabled:?}: {result:?}"
+                );
+            }
+        }
+        // One attempt is valid: a configured policy that never retries.
+        let one = from(&[
+            ("KRAKEN_HUB_RETRY_ENABLED", "true"),
+            ("KRAKEN_HUB_RETRY_MAX_ATTEMPTS", "1"),
+        ]);
+        assert_eq!(one.hub_retry.map(|p| p.max_attempts), Some(1));
+    }
+
+    #[test]
+    fn validate_rejects_an_invalid_retry_policy_set_in_code() {
+        for policy in [
+            RetryPolicy {
+                max_attempts: 0,
+                ..RetryPolicy::default()
+            },
+            RetryPolicy {
+                multiplier: 0.9,
+                ..RetryPolicy::default()
+            },
+            RetryPolicy {
+                multiplier: f64::NAN,
+                ..RetryPolicy::default()
+            },
+        ] {
+            let c = Config {
+                hub_retry: Some(policy.clone()),
+                ..code_config()
+            };
+            assert!(
+                matches!(c.validate(), Err(MessagingError::InvalidMessage(_))),
+                "{policy:?} accepted"
+            );
+        }
+        let ok = Config {
+            hub_retry: Some(RetryPolicy::NONE),
+            ..code_config()
+        };
+        assert!(ok.validate().is_ok());
     }
 
     #[test]

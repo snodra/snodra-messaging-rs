@@ -508,7 +508,7 @@ async fn flow_peer(
     service: &str,
     handles: bool,
     permits: usize,
-    retry: RetryPolicy,
+    retry: Option<RetryPolicy>,
 ) -> FlowPeer {
     let (tx, mut rx) = mpsc::channel::<Inbound>(256);
     let settings = HubSettings {
@@ -748,8 +748,9 @@ async fn await_queued(hub: &HubContainer, service: &str, count: u64) {
     }
 }
 
-fn no_retry() -> RetryPolicy {
-    RetryPolicy::disabled()
+/// No retry configured on the sender.
+fn no_retry() -> Option<RetryPolicy> {
+    None
 }
 
 #[tokio::test]
@@ -861,7 +862,7 @@ async fn new_hub_full_queue_is_handler_busy_and_a_retried_command_gets_through()
         .send_command(
             &rec(),
             SendOptions {
-                retry: Some(RetryPolicy::disabled()),
+                retry: Some(RetryPolicy::NONE),
                 ..Default::default()
             },
         )
@@ -882,7 +883,7 @@ async fn new_hub_full_queue_is_handler_busy_and_a_retried_command_gets_through()
                     retry: Some(RetryPolicy {
                         max_attempts: 10,
                         initial_backoff: Duration::from_millis(200),
-                        ..RetryPolicy::enabled()
+                        ..RetryPolicy::default()
                     }),
                     ..Default::default()
                 },
@@ -922,9 +923,9 @@ async fn new_hub_retry_never_repeats_a_handler_error_or_a_timed_out_command() {
     let retry = RetryPolicy {
         max_attempts: 3,
         initial_backoff: Duration::from_millis(50),
-        ..RetryPolicy::enabled()
+        ..RetryPolicy::default()
     };
-    let a = flow_peer(&hub.address, "flow-a", false, 256, retry).await;
+    let a = flow_peer(&hub.address, "flow-a", false, 256, Some(retry)).await;
     let budget = || SendOptions {
         timeout: Some(Duration::from_secs(3)),
         ..Default::default()

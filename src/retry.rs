@@ -1,5 +1,11 @@
 //! Caller-side retry for commands and queries sent over the hub (opt-in).
 //!
+//! A [`RetryPolicy`] is always in force as written: [`RetryPolicy::default()`] retries (3
+//! attempts, 100 ms doubling to 2 s) and [`RetryPolicy::NONE`] (one attempt) does not. Opting in
+//! happens one level up: `Config.hub_retry` / `SenderSettings.retry` are `None` (no retry) unless
+//! set, and `SendOptions.retry` sets a policy for one call (`Some(RetryPolicy::NONE)` switches a
+//! configured one off). A policy with `max_attempts == 0` is invalid.
+//!
 //! [`is_retryable`] is the one place that decides which failures may be retried. It is shared by
 //! [`crate::hub::Sender`] and, later, the saga relay, so both apply the same transient /
 //! non-transient split (mirrors Axon's `RetryScheduler`):
@@ -23,9 +29,7 @@ use crate::proto::RequestKind;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RetryPolicy {
-    /// Off by default: without it every failure reaches the caller at once, as before.
-    pub enabled: bool,
-    /// Attempts in total, the first one included.
+    /// Attempts in total, the first one included; at least 1 (1 = no retry).
     pub max_attempts: u32,
     /// Wait before the second attempt (each wait is jittered by ±20 %).
     pub initial_backoff: Duration,
@@ -35,39 +39,40 @@ pub struct RetryPolicy {
     pub max_backoff: Duration,
 }
 
+/// 3 attempts, 100 ms doubling to 2 s: in force wherever it is used.
 impl Default for RetryPolicy {
     fn default() -> Self {
         RetryPolicy {
-            enabled: false,
             max_attempts: 3,
-            initial_backoff: Duration::from_millis(100),
-            multiplier: 2.0,
-            max_backoff: Duration::from_secs(2),
+            ..RetryPolicy::NONE
         }
     }
 }
 
 impl RetryPolicy {
-    /// The default policy, switched on.
-    pub fn enabled() -> Self {
-        RetryPolicy {
-            enabled: true,
-            ..RetryPolicy::default()
-        }
-    }
+    /// One attempt, no retry: as `SendOptions.retry` it switches a configured policy off for that
+    /// call. The other values are the defaults.
+    pub const NONE: RetryPolicy = RetryPolicy {
+        max_attempts: 1,
+        initial_backoff: Duration::from_millis(100),
+        multiplier: 2.0,
+        max_backoff: Duration::from_secs(2),
+    };
 
-    /// No retries (one attempt), whatever the configured policy says.
-    pub fn disabled() -> Self {
-        RetryPolicy::default()
-    }
-
-    /// Attempts this policy allows, at least one.
-    pub fn attempts(&self) -> u32 {
-        if self.enabled {
-            self.max_attempts.max(1)
-        } else {
-            1
+    /// `InvalidMessage` unless `max_attempts >= 1` and `multiplier` is a finite number `>= 1`.
+    pub fn validate(&self) -> Result<(), MessagingError> {
+        if self.max_attempts == 0 {
+            return Err(MessagingError::InvalidMessage(
+                "retry max_attempts must be at least 1 (1 = no retry)".into(),
+            ));
         }
+        if !(self.multiplier.is_finite() && self.multiplier >= 1.0) {
+            return Err(MessagingError::InvalidMessage(format!(
+                "retry multiplier must be a finite number >= 1, got {}",
+                self.multiplier
+            )));
+        }
+        Ok(())
     }
 
     /// The base of the wait after failed attempt `attempt` (1-based), deterministic:
@@ -201,24 +206,49 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_off_three_attempts_100ms_doubling_to_2s() {
+    fn the_default_retries_three_times_100ms_doubling_to_2s_and_none_does_not() {
         let p = RetryPolicy::default();
-        assert!(!p.enabled);
-        assert_eq!(p.attempts(), 1);
-        assert_eq!(RetryPolicy::enabled().attempts(), 3);
         assert_eq!(p.max_attempts, 3);
         assert_eq!(p.initial_backoff, Duration::from_millis(100));
         assert_eq!(p.multiplier, 2.0);
         assert_eq!(p.max_backoff, Duration::from_secs(2));
+        assert_eq!(
+            RetryPolicy::NONE,
+            RetryPolicy {
+                max_attempts: 1,
+                ..RetryPolicy::default()
+            }
+        );
+        // A policy is in force as written: no separate switch can leave it disabled.
+        let five = RetryPolicy {
+            max_attempts: 5,
+            ..RetryPolicy::default()
+        };
+        assert_eq!(five.max_attempts, 5);
+        assert!(five.validate().is_ok() && RetryPolicy::NONE.validate().is_ok());
+    }
+
+    #[test]
+    fn zero_attempts_and_a_multiplier_below_one_or_not_finite_are_invalid() {
+        let with = |max_attempts, multiplier| RetryPolicy {
+            max_attempts,
+            multiplier,
+            ..RetryPolicy::default()
+        };
+        assert!(with(0, 2.0).validate().is_err());
+        for m in [0.5, f64::NAN, f64::INFINITY, -1.0] {
+            assert!(with(3, m).validate().is_err(), "multiplier {m} accepted");
+        }
+        assert!(with(1, 1.0).validate().is_ok());
     }
 
     #[test]
     fn waits_are_jittered_by_twenty_percent_and_never_exceed_the_cap() {
-        let p = RetryPolicy::enabled(); // 100 ms doubling to 2 s
+        let p = RetryPolicy::default(); // 100 ms doubling to 2 s
         // Attempt 2 of this one has a base of 1.8 s: 1.2 x that would pass the 2 s cap.
         let near_cap = RetryPolicy {
             initial_backoff: Duration::from_millis(900),
-            ..RetryPolicy::enabled()
+            ..RetryPolicy::default()
         };
         for (policy, attempt) in [(&p, 1), (&p, 3), (&p, 5), (&p, 6), (&p, 9), (&near_cap, 2)] {
             let base = policy.backoff(attempt);
@@ -240,16 +270,11 @@ mod tests {
 
     #[test]
     fn backoff_grows_by_the_multiplier_up_to_the_cap() {
-        let p = RetryPolicy::enabled();
+        let p = RetryPolicy::default();
         let ms = |a| p.backoff(a).as_millis();
         assert_eq!(
             [ms(1), ms(2), ms(3), ms(4), ms(5), ms(6)],
             [100, 200, 400, 800, 1600, 2000]
         );
-        let zero = RetryPolicy {
-            max_attempts: 0,
-            ..RetryPolicy::enabled()
-        };
-        assert_eq!(zero.attempts(), 1);
     }
 }

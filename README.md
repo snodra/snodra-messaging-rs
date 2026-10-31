@@ -89,7 +89,7 @@ consumer's transaction (`Arc<Mutex<ClientSession>>`), so writes done through it,
 `events.publish_in(&event, key, &mut session)`, commit together with the dedupe marker.
 
 Sending: `app.commands().send_command(&cmd, SendOptions::default()).await?` and
-`app.queries().send_query(&q, SendOptions { routing_key, timeout, authorization })`. Inside a handler
+`app.queries().send_query(&q, SendOptions { routing_key, timeout, ..Default::default() })`. Inside a handler
 the caller's `correlationId` and bearer token are forwarded automatically (task-local
 `MessageContext::current()`).
 
@@ -110,9 +110,9 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 | `KRAKEN_HUB_LOAD_FACTOR` | 100 | `Register.load_factor`: relative capacity; weights this instance's share of keyed commands and its load score |
 | `KRAKEN_HUB_TAGS` | none | `Register.tags`, `k=v,k=v`: unkeyed requests prefer instances whose tags match more of the sender's tags |
 | `KRAKEN_HUB_PRIORITIES` | none | default `Request.priority` per outgoing type, `type=n,type=n` (higher first while the target's queue at the hub is not empty); `SendOptions.priority` wins |
-| `KRAKEN_HUB_RETRY_ENABLED` | false | caller-side retry of transient failures (see Retry); `SendOptions.retry` wins per call |
-| `KRAKEN_HUB_RETRY_MAX_ATTEMPTS` | 3 | attempts in total, the first included |
-| `KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS`, `_MULTIPLIER`, `_MAX_BACKOFF_MS` | 100, 2, 2000 | wait before the second attempt, growth factor (>= 1), cap of one wait; each wait is jittered by ±20 % and never above the cap (at the cap: 80-100 % of it), like the reconnect backoff |
+| `KRAKEN_HUB_RETRY_ENABLED` | false | caller-side retry of transient failures (see Retry): `true` sets `Config.hub_retry` to the policy the variables below describe, `false` leaves it `None` (no retry unless a call sets `SendOptions.retry`, which wins per call) |
+| `KRAKEN_HUB_RETRY_MAX_ATTEMPTS` | 3 | attempts in total, the first included; at least 1 (`0` is rejected at startup, also while retry is disabled) |
+| `KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS`, `_MULTIPLIER`, `_MAX_BACKOFF_MS` | 100, 2, 2000 | wait before the second attempt, growth factor (a finite number >= 1, else rejected at startup), cap of one wait; each wait is jittered by ±20 % and never above the cap (at the cap: 80-100 % of it), like the reconnect backoff |
 | `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS` | true, 5 | consumer starts only when event handlers are registered |
 | `KRAKEN_OUTBOX_ENABLED`, `KRAKEN_OUTBOX_POLL_INTERVAL_MS`, `KRAKEN_OUTBOX_BATCH_SIZE`, `KRAKEN_OUTBOX_MAX_ATTEMPTS` | true, 200, 100, 10 | |
 | `KRAKEN_FORWARD_JWT` | true | |
@@ -166,9 +166,13 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
   grants or 50 ms after the first unsent one. A hub without the capability (P0 or v1) gets no
   `Permits` and forwards without limit, as before.
 - **SendOptions**: `routing_key`, `timeout`, `authorization`, `priority` (else
-  `KRAKEN_HUB_PRIORITIES` for the type, else 0) and `retry` (else `KRAKEN_HUB_RETRY_*`;
-  `RetryPolicy::disabled()` switches it off for one call).
-- **Retry** (opt-in): `retry::is_retryable(kind, &error)` is the one classification (shared with
+  `KRAKEN_HUB_PRIORITIES` for the type, else 0) and `retry` (else `Config.hub_retry`, from
+  `KRAKEN_HUB_RETRY_*`). A `RetryPolicy` is in force as written: `RetryPolicy::default()` is 3
+  attempts, 100 ms doubling to 2 s; `Some(RetryPolicy::NONE)` (one attempt) switches a configured
+  policy off for one call. A policy with `max_attempts: 0` fails the call with `InvalidMessage`
+  before anything is sent (`Config::validate` rejects it at startup).
+- **Retry** (opt-in: no policy applies unless `Config.hub_retry` or `SendOptions.retry` sets
+  one): `retry::is_retryable(kind, &error)` is the one classification (shared with
   the saga relay). Commands retry `HubUnavailable`, `NoHandler` and `HandlerBusy` (the handler never
   ran); queries also `HandlerDisconnected`, `Timeout` and `HubConnectionLost`. A command whose
   outcome is unknown is never retried; nothing else is retried. Each attempt has a fresh request id.

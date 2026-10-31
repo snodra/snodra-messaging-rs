@@ -513,7 +513,11 @@ async fn resource_exhausted_maps_to_handler_busy() {
         matches!(err, MessagingError::HandlerBusy(ref t) if t == "t.Ping"),
         "{err:?}"
     );
-    assert_eq!(hub.requests().await.len(), 1, "no retry unless enabled");
+    assert_eq!(
+        hub.requests().await.len(),
+        1,
+        "no retry unless a policy is set"
+    );
     conn.shutdown().await;
     hub.stop();
 }
@@ -535,7 +539,7 @@ async fn failing_then_ok(hub: &FakeHub, failures: usize, code: ErrorCode, ok: &'
 fn fast_retry() -> RetryPolicy {
     RetryPolicy {
         initial_backoff: Duration::from_millis(20),
-        ..RetryPolicy::enabled()
+        ..RetryPolicy::default()
     }
 }
 
@@ -546,7 +550,7 @@ async fn retry_resends_a_busy_command_with_a_fresh_id() {
     let (sender, conn) = sender_with(
         &hub,
         SenderSettings {
-            retry: fast_retry(),
+            retry: Some(fast_retry()),
             ..SenderSettings::default()
         },
     )
@@ -579,7 +583,7 @@ async fn retry_follows_the_classification_per_kind() {
         let (sender, conn) = sender_with(
             &hub,
             SenderSettings {
-                retry: fast_retry(),
+                retry: Some(fast_retry()),
                 ..SenderSettings::default()
             },
         )
@@ -612,11 +616,97 @@ async fn retry_follows_the_classification_per_kind() {
     }
 }
 
+/// A policy built in code is in force as written: there is no separate switch on the policy that
+/// would leave `RetryPolicy { max_attempts: 5, ..RetryPolicy::default() }` silently disabled.
+#[tokio::test]
+async fn a_policy_built_in_code_is_in_force_as_written() {
+    let hub = FakeHub::start().await;
+    failing_then_ok(&hub, 2, ErrorCode::NoHandler, r#"{"echoed":"x"}"#).await;
+    let (sender, conn) = sender(&hub, None).await;
+    let policy = RetryPolicy {
+        max_attempts: 5,
+        initial_backoff: Duration::from_millis(20),
+        ..RetryPolicy::default()
+    };
+    let pong = sender
+        .send_command(
+            &Ping { text: "x".into() },
+            SendOptions {
+                retry: Some(policy),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(pong.is_ok(), "the user-built policy was ignored: {pong:?}");
+    assert_eq!(hub.requests().await.len(), 3);
+    conn.shutdown().await;
+    hub.stop();
+}
+
+/// A policy without a single attempt is a caller bug: the call fails at once with
+/// `InvalidMessage` and nothing is sent, whether the policy came with the call or with the sender's
+/// settings (built in code, so `Config::validate` never saw it).
+#[tokio::test]
+async fn a_policy_with_zero_attempts_fails_the_call_before_anything_is_sent() {
+    let hub = FakeHub::start().await;
+    hub.set_responder(|req| Some(reply_with(&req, r#"{"n":1}"#)))
+        .await;
+    let zero = RetryPolicy {
+        max_attempts: 0,
+        ..RetryPolicy::default()
+    };
+    let (sender, conn) = sender(&hub, None).await;
+    let per_call = sender
+        .send_command(
+            &Ping { text: "x".into() },
+            SendOptions {
+                retry: Some(zero.clone()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(per_call, Err(MessagingError::InvalidMessage(_))),
+        "{per_call:?}"
+    );
+    let (configured, conn2) = sender_with(
+        &hub,
+        SenderSettings {
+            retry: Some(zero),
+            ..SenderSettings::default()
+        },
+    )
+    .await;
+    let from_settings = configured
+        .send_query(&Count { name: "a".into() }, SendOptions::default())
+        .await;
+    assert!(
+        matches!(from_settings, Err(MessagingError::InvalidMessage(_))),
+        "{from_settings:?}"
+    );
+    assert!(hub.requests().await.is_empty(), "nothing may be sent");
+    // A valid policy for the call wins over the invalid configured one.
+    let total = configured
+        .send_query(
+            &Count { name: "a".into() },
+            SendOptions {
+                retry: Some(RetryPolicy::NONE),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(total, Total { n: 1 });
+    conn.shutdown().await;
+    conn2.shutdown().await;
+    hub.stop();
+}
+
 #[tokio::test]
 async fn retry_can_be_switched_per_call() {
     let hub = FakeHub::start().await;
     failing_then_ok(&hub, 1, ErrorCode::NoHandler, r#"{"echoed":"x"}"#).await;
-    let (sender, conn) = sender(&hub, None).await; // retry off in the settings
+    let (sender, conn) = sender(&hub, None).await; // no policy in the settings
     let ok = sender
         .send_command(
             &Ping { text: "x".into() },
@@ -631,7 +721,7 @@ async fn retry_can_be_switched_per_call() {
     let (sender2, conn2) = sender_with(
         &hub,
         SenderSettings {
-            retry: fast_retry(),
+            retry: Some(fast_retry()),
             ..SenderSettings::default()
         },
     )
@@ -640,7 +730,7 @@ async fn retry_can_be_switched_per_call() {
         .send_command(
             &Ping { text: "x".into() },
             SendOptions {
-                retry: Some(RetryPolicy::disabled()),
+                retry: Some(RetryPolicy::NONE),
                 ..Default::default()
             },
         )
@@ -658,12 +748,12 @@ async fn all_attempts_stay_within_the_callers_budget() {
     let policy = RetryPolicy {
         max_attempts: 10,
         initial_backoff: Duration::from_millis(200),
-        ..RetryPolicy::enabled()
+        ..RetryPolicy::default()
     };
     let (sender, conn) = sender_with(
         &hub,
         SenderSettings {
-            retry: policy,
+            retry: Some(policy),
             ..SenderSettings::default()
         },
     )
@@ -718,12 +808,12 @@ async fn without_a_chosen_timeout_the_budget_is_the_hubs_bound_for_the_type() {
     let policy = RetryPolicy {
         max_attempts: 10,
         initial_backoff: Duration::from_millis(300),
-        ..RetryPolicy::enabled()
+        ..RetryPolicy::default()
     };
     let (sender, conn) = sender_with(
         &hub,
         SenderSettings {
-            retry: policy,
+            retry: Some(policy),
             ..SenderSettings::default()
         },
     )
@@ -762,12 +852,12 @@ async fn a_retry_starts_only_with_room_left_in_the_budget() {
         max_attempts: 100,
         initial_backoff: Duration::from_millis(100),
         multiplier: 1.0,
-        ..RetryPolicy::enabled()
+        ..RetryPolicy::default()
     };
     let (sender, conn) = sender_with(
         &hub,
         SenderSettings {
-            retry: policy,
+            retry: Some(policy),
             ..SenderSettings::default()
         },
     )
