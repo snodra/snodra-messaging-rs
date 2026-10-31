@@ -26,6 +26,11 @@ pub const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub const LOCAL_GUARD_MARGIN: Duration = Duration::from_secs(1);
 /// Used for the guard when a v2 ack carries no maximum (never sent by the hub; defensive).
 const FALLBACK_MAX_TIMEOUT_MS: u32 = 60_000;
+/// The least of a call's budget a retry must have left once its wait is over (or the policy's
+/// `initial_backoff`, when larger); with less the call ends with the last error at once.
+pub const RETRY_MIN_REMAINING: Duration = Duration::from_millis(250);
+/// The smallest `timeout_ms` sent for a timeout that was chosen (0 would mean "the hub decides").
+const MIN_TIMEOUT: Duration = Duration::from_millis(1);
 
 /// `Request.timeout_ms` and the local guard for a request of `type_name` on a stream with
 /// `handshake`, when the caller chose `chosen` (per call, or the configured default).
@@ -34,13 +39,15 @@ const FALLBACK_MAX_TIMEOUT_MS: u32 = 60_000;
 ///   default); guard with the hub's upper bound for the request, i.e. `min(chosen, override or
 ///   max)` or, when 0 was sent, `override or max`, plus [`LOCAL_GUARD_MARGIN`].
 /// - Legacy hub: send the chosen timeout or [`LEGACY_REQUEST_TIMEOUT`]; guard with that plus the margin.
+///
+/// A zero `chosen` counts as none; a chosen timeout under a millisecond is sent as 1 ms, never as 0.
 pub fn request_timing(
     handshake: &Handshake,
     type_name: &str,
     chosen: Option<Duration>,
 ) -> (u32, Duration) {
     let ms = |d: Duration| d.as_millis().min(u32::MAX as u128) as u32;
-    let chosen = chosen.filter(|d| ms(*d) > 0);
+    let chosen = chosen.filter(|d| !d.is_zero()).map(|d| d.max(MIN_TIMEOUT));
     match handshake {
         Handshake::V2(ack) => {
             let sent = chosen.map(ms).unwrap_or(0);
@@ -283,7 +290,10 @@ impl Sender {
     }
 
     /// One logical call: the first attempt, plus retries the policy and the classification allow,
-    /// each with a fresh request id, all within one time budget ([`retry_budget`]).
+    /// each with a fresh request id, all within one time budget ([`retry_budget`]). A retry starts
+    /// only if, once its wait is over, at least `max(initial_backoff, RETRY_MIN_REMAINING)` of the
+    /// budget is left; otherwise the last error is returned at once, without waiting. Each attempt
+    /// sends what is left of the budget at its start (at least 1 ms) as `timeout_ms`.
     async fn request(
         &self,
         kind: RequestKind,
@@ -313,10 +323,13 @@ impl Sender {
 
         let budget = retry_budget(self.conn.handshake().as_ref(), type_name, chosen);
         let started = tokio::time::Instant::now();
+        let min_remaining = policy.initial_backoff.max(RETRY_MIN_REMAINING);
+        // The first attempt is never gated and gets the whole budget.
+        let mut remaining = budget.saturating_sub(started.elapsed());
         let mut attempt = 1;
         loop {
-            let remaining = budget.saturating_sub(started.elapsed());
-            let result = self.attempt(&call, payload.clone(), Some(remaining)).await;
+            let timeout = remaining.max(MIN_TIMEOUT);
+            let result = self.attempt(&call, payload.clone(), Some(timeout)).await;
             let error = match result {
                 Ok(bytes) => return Ok(bytes),
                 Err(e) => e,
@@ -325,11 +338,18 @@ impl Sender {
                 return Err(error);
             }
             let wait = policy.backoff(attempt);
-            // A wait that leaves less than a millisecond for the next attempt ends the retries.
-            if started.elapsed() + wait + Duration::from_millis(1) >= budget {
-                tracing::debug!(r#type = type_name, attempt, "retry budget spent: {error}");
-                return Err(error);
-            }
+            // What the next attempt would have, from the moment its wait is over.
+            remaining = match budget.checked_sub(started.elapsed() + wait) {
+                Some(left) if left >= min_remaining => left,
+                _ => {
+                    tracing::debug!(
+                        r#type = type_name,
+                        attempt,
+                        "no room left in the budget for a retry: {error}"
+                    );
+                    return Err(error);
+                }
+            };
             tracing::debug!(r#type = type_name, attempt, retry_in = ?wait, "retrying: {error}");
             tokio::time::sleep(wait).await;
             attempt += 1;
@@ -512,6 +532,19 @@ mod tests {
             (5_000, S(6))
         );
         assert_eq!(request_timing(&ack(&[]), "t.X", Some(MS(0))), (0, S(61)));
+    }
+
+    #[test]
+    fn a_sub_millisecond_timeout_is_sent_as_one_millisecond() {
+        let us = Duration::from_micros;
+        assert_eq!(
+            request_timing(&ack(&[]), "t.X", Some(us(400))),
+            (1, MS(1) + LOCAL_GUARD_MARGIN)
+        );
+        assert_eq!(
+            request_timing(&Handshake::Legacy, "t.X", Some(us(400))),
+            (1, MS(1) + LOCAL_GUARD_MARGIN)
+        );
     }
 
     #[test]

@@ -688,7 +688,7 @@ async fn all_attempts_stay_within_the_callers_budget() {
         elapsed < Duration::from_millis(500),
         "overran the budget: {elapsed:?}"
     );
-    // Attempts at ~0 and ~200 ms; the next wait (400 ms) would overrun the 500 ms budget.
+    // Attempts at ~0 and ~200 ms; after the next wait (400 ms) nothing would be left of the 500 ms.
     let sent = hub.requests().await;
     assert_eq!(sent.len(), 2, "{sent:?}");
     // Each attempt carries what is left of the budget.
@@ -710,13 +710,13 @@ async fn all_attempts_stay_within_the_callers_budget() {
 async fn without_a_chosen_timeout_the_budget_is_the_hubs_bound_for_the_type() {
     let hub = FakeHub::start().await;
     hub.set_ack(Some(proto::RegisterAck {
-        type_timeouts_ms: [("t.Ping".to_string(), 250)].into(),
+        type_timeouts_ms: [("t.Ping".to_string(), 1_000)].into(),
         ..default_ack()
     }));
     failing_then_ok(&hub, 100, ErrorCode::NoHandler, "{}").await;
     let policy = RetryPolicy {
         max_attempts: 10,
-        initial_backoff: Duration::from_millis(100),
+        initial_backoff: Duration::from_millis(300),
         ..RetryPolicy::enabled()
     };
     let (sender, conn) = sender_with(
@@ -732,13 +732,97 @@ async fn without_a_chosen_timeout_the_budget_is_the_hubs_bound_for_the_type() {
         .await
         .unwrap_err();
     let sent = hub.requests().await;
-    // Attempts at ~0 and ~100 ms; waiting 200 ms more would pass the 250 ms override.
+    // The budget is the 1 s override. Attempts at ~0 and ~300 ms; after the next wait (600 ms)
+    // less than the 300 ms minimum (the initial backoff) would be left of it.
     assert_eq!(sent.len(), 2, "{sent:?}");
     assert!(
-        sent[0].timeout_ms <= 250 && sent[0].timeout_ms > 200,
+        sent[0].timeout_ms <= 1_000 && sent[0].timeout_ms > 950,
         "{}",
         sent[0].timeout_ms
     );
+    assert!(
+        sent[1].timeout_ms <= 700 && sent[1].timeout_ms >= 300,
+        "{}",
+        sent[1].timeout_ms
+    );
     conn.shutdown().await;
+    hub.stop();
+}
+
+/// A retry needs room: the next attempt starts only if, after its wait, at least
+/// max(initial_backoff, 250 ms) of the budget is left; otherwise the last error comes back at once.
+/// Budget 1 s, NO_HANDLER at once, 100 ms between attempts: no attempt is sent with less than
+/// 250 ms to live.
+#[tokio::test]
+async fn a_retry_starts_only_with_room_left_in_the_budget() {
+    let hub = FakeHub::start().await;
+    failing_then_ok(&hub, usize::MAX, ErrorCode::NoHandler, "{}").await;
+    let policy = RetryPolicy {
+        max_attempts: 100,
+        initial_backoff: Duration::from_millis(100),
+        multiplier: 1.0,
+        ..RetryPolicy::enabled()
+    };
+    let (sender, conn) = sender_with(
+        &hub,
+        SenderSettings {
+            retry: policy,
+            ..SenderSettings::default()
+        },
+    )
+    .await;
+    let started = std::time::Instant::now();
+    let err = sender
+        .send_command(
+            &Ping { text: "x".into() },
+            SendOptions {
+                timeout: Some(Duration::from_secs(1)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(matches!(err, MessagingError::NoHandler(_)), "{err:?}");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "overran the budget: {elapsed:?}"
+    );
+    let sent: Vec<u32> = hub.requests().await.iter().map(|r| r.timeout_ms).collect();
+    assert!(sent.len() >= 2, "never retried: {sent:?}");
+    assert!(sent[0] <= 1_000 && sent[0] > 950, "{sent:?}");
+    assert!(
+        sent[1..].iter().all(|&ms| ms >= 250),
+        "a retry was sent with less than 250 ms left: {sent:?}"
+    );
+    conn.shutdown().await;
+    hub.stop();
+}
+
+/// What is left of a budget is sent as at least 1 ms: a sub-millisecond remainder never becomes
+/// `timeout_ms = 0`, which would let the hub apply its default (5 s) instead.
+#[tokio::test]
+async fn a_sub_millisecond_budget_is_sent_as_one_millisecond_never_as_unset() {
+    let hub = FakeHub::start().await;
+    failing_then_ok(&hub, usize::MAX, ErrorCode::NoHandler, "{}").await;
+    for (n, retry) in [Some(fast_retry()), None].into_iter().enumerate() {
+        let (sender, conn) = sender(&hub, None).await;
+        let err = sender
+            .send_command(
+                &Ping { text: "x".into() },
+                SendOptions {
+                    timeout: Some(Duration::from_micros(500)),
+                    retry,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MessagingError::NoHandler(_)), "{err:?}");
+        let sent = hub.requests().await;
+        assert_eq!(sent.len(), n + 1, "no room for a retry");
+        assert_eq!(sent[n].timeout_ms, 1, "case {n}: {:?}", sent[n]);
+        conn.shutdown().await;
+    }
     hub.stop();
 }

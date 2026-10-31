@@ -173,8 +173,10 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
   ran); queries also `HandlerDisconnected`, `Timeout` and `HubConnectionLost`. A command whose
   outcome is unknown is never retried; nothing else is retried. Each attempt has a fresh request id.
   All attempts share one budget: the caller's timeout, else the hub's bound for the type (override,
-  else default; 5 s against a legacy hub). Each attempt sends the remaining budget as `timeout_ms`;
-  a backoff that would overrun it ends the retries with the last error.
+  else default; 5 s against a legacy hub). A retry starts only if, once its backoff is over, at
+  least `max(initial_backoff, 250 ms)` of the budget is left; otherwise the last error is returned
+  at once, without waiting. Each attempt sends what is left of the budget as `timeout_ms`, never
+  less than 1 ms (a remainder never turns into "unset", which would let the hub apply its default).
 - **Liveness**: a stream with no heartbeat echo for three intervals is dropped and reconnected; the
   channel also sends HTTP/2 keepalive pings every 10 s (5 s to answer, also while idle).
 - **Replies** go back on the stream the request arrived on; when that stream is gone the reply is
