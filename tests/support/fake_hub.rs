@@ -105,6 +105,7 @@ impl Hub for Service {
                                 }
                             }
                             client_message::Message::Reply(r) => state.replies.lock().await.push((stream_no, r)),
+                            client_message::Message::Permits(_) => {}
                             client_message::Message::Request(req) => {
                                 state.requests.lock().await.push(req.clone());
                                 let response = state.responder.lock().await.as_ref().and_then(|f| f(req));

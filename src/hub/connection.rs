@@ -391,6 +391,9 @@ impl HubConnection {
             capabilities: CAPABILITIES.iter().map(|c| c.to_string()).collect(),
             credentials: None,
             client_version: CLIENT_VERSION.to_string(),
+            initial_permits: 0,
+            load_factor: 0,
+            tags: Default::default(),
         };
         tx.send(ClientMessage {
             message: Some(client_message::Message::Register(register)),

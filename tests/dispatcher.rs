@@ -145,6 +145,7 @@ fn request(kind: RequestKind, type_name: &str, payload: &str, headers: &[(&str, 
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect::<HashMap<_, _>>(),
         timeout_ms: 0,
+        priority: 0,
     }
 }
 

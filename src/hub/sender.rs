@@ -267,6 +267,7 @@ impl Sender {
                     payload,
                     headers,
                     timeout_ms,
+                    priority: 0,
                 };
                 let msg = ClientMessage {
                     message: Some(client_message::Message::Request(request)),
