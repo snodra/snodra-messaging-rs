@@ -106,7 +106,13 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 | `KRAKEN_HUB_REQUEST_TIMEOUT_MS` | unset | default request timeout, sent as `timeout_ms` (`SendOptions.timeout` wins per call). Unset: a v2 hub gets `timeout_ms = 0` and applies its per-type override or its default (5 s); a legacy hub gets 5000 as before. `0` counts as unset (here and for `SendOptions.timeout`) |
 | `KRAKEN_HEARTBEAT_INTERVAL_MS` | 10000 | fallback only: a v2 hub announces its interval (3 s by default) in `RegisterAck`; this value applies to legacy hubs |
 | `KRAKEN_RECONNECT_BACKOFF_MIN_MS` / `_MAX_MS` | 500 / 5000 | exponential, each wait ±20 % jitter and never above the max (at the max: 80-100 % of it); back to the min once a connect reached the handshake |
-| `KRAKEN_MAX_CONCURRENT_HANDLERS` | 256 | |
+| `KRAKEN_MAX_CONCURRENT_HANDLERS` | 256 | handlers run at once; also the permits offered to a hub with flow control (`Register.initial_permits`), which queues further requests for this instance |
+| `KRAKEN_HUB_LOAD_FACTOR` | 100 | `Register.load_factor`: relative capacity; weights this instance's share of keyed commands and its load score |
+| `KRAKEN_HUB_TAGS` | none | `Register.tags`, `k=v,k=v`: unkeyed requests prefer instances whose tags match more of the sender's tags |
+| `KRAKEN_HUB_PRIORITIES` | none | default `Request.priority` per outgoing type, `type=n,type=n` (higher first while the target's queue at the hub is not empty); `SendOptions.priority` wins |
+| `KRAKEN_HUB_RETRY_ENABLED` | false | caller-side retry of transient failures (see Retry); `SendOptions.retry` wins per call |
+| `KRAKEN_HUB_RETRY_MAX_ATTEMPTS` | 3 | attempts in total, the first included |
+| `KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS`, `_MULTIPLIER`, `_MAX_BACKOFF_MS` | 100, 2, 2000 | wait before the second attempt, growth factor (>= 1), cap of one wait |
 | `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS` | true, 5 | consumer starts only when event handlers are registered |
 | `KRAKEN_OUTBOX_ENABLED`, `KRAKEN_OUTBOX_POLL_INTERVAL_MS`, `KRAKEN_OUTBOX_BATCH_SIZE`, `KRAKEN_OUTBOX_MAX_ATTEMPTS` | true, 200, 100, 10 | |
 | `KRAKEN_FORWARD_JWT` | true | |
@@ -115,7 +121,9 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 
 - **Errors** map exactly as `HubErrors.kt`: `NoHandler`, `Timeout`, `HandlerDisconnected`,
   `RemoteHandler`, `Unauthenticated`, `AccessDenied`, `InvalidMessage`, `HubUnavailable`,
-  `HubConnectionLost`. `HubUnavailable`: the request was never written to a live hub stream (no
+  `HubConnectionLost`, `HandlerBusy`. `HandlerBusy` (hub code `RESOURCE_EXHAUSTED`): the target
+  instance's queue at the hub is full; the handler never saw the request. A hub only sends it to
+  clients that declared flow control; others get `RemoteHandler` "handler busy" as before. `HubUnavailable`: the request was never written to a live hub stream (no
   stream, or the write failed), so a retry is safe. `HubConnectionLost`: the request was accepted by
   a stream's outbound queue and that stream broke before the answer, so the outcome is unknown (treat
   it like `Timeout`). An unknown code (including `UNSUPPORTED`, declared but not produced yet) reads
@@ -139,14 +147,31 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 - **Shutdown** drains in-flight handlers (10 s bound), closes the hub stream, fails this instance's outgoing requests still in flight with `HubConnectionLost`, stops the publisher and the consumer.
 - **Start** does not wait for the hub. `await_hub(timeout)` tells you when the registration was
   confirmed; sends before that fail with `HubUnavailable`.
-- **Handshake** (hub protocol v2, ADR 0013): `Register` carries `protocol_version = 2`, an empty
-  capability list and `client_version = kraken-messaging-rs/<version>`. A v2 hub answers with a
+- **Handshake** (hub protocol v2, ADR 0013): `Register` carries `protocol_version = 2`, the
+  capabilities (`flow-control`) and `client_version = kraken-messaging-rs/<version>`. A v2 hub answers with a
   `RegisterAck` before it echoes the first heartbeat; the client then heartbeats at the announced
   interval (3 s; the hub evicts after 10 s) and sends `timeout_ms = 0` unless a timeout was chosen,
   guarding locally with the ack's per-type or maximum timeout plus 1 s. When the echo arrives without
   an ack the hub predates v2 and the client runs in legacy mode: configured heartbeat interval,
   `timeout_ms` = the chosen timeout or 5 s, guard = that plus 1 s. `HubConnection::handshake()`
   tells which (`Handshake::V2(ack)` / `Handshake::Legacy`).
+- **Flow control** (capability `flow-control`, ADR 0014): `Register` declares the capability and
+  offers `max_concurrent_handlers` permits, `load_factor` and `tags`. A hub whose ack shares the
+  capability forwards only while this instance has permits and queues the rest (by priority, then
+  age; queued requests keep their own deadline). Every finished request gives its permit back on
+  the stream it arrived on, batched: one `Permits` message at 16 pending grants or 50 ms after the
+  first unflushed one. A hub without the capability (P0 or v1) gets no `Permits` and forwards
+  without limit, as before.
+- **SendOptions**: `routing_key`, `timeout`, `authorization`, `priority` (else
+  `KRAKEN_HUB_PRIORITIES` for the type, else 0) and `retry` (else `KRAKEN_HUB_RETRY_*`;
+  `RetryPolicy::disabled()` switches it off for one call).
+- **Retry** (opt-in): `retry::is_retryable(kind, &error)` is the one classification (shared with
+  the saga relay). Commands retry `HubUnavailable`, `NoHandler` and `HandlerBusy` (the handler never
+  ran); queries also `HandlerDisconnected`, `Timeout` and `HubConnectionLost`. A command whose
+  outcome is unknown is never retried; nothing else is retried. Each attempt has a fresh request id.
+  All attempts share one budget: the caller's timeout, else the hub's bound for the type (override,
+  else default; 5 s against a legacy hub). Each attempt sends the remaining budget as `timeout_ms`;
+  a backoff that would overrun it ends the retries with the last error.
 - **Liveness**: a stream with no heartbeat echo for three intervals is dropped and reconnected; the
   channel also sends HTTP/2 keepalive pings every 10 s (5 s to answer, also while idle).
 - **Replies** go back on the stream the request arrived on; when that stream is gone the reply is
@@ -166,8 +191,9 @@ cargo test                            # unit tests + integration tests (Docker r
 Integration tests start Kafka (`apache/kafka`), MongoDB (replica set) and `kraken-hub:dev` with
 testcontainers. The hub image is built from the sibling repo: `docker build -t kraken-hub:dev .` in
 `../kraken-hub` (override with `KRAKEN_HUB_IMAGE`). `tests/hub_compat.rs` also runs against the
-previous hub release, `kraken-hub:v1-baseline` (override with `KRAKEN_HUB_BASELINE_IMAGE`), to prove
-legacy mode. Without Docker the integration tests print a notice and skip; with Docker but no hub
+previous hub releases: `kraken-hub:p0` (protocol v2 without flow control, override with
+`KRAKEN_HUB_P0_IMAGE`) and `kraken-hub:v1-baseline` (override with `KRAKEN_HUB_BASELINE_IMAGE`), to
+prove the client behaves as before against both. Without Docker the integration tests print a notice and skip; with Docker but no hub
 image they fail with the build command. On Rancher Desktop export
 `DOCKER_HOST=unix://$HOME/.rd/docker.sock` first. A unit test and `scripts/check-proto-sync.sh` (CI
 job `proto-sync`) check that `proto/hub.proto` is byte-identical to `../kraken/protocol/hub.proto`
