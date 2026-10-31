@@ -15,6 +15,7 @@ use crate::codec;
 use crate::context::{MessageContext, hub_headers};
 use crate::error::MessagingError;
 use crate::proto::{self, ClientMessage, RequestKind, client_message, reply};
+use crate::retry::{self, RetryPolicy};
 use crate::types::{Command, Query};
 
 use super::connection::{Handshake, HubConnection, Inbound, StreamId};
@@ -88,6 +89,69 @@ pub struct SendOptions {
     pub timeout: Option<Duration>,
     /// Full header value (`Bearer <jwt>`) to send instead of the one forwarded from the current handler context.
     pub authorization: Option<String>,
+    /// `Request.priority` for this call (higher is served first while the target's queue at the
+    /// hub is not empty). Without one, `Config.hub_priorities` for the type, else 0.
+    pub priority: Option<i32>,
+    /// Retry policy for this call (`RetryPolicy::disabled()` switches retries off). Without one,
+    /// `Config.hub_retry` applies.
+    pub retry: Option<RetryPolicy>,
+}
+
+/// What a [`Sender`] applies to every call unless [`SendOptions`] says otherwise.
+#[derive(Clone, Debug)]
+pub struct SenderSettings {
+    /// `Config.hub_request_timeout`.
+    pub default_timeout: Option<Duration>,
+    /// Forward the current handler's bearer token.
+    pub forward_jwt: bool,
+    /// Default priority per type (`Config.hub_priorities`).
+    pub priorities: HashMap<String, i32>,
+    /// Default retry policy (`Config.hub_retry`, off by default).
+    pub retry: RetryPolicy,
+}
+
+impl Default for SenderSettings {
+    fn default() -> Self {
+        SenderSettings {
+            default_timeout: None,
+            forward_jwt: true,
+            priorities: HashMap::new(),
+            retry: RetryPolicy::default(),
+        }
+    }
+}
+
+/// The time all attempts of one call share: the caller's chosen timeout; else, against a v2 hub,
+/// its bound for the type (the per-type override, else its default); else (legacy hub, or not
+/// connected yet) [`LEGACY_REQUEST_TIMEOUT`].
+pub fn retry_budget(
+    handshake: Option<&Handshake>,
+    type_name: &str,
+    chosen: Option<Duration>,
+) -> Duration {
+    if let Some(chosen) = chosen.filter(|d| !d.is_zero()) {
+        return chosen;
+    }
+    handshake
+        .and_then(Handshake::ack)
+        .and_then(|ack| {
+            ack.type_timeouts_ms
+                .get(type_name)
+                .copied()
+                .filter(|&ms| ms > 0)
+                .or(Some(ack.default_timeout_ms).filter(|&ms| ms > 0))
+        })
+        .map(|ms| Duration::from_millis(ms.into()))
+        .unwrap_or(LEGACY_REQUEST_TIMEOUT)
+}
+
+/// The parts of a call that stay the same across its attempts.
+struct Attempt<'a> {
+    kind: RequestKind,
+    type_name: &'a str,
+    routing_key: &'a str,
+    headers: &'a HashMap<String, String>,
+    priority: i32,
 }
 
 type Pending = oneshot::Sender<Result<Vec<u8>, MessagingError>>;
@@ -121,6 +185,8 @@ pub struct Sender {
     pending: Mutex<HashMap<String, Entry>>,
     default_timeout: Option<Duration>,
     forward_jwt: bool,
+    priorities: HashMap<String, i32>,
+    retry: RetryPolicy,
 }
 
 impl Sender {
@@ -129,11 +195,24 @@ impl Sender {
         default_timeout: Option<Duration>,
         forward_jwt: bool,
     ) -> Arc<Sender> {
+        Self::with_settings(
+            conn,
+            SenderSettings {
+                default_timeout,
+                forward_jwt,
+                ..SenderSettings::default()
+            },
+        )
+    }
+
+    pub fn with_settings(conn: Arc<HubConnection>, settings: SenderSettings) -> Arc<Sender> {
         Arc::new(Sender {
             conn,
             pending: Mutex::new(HashMap::new()),
-            default_timeout,
-            forward_jwt,
+            default_timeout: settings.default_timeout,
+            forward_jwt: settings.forward_jwt,
+            priorities: settings.priorities,
+            retry: settings.retry,
         })
     }
 
@@ -203,6 +282,8 @@ impl Sender {
         }
     }
 
+    /// One logical call: the first attempt, plus retries the policy and the classification allow,
+    /// each with a fresh request id, all within one time budget ([`retry_budget`]).
     async fn request(
         &self,
         kind: RequestKind,
@@ -210,7 +291,53 @@ impl Sender {
         payload: Vec<u8>,
         opts: SendOptions,
     ) -> Result<Vec<u8>, MessagingError> {
-        let id = uuid::Uuid::new_v4().to_string();
+        let headers = self.headers(opts.authorization.clone());
+        let priority = opts
+            .priority
+            .or_else(|| self.priorities.get(type_name).copied())
+            .unwrap_or(0);
+        let chosen = chosen_timeout(opts.timeout, self.default_timeout);
+        let routing_key = opts.routing_key.unwrap_or_default();
+        let policy = opts.retry.unwrap_or_else(|| self.retry.clone());
+        let call = Attempt {
+            kind,
+            type_name,
+            routing_key: &routing_key,
+            headers: &headers,
+            priority,
+        };
+        let attempts = policy.attempts();
+        if attempts == 1 {
+            return self.attempt(&call, payload, chosen).await;
+        }
+
+        let budget = retry_budget(self.conn.handshake().as_ref(), type_name, chosen);
+        let started = tokio::time::Instant::now();
+        let mut attempt = 1;
+        loop {
+            let remaining = budget.saturating_sub(started.elapsed());
+            let result = self.attempt(&call, payload.clone(), Some(remaining)).await;
+            let error = match result {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) => e,
+            };
+            if attempt >= attempts || !retry::is_retryable(kind, &error) {
+                return Err(error);
+            }
+            let wait = policy.backoff(attempt);
+            // A wait that leaves less than a millisecond for the next attempt ends the retries.
+            if started.elapsed() + wait + Duration::from_millis(1) >= budget {
+                tracing::debug!(r#type = type_name, attempt, "retry budget spent: {error}");
+                return Err(error);
+            }
+            tracing::debug!(r#type = type_name, attempt, retry_in = ?wait, "retrying: {error}");
+            tokio::time::sleep(wait).await;
+            attempt += 1;
+        }
+    }
+
+    /// Correlation id, forwarded bearer token and trace parent, shared by every attempt.
+    fn headers(&self, authorization: Option<String>) -> HashMap<String, String> {
         let current = MessageContext::current();
         let mut headers = HashMap::new();
         headers.insert(
@@ -221,7 +348,7 @@ impl Sender {
                 .filter(|c| !c.is_empty())
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         );
-        let authorization = opts.authorization.or_else(|| {
+        let authorization = authorization.or_else(|| {
             if self.forward_jwt {
                 current.as_ref().and_then(|c| c.authorization.clone())
             } else {
@@ -237,9 +364,19 @@ impl Sender {
         {
             headers.insert(hub_headers::TRACEPARENT.to_string(), tp.clone());
         }
-        let chosen = chosen_timeout(opts.timeout, self.default_timeout);
-        let routing_key = opts.routing_key.unwrap_or_default();
+        headers
+    }
 
+    /// One `Request` with a fresh id: written, then awaited until the reply, the hub's error or
+    /// the local guard.
+    async fn attempt(
+        &self,
+        call: &Attempt<'_>,
+        payload: Vec<u8>,
+        chosen: Option<Duration>,
+    ) -> Result<Vec<u8>, MessagingError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let type_name = call.type_name;
         let (tx, rx) = oneshot::channel();
         let _forget = ForgetOnDrop {
             pending: &self.pending,
@@ -261,13 +398,13 @@ impl Sender {
                 );
                 let request = proto::Request {
                     id: id.clone(),
-                    kind: kind as i32,
+                    kind: call.kind as i32,
                     r#type: type_name.to_string(),
-                    routing_key,
+                    routing_key: call.routing_key.to_string(),
                     payload,
-                    headers,
+                    headers: call.headers.clone(),
                     timeout_ms,
-                    priority: 0,
+                    priority: call.priority,
                 };
                 let msg = ClientMessage {
                     message: Some(client_message::Message::Request(request)),
@@ -382,6 +519,30 @@ mod tests {
         let h = ack(&[("t.Zero", 0)]);
         assert_eq!(request_timing(&h, "t.Zero", None), (0, S(61)));
         assert_eq!(request_timing(&h, "t.Zero", Some(S(2))), (2_000, S(3)));
+    }
+
+    #[test]
+    fn retry_budget_is_the_chosen_timeout_else_the_hubs_bound() {
+        let h = ack(&[("t.Slow", 120_000), ("t.Zero", 0)]);
+        assert_eq!(retry_budget(Some(&h), "t.X", Some(S(2))), S(2));
+        assert_eq!(retry_budget(Some(&h), "t.Slow", None), S(120));
+        assert_eq!(
+            retry_budget(Some(&h), "t.Zero", None),
+            S(5),
+            "a zero override is ignored"
+        );
+        assert_eq!(
+            retry_budget(Some(&h), "t.X", None),
+            S(5),
+            "the ack's default"
+        );
+        assert_eq!(retry_budget(Some(&Handshake::Legacy), "t.X", None), S(5));
+        assert_eq!(retry_budget(None, "t.X", None), S(5));
+        assert_eq!(
+            retry_budget(Some(&h), "t.X", Some(MS(0))),
+            S(5),
+            "zero is unset"
+        );
     }
 
     #[test]

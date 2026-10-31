@@ -13,4 +13,7 @@ pub use connection::{
 };
 pub use dispatcher::Dispatcher;
 pub use registry::{EventContext, HandlerRegistry};
-pub use sender::{LEGACY_REQUEST_TIMEOUT, LOCAL_GUARD_MARGIN, SendOptions, Sender, request_timing};
+pub use sender::{
+    LEGACY_REQUEST_TIMEOUT, LOCAL_GUARD_MARGIN, SendOptions, Sender, SenderSettings,
+    request_timing, retry_budget,
+};

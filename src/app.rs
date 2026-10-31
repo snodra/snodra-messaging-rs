@@ -26,6 +26,7 @@ use crate::context::MessageContext;
 use crate::error::MessagingError;
 use crate::hub::{
     Dispatcher, EventContext, HandlerRegistry, HubConnection, HubSettings, Inbound, Sender,
+    SenderSettings,
 };
 use crate::identity::{Guard, IdentityResolver, JwksVerifier};
 use crate::kafka::{EventBus, EventConsumer, OutboxPublisher, ensure_indexes};
@@ -101,10 +102,14 @@ impl KrakenMessaging {
             uuid::Uuid::new_v4().to_string(),
             tx,
         );
-        let sender = Sender::new(
+        let sender = Sender::with_settings(
             Arc::clone(&conn),
-            config.hub_request_timeout,
-            config.forward_jwt,
+            SenderSettings {
+                default_timeout: config.hub_request_timeout,
+                forward_jwt: config.forward_jwt,
+                priorities: config.hub_priorities.clone(),
+                retry: config.hub_retry.clone(),
+            },
         );
         Ok(KrakenMessagingBuilder {
             config,

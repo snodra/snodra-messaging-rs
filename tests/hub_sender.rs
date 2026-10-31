@@ -3,8 +3,11 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
+use kraken_messaging::RetryPolicy;
 use kraken_messaging::context::CURRENT;
-use kraken_messaging::hub::{HubConnection, HubSettings, Inbound, SendOptions, Sender};
+use kraken_messaging::hub::{
+    HubConnection, HubSettings, Inbound, SendOptions, Sender, SenderSettings,
+};
 use kraken_messaging::proto::{self, ErrorCode, ServerMessage, reply, server_message};
 use kraken_messaging::{Command, MessageContext, MessagingError, Query, message_type};
 use serde::{Deserialize, Serialize};
@@ -82,6 +85,20 @@ async fn sender(
     hub: &FakeHub,
     default_timeout: Option<Duration>,
 ) -> (Arc<Sender>, Arc<HubConnection>) {
+    sender_with(
+        hub,
+        SenderSettings {
+            default_timeout,
+            ..SenderSettings::default()
+        },
+    )
+    .await
+}
+
+async fn sender_with(
+    hub: &FakeHub,
+    sender_settings: SenderSettings,
+) -> (Arc<Sender>, Arc<HubConnection>) {
     let (tx, mut rx) = mpsc::channel::<Inbound>(64);
     let settings = HubSettings {
         address: hub.address(),
@@ -93,7 +110,7 @@ async fn sender(
     let conn = HubConnection::new(settings, "svc".into(), uuid::Uuid::new_v4().to_string(), tx);
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);
-    let sender = Sender::new(Arc::clone(&conn), default_timeout, true);
+    let sender = Sender::with_settings(Arc::clone(&conn), sender_settings);
     let forward = Arc::clone(&sender);
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -437,6 +454,291 @@ async fn dropped_caller_future_leaves_no_pending_entry() {
     assert!(gave_up.is_err(), "the fake hub never answers");
     assert_eq!(hub.requests().await.len(), 1, "the request was written");
     assert_eq!(sender.in_flight(), 0, "abandoned request still pending");
+    conn.shutdown().await;
+    hub.stop();
+}
+
+// ---- priority and retry (P1) ----
+
+#[tokio::test]
+async fn priority_comes_from_send_options_then_config_then_zero() {
+    let hub = FakeHub::start().await;
+    hub.set_responder(|req| Some(reply_with(&req, r#"{"echoed":"x"}"#)))
+        .await;
+    let (sender, conn) = sender_with(
+        &hub,
+        SenderSettings {
+            priorities: [("t.Ping".to_string(), 7)].into(),
+            ..SenderSettings::default()
+        },
+    )
+    .await;
+    let ping = || Ping { text: "x".into() };
+    sender
+        .send_command(&ping(), SendOptions::default())
+        .await
+        .unwrap();
+    sender
+        .send_command(
+            &ping(),
+            SendOptions {
+                priority: Some(-3),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    hub.set_responder(|req| Some(reply_with(&req, "{}"))).await;
+    sender
+        .send_command(&Nop {}, SendOptions::default())
+        .await
+        .unwrap();
+    let priorities: Vec<i32> = hub.requests().await.iter().map(|r| r.priority).collect();
+    assert_eq!(priorities, [7, -3, 0]);
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn resource_exhausted_maps_to_handler_busy() {
+    let hub = FakeHub::start().await;
+    hub.set_responder(|req| Some(hub_error(&req, ErrorCode::ResourceExhausted, "queue full")))
+        .await;
+    let (sender, conn) = sender(&hub, None).await;
+    let err = sender
+        .send_command(&Ping { text: "x".into() }, SendOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, MessagingError::HandlerBusy(ref t) if t == "t.Ping"),
+        "{err:?}"
+    );
+    assert_eq!(hub.requests().await.len(), 1, "no retry unless enabled");
+    conn.shutdown().await;
+    hub.stop();
+}
+
+/// Answers the first `failures` requests with hub error `code`, then replies `ok`.
+async fn failing_then_ok(hub: &FakeHub, failures: usize, code: ErrorCode, ok: &'static str) {
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    hub.set_responder(move |req| {
+        let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(if n < failures {
+            hub_error(&req, code, "transient")
+        } else {
+            reply_with(&req, ok)
+        })
+    })
+    .await;
+}
+
+fn fast_retry() -> RetryPolicy {
+    RetryPolicy {
+        initial_backoff: Duration::from_millis(20),
+        ..RetryPolicy::enabled()
+    }
+}
+
+#[tokio::test]
+async fn retry_resends_a_busy_command_with_a_fresh_id() {
+    let hub = FakeHub::start().await;
+    failing_then_ok(&hub, 2, ErrorCode::ResourceExhausted, r#"{"echoed":"x"}"#).await;
+    let (sender, conn) = sender_with(
+        &hub,
+        SenderSettings {
+            retry: fast_retry(),
+            ..SenderSettings::default()
+        },
+    )
+    .await;
+    let pong = sender
+        .send_command(&Ping { text: "x".into() }, SendOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(pong, Pong { echoed: "x".into() });
+    let ids: std::collections::HashSet<String> =
+        hub.requests().await.into_iter().map(|r| r.id).collect();
+    assert_eq!(ids.len(), 3, "three attempts, three request ids");
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn retry_follows_the_classification_per_kind() {
+    // (hub code, command retried, query retried)
+    let cases = [
+        (ErrorCode::NoHandler, true, true),
+        (ErrorCode::ResourceExhausted, true, true),
+        (ErrorCode::HandlerDisconnected, false, true),
+        (ErrorCode::Timeout, false, true),
+        (ErrorCode::PermissionDenied, false, false),
+        (ErrorCode::HandlerError, false, false),
+    ];
+    for (code, command, query) in cases {
+        let hub = FakeHub::start().await;
+        let (sender, conn) = sender_with(
+            &hub,
+            SenderSettings {
+                retry: fast_retry(),
+                ..SenderSettings::default()
+            },
+        )
+        .await;
+        failing_then_ok(&hub, 1, code, r#"{"echoed":"x"}"#).await;
+        let c = sender
+            .send_command(&Ping { text: "x".into() }, SendOptions::default())
+            .await;
+        assert_eq!(c.is_ok(), command, "command after {code:?}: {c:?}");
+        let attempts_c = hub.requests().await.len();
+        assert_eq!(
+            attempts_c,
+            if command { 2 } else { 1 },
+            "command attempts after {code:?}"
+        );
+
+        failing_then_ok(&hub, 1, code, r#"{"n":1}"#).await;
+        let q = sender
+            .send_query(&Count { name: "a".into() }, SendOptions::default())
+            .await;
+        assert_eq!(q.is_ok(), query, "query after {code:?}: {q:?}");
+        let attempts_q = hub.requests().await.len() - attempts_c;
+        assert_eq!(
+            attempts_q,
+            if query { 2 } else { 1 },
+            "query attempts after {code:?}"
+        );
+        conn.shutdown().await;
+        hub.stop();
+    }
+}
+
+#[tokio::test]
+async fn retry_can_be_switched_per_call() {
+    let hub = FakeHub::start().await;
+    failing_then_ok(&hub, 1, ErrorCode::NoHandler, r#"{"echoed":"x"}"#).await;
+    let (sender, conn) = sender(&hub, None).await; // retry off in the settings
+    let ok = sender
+        .send_command(
+            &Ping { text: "x".into() },
+            SendOptions {
+                retry: Some(fast_retry()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(ok.is_ok(), "{ok:?}");
+    failing_then_ok(&hub, 1, ErrorCode::NoHandler, r#"{"echoed":"x"}"#).await;
+    let (sender2, conn2) = sender_with(
+        &hub,
+        SenderSettings {
+            retry: fast_retry(),
+            ..SenderSettings::default()
+        },
+    )
+    .await;
+    let off = sender2
+        .send_command(
+            &Ping { text: "x".into() },
+            SendOptions {
+                retry: Some(RetryPolicy::disabled()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(off, Err(MessagingError::NoHandler(_))), "{off:?}");
+    conn.shutdown().await;
+    conn2.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn all_attempts_stay_within_the_callers_budget() {
+    let hub = FakeHub::start().await;
+    failing_then_ok(&hub, 100, ErrorCode::NoHandler, "{}").await;
+    let policy = RetryPolicy {
+        max_attempts: 10,
+        initial_backoff: Duration::from_millis(200),
+        ..RetryPolicy::enabled()
+    };
+    let (sender, conn) = sender_with(
+        &hub,
+        SenderSettings {
+            retry: policy,
+            ..SenderSettings::default()
+        },
+    )
+    .await;
+    let started = std::time::Instant::now();
+    let err = sender
+        .send_command(
+            &Ping { text: "x".into() },
+            SendOptions {
+                timeout: Some(Duration::from_millis(500)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(err, MessagingError::NoHandler(_)),
+        "the last error is returned: {err:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "overran the budget: {elapsed:?}"
+    );
+    // Attempts at ~0 and ~200 ms; the next wait (400 ms) would overrun the 500 ms budget.
+    let sent = hub.requests().await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    // Each attempt carries what is left of the budget.
+    assert!(
+        sent[0].timeout_ms <= 500 && sent[0].timeout_ms > 450,
+        "{}",
+        sent[0].timeout_ms
+    );
+    assert!(
+        sent[1].timeout_ms <= 300 && sent[1].timeout_ms > 200,
+        "{}",
+        sent[1].timeout_ms
+    );
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn without_a_chosen_timeout_the_budget_is_the_hubs_bound_for_the_type() {
+    let hub = FakeHub::start().await;
+    hub.set_ack(Some(proto::RegisterAck {
+        type_timeouts_ms: [("t.Ping".to_string(), 250)].into(),
+        ..default_ack()
+    }));
+    failing_then_ok(&hub, 100, ErrorCode::NoHandler, "{}").await;
+    let policy = RetryPolicy {
+        max_attempts: 10,
+        initial_backoff: Duration::from_millis(100),
+        ..RetryPolicy::enabled()
+    };
+    let (sender, conn) = sender_with(
+        &hub,
+        SenderSettings {
+            retry: policy,
+            ..SenderSettings::default()
+        },
+    )
+    .await;
+    sender
+        .send_command(&Ping { text: "x".into() }, SendOptions::default())
+        .await
+        .unwrap_err();
+    let sent = hub.requests().await;
+    // Attempts at ~0 and ~100 ms; waiting 200 ms more would pass the 250 ms override.
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(
+        sent[0].timeout_ms <= 250 && sent[0].timeout_ms > 200,
+        "{}",
+        sent[0].timeout_ms
+    );
     conn.shutdown().await;
     hub.stop();
 }
