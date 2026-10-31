@@ -39,6 +39,7 @@ pub fn request_timing(
     chosen: Option<Duration>,
 ) -> (u32, Duration) {
     let ms = |d: Duration| d.as_millis().min(u32::MAX as u128) as u32;
+    let chosen = chosen.filter(|d| ms(*d) > 0);
     match handshake {
         Handshake::V2(ack) => {
             let sent = chosen.map(ms).unwrap_or(0);
@@ -59,6 +60,16 @@ pub fn request_timing(
             (ms(timeout), timeout + LOCAL_GUARD_MARGIN)
         }
     }
+}
+
+/// The timeout the caller chose: the per-call one, else the configured default. A zero duration
+/// counts as not chosen (it would mean an instant local guard).
+pub(crate) fn chosen_timeout(
+    per_call: Option<Duration>,
+    default: Option<Duration>,
+) -> Option<Duration> {
+    let set = |d: Option<Duration>| d.filter(|d| !d.is_zero());
+    set(per_call).or(set(default))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -204,7 +215,7 @@ impl Sender {
         {
             headers.insert(hub_headers::TRACEPARENT.to_string(), tp.clone());
         }
-        let chosen = opts.timeout.or(self.default_timeout);
+        let chosen = chosen_timeout(opts.timeout, self.default_timeout);
         let routing_key = opts.routing_key.unwrap_or_default();
 
         let (tx, rx) = oneshot::channel();
@@ -300,6 +311,20 @@ mod tests {
             request_timing(&h, "t.Quick", Some(S(4))),
             (4_000, MS(2_500))
         );
+    }
+
+    #[test]
+    fn zero_chosen_timeout_means_unset() {
+        assert_eq!(chosen_timeout(Some(MS(0)), Some(S(3))), Some(S(3)));
+        assert_eq!(chosen_timeout(Some(MS(0)), Some(MS(0))), None);
+        assert_eq!(chosen_timeout(None, Some(MS(0))), None);
+        assert_eq!(chosen_timeout(Some(S(2)), Some(S(3))), Some(S(2)));
+        // Defensive: a zero reaching the timing is treated as unset too.
+        assert_eq!(
+            request_timing(&Handshake::Legacy, "t.X", Some(MS(0))),
+            (5_000, S(6))
+        );
+        assert_eq!(request_timing(&ack(&[]), "t.X", Some(MS(0))), (0, S(61)));
     }
 
     #[test]

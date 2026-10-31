@@ -82,13 +82,17 @@ impl Config {
     /// `KRAKEN_OUTBOX_ENABLED`, `KRAKEN_OUTBOX_POLL_INTERVAL_MS`, `KRAKEN_OUTBOX_BATCH_SIZE`,
     /// `KRAKEN_OUTBOX_MAX_ATTEMPTS`, `KRAKEN_FORWARD_JWT`.
     pub fn from_env() -> Result<Config, MessagingError> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// [`Config::from_env`] over an arbitrary variable lookup (hermetic in tests).
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, MessagingError> {
         let required = |name: &str| {
-            std::env::var(name)
-                .ok()
+            lookup(name)
                 .filter(|v| !v.trim().is_empty())
                 .ok_or_else(|| MessagingError::InvalidMessage(format!("{name} is required")))
         };
-        let optional = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+        let optional = |name: &str| lookup(name).filter(|v| !v.trim().is_empty());
         let mut c = Config::new(
             &required("KRAKEN_SERVICE_NAME")?,
             &optional("KRAKEN_HUB_ADDRESS").unwrap_or_else(|| "static://kraken-hub:7000".into()),
@@ -101,7 +105,9 @@ impl Config {
         c.jwks_url = optional("KRAKEN_JWKS_URL");
         c.issuer = optional("KRAKEN_ISSUER");
         if let Some(v) = optional("KRAKEN_HUB_REQUEST_TIMEOUT_MS") {
-            c.hub_request_timeout = Some(millis("KRAKEN_HUB_REQUEST_TIMEOUT_MS", &v)?);
+            // 0 means "not chosen", like leaving it unset (the hub decides).
+            c.hub_request_timeout =
+                Some(millis("KRAKEN_HUB_REQUEST_TIMEOUT_MS", &v)?).filter(|d| !d.is_zero());
         }
         if let Some(v) = optional("KRAKEN_HEARTBEAT_INTERVAL_MS") {
             c.heartbeat_interval = millis("KRAKEN_HEARTBEAT_INTERVAL_MS", &v)?;
@@ -178,6 +184,37 @@ fn flag(name: &str, v: &str) -> Result<bool, MessagingError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn from(vars: &[(&str, &str)]) -> Config {
+        let vars: Vec<(String, String)> = [
+            ("KRAKEN_SERVICE_NAME", "svc"),
+            ("KRAKEN_MONGODB_URI", "mongodb://m/db"),
+        ]
+        .iter()
+        .chain(vars)
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        Config::from_lookup(|n| {
+            vars.iter()
+                .rev()
+                .find(|(k, _)| k == n)
+                .map(|(_, v)| v.clone())
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn zero_request_timeout_means_unset() {
+        assert_eq!(from(&[]).hub_request_timeout, None);
+        assert_eq!(
+            from(&[("KRAKEN_HUB_REQUEST_TIMEOUT_MS", "0")]).hub_request_timeout,
+            None
+        );
+        assert_eq!(
+            from(&[("KRAKEN_HUB_REQUEST_TIMEOUT_MS", "2500")]).hub_request_timeout,
+            Some(Duration::from_millis(2500))
+        );
+    }
 
     #[test]
     fn hub_defaults_follow_protocol_v2() {
