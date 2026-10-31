@@ -419,3 +419,75 @@ async fn shutdown_is_prompt_and_builder_exposes_database() {
         started.elapsed()
     );
 }
+
+#[derive(Serialize, Deserialize)]
+struct Stall {}
+message_type!(Stall, "t.Stall");
+impl Command for Stall {
+    type Reply = ();
+}
+
+/// Review fix 1: a request of A still in flight when A shuts down fails at once with
+/// `HubConnectionLost` (it was written; the outcome is unknown) instead of waiting for its local
+/// guard.
+#[tokio::test]
+async fn shutdown_fails_outgoing_requests_in_flight_with_hub_connection_lost() {
+    require_docker!();
+    let hub = support::containers::hub().await;
+    let mongo = support::containers::mongo().await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut cfg_b = config("svc-b", &hub.address, "127.0.0.1:1", &mongo.uri_for("b"));
+    cfg_b.outbox_enabled = false;
+    cfg_b.consumer_enabled = false;
+    let (s, r) = (Arc::clone(&started), Arc::clone(&release));
+    let b = KrakenMessaging::builder(cfg_b)
+        .await
+        .unwrap()
+        .command::<Stall, _, _>(move |_, _| {
+            let (s, r) = (Arc::clone(&s), Arc::clone(&r));
+            async move {
+                s.notify_one();
+                r.notified().await;
+                Ok(())
+            }
+        })
+        .start()
+        .await
+        .unwrap();
+    let mut cfg_a = config("svc-a", &hub.address, "127.0.0.1:1", &mongo.uri_for("a"));
+    cfg_a.outbox_enabled = false;
+    cfg_a.consumer_enabled = false;
+    let builder_a = KrakenMessaging::builder(cfg_a).await.unwrap();
+    let sender = builder_a.sender();
+    let a = builder_a.start().await.unwrap();
+    assert!(
+        a.await_hub(Duration::from_secs(15)).await && b.await_hub(Duration::from_secs(15)).await
+    );
+
+    let call = tokio::spawn(async move {
+        sender
+            .send_command(
+                &Stall {},
+                SendOptions {
+                    timeout: Some(Duration::from_secs(30)),
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("B never received the request");
+    a.shutdown().await;
+    let result = tokio::time::timeout(Duration::from_secs(3), call)
+        .await
+        .expect("the in-flight request outlived shutdown")
+        .unwrap();
+    assert!(
+        matches!(result, Err(MessagingError::HubConnectionLost(_))),
+        "{result:?}"
+    );
+    release.notify_one();
+    b.shutdown().await;
+}

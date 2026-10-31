@@ -292,6 +292,24 @@ impl Sender {
         }
     }
 
+    /// Fails every pending request with `HubConnectionLost` (used on shutdown, after the stream is
+    /// closed: every pending request was written to a stream that is now gone).
+    pub fn fail_all_lost(&self, reason: &str) {
+        let lost: Vec<Entry> = self
+            .pending
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, e)| e)
+            .collect();
+        for e in lost {
+            let _ = e.tx.send(Err(MessagingError::HubConnectionLost(format!(
+                "{reason} before the reply to '{}'; the outcome is unknown",
+                e.type_name
+            ))));
+        }
+    }
+
     /// Requests sent and not yet answered, failed or abandoned.
     pub fn in_flight(&self) -> usize {
         self.pending.lock().unwrap().len()

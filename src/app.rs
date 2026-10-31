@@ -158,8 +158,12 @@ impl KrakenMessaging {
         {
             tracing::warn!("handlers still running after 10 s, closing the hub stream anyway");
         }
-        self.cancel.cancel();
+        // Close the stream before stopping the inbound loop, then fail whatever is still pending:
+        // those requests were written, so the outcome is unknown (the Disconnected of the closed
+        // stream may still sit in the inbound queue when the loop stops).
         self.conn.shutdown().await;
+        self.sender.fail_all_lost("hub stream closed by shutdown");
+        self.cancel.cancel();
         for t in self.tasks {
             if tokio::time::timeout(Duration::from_secs(5), t)
                 .await

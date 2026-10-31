@@ -136,7 +136,7 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
   `events.publish_in` must come from it (the driver rejects sessions of another client).
 - **Verified identity** checks signature, `exp`, `nbf` and `iss`; `aud` is not validated (Keycloak sets it, Spring's
   decoder ignores it too). A JWKS outage is `UNAUTHENTICATED` for the caller, never an internal error with a URL.
-- **Shutdown** drains in-flight handlers (10 s bound), closes the hub stream, stops the publisher and the consumer.
+- **Shutdown** drains in-flight handlers (10 s bound), closes the hub stream, fails this instance's outgoing requests still in flight with `HubConnectionLost`, stops the publisher and the consumer.
 - **Start** does not wait for the hub. `await_hub(timeout)` tells you when the registration was
   confirmed; sends before that fail with `HubUnavailable`.
 - **Handshake** (hub protocol v2, ADR 0013): `Register` carries `protocol_version = 2`, an empty
