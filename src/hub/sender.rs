@@ -48,7 +48,13 @@ pub fn request_timing(
             } else {
                 ack.max_timeout_ms
             };
-            let limit = ack.type_timeouts_ms.get(type_name).copied().unwrap_or(max);
+            // A zero override is meaningless (the hub rejects it); fall back to the maximum.
+            let limit = ack
+                .type_timeouts_ms
+                .get(type_name)
+                .copied()
+                .filter(|&ms| ms > 0)
+                .unwrap_or(max);
             let bound = if sent > 0 { sent.min(limit) } else { limit };
             (
                 sent,
@@ -325,6 +331,13 @@ mod tests {
             (5_000, S(6))
         );
         assert_eq!(request_timing(&ack(&[]), "t.X", Some(MS(0))), (0, S(61)));
+    }
+
+    #[test]
+    fn zero_override_in_the_ack_is_ignored() {
+        let h = ack(&[("t.Zero", 0)]);
+        assert_eq!(request_timing(&h, "t.Zero", None), (0, S(61)));
+        assert_eq!(request_timing(&h, "t.Zero", Some(S(2))), (2_000, S(3)));
     }
 
     #[test]
