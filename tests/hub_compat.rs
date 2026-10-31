@@ -1,27 +1,41 @@
 //! Compatibility suite against real hub images (roadmap rule: every phase checks new clients
 //! against the new hub and against the previous hub image).
 //!
-//! - `kraken-hub:dev` (`KRAKEN_HUB_IMAGE`): protocol v2. The ack carries the configured values,
-//!   per-type timeout overrides apply to requests sent with `timeout_ms` 0, a request lost with the
-//!   stream is `HubConnectionLost`, one never written is `HubUnavailable`, and the client is back
-//!   within the 5 s backoff cap after a hub restart.
+//! - `kraken-hub:dev` (`KRAKEN_HUB_IMAGE`): protocol v2 with flow control. The ack carries the
+//!   configured values and shares `flow-control`, per-type timeout overrides apply to requests sent
+//!   with `timeout_ms` 0, a request lost with the stream is `HubConnectionLost`, one never written is
+//!   `HubUnavailable`, and the client is back within the 5 s backoff cap after a hub restart. Flow
+//!   control (P1): a slow handler with one permit turns a burst into latency (the topology shows the
+//!   instance flow-controlled with a queue), a full queue answers `HandlerBusy` and a retried command
+//!   gets through once it drains, retry never repeats a handler error or a timed-out command, and
+//!   queued requests are served by priority.
+//! - `kraken-hub:p0` (`KRAKEN_HUB_P0_IMAGE`): protocol v2 without flow control. The ack lists no
+//!   capability, no `Permits` are sent, the hub forwards without waiting and everything works as in
+//!   P0, reconnect included.
 //! - `kraken-hub:v1-baseline` (`KRAKEN_HUB_BASELINE_IMAGE`): the hub before protocol v2. The client
-//!   detects it (echo without ack) and works exactly as before.
+//!   detects it (echo without ack) and works exactly as before, without `Permits`.
 //!
-//! No Kafka or MongoDB: the participants are a `HubConnection` and a `Sender` each.
+//! A missing image fails the test with the command that builds it. No Kafka or MongoDB: the
+//! participants are a `HubConnection` and a `Sender` each; a pass-through (`PermitTap`) records the
+//! `Permits` a participant writes.
 mod support;
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use kraken_messaging::hub::{
-    CLIENT_VERSION, Handshake, HubConnection, HubSettings, Inbound, SendOptions, Sender,
+    CLIENT_VERSION, Handshake, HubConnection, HubSettings, Inbound, PERMIT_FLUSH_AFTER,
+    SendOptions, Sender, SenderSettings,
 };
 use kraken_messaging::proto::{self, ClientMessage, client_message, reply};
-use kraken_messaging::{Command, MessagingError, message_type};
+use kraken_messaging::{Command, MessagingError, Query, RetryPolicy, message_type};
 use serde::{Deserialize, Serialize};
 use support::containers::{HubContainer, HubImage, HubOptions, free_port, hub_with};
 use tokio::sync::mpsc;
+use tokio_stream::{Stream, StreamExt};
+use tonic::Status;
 
 macro_rules! require_docker {
     () => {
@@ -105,6 +119,7 @@ async fn peer(address: &str, service: &str, commands: &[&str]) -> Peer {
                                 })),
                             })
                             .await;
+                        reply_to.grant().await; // a flow-controlled hub needs the permit back
                     });
                 }
                 other => forward.on_inbound(other),
@@ -177,7 +192,11 @@ async fn new_hub_acks_with_its_configured_values_and_applies_type_overrides() {
     };
     assert_eq!(ack.hub_id, "compat-hub");
     assert_eq!(ack.protocol_version, 2);
-    assert!(ack.capabilities.is_empty());
+    assert_eq!(
+        ack.capabilities,
+        ["flow-control"],
+        "the hub shares what we declared"
+    );
     assert_eq!(ack.heartbeat_interval_ms, 3_000);
     assert_eq!(ack.heartbeat_timeout_ms, 10_000);
     assert_eq!(ack.default_timeout_ms, 5_000);
@@ -342,9 +361,25 @@ async fn baseline_hub_runs_in_legacy_mode_without_regression() {
 #[tokio::test]
 async fn reconnects_within_the_backoff_cap_after_a_hub_restart() {
     require_docker!();
+    reconnects_within_the_backoff_cap(HubImage::Current).await;
+}
+
+#[tokio::test]
+async fn p0_hub_reconnects_within_the_backoff_cap_after_a_hub_restart() {
+    require_docker!();
+    reconnects_within_the_backoff_cap(HubImage::P0).await;
+}
+
+#[tokio::test]
+async fn baseline_hub_reconnects_within_the_backoff_cap_after_a_hub_restart() {
+    require_docker!();
+    reconnects_within_the_backoff_cap(HubImage::Baseline).await;
+}
+
+async fn reconnects_within_the_backoff_cap(image: HubImage) {
     support::init_tracing();
     let port = free_port();
-    let hub = hub_with(HubOptions::new(HubImage::Current).port(port)).await;
+    let hub = hub_with(HubOptions::new(image).port(port)).await;
     let b = peer(&hub.address, "compat-b", &["compat.Fast"]).await;
     let a = peer(&hub.address, "compat-a", &[]).await;
 
@@ -365,7 +400,13 @@ async fn reconnects_within_the_backoff_cap_after_a_hub_restart() {
     );
     let took = ready.elapsed();
     assert!(ra && rb, "did not re-register after the hub restart");
-    eprintln!("re-registered {took:?} after the restarted hub was reachable");
+    eprintln!("{image:?}: re-registered {took:?} after the restarted hub was reachable");
+    let handshake = a.conn.handshake().unwrap();
+    assert_eq!(
+        handshake.is_legacy(),
+        image == HubImage::Baseline,
+        "{handshake:?}"
+    );
     // Cap 5 s (jitter never exceeds it) plus connect and handshake time.
     assert!(
         took <= Duration::from_millis(5_500),
@@ -377,4 +418,642 @@ async fn reconnects_within_the_backoff_cap_after_a_hub_restart() {
         .expect("round trip after the restart");
     a.shutdown().await;
     b.shutdown().await;
+}
+
+// ---- P1: flow control, priority, retry ----
+
+#[derive(Serialize, Deserialize)]
+struct FlowSlow {}
+message_type!(FlowSlow, "flow.Slow");
+impl Command for FlowSlow {
+    type Reply = ();
+}
+
+#[derive(Serialize, Deserialize)]
+struct FlowGate {}
+message_type!(FlowGate, "flow.Gate");
+impl Command for FlowGate {
+    type Reply = ();
+}
+
+#[derive(Serialize, Deserialize)]
+struct FlowRec {
+    label: String,
+}
+message_type!(FlowRec, "flow.Rec");
+impl Command for FlowRec {
+    type Reply = ();
+}
+
+#[derive(Serialize, Deserialize)]
+struct FlowFail {}
+message_type!(FlowFail, "flow.Fail");
+impl Command for FlowFail {
+    type Reply = ();
+}
+
+#[derive(Serialize, Deserialize)]
+struct FlowHang {}
+message_type!(FlowHang, "flow.Hang");
+impl Command for FlowHang {
+    type Reply = ();
+}
+
+#[derive(Serialize, Deserialize)]
+struct FlowHangQuery {}
+message_type!(FlowHangQuery, "flow.HangQuery");
+impl Query for FlowHangQuery {
+    type Reply = ();
+}
+
+const FLOW_COMMANDS: &[&str] = &[
+    "flow.Slow",
+    "flow.Gate",
+    "flow.Rec",
+    "flow.Fail",
+    "flow.Hang",
+];
+const FLOW_QUERIES: &[&str] = &["flow.HangQuery"];
+
+/// What a flow peer handled, in the order it started handling: (type, payload, priority).
+type Handled = Arc<std::sync::Mutex<Vec<(String, String, i32)>>>;
+
+struct FlowPeer {
+    peer: Peer,
+    handled: Handled,
+    /// Opens `flow.Gate` handlers, one per permit added.
+    gate: Arc<tokio::sync::Semaphore>,
+    /// Most handlers that ran at the same time.
+    max_in_flight: Arc<AtomicUsize>,
+}
+
+/// A participant offering `permits` concurrent handlers (`max_concurrent_handlers`, which is also
+/// `Register.initial_permits`). As a handler (`handles`) it registers the `flow.*` types:
+/// `flow.Slow` takes 300 ms, `flow.Gate` waits for a permit of `gate`, `flow.Rec` 20 ms,
+/// `flow.Fail` answers `HANDLER_ERROR "handler busy"` (the v1 text of a full hub), `flow.Hang` and
+/// `flow.HangQuery` 30 s. Every finished request grants its permit back, like the library does.
+/// `retry` is the sender's configured default.
+async fn flow_peer(
+    address: &str,
+    service: &str,
+    handles: bool,
+    permits: usize,
+    retry: RetryPolicy,
+) -> FlowPeer {
+    let (tx, mut rx) = mpsc::channel::<Inbound>(256);
+    let settings = HubSettings {
+        address: address.to_string(),
+        backoff_min: Duration::from_millis(500),
+        backoff_max: Duration::from_secs(5),
+        max_concurrent_handlers: permits,
+        ..HubSettings::default()
+    };
+    let conn = HubConnection::new(
+        settings,
+        service.to_string(),
+        uuid::Uuid::new_v4().to_string(),
+        tx,
+    );
+    if handles {
+        let names = |types: &[&str]| types.iter().map(|t| t.to_string()).collect();
+        conn.set_types(names(FLOW_COMMANDS), names(FLOW_QUERIES));
+    }
+    let sender = Sender::with_settings(
+        Arc::clone(&conn),
+        SenderSettings {
+            forward_jwt: false,
+            retry,
+            ..SenderSettings::default()
+        },
+    );
+    let handled: Handled = Arc::default();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
+    let forward = Arc::clone(&sender);
+    let (log, g, now, max) = (
+        Arc::clone(&handled),
+        Arc::clone(&gate),
+        Arc::clone(&in_flight),
+        Arc::clone(&max_in_flight),
+    );
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                Inbound::Request { request, reply_to } => {
+                    let (log, g, now, max) = (
+                        Arc::clone(&log),
+                        Arc::clone(&g),
+                        Arc::clone(&now),
+                        Arc::clone(&max),
+                    );
+                    tokio::spawn(async move {
+                        max.fetch_max(now.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                        log.lock().unwrap().push((
+                            request.r#type.clone(),
+                            String::from_utf8_lossy(&request.payload).into_owned(),
+                            request.priority,
+                        ));
+                        let result = match request.r#type.as_str() {
+                            "flow.Slow" => {
+                                tokio::time::sleep(Duration::from_millis(300)).await;
+                                reply::Result::Payload(b"{}".to_vec())
+                            }
+                            "flow.Gate" => {
+                                g.acquire().await.unwrap().forget();
+                                reply::Result::Payload(b"{}".to_vec())
+                            }
+                            "flow.Rec" => {
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                                reply::Result::Payload(b"{}".to_vec())
+                            }
+                            "flow.Fail" => reply::Result::Error(proto::Error {
+                                request_id: request.id.clone(),
+                                code: proto::ErrorCode::HandlerError as i32,
+                                message: "handler busy".into(),
+                                details: vec![],
+                            }),
+                            _ => {
+                                tokio::time::sleep(Duration::from_secs(30)).await;
+                                reply::Result::Payload(b"{}".to_vec())
+                            }
+                        };
+                        now.fetch_sub(1, Ordering::SeqCst);
+                        let _ = reply_to
+                            .send(ClientMessage {
+                                message: Some(client_message::Message::Reply(proto::Reply {
+                                    request_id: request.id,
+                                    result: Some(result),
+                                })),
+                            })
+                            .await;
+                        reply_to.grant().await;
+                    });
+                }
+                other => forward.on_inbound(other),
+            }
+        }
+    });
+    conn.start();
+    assert!(
+        conn.await_registered(Duration::from_secs(15)).await,
+        "{service} did not register"
+    );
+    FlowPeer {
+        peer: Peer { conn, sender },
+        handled,
+        gate,
+        max_in_flight,
+    }
+}
+
+impl FlowPeer {
+    fn count(&self, type_name: &str) -> usize {
+        self.handled
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(t, _, _)| t == type_name)
+            .count()
+    }
+
+    /// Waits until `n` requests reached the handler (bounded by 10 s).
+    async fn handled_at_least(&self, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.handled.lock().unwrap().len() < n {
+            assert!(
+                Instant::now() < deadline,
+                "only {:?} handled",
+                self.handled.lock().unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+/// A gRPC pass-through between one participant and a real hub that adds up the `Permits` the
+/// participant writes: a hub image gives no view of what a client sent.
+struct PermitTap {
+    address: String,
+    permits: Arc<AtomicU64>,
+}
+
+impl PermitTap {
+    async fn start(upstream: &str) -> PermitTap {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tap = Tap {
+            upstream: upstream.replace("static://", "http://"),
+            permits: Arc::default(),
+        };
+        let permits = Arc::clone(&tap.permits);
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(proto::hub_server::HubServer::new(tap))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        PermitTap {
+            address: format!("static://{addr}"),
+            permits,
+        }
+    }
+
+    /// Permits written so far (the sum of the counts).
+    fn permits(&self) -> u64 {
+        self.permits.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Clone)]
+struct Tap {
+    upstream: String,
+    permits: Arc<AtomicU64>,
+}
+
+impl Tap {
+    /// The RPC is called `Connect`, so the generated client has no `connect(url)` constructor.
+    async fn hub(&self) -> Result<proto::hub_client::HubClient<tonic::transport::Channel>, Status> {
+        let channel = tonic::transport::Endpoint::from_shared(self.upstream.clone())
+            .map_err(|e| Status::internal(e.to_string()))?
+            .connect()
+            .await
+            .map_err(|e| Status::unavailable(e.to_string()))?;
+        Ok(proto::hub_client::HubClient::new(channel))
+    }
+}
+
+#[tonic::async_trait]
+impl proto::hub_server::Hub for Tap {
+    type ConnectStream =
+        Pin<Box<dyn Stream<Item = Result<proto::ServerMessage, Status>> + Send + 'static>>;
+
+    async fn connect(
+        &self,
+        request: tonic::Request<tonic::Streaming<ClientMessage>>,
+    ) -> Result<tonic::Response<Self::ConnectStream>, Status> {
+        let permits = Arc::clone(&self.permits);
+        let outbound = request.into_inner().map_while(Result::ok).map(move |m| {
+            if let Some(client_message::Message::Permits(p)) = &m.message {
+                permits.fetch_add(p.count.into(), Ordering::SeqCst);
+            }
+            m
+        });
+        let inbound = self.hub().await?.connect(outbound).await?.into_inner();
+        Ok(tonic::Response::new(Box::pin(inbound)))
+    }
+
+    async fn topology(
+        &self,
+        request: tonic::Request<proto::TopologyRequest>,
+    ) -> Result<tonic::Response<proto::TopologyResponse>, Status> {
+        self.hub().await?.topology(request.into_inner()).await
+    }
+}
+
+/// `service`'s only instance in the hub's topology.
+async fn instance_view(hub: &HubContainer, service: &str) -> serde_json::Value {
+    let t = topology(hub).await;
+    t["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["serviceName"] == service)
+        .unwrap_or_else(|| panic!("{service} not in {t}"))["instances"][0]
+        .clone()
+}
+
+/// Waits until the hub's topology shows `count` requests queued for `service` (bounded by 10 s).
+async fn await_queued(hub: &HubContainer, service: &str, count: u64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let view = instance_view(hub, service).await;
+        if view["queued"].as_u64().unwrap_or(0) >= count {
+            return;
+        }
+        assert!(Instant::now() < deadline, "never {count} queued: {view}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn no_retry() -> RetryPolicy {
+    RetryPolicy::disabled()
+}
+
+#[tokio::test]
+async fn new_hub_turns_a_slow_handler_with_one_permit_into_latency_not_timeouts() {
+    require_docker!();
+    let hub = hub_with(HubOptions::new(HubImage::Current)).await;
+    let tap = PermitTap::start(&hub.address).await;
+    let b = flow_peer(&tap.address, "flow-b", true, 1, no_retry()).await;
+    let a = flow_peer(&hub.address, "flow-a", false, 256, no_retry()).await;
+    let handshake = b.peer.conn.handshake().unwrap();
+    assert!(handshake.flow_control(), "{handshake:?}");
+
+    let started = Instant::now();
+    let calls: Vec<_> = (0..5)
+        .map(|_| {
+            let s = Arc::clone(&a.peer.sender);
+            tokio::spawn(async move { s.send_command(&FlowSlow {}, SendOptions::default()).await })
+        })
+        .collect();
+    // While they wait, the hub shows the instance as flow-controlled with its queue.
+    let mut saw_queue = false;
+    for _ in 0..20 {
+        let view = instance_view(&hub, "flow-b").await;
+        assert_eq!(view["flowControlled"], true, "{view}");
+        assert!(view["permitsAvailable"].as_u64().unwrap() <= 1, "{view}");
+        saw_queue |= view["queued"].as_u64().unwrap() > 0;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for c in calls {
+        c.await.unwrap().expect("queued, not timed out");
+    }
+    let elapsed = started.elapsed();
+    eprintln!("5 calls to a 300 ms handler with one permit took {elapsed:?}");
+    assert!(saw_queue, "the hub never queued a request");
+    assert!(
+        elapsed >= Duration::from_millis(1_500),
+        "five 300 ms requests with one permit finished in {elapsed:?}"
+    );
+    assert_eq!(b.max_in_flight.load(Ordering::SeqCst), 1, "one at a time");
+    // The last grant leaves in its batch, up to PERMIT_FLUSH_AFTER after the last reply.
+    tokio::time::sleep(PERMIT_FLUSH_AFTER * 3).await;
+    assert!(
+        tap.permits() >= 5,
+        "one permit back per request, got {}",
+        tap.permits()
+    );
+    a.peer.shutdown().await;
+    b.peer.shutdown().await;
+}
+
+#[tokio::test]
+async fn new_hub_full_queue_is_handler_busy_and_a_retried_command_gets_through() {
+    require_docker!();
+    let hub = hub_with(
+        HubOptions::new(HubImage::Current).env("KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE", "1"),
+    )
+    .await;
+    let b = flow_peer(&hub.address, "flow-b", true, 1, no_retry()).await;
+    let a = flow_peer(&hub.address, "flow-a", false, 256, no_retry()).await;
+    let gated = || {
+        let s = Arc::clone(&a.peer.sender);
+        tokio::spawn(async move { s.send_command(&FlowGate {}, SendOptions::default()).await })
+    };
+    let rec = || FlowRec {
+        label: "after-busy".into(),
+    };
+
+    let first = gated(); // takes the only permit
+    b.handled_at_least(1).await;
+    let second = gated(); // fills the queue (capacity 1)
+    await_queued(&hub, "flow-b", 1).await;
+
+    let busy = a
+        .peer
+        .sender
+        .send_command(
+            &rec(),
+            SendOptions {
+                retry: Some(RetryPolicy::disabled()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(busy, Err(MessagingError::HandlerBusy(ref t)) if t == "flow.Rec"),
+        "{busy:?}"
+    );
+
+    let retried = {
+        let s = Arc::clone(&a.peer.sender);
+        let command = rec();
+        tokio::spawn(async move {
+            s.send_command(
+                &command,
+                SendOptions {
+                    timeout: Some(Duration::from_secs(10)),
+                    retry: Some(RetryPolicy {
+                        max_attempts: 10,
+                        initial_backoff: Duration::from_millis(200),
+                        ..RetryPolicy::enabled()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    b.gate.add_permits(2); // the queue drains; a later attempt finds room
+    tokio::time::timeout(Duration::from_secs(15), retried)
+        .await
+        .expect("retried command still pending")
+        .unwrap()
+        .expect("retried past the full queue");
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    assert_eq!(
+        b.count("flow.Rec"),
+        1,
+        "rejected attempts never reached the handler"
+    );
+    a.peer.shutdown().await;
+    b.peer.shutdown().await;
+}
+
+#[tokio::test]
+async fn new_hub_retry_never_repeats_a_handler_error_or_a_timed_out_command() {
+    require_docker!();
+    // The hub ends both hang types after 300 ms, well inside the 3 s budget the caller chooses, so
+    // only the classification can stop a retry (a query is retried, a command is not).
+    let hub = hub_with(HubOptions::new(HubImage::Current).env(
+        "KRAKEN_HUB_TIMEOUT_OVERRIDES",
+        "flow.Hang=300,flow.HangQuery=300",
+    ))
+    .await;
+    let b = flow_peer(&hub.address, "flow-b", true, 8, no_retry()).await;
+    let retry = RetryPolicy {
+        max_attempts: 3,
+        initial_backoff: Duration::from_millis(50),
+        ..RetryPolicy::enabled()
+    };
+    let a = flow_peer(&hub.address, "flow-a", false, 256, retry).await;
+    let budget = || SendOptions {
+        timeout: Some(Duration::from_secs(3)),
+        ..Default::default()
+    };
+
+    let failed = a.peer.sender.send_command(&FlowFail {}, budget()).await;
+    assert!(
+        matches!(failed, Err(MessagingError::RemoteHandler { ref message, .. }) if message == "handler busy"),
+        "{failed:?}"
+    );
+
+    let started = Instant::now();
+    let timed_out = a.peer.sender.send_command(&FlowHang {}, budget()).await;
+    assert!(
+        matches!(timed_out, Err(MessagingError::Timeout(ref t)) if t == "flow.Hang"),
+        "{timed_out:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+
+    let query = a.peer.sender.send_query(&FlowHangQuery {}, budget()).await;
+    assert!(
+        matches!(query, Err(MessagingError::Timeout(_))),
+        "{query:?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(b.count("flow.Fail"), 1, "a handler error is not retried");
+    assert_eq!(
+        b.count("flow.Hang"),
+        1,
+        "a timed-out command is not retried"
+    );
+    assert_eq!(b.count("flow.HangQuery"), 3, "a timed-out query is retried");
+    a.peer.shutdown().await;
+    b.peer.shutdown().await;
+}
+
+#[tokio::test]
+async fn new_hub_serves_queued_requests_by_priority() {
+    require_docker!();
+    let hub = hub_with(HubOptions::new(HubImage::Current)).await;
+    let b = flow_peer(&hub.address, "flow-b", true, 1, no_retry()).await;
+    let a = flow_peer(&hub.address, "flow-a", false, 256, no_retry()).await;
+
+    // B's only permit is taken by a request that waits for the gate.
+    let blocker = {
+        let s = Arc::clone(&a.peer.sender);
+        tokio::spawn(async move { s.send_command(&FlowGate {}, SendOptions::default()).await })
+    };
+    b.handled_at_least(1).await;
+    // Three more queue at the hub, in this arrival order: low, low, high.
+    let mut queued = Vec::new();
+    for (n, (label, priority)) in [("low-1", 0), ("low-2", 0), ("high", 10)]
+        .into_iter()
+        .enumerate()
+    {
+        let s = Arc::clone(&a.peer.sender);
+        queued.push(tokio::spawn(async move {
+            let command = FlowRec {
+                label: label.into(),
+            };
+            let opts = SendOptions {
+                priority: Some(priority),
+                ..Default::default()
+            };
+            s.send_command(&command, opts).await
+        }));
+        await_queued(&hub, "flow-b", n as u64 + 1).await;
+    }
+    b.gate.add_permits(1);
+    blocker.await.unwrap().unwrap();
+    for q in queued {
+        q.await.unwrap().unwrap();
+    }
+    let order: Vec<(String, i32)> = b
+        .handled
+        .lock()
+        .unwrap()
+        .iter()
+        .skip(1)
+        .map(|(_, payload, priority)| {
+            let body: serde_json::Value = serde_json::from_str(payload).unwrap();
+            (body["label"].as_str().unwrap().to_string(), *priority)
+        })
+        .collect();
+    assert_eq!(
+        order,
+        [
+            ("high".to_string(), 10),
+            ("low-1".to_string(), 0),
+            ("low-2".to_string(), 0)
+        ],
+        "higher priority first, then arrival"
+    );
+    a.peer.shutdown().await;
+    b.peer.shutdown().await;
+}
+
+/// Older hubs (P0: v2 without flow control; v1 baseline) ignore the new `Register` fields and
+/// forward without permits: the P1 client sends no `Permits`, never stalls and works as before.
+async fn older_hub_works_as_before(image: HubImage) {
+    let hub = hub_with(HubOptions::new(image)).await;
+    let tap = PermitTap::start(&hub.address).await;
+    let b = flow_peer(&tap.address, "flow-b", true, 2, no_retry()).await;
+    let a = flow_peer(&hub.address, "flow-a", false, 256, no_retry()).await;
+    let handshake = b.peer.conn.handshake().unwrap();
+    assert!(!handshake.flow_control(), "{handshake:?}");
+    match image {
+        HubImage::Baseline => assert!(handshake.is_legacy(), "{handshake:?}"),
+        _ => {
+            let ack = handshake.ack().expect("a v2 ack");
+            assert_eq!(ack.protocol_version, 2);
+            assert!(ack.capabilities.is_empty(), "{ack:?}");
+        }
+    }
+
+    // More requests than the permits offered: an older hub forwards them all at once.
+    let started = Instant::now();
+    let calls: Vec<_> = (0..6)
+        .map(|i| {
+            let s = Arc::clone(&a.peer.sender);
+            tokio::spawn(async move {
+                let opts = SendOptions {
+                    priority: Some(i % 3), // ignored by an older hub
+                    ..Default::default()
+                };
+                s.send_command(&FlowSlow {}, opts).await
+            })
+        })
+        .collect();
+    for c in calls {
+        c.await.unwrap().expect("round trip through an older hub");
+    }
+    eprintln!(
+        "{image:?}: 6 calls to a 300 ms handler offering 2 permits took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(b.count("flow.Slow"), 6);
+    assert!(
+        b.max_in_flight.load(Ordering::SeqCst) > 2,
+        "an older hub does not wait for permits"
+    );
+    let unknown = a
+        .peer
+        .sender
+        .send_command(&Fast {}, SendOptions::default())
+        .await;
+    assert!(
+        matches!(unknown, Err(MessagingError::NoHandler(_))),
+        "{unknown:?}"
+    );
+    tokio::time::sleep(PERMIT_FLUSH_AFTER * 3).await;
+    assert_eq!(
+        tap.permits(),
+        0,
+        "permits sent to a hub without flow control"
+    );
+    a.peer.shutdown().await;
+    b.peer.shutdown().await;
+}
+
+#[tokio::test]
+async fn p0_hub_acks_without_flow_control_and_works_as_before() {
+    require_docker!();
+    older_hub_works_as_before(HubImage::P0).await;
+}
+
+#[tokio::test]
+async fn baseline_hub_works_as_before_without_flow_control() {
+    require_docker!();
+    older_hub_works_as_before(HubImage::Baseline).await;
 }

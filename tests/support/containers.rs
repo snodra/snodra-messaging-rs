@@ -51,6 +51,9 @@ pub enum HubImage {
     /// The previous hub release, for compatibility tests: `KRAKEN_HUB_BASELINE_IMAGE`, default
     /// `kraken-hub:v1-baseline` (the hub before protocol v2).
     Baseline,
+    /// The merged P0 hub (protocol v2 without flow control): `KRAKEN_HUB_P0_IMAGE`, default
+    /// `kraken-hub:p0`.
+    P0,
 }
 
 impl HubImage {
@@ -61,6 +64,9 @@ impl HubImage {
             }
             HubImage::Baseline => std::env::var("KRAKEN_HUB_BASELINE_IMAGE")
                 .unwrap_or_else(|_| "kraken-hub:v1-baseline".to_string()),
+            HubImage::P0 => {
+                std::env::var("KRAKEN_HUB_P0_IMAGE").unwrap_or_else(|_| "kraken-hub:p0".to_string())
+            }
         }
     }
 
@@ -71,6 +77,9 @@ impl HubImage {
             }
             HubImage::Baseline => {
                 "tag the previous hub release, e.g. `git worktree add /tmp/hub-v1 <tag> && docker build -t kraken-hub:v1-baseline /tmp/hub-v1` (or set KRAKEN_HUB_BASELINE_IMAGE)"
+            }
+            HubImage::P0 => {
+                "build the merged P0 hub and tag it `kraken-hub:p0` (or set KRAKEN_HUB_P0_IMAGE)"
             }
         }
     }
