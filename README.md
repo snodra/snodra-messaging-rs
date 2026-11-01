@@ -27,6 +27,7 @@ indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
 | Connect to every hub of a list or a DNS name, route and fail over between them | `hub::HubPool` |
 | Send commands and queries, typed replies, timeouts, error mapping | `hub::Sender` (`app.commands()`, `app.queries()`) |
 | Shared query types and scatter-gather queries | `shared_query`, `Sender::scatter_gather` (see [Scatter-gather](#scatter-gather)) |
+| Streaming queries under the caller's credits | `streaming_query`, `Sender::stream` (see [Streaming queries](#streaming-queries)) |
 | Publish events through the Mongo outbox, relay to Kafka | `kafka::EventBus`, `kafka::OutboxPublisher` |
 | Consume events idempotently (marker + handler in one transaction) | `kafka::EventConsumer` |
 | Identity from the forwarded JWT: JWKS verification or unverified parsing; handler guards | `identity::{IdentityResolver, JwksVerifier, Guard}` |
@@ -39,6 +40,7 @@ indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
 - [Semantics worth knowing](#semantics-worth-knowing)
 - [Multiple hubs](#multiple-hubs)
 - [Scatter-gather](#scatter-gather)
+- [Streaming queries](#streaming-queries)
 - [Build and test](#build-and-test)
 - [Example](#example)
 - [CI/CD pipeline](#cicd-pipeline)
@@ -337,6 +339,92 @@ while let Some(part) = parts.next().await { let part = part?; /* ... */ }
   (`HubUnavailable`, `NoHandler`, `HandlerBusy`, `HandlerDisconnected`, `Timeout`,
   `HubConnectionLost`): a retry is a new gather with a fresh id, collected from scratch, within the
   same budget. The stream retries only until its first part; after that an error ends it.
+
+## Streaming queries
+
+A query whose result is a flow of items from one instance of one owner, under the caller's
+back-pressure ([ADR 0017, P4b](../kraken/docs/adr/0017-query-modes-and-shared-query-types.md)),
+the counterpart of kraken-messaging's streaming query API.
+
+```rust
+use futures::StreamExt;
+use kraken_messaging::{StreamOptions, StreamingQuery};
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Export { since: chrono::DateTime<chrono::Utc> }
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Row { id: String }
+message_type!(Export, "files.Export");
+impl StreamingQuery for Export { type Item = Row; }
+
+// Handler side: return any `Stream<Item = Result<Row, MessagingError>>`; it is pulled only while
+// the sender has credit. An `Err` item ends the stream with that error.
+let app = KrakenMessaging::builder(config).await?
+    .streaming_query::<Export, _, _, _>(|q, ctx| async move { Ok(rows_since(q.since)) })
+    // .shared_streaming_query::<Search, _, _, _>(..)   // many services may own it
+    .start().await?;
+
+// Sender side: the open waits for the first item (or the end, or a failure); then pull.
+let mut rows = app.queries().stream(&Export { since }, StreamOptions {
+    timeout: None,         // idle timeout (hub-side, reset by every part); else Config.hub_request_timeout, else the hub's
+    max_results: 0,        // end after this many items (the hub cancels the handler); 0: no limit
+    priority: None,        // else KRAKEN_HUB_PRIORITIES for the type, else 0
+    initial_credit: 64,    // the credit window; half of it is refilled every time half was consumed
+}).await?;
+while let Some(row) = rows.next().await { let row = row?; /* in the handler's order */ }
+```
+
+| API | Signature |
+|---|---|
+| Trait | `trait StreamingQuery: MessageType + Serialize + DeserializeOwned + Send + Sync + 'static { type Item: Serialize + DeserializeOwned + Send + 'static; }` |
+| Register a handler | `KrakenMessagingBuilder::streaming_query::<Q, F, Fut, S>(handler) -> Self` and `shared_streaming_query` (also on `HandlerRegistry`), with `F: Fn(Q, MessageContext) -> Fut`, `Fut: Future<Output = Result<S, MessagingError>>`, `S: Stream<Item = Result<Q::Item, MessagingError>> + Send + 'static` (a `BoxStream` fits) |
+| Registered types | `HandlerRegistry::streaming_query_types()` (exclusive and shared); `registered_types() -> RegisteredTypes { commands, queries, shared_queries, streaming_queries }`: `streaming_queries` are the exclusive streaming types, announced in `Register.query_types` with `queries`; a shared streaming type is in `shared_queries` like any shared query (the hub does not tell a streaming type from a unary one: the mode is the sender's choice) |
+| Stream | `Sender::stream<Q: StreamingQuery>(&self, &Q, StreamOptions) -> Result<BoxStream<'_, Result<Q::Item, MessagingError>>, MessagingError>` (`async`) |
+| Options | `StreamOptions { timeout: Option<Duration>, max_results: u32, priority: Option<i32>, initial_credit: u32 }` (`Default`: `initial_credit` 64, `hub::DEFAULT_CREDIT`; 0 reads as 64) |
+| Errors | `MessagingError::UnsupportedByHub`, `NoHandler`, `InvalidMessage`, `Timeout`, `RemoteHandler`, `HandlerDisconnected`, `HandlerBusy`, `Cancelled` (the hub's max stream duration), `HubUnavailable`, `HubConnectionLost`, `Serialization` |
+
+- **Capability.** The client declares `streaming`, as sender and as handler. A stream goes only
+  to a hub whose `RegisterAck` lists it (`Handshake::streaming`), checked again on the very
+  stream it is written to; with none (a P4a or older hub, a legacy hub) `stream` fails at once
+  with `UnsupportedByHub`, nothing sent. The hub streams only to an instance that negotiated
+  `streaming` and lists the type: an owner whose instances run an older library is
+  `UnsupportedByHub` too (the hub names the services). Unary queries and gathers are untouched.
+- **One handler, one instance.** The hub picks one capable instance as for a point query (on a
+  shared type, one pool over every owner). The handler gets `Request{id = <id>#1, mode =
+  STREAMING, initial_credit}` and only a streaming handler serves it: a unary query to a
+  streaming type, or a stream to a unary type, is `NoHandler` on that instance (a type has one
+  handler, whatever its kind; the sender's retry may find another instance).
+- **Credits.** The handler's stream is pulled only while there is credit (`initial_credit` plus
+  every `Flow`), one `ReplyPart` per item (`seq` from 1), then `ReplyEnd`; the end of its stream
+  is found by a poll, which needs one credit beyond the last item. The sender refills
+  `max(1, initial_credit / 2)` credits every time that many items were pulled by the caller (not
+  on arrival), so a handler never runs more than a window ahead of the consumer and always gets
+  the credit to find its end. Items use the unary reply codec (`()` accepts `{}`).
+- **Open.** `stream().await` returns once the first item is in (or the end: an empty stream), so
+  everything before that is the call's error: `UnsupportedByHub`, `NoHandler` (no owner),
+  `InvalidMessage` (a command type), `Timeout` (no first item within the idle timeout), the
+  handler's error (`RemoteHandler`, ...), `HubUnavailable` / `HubConnectionLost`.
+- **Endings.** The stream ends on the hub's `ReplyEnd`; with an error it is the last item, mapped
+  like a unary error of that code: `Timeout` (the idle timeout, from the forward and reset by every
+  part), `RemoteHandler` (the handler's `Err` item, or a part beyond the credit: `InvalidMessage`),
+  `HandlerDisconnected` (the handler left), `Cancelled` (`KRAKEN_HUB_MAX_STREAM_DURATION`). A hub
+  stream lost after the first item is `HubConnectionLost`, a part that does not decode
+  `Serialization` (the handler is cancelled). After `max_results` items the hub ends the stream
+  and cancels the handler. The local guard (the hub's bound plus 1 s) is an idle guard.
+- **Cancel.** Dropping the stream before its end sends `Cancel{id, "dropped by the sender"}`
+  (best effort, from the drop) and forgets the request, also when the open is dropped while its
+  write is still blocked. A handler whose stream is cancelled by the hub (the sender dropped it or
+  left, `max_results`, the idle timeout, the hub's limits) has its stream dropped and sends
+  nothing more; the hub's `Cancel` for a unary or scatter-gather target (a gather that ended
+  early) aborts that handler too. The handler permit (`max_concurrent_handlers`, and the hub's)
+  is held for the whole stream and released on every ending path.
+- **Retry.** `Config.hub_retry` applies until the first item, for the same errors as a unary query
+  (`HubUnavailable`, `NoHandler`, `HandlerBusy`, `HandlerDisconnected`, `Timeout`,
+  `HubConnectionLost`): a retry is a new stream with a fresh id; a hub stream lost while the
+  request still sat in its outbound buffer moves to the next capable hub with the same id, as a
+  unary request. Nothing is retried after the first item.
+- **Compat.** Against a P3 / P4a hub `stream` fails with `UnsupportedByHub` (`tests/hub_compat.rs`);
+  the P4b hub serves it (`tests/e2e_stream.rs`, image `kraken-hub:p4b-hub`, `KRAKEN_HUB_P4B_IMAGE`).
 
 ## Build and test
 
