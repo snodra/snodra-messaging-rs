@@ -30,6 +30,27 @@ impl Query for Reverse {
     type Reply = Reversed;
 }
 
+/// A shared query type (ADR 0017): service-b (Kotlin) owns it too, so a point query goes to one of
+/// them and a scatter-gather asks both.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Inventory {
+    pub item: String,
+}
+/// The answering service and instance (the container's host name), a fixed count per service and
+/// how many Inventory queries the instance answered so far.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct InventoryLevel {
+    pub service: String,
+    pub instance: String,
+    pub item: String,
+    pub count: i64,
+    pub answered: i64,
+}
+message_type!(Inventory, "examples.Inventory");
+impl Query for Inventory {
+    type Reply = InventoryLevel;
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TextShouted {
     pub text: String,
