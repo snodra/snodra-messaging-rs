@@ -32,6 +32,15 @@ impl Command for Work {
 
 const IDS: [&str; 2] = ["e2e-hub-1", "e2e-hub-2"];
 
+/// Bound for both hubs to show the instance's first `InstanceStatus` (5 s period) after the
+/// registration: the period plus 3 s of scheduling slack.
+const STATUS_SEEN_WITHIN: Duration = Duration::from_secs(8);
+/// Bound for re-registering on a restarted hub once it answers `Topology`: the backoff cap (5 s,
+/// jitter clamped to it) plus 7 s for an attempt still in flight against the restarting container
+/// (connect and handshake), under `registered_on`'s 15 s. The point is "within the backoff cap,
+/// not after a stall", not a tight latency bound.
+const REJOIN_WITHIN: Duration = Duration::from_secs(12);
+
 /// Two P3 hubs with fixed ids, on fixed host ports (a restart keeps the address).
 async fn two_hubs() -> (HubContainer, HubContainer) {
     let start = |id: &'static str| {
@@ -135,7 +144,9 @@ async fn both_hubs_list_the_instance_with_both_ids_and_share_unkeyed_requests() 
     let registered = Instant::now();
     registered_on(&a, &IDS, Duration::from_secs(15)).await;
 
-    // Both hubs list the instance with both hub ids once its first report (5 s) is in.
+    // Both hubs list the instance with both hub ids once its first report (5 s period) is in. The
+    // first report goes one period after the pool starts, which is before `registered`; 8 s leaves
+    // 3 s for a slow container or CI scheduler on top of the period.
     for hub in [&h1, &h2] {
         loop {
             let view = instance(hub, "e2e-b").await;
@@ -155,7 +166,7 @@ async fn both_hubs_list_the_instance_with_both_ids_and_share_unkeyed_requests() 
                 break;
             }
             assert!(
-                registered.elapsed() < Duration::from_millis(6_500),
+                registered.elapsed() < STATUS_SEEN_WITHIN,
                 "{} still shows {view:?}",
                 hub.http
             );
@@ -285,7 +296,7 @@ async fn a_hub_stopped_mid_traffic_fails_over_and_is_rejoined_after_its_restart(
     );
     eprintln!("re-registered on the restarted hub after {ta:?} (caller) and {tb:?} (worker)");
     assert!(
-        ta.max(tb) <= Duration::from_millis(5_500),
+        ta.max(tb) <= REJOIN_WITHIN,
         "re-registered only after {:?}",
         ta.max(tb)
     );
