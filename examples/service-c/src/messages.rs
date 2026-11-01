@@ -1,7 +1,7 @@
 //! Wire types shared with the Kotlin `examples-api` (same names, same fields, same `@MessageType`s).
 
 use chrono::{DateTime, Utc};
-use kraken_messaging::{Command, Event, Query, message_type};
+use kraken_messaging::{Command, Event, Query, StreamingQuery, message_type};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -76,3 +76,25 @@ pub struct GreetingDelivered {
 }
 message_type!(GreetingDelivered, "examples.GreetingDelivered");
 impl Event for GreetingDelivered {}
+
+/// A shared streaming query type (ADR 0017, P4b): service-b (Kotlin) owns it too, so a stream goes
+/// to one instance of either. `fail_at > 0` makes the handler fail on reaching that row.
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Rows {
+    pub count: i32,
+    #[serde(default)]
+    pub fail_at: i32,
+}
+/// One element of a `Rows` stream: the answering service and instance (the container's host
+/// name) and the row number `n` (1..=count).
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct Row {
+    pub service: String,
+    pub instance: String,
+    pub n: i32,
+}
+message_type!(Rows, "examples.Rows");
+impl StreamingQuery for Rows {
+    type Item = Row;
+}

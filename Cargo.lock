@@ -3281,6 +3281,7 @@ name = "service-c"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "futures",
  "kraken-messaging-rs",
  "serde",
  "tokio",

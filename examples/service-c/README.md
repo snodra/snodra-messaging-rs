@@ -5,7 +5,10 @@ picture and the curl walkthrough). Handles `examples.Shout` and `examples.Revers
 `examples.TextShouted` / `examples.TextReversed` through its outbox, logs `examples.GreetingDelivered`.
 Shares the query `examples.Inventory` with service-b (`shared_query`, ADR 0017): it answers with its
 service name, its host name (the container id under Docker), a fixed count of 3 and how many
-Inventory queries it answered.
+Inventory queries it answered. Shares the streaming query `examples.Rows` with service-b too
+(`shared_streaming_query`, ADR 0017 P4b): it streams the rows `1..=count`, each naming the service
+and instance, lazily under the sender's credits; with `failAt > 0` the item for that row is an
+`Err` (`HANDLER_ERROR` "Rows failed at row n") and the stream ends there.
 
 Configuration is the crate's `Config::from_env`: `KRAKEN_SERVICE_NAME` (`service-c`), `KRAKEN_HUB_ADDRESS`,
 `KRAKEN_KAFKA_BOOTSTRAP`, `KRAKEN_MONGODB_URI` (its own database), `RUST_LOG` (default `info`).

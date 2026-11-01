@@ -3,13 +3,14 @@ name = "service-c"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
-description = "kraken example service C: handles Shout and Reverse, publishes text events, logs GreetingDelivered"
+description = "kraken example service C: handles Shout and Reverse, co-owns Inventory and the streaming Rows, publishes text events, logs GreetingDelivered"
 license = "MIT"
 publish = false
 
 [dependencies]
 kraken-messaging-rs = { path = "../.." }
 tokio = { version = "1.54.1", features = ["full"] }
+futures = "0.3"
 serde = { version = "1.0.229", features = ["derive"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 tracing = "0.1.44"
