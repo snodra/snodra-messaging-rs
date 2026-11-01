@@ -285,6 +285,7 @@ impl Dispatcher {
         reply_to: &ReplyTo,
     ) {
         let request_id = req.id.clone();
+        let type_name = req.r#type.clone();
         // Spawned so that a panic in the handler or its stream is this stream's error.
         let mut pump = AbortOnDrop(tokio::spawn(Arc::clone(self).pump(
             req,
@@ -297,7 +298,7 @@ impl Dispatcher {
                 Ok(()) => {}
                 Err(join) if join.is_panic() => {
                     let e = MessagingError::RemoteHandler {
-                        type_name: String::new(),
+                        type_name,
                         message: "handler panicked".into(),
                         details: vec![],
                     };
