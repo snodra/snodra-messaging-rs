@@ -117,6 +117,8 @@ impl Hub for Service {
                             }
                             client_message::Message::Reply(r) => state.replies.lock().await.push((stream_no, r)),
                             client_message::Message::Permits(p) => state.permits.lock().unwrap().push((stream_no, p.count, std::time::Instant::now())),
+                            // Multi-hub status reports (ADR 0016): the client does not send them yet.
+                            client_message::Message::Status(_) => {}
                             client_message::Message::Request(req) => {
                                 state.requests.lock().await.push(req.clone());
                                 let response = state.responder.lock().await.as_ref().and_then(|f| f(req));
