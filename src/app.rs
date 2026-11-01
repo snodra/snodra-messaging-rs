@@ -7,6 +7,7 @@
 //!     .command::<Shout, _, _>(move |cmd, ctx| { let events = events.clone(); async move { ... } })
 //!     .query::<Reverse, _, _>(|q, ctx| async move { ... })
 //!     .shared_query::<Search, _, _>(|q, ctx| async move { ... }) // many services may own it
+//!     .streaming_query::<Export, _, _, _>(|q, ctx| async move { Ok(rows(q)) }) // a stream of items
 //!     .event::<GreetingDelivered, _, _>(|e, ctx| async move { ... })
 //!     .start()
 //!     .await?;
@@ -53,7 +54,7 @@ async fn reply_on_arrival_stream(
     // The request is finished either way: one permit back to the hub it came from.
     reply_to.grant().await;
 }
-use crate::types::{Command, Event, MessageType, Query};
+use crate::types::{Command, Event, MessageType, Query, StreamingQuery};
 
 pub struct KrakenMessagingBuilder {
     config: Config,
@@ -240,6 +241,40 @@ impl KrakenMessagingBuilder {
         self
     }
 
+    /// A streaming query handler (ADR 0017, P4b): `Q` is served to [`Sender::stream`] callers
+    /// as a stream of `Q::Item`s under their credits; this service is its only owner. See
+    /// [`HandlerRegistry::streaming_query`].
+    ///
+    /// # Panics
+    /// When `Q` already has a handler here.
+    pub fn streaming_query<Q, F, Fut, S>(mut self, handler: F) -> Self
+    where
+        Q: StreamingQuery,
+        F: Fn(Q, MessageContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<S, MessagingError>> + Send + 'static,
+        S: futures::Stream<Item = Result<Q::Item, MessagingError>> + Send + 'static,
+    {
+        self.registry.streaming_query::<Q, F, Fut, S>(handler);
+        self
+    }
+
+    /// A shared streaming query handler: several services may own `Q`; a stream goes to one
+    /// capable instance of any owner. See [`HandlerRegistry::shared_streaming_query`].
+    ///
+    /// # Panics
+    /// When `Q` already has a handler here (shared or exclusive).
+    pub fn shared_streaming_query<Q, F, Fut, S>(mut self, handler: F) -> Self
+    where
+        Q: StreamingQuery,
+        F: Fn(Q, MessageContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<S, MessagingError>> + Send + 'static,
+        S: futures::Stream<Item = Result<Q::Item, MessagingError>> + Send + 'static,
+    {
+        self.registry
+            .shared_streaming_query::<Q, F, Fut, S>(handler);
+        self
+    }
+
     pub fn event<E, F, Fut>(mut self, handler: F) -> Self
     where
         E: Event,
@@ -353,7 +388,7 @@ impl KrakenMessagingBuilder {
             )?;
             tasks.push(consumer.start(cancel.clone()));
         }
-        tracing::info!(service = %config.service_name, instance = %hubs.instance_id(), hubs = ?hubs.targets(), commands = ?registry.command_types(), queries = ?registry.exclusive_query_types(), shared_queries = ?registry.shared_query_types(), events = ?registry.event_types(), "kraken messaging started");
+        tracing::info!(service = %config.service_name, instance = %hubs.instance_id(), hubs = ?hubs.targets(), commands = ?registry.command_types(), queries = ?registry.exclusive_query_types(), shared_queries = ?registry.shared_query_types(), streaming_queries = ?registry.streaming_query_types(), events = ?registry.event_types(), "kraken messaging started");
         Ok(KrakenMessaging {
             hubs,
             sender,

@@ -21,4 +21,4 @@ pub use error::MessagingError;
 pub use hub::{EventContext, SendOptions};
 pub use identity::{Guard, Identity};
 pub use retry::RetryPolicy;
-pub use types::{Command, Event, MessageType, Query};
+pub use types::{Command, Event, MessageType, Query, StreamingQuery};

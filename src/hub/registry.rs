@@ -5,13 +5,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use futures::stream::{BoxStream, Stream, StreamExt};
 use tokio::sync::Mutex;
 
 use crate::codec;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
 use crate::identity::Guard;
-use crate::types::{Command, Event, MessageType, Query};
+use crate::types::{Command, Event, MessageType, Query, StreamingQuery};
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// Why an erased request handler did not produce a payload: the dispatcher maps each case to its
@@ -25,6 +26,10 @@ pub(crate) enum Invocation {
 
 pub(crate) type RequestHandler =
     Arc<dyn Fn(Vec<u8>, MessageContext) -> BoxFut<Result<Vec<u8>, Invocation>> + Send + Sync>;
+/// The items of an erased streaming handler, each encoded (or why it could not be).
+pub(crate) type ItemStream = BoxStream<'static, Result<Vec<u8>, Invocation>>;
+pub(crate) type StreamHandler =
+    Arc<dyn Fn(Vec<u8>, MessageContext) -> BoxFut<Result<ItemStream, Invocation>> + Send + Sync>;
 pub(crate) type EventHandler =
     Arc<dyn Fn(Vec<u8>, EventContext) -> BoxFut<Result<(), MessagingError>> + Send + Sync>;
 
@@ -40,7 +45,9 @@ pub struct EventContext {
 pub struct HandlerRegistry {
     commands: HashMap<&'static str, RequestHandler>,
     queries: HashMap<&'static str, RequestHandler>,
-    /// The query types registered as shared (their handlers are in `queries`).
+    /// Streaming queries (ADR 0017, P4b), served only for `mode = STREAMING`.
+    streams: HashMap<&'static str, StreamHandler>,
+    /// The query types registered as shared (their handlers are in `queries` or `streams`).
     shared: HashSet<&'static str>,
     events: HashMap<&'static str, Vec<EventHandler>>,
     guards: HashMap<&'static str, Guard>,
@@ -98,6 +105,47 @@ impl HandlerRegistry {
         self.shared.insert(Q::TYPE);
     }
 
+    /// An exclusive streaming query (ADR 0017, P4b): the handler returns a stream of items the
+    /// library sends one `ReplyPart` at a time under the sender's credits (the stream is not
+    /// polled while the credit is 0), then a `ReplyEnd`. An `Err` item ends the stream with
+    /// that error (`ReplyEnd{error}`, the stream dropped); a hub `Cancel` drops it silently. The
+    /// handler permit is held for the whole stream. The type is announced in
+    /// `Register.query_types`; only a streaming request (`Sender::stream`) reaches the handler, a
+    /// unary query to the type is `NO_HANDLER` here.
+    ///
+    /// # Panics
+    /// When the type already has a handler here.
+    pub fn streaming_query<Q, F, Fut, S>(&mut self, handler: F)
+    where
+        Q: StreamingQuery,
+        F: Fn(Q, MessageContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<S, MessagingError>> + Send + 'static,
+        S: Stream<Item = Result<Q::Item, MessagingError>> + Send + 'static,
+    {
+        self.assert_unowned(Q::TYPE, Some(false));
+        self.streams
+            .insert(Q::TYPE, erase_stream::<Q, F, Fut, S>(handler));
+    }
+
+    /// A shared streaming query (`Register.shared_query_types`): several services may own it;
+    /// a stream goes to one capable instance of any owner. See
+    /// [`streaming_query`](Self::streaming_query) and [`shared_query`](Self::shared_query).
+    ///
+    /// # Panics
+    /// When the type already has a handler here, shared or exclusive.
+    pub fn shared_streaming_query<Q, F, Fut, S>(&mut self, handler: F)
+    where
+        Q: StreamingQuery,
+        F: Fn(Q, MessageContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<S, MessagingError>> + Send + 'static,
+        S: Stream<Item = Result<Q::Item, MessagingError>> + Send + 'static,
+    {
+        self.assert_unowned(Q::TYPE, Some(true));
+        self.streams
+            .insert(Q::TYPE, erase_stream::<Q, F, Fut, S>(handler));
+        self.shared.insert(Q::TYPE);
+    }
+
     /// Several handlers may react to the same event type.
     pub fn event<E, F, Fut>(&mut self, handler: F)
     where
@@ -119,7 +167,9 @@ impl HandlerRegistry {
     /// Opt-in authorization for a registered command or query (the `@RequiresAuthentication` of Rust).
     pub fn requires<M: MessageType>(&mut self, guard: Guard) {
         assert!(
-            self.commands.contains_key(M::TYPE) || self.queries.contains_key(M::TYPE),
+            self.commands.contains_key(M::TYPE)
+                || self.queries.contains_key(M::TYPE)
+                || self.streams.contains_key(M::TYPE),
             "requires::<{}>: register the command or query handler first",
             M::TYPE
         );
@@ -130,28 +180,35 @@ impl HandlerRegistry {
         sorted(self.commands.keys())
     }
 
-    /// Every query type served here, exclusive and shared (as kraken-messaging's `queryTypes()`).
+    /// Every query type served here, unary and streaming, exclusive and shared (as
+    /// kraken-messaging's `queryTypes()`).
     pub fn query_types(&self) -> Vec<String> {
-        sorted(self.queries.keys())
+        sorted(self.queries.keys().chain(self.streams.keys()))
     }
 
-    /// The exclusive query types (`Register.query_types`).
+    /// The exclusive unary query types (`RegisteredTypes.queries`).
     pub fn exclusive_query_types(&self) -> Vec<String> {
         sorted(self.queries.keys().filter(|t| !self.shared.contains(*t)))
     }
 
-    /// The shared query types (`Register.shared_query_types`).
+    /// Every streaming query type served here, exclusive and shared.
+    pub fn streaming_query_types(&self) -> Vec<String> {
+        sorted(self.streams.keys())
+    }
+
+    /// The shared query types, unary and streaming (`Register.shared_query_types`).
     pub fn shared_query_types(&self) -> Vec<String> {
         sorted(self.shared.iter())
     }
 
-    /// Everything the `Register` announces: the exclusive and the shared query types apart.
+    /// Everything the `Register` announces: the exclusive unary, the exclusive streaming and the
+    /// shared query types apart (see [`super::RegisteredTypes`]).
     pub fn registered_types(&self) -> super::RegisteredTypes {
         super::RegisteredTypes {
             commands: self.command_types(),
             queries: self.exclusive_query_types(),
             shared_queries: self.shared_query_types(),
-            ..super::RegisteredTypes::default()
+            streaming_queries: sorted(self.streams.keys().filter(|t| !self.shared.contains(*t))),
         }
     }
 
@@ -171,6 +228,10 @@ impl HandlerRegistry {
         self.queries.get(type_name)
     }
 
+    pub(crate) fn stream_handler(&self, type_name: &str) -> Option<&StreamHandler> {
+        self.streams.get(type_name)
+    }
+
     pub(crate) fn event_handlers(&self, type_name: &str) -> &[EventHandler] {
         self.events.get(type_name).map(Vec::as_slice).unwrap_or(&[])
     }
@@ -181,15 +242,16 @@ impl HandlerRegistry {
 
     /// `shared`: the flavour of the query being registered (`None` for a command).
     fn assert_unowned(&self, type_name: &str, shared: Option<bool>) {
+        let query = self.queries.contains_key(type_name) || self.streams.contains_key(type_name);
         if let Some(shared) = shared {
             assert!(
-                !self.queries.contains_key(type_name) || self.shared.contains(type_name) == shared,
+                !query || self.shared.contains(type_name) == shared,
                 "{type_name} registered both as an exclusive and as a shared query; every \
                  registrant must agree on one"
             );
         }
         assert!(
-            !self.commands.contains_key(type_name) && !self.queries.contains_key(type_name),
+            !self.commands.contains_key(type_name) && !query,
             "duplicate handler for {type_name}"
         );
     }
@@ -217,6 +279,34 @@ where
             let reply = handler(message, ctx).await.map_err(Invocation::Handler)?;
             codec::encode_reply(&reply)
                 .map_err(|e| Invocation::Encode(format!("cannot encode reply: {e}")))
+        })
+    })
+}
+
+/// Erases a streaming handler: the query decoded, the handler's stream boxed with each item
+/// encoded with the reply codec (an `Err` item, or one that does not encode, ends it).
+fn erase_stream<Q, F, Fut, S>(handler: F) -> StreamHandler
+where
+    Q: StreamingQuery,
+    F: Fn(Q, MessageContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<S, MessagingError>> + Send + 'static,
+    S: Stream<Item = Result<Q::Item, MessagingError>> + Send + 'static,
+{
+    let handler = Arc::new(handler);
+    Arc::new(move |payload: Vec<u8>, ctx: MessageContext| {
+        let handler = Arc::clone(&handler);
+        Box::pin(async move {
+            let query: Q = codec::decode(&payload)
+                .map_err(|e| Invocation::Decode(format!("cannot decode payload: {e}")))?;
+            let items = handler(query, ctx).await.map_err(Invocation::Handler)?;
+            let items: ItemStream = items
+                .map(|item| match item {
+                    Ok(item) => codec::encode_reply(&item)
+                        .map_err(|e| Invocation::Encode(format!("cannot encode item: {e}"))),
+                    Err(e) => Err(Invocation::Handler(e)),
+                })
+                .boxed();
+            Ok(items)
         })
     })
 }

@@ -20,6 +20,15 @@ pub trait Query: MessageType + Serialize + DeserializeOwned + Send + Sync + 'sta
     type Reply: Serialize + DeserializeOwned + Send + 'static;
 }
 
+/// A read request whose result is a flow of `Item`s from one instance of one owning service,
+/// under the caller's back-pressure (ADR 0017, P4b: `Request.mode = STREAMING`, credits). Routed
+/// through the hub to an instance whose library negotiated `streaming`.
+pub trait StreamingQuery:
+    MessageType + Serialize + DeserializeOwned + Send + Sync + 'static
+{
+    type Item: Serialize + DeserializeOwned + Send + 'static;
+}
+
 /// A fact that happened; published to Kafka topic `kraken.events`.
 pub trait Event: MessageType + Serialize + DeserializeOwned + Send + Sync + 'static {}
 
