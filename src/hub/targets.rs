@@ -30,7 +30,8 @@ pub enum HubTargets {
 
 impl HubTargets {
     /// Parses `KRAKEN_HUB_ADDRESS` / `Config.hub_address`. `InvalidMessage` when it names no hub,
-    /// when a `dns:///` target is not alone, or when it lacks a host or a port (1-65535).
+    /// when a `dns:///` target is not alone, or when it lacks a host or a port (1-65535) or its
+    /// host contains `/`.
     pub fn parse(address: &str) -> Result<HubTargets, MessagingError> {
         let bad = |why: &str| {
             MessagingError::InvalidMessage(format!(
@@ -62,6 +63,9 @@ impl HubTargets {
                 .ok_or_else(|| bad("dns:///name:port needs a port from 1 to 65535"))?;
             if host.is_empty() {
                 return Err(bad("dns:///name:port needs a name"));
+            }
+            if host.contains('/') {
+                return Err(bad("dns:///name:port takes a host name, not a path"));
             }
             return Ok(HubTargets::Dns {
                 host: host.to_string(),
@@ -264,10 +268,12 @@ mod tests {
         for bad in [
             "",
             " , ",
-            "dns:///kraken-hub",             // no port
-            "dns:///kraken-hub:0",           // port 0
-            "dns:///kraken-hub:x",           // not a port
-            "dns:///:7000",                  // no host
+            "dns:///kraken-hub",      // no port
+            "dns:///kraken-hub:0",    // port 0
+            "dns:///kraken-hub:x",    // not a port
+            "dns:///:7000",           // no host
+            "dns:///kraken/hub:7000", // a path, not a host
+            "dns:///kraken-hub/:7000",
             "dns://8.8.8.8/kraken-hub:7000", // an authority (DNS server) is not supported
             "dns:///a:7000,dns:///b:7000",   // dns only alone
             "hub-1:7000,dns:///b:7000",

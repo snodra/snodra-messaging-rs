@@ -159,9 +159,19 @@ impl KrakenMessaging {
         self.db.clone()
     }
 
-    /// True once a hub (with several: at least one) confirmed this instance's registration.
+    /// True once a hub (with several: at least one, so requests can be sent) confirmed this
+    /// instance's registration. kraken-messaging's `HubConnections.awaitRegistered` waits for
+    /// every hub; that is [`await_all_hubs`](Self::await_all_hubs) here.
     pub async fn await_hub(&self, timeout: Duration) -> bool {
         self.hubs.await_registered(timeout).await
+    }
+
+    /// True once every hub of `hub_address` confirmed this instance's registration (with
+    /// `dns:///`: every address of the latest resolution; a second target of a hub already reached
+    /// does not count). Use it when every hub must be able to route to this instance before
+    /// going on, e.g. before taking traffic in a rollout.
+    pub async fn await_all_hubs(&self, timeout: Duration) -> bool {
+        self.hubs.await_all_registered(timeout).await
     }
 
     /// Drains in-flight handlers (bounded), closes every hub stream (each hub drops this instance at once),

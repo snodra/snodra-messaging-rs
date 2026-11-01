@@ -149,8 +149,11 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
   decoder ignores it too). A JWKS outage is `UNAUTHENTICATED` for the caller, never an internal error with a URL.
 - **Shutdown** drains in-flight handlers (10 s bound), closes every hub stream, fails this instance's outgoing requests still in flight with `HubConnectionLost`, stops the publisher and the consumer.
 - **Start** does not wait for the hub. `await_hub(timeout)` tells you when the registration was
-  confirmed (with several hubs: by at least one; `app.hub_ids()` lists them); sends before that
-  fail with `HubUnavailable`.
+  confirmed by at least one hub (requests can then be sent; before that they fail with
+  `HubUnavailable`); `await_all_hubs(timeout)` waits until every hub confirmed it (with
+  `dns:///`: every address of the latest resolution; a second target of a hub already reached does
+  not count). `app.hub_ids()` lists the hubs registered on now. kraken-messaging (Kotlin) differs
+  here: its `HubConnections.awaitRegistered` waits for every hub, like `await_all_hubs`.
 - **Handshake** (hub protocol v2, ADR 0013): `Register` carries `protocol_version = 2`, the
   capabilities (`flow-control`, `instance-status`) and `client_version = kraken-messaging-rs/<version>`. A v2 hub answers with a
   `RegisterAck` before it echoes the first heartbeat; the client then heartbeats at the announced
@@ -206,7 +209,7 @@ every instance registers on every hub, and the client picks a hub per request.
   connection, a vanished one leaves the routing at once and is closed once idle (no request of
   ours written to it unanswered, no handler of its requests running; at most 65 s later). A
   failed or empty resolution keeps the current hubs. `dns:///` must be the only target and needs a
-  port; `dns://server/...` is not supported. An address that names no hub fails `Config::validate`.
+  port; its host may not contain `/`; `dns://server/...` is not supported. An address that names no hub fails `Config::validate`.
 - **Connections.** One stream per hub, each with its own handshake, heartbeat, reconnect backoff
   and legacy detection, all with the identical `Register`. Two targets whose acks carry the same
   `hub_id` are one hub: the connection acknowledged first keeps it and the other is closed for

@@ -140,6 +140,7 @@ async fn both_hubs_list_the_instance_with_both_ids_and_share_unkeyed_requests() 
     let hubs = format!("{},{}", h1.address, h2.address);
     let b = worker(config("e2e-b", &hubs, &db.uri_for("b"))).await;
     let a = caller(config("e2e-a", &hubs, &db.uri_for("a"))).await;
+    assert!(b.await_all_hubs(Duration::from_secs(15)).await);
     registered_on(&b, &IDS, Duration::from_secs(15)).await;
     let registered = Instant::now();
     registered_on(&a, &IDS, Duration::from_secs(15)).await;

@@ -245,7 +245,8 @@ impl HubPool {
         }
     }
 
-    /// True once at least one hub confirmed the registration.
+    /// True once at least one hub confirmed the registration (the client can send); see
+    /// [`await_all_registered`](Self::await_all_registered) for every hub.
     pub async fn await_registered(&self, timeout: Duration) -> bool {
         let mut changes = self.changes.subscribe();
         let deadline = tokio::time::Instant::now() + timeout;
@@ -260,6 +261,34 @@ impl HubPool {
                 _ = tokio::time::sleep_until(deadline) => return !self.live().is_empty(),
             }
         }
+    }
+
+    /// True once every hub of the pool confirmed the registration (kraken-messaging's
+    /// `HubConnections.awaitRegistered`): there is at least one connection, and every connection still in use
+    /// (not a closed duplicate, not draining) has a handshaken stream. With `dns:///`, the hubs of
+    /// the latest resolution.
+    pub async fn await_all_registered(&self, timeout: Duration) -> bool {
+        let mut changes = self.changes.subscribe();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.all_registered() {
+                return true;
+            }
+            tokio::select! {
+                _ = changes.changed() => {}
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                _ = tokio::time::sleep_until(deadline) => return self.all_registered(),
+            }
+        }
+    }
+
+    fn all_registered(&self) -> bool {
+        let active: Vec<_> = self
+            .members()
+            .into_iter()
+            .filter(|m| m.role() == Role::Active)
+            .collect();
+        !active.is_empty() && active.iter().all(|m| m.conn.handshake().is_some())
     }
 
     /// The ids of the hubs live now (handshaken streams), in target order; a hub without an id

@@ -180,6 +180,25 @@ async fn a_stream_opened_while_the_other_hub_is_down_offers_all_permits() {
     c.shutdown().await;
 }
 
+/// `await_registered` is "any hub" (the client can send), `await_all_registered` "every hub"
+/// (kraken-messaging's `awaitRegistered`): a hub that is down holds back only the latter.
+#[tokio::test]
+async fn await_registered_waits_for_any_hub_and_await_all_registered_for_every_hub() {
+    let (a, b) = (answering("hub-a").await, answering("hub-b").await);
+    b.set_down(true);
+    let c = client(settings(addresses(&[&a, &b]))).await;
+    assert!(c.pool.await_registered(Duration::from_secs(5)).await);
+    assert!(
+        !c.pool
+            .await_all_registered(Duration::from_millis(300))
+            .await
+    );
+    b.set_down(false);
+    assert!(c.pool.await_all_registered(Duration::from_secs(5)).await);
+    assert_eq!(c.pool.hub_ids(), ["hub-a", "hub-b"]);
+    c.shutdown().await;
+}
+
 #[tokio::test]
 async fn unkeyed_requests_round_robin_over_live_hubs_and_skip_a_dead_one() {
     let (a, b) = (answering("hub-a").await, answering("hub-b").await);
@@ -420,6 +439,10 @@ async fn two_targets_of_one_replacing_hub_settle_without_ping_pong() {
     assert!(
         hub.evictions() >= 1,
         "the fake hub replaces sessions like kraken-hub"
+    );
+    assert!(
+        c.pool.await_all_registered(Duration::from_secs(1)).await,
+        "a closed duplicate is not a hub to wait for"
     );
     let (evictions, streams) = (hub.evictions(), hub.streams());
     for _ in 0..20 {
