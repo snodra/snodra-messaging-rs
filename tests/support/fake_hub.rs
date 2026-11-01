@@ -50,8 +50,33 @@
 //! it) ends it with `TIMEOUT` and `Cancel{"idle timeout"}`; the handler leaving ends it with
 //! `HANDLER_DISCONNECTED`, the sender leaving cancels the handler (`"sender disconnected"`).
 //! Client-sent parts, ends, flows and cancels are recorded per stream.
+//!
+//! Subscriptions like kraken-hub (ADR 0017, P4c): the ack lists "subscription" when the client
+//! declared it, unless `set_subscription(false)` (a P4b hub). A `Request` with
+//! `mode = SUBSCRIPTION` on a session without it is `UNSUPPORTED` (unary on a session that knows
+//! no modes); then a command `INVALID_REQUEST`, no owner `NO_HANDLER`, no owner instance that
+//! negotiated "subscription" `UNSUPPORTED`, a duplicate id `INVALID_REQUEST`, a target already
+//! serving `set_max_subscriptions_per_instance` (1024) subscriptions `RESOURCE_EXHAUSTED`. Else
+//! every capable instance listing the type (by service, then instance id) gets
+//! `Request{<id>#n, mode = SUBSCRIPTION}` (`n` from 1; `initial_credit` and `max_results` 0) and
+//! one of them (round-robin) `Request{<id>#0, mode = UNARY}` for the initial result, whose
+//! `Reply{payload}` is `ReplyPart{seq 1}` to the sender (`Reply{error}`, no reply within
+//! `timeout_ms` (else 5 s) or its handler leaving: `ReplyEnd{error}` and `Cancel{"initial result
+//! failed"}` to the targets). A target's `ReplyPart` is an update: relayed in arrival order with
+//! the hub's own `seq` (2, 3, ...; the handler's is dropped) under the sender's credit
+//! (`initial_credit`, 0 reads as 64, plus every `Flow`; the initial part takes one), buffered
+//! behind the initial part and beyond the credit up to `set_subscription_buffer` (256): one more
+//! ends it with `RESOURCE_EXHAUSTED "subscriber buffer (N) exceeded"` and `Cancel{"subscriber
+//! buffer exceeded"}`; a part carrying `error` or an error `ReplyEnd` from any target ends it with
+//! that error and `Cancel{"target <instance> failed"}` to the others; a clean `ReplyEnd` removes
+//! the target, the last one's ends the subscription with `ReplyEnd{parts}` once the buffer is
+//! out; after `max_results` updates `ReplyEnd{parts}` and `Cancel{"max results"}`. A sender
+//! `Cancel` (or the sender leaving: `"sender disconnected"`) is fanned out to the targets (and to
+//! `<id>#0` while forwarded), nothing more to the sender; a target leaving is silent unless it
+//! was the last (`HANDLER_DISCONNECTED`). `set_subscription_max_duration(Some(d))` ends one open
+//! longer with `CANCELLED "max subscription duration (<d>) exceeded"`. No idle timeout.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -97,7 +122,28 @@ struct Route {
     scatter: bool,
     /// The session declared "streaming" and the hub shares it.
     streaming: bool,
+    /// The session declared "subscription" and the hub shares it.
+    subscription: bool,
     tx: Outbound,
+}
+
+/// A subscription in progress (P4c).
+struct SubState {
+    sender: Outbound,
+    sender_no: usize,
+    /// The update targets still serving: target id → (stream number, service, instance, outbound).
+    targets: HashMap<String, (usize, String, String, Outbound)>,
+    /// The initial request `<id>#0` while forwarded: (stream number, service, instance, outbound).
+    initial: Option<(usize, String, String, Outbound)>,
+    initial_done: bool,
+    credit: u32,
+    /// Parts sent to the sender: the hub's `seq`.
+    parts: u32,
+    /// Updates relayed (for `max_results`).
+    updates: u32,
+    max_results: u32,
+    /// Updates waiting for credit or for the initial part: (payload, service, instance).
+    buffered: VecDeque<(Vec<u8>, String, String)>,
 }
 
 /// A streaming query in progress (P4b).
@@ -217,6 +263,15 @@ pub struct State {
     stream_target_of: StdMutex<HashMap<String, String>>,
     /// Round-robin over the capable instances of a streaming query.
     rotation: AtomicUsize,
+    subscription: AtomicBool,
+    /// subscription id → the subscription; `<id>#n` / `<id>#0` → subscription id.
+    subscriptions: StdMutex<HashMap<String, SubState>>,
+    sub_target_of: StdMutex<HashMap<String, String>>,
+    /// Round-robin over the targets for the initial result.
+    sub_rotation: AtomicUsize,
+    subscription_buffer: AtomicUsize,
+    max_subscriptions_per_instance: AtomicUsize,
+    subscription_max_duration: StdMutex<Option<Duration>>,
     /// Client-sent multi-part messages: (stream number, message).
     parts: StdMutex<Vec<(usize, proto::ReplyPart)>>,
     ends: StdMutex<Vec<(usize, proto::ReplyEnd)>>,
@@ -441,8 +496,560 @@ impl State {
         let mut targets: Vec<(&String, &(usize, String, String))> = g.outstanding.iter().collect();
         targets.sort();
         for (target_id, (n, _, _)) in targets {
-            if let Some(r) = routes.get(n).filter(|r| r.streaming) {
+            if let Some(r) = routes.get(n).filter(|r| r.streaming || r.subscription) {
                 out.push((r.tx.clone(), cancel_msg(target_id, reason)));
+            }
+        }
+        out
+    }
+
+    /// A subscription `Request` from stream `stream_no`: rejected, or forwarded to every capable
+    /// instance (and the initial request to one of them). `false` when the session knows no
+    /// query modes at all (served as unary).
+    async fn open_subscription(
+        self: &Arc<Self>,
+        stream_no: usize,
+        req: &proto::Request,
+        tx: &Outbound,
+    ) -> bool {
+        use proto::ErrorCode;
+        let reject = |code, message: &str| hub_error(&req.id, code, message);
+        let (knows_modes, listed) = self
+            .routes
+            .lock()
+            .unwrap()
+            .get(&stream_no)
+            .map(|r| (r.scatter || r.streaming || r.subscription, r.subscription))
+            .unwrap_or((false, false));
+        if !knows_modes {
+            return false;
+        }
+        if !listed || !self.subscription.load(Ordering::SeqCst) {
+            let _ = tx
+                .send(Ok(reject(
+                    ErrorCode::Unsupported,
+                    "subscription not negotiated",
+                )))
+                .await;
+            return true;
+        }
+        let (is_command, owners, mut capable) = {
+            let routes = self.routes.lock().unwrap();
+            let is_command = req.kind == proto::RequestKind::Command as i32
+                || routes.values().any(|r| r.commands.contains(&req.r#type));
+            let owners: Vec<String> = routes
+                .values()
+                .filter(|r| r.queries.contains(&req.r#type))
+                .map(|r| r.service.clone())
+                .collect();
+            let capable: Vec<(usize, String, String, Outbound)> = routes
+                .iter()
+                .filter(|(_, r)| r.queries.contains(&req.r#type) && r.subscription)
+                .map(|(n, r)| (*n, r.service.clone(), r.instance.clone(), r.tx.clone()))
+                .collect();
+            (is_command, owners, capable)
+        };
+        capable.sort_by(|a, b| (&a.1, &a.2).cmp(&(&b.1, &b.2)));
+        let max = self.max_subscriptions_per_instance.load(Ordering::SeqCst);
+        let rejection = if is_command {
+            Some(reject(
+                ErrorCode::InvalidRequest,
+                "invalid request: a command",
+            ))
+        } else if owners.is_empty() {
+            Some(reject(ErrorCode::NoHandler, "no handler"))
+        } else if capable.is_empty() {
+            Some(reject(
+                ErrorCode::Unsupported,
+                &format!("no instance of {owners:?} negotiated subscription"),
+            ))
+        } else if self.subscriptions.lock().unwrap().contains_key(&req.id)
+            || self.open_streams.lock().unwrap().contains_key(&req.id)
+            || self.gathers.lock().unwrap().contains_key(&req.id)
+        {
+            Some(reject(ErrorCode::InvalidRequest, "duplicate id"))
+        } else if let Some((_, _, instance, _)) = {
+            let subscriptions = self.subscriptions.lock().unwrap();
+            capable.iter().find(|(n, _, _, _)| {
+                subscriptions
+                    .values()
+                    .flat_map(|s| s.targets.values())
+                    .filter(|(target_no, _, _, _)| target_no == n)
+                    .count()
+                    >= max
+            })
+        } {
+            Some(reject(
+                ErrorCode::ResourceExhausted,
+                &format!(
+                    "handler instance {instance} already serves {max} subscription{} (KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE)",
+                    if max == 1 { "" } else { "s" }
+                ),
+            ))
+        } else {
+            None
+        };
+        if let Some(rejection) = rejection {
+            let _ = tx.send(Ok(rejection)).await;
+            return true;
+        }
+        let pick = self.sub_rotation.fetch_add(1, Ordering::SeqCst) % capable.len();
+        let (initial_no, initial_service, initial_instance, initial_tx) = capable[pick].clone();
+        let credit = if req.initial_credit == 0 {
+            64
+        } else {
+            req.initial_credit
+        };
+        let ids: Vec<String> = (1..=capable.len())
+            .map(|n| format!("{}#{n}", req.id))
+            .collect();
+        let initial_id = format!("{}#0", req.id);
+        {
+            let mut subscriptions = self.subscriptions.lock().unwrap();
+            subscriptions.insert(
+                req.id.clone(),
+                SubState {
+                    sender: tx.clone(),
+                    sender_no: stream_no,
+                    targets: ids.iter().cloned().zip(capable.iter().cloned()).collect(),
+                    initial: Some((
+                        initial_no,
+                        initial_service,
+                        initial_instance,
+                        initial_tx.clone(),
+                    )),
+                    initial_done: false,
+                    credit,
+                    parts: 0,
+                    updates: 0,
+                    max_results: req.max_results,
+                    buffered: VecDeque::new(),
+                },
+            );
+            let mut target_of = self.sub_target_of.lock().unwrap();
+            for id in &ids {
+                target_of.insert(id.clone(), req.id.clone());
+            }
+            target_of.insert(initial_id.clone(), req.id.clone());
+        }
+        // The initial request's deadline, as a unary request's.
+        let timeout = if req.timeout_ms > 0 {
+            req.timeout_ms
+        } else {
+            5_000
+        };
+        let me = Arc::clone(self);
+        let id = req.id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(timeout.into())).await;
+            let pending = me
+                .subscriptions
+                .lock()
+                .unwrap()
+                .get(&id)
+                .is_some_and(|s| !s.initial_done);
+            if pending {
+                let end = me.end_subscription(
+                    &id,
+                    Some(Some(error(
+                        &id,
+                        proto::ErrorCode::Timeout,
+                        "initial request timed out",
+                    ))),
+                    Some("initial result failed"),
+                );
+                deliver(end).await;
+            }
+        });
+        if let Some(max) = *self.subscription_max_duration.lock().unwrap() {
+            let me = Arc::clone(self);
+            let id = req.id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(max).await;
+                let message = format!("max subscription duration ({max:?}) exceeded");
+                let end = me.end_subscription(
+                    &id,
+                    Some(Some(error(&id, proto::ErrorCode::Cancelled, &message))),
+                    Some(&message),
+                );
+                deliver(end).await;
+            });
+        }
+        // Written directly, no permit: the targets first, then the initial request.
+        for (id, (_, _, _, target)) in ids.iter().zip(&capable) {
+            let forwarded = proto::Request {
+                id: id.clone(),
+                mode: proto::RequestMode::Subscription as i32,
+                initial_credit: 0,
+                max_results: 0,
+                ..req.clone()
+            };
+            let _ = target
+                .send(Ok(server(server_message::Message::Request(forwarded))))
+                .await;
+        }
+        let initial = proto::Request {
+            id: initial_id,
+            mode: proto::RequestMode::Unary as i32,
+            initial_credit: 0,
+            max_results: 0,
+            ..req.clone()
+        };
+        let _ = initial_tx
+            .send(Ok(server(server_message::Message::Request(initial))))
+            .await;
+        true
+    }
+
+    /// The `Reply` to `<id>#0` from stream `stream_no`, if it is a subscription's initial
+    /// request: the first part (`seq` 1), then the buffered updates under the credit; an error
+    /// ends the subscription.
+    async fn initial_reply(
+        &self,
+        stream_no: usize,
+        id: &str,
+        result: Result<Vec<u8>, proto::Error>,
+    ) {
+        let Some(parent) = self.sub_target_of.lock().unwrap().get(id).cloned() else {
+            return;
+        };
+        if !id.ends_with("#0") {
+            return;
+        }
+        let out = {
+            let mut subscriptions = self.subscriptions.lock().unwrap();
+            let Some(st) = subscriptions.get_mut(&parent) else {
+                return;
+            };
+            if !st.initial.as_ref().is_some_and(|i| i.0 == stream_no) {
+                return;
+            }
+            let Some((_, service, instance, _)) = st.initial.take() else {
+                return;
+            };
+            match result {
+                Ok(payload) => {
+                    st.initial_done = true;
+                    st.parts += 1;
+                    st.credit = st.credit.saturating_sub(1);
+                    let part = server(server_message::Message::Part(proto::ReplyPart {
+                        request_id: parent.clone(),
+                        payload,
+                        error: None,
+                        responder_service: service,
+                        responder_instance: instance,
+                        seq: u64::from(st.parts),
+                    }));
+                    let mut out = vec![(st.sender.clone(), part)];
+                    let (drained, maxed) = Self::drain(&parent, st);
+                    out.extend(drained);
+                    let complete = st.targets.is_empty() && st.buffered.is_empty() && !maxed;
+                    drop(subscriptions);
+                    if maxed {
+                        out.extend(self.end_subscription(&parent, Some(None), Some("max results")));
+                    } else if complete {
+                        out.extend(self.end_subscription(&parent, Some(None), None));
+                    }
+                    out
+                }
+                Err(e) => {
+                    drop(subscriptions);
+                    self.end_subscription(&parent, Some(Some(e)), Some("initial result failed"))
+                }
+            }
+        };
+        self.sub_target_of.lock().unwrap().remove(id);
+        deliver(out).await;
+    }
+
+    /// Relays the buffered updates of `id` while it has credit, with the hub's `seq`. True when
+    /// `max_results` is reached.
+    fn drain(id: &str, st: &mut SubState) -> (Vec<(Outbound, ServerMessage)>, bool) {
+        let mut out = vec![];
+        while st.credit > 0 {
+            let Some((payload, service, instance)) = st.buffered.pop_front() else {
+                return (out, false);
+            };
+            st.credit -= 1;
+            st.parts += 1;
+            st.updates += 1;
+            out.push((
+                st.sender.clone(),
+                server(server_message::Message::Part(proto::ReplyPart {
+                    request_id: id.to_string(),
+                    payload,
+                    error: None,
+                    responder_service: service,
+                    responder_instance: instance,
+                    seq: u64::from(st.parts),
+                })),
+            ));
+            if st.max_results > 0 && st.updates >= st.max_results {
+                return (out, true);
+            }
+        }
+        (out, false)
+    }
+
+    /// Ends subscription `id` (if still open): `end` is `Some(error)` for a `ReplyEnd` to the
+    /// sender (`None`: nothing more to the sender), `cancel` the reason of a `Cancel` to every
+    /// target still serving (and to `<id>#0` while forwarded).
+    fn end_subscription(
+        &self,
+        id: &str,
+        end: Option<Option<proto::Error>>,
+        cancel: Option<&str>,
+    ) -> Vec<(Outbound, ServerMessage)> {
+        let Some(st) = self.subscriptions.lock().unwrap().remove(id) else {
+            return vec![];
+        };
+        {
+            let mut target_of = self.sub_target_of.lock().unwrap();
+            for t in st.targets.keys() {
+                target_of.remove(t);
+            }
+            target_of.remove(&format!("{id}#0"));
+        }
+        let mut out = vec![];
+        if let Some(error) = end {
+            let error = error.map(|mut e| {
+                e.request_id = id.to_string();
+                e
+            });
+            out.push((
+                st.sender.clone(),
+                server(server_message::Message::End(proto::ReplyEnd {
+                    request_id: id.to_string(),
+                    error,
+                    parts: st.parts,
+                    failed: 0,
+                    timed_out: 0,
+                })),
+            ));
+        }
+        if let Some(reason) = cancel {
+            if let Some((_, _, _, initial_tx)) = &st.initial {
+                out.push((initial_tx.clone(), cancel_msg(&format!("{id}#0"), reason)));
+            }
+            let mut targets: Vec<(&String, &(usize, String, String, Outbound))> =
+                st.targets.iter().collect();
+            targets.sort_by(|a, b| a.0.cmp(b.0));
+            for (target_id, (_, _, _, target)) in targets {
+                out.push((target.clone(), cancel_msg(target_id, reason)));
+            }
+        }
+        out
+    }
+
+    /// A target's `ReplyPart` for `<id>#n` from stream `stream_no`: an update, relayed under
+    /// the credit (buffered behind the initial part and beyond the credit).
+    fn on_sub_part(
+        &self,
+        stream_no: usize,
+        p: proto::ReplyPart,
+    ) -> Option<Vec<(Outbound, ServerMessage)>> {
+        let parent = self
+            .sub_target_of
+            .lock()
+            .unwrap()
+            .get(&p.request_id)
+            .cloned()?;
+        let cap = self.subscription_buffer.load(Ordering::SeqCst);
+        let ended = {
+            let mut subscriptions = self.subscriptions.lock().unwrap();
+            let st = subscriptions.get_mut(&parent)?;
+            let (_, service, instance, _) = st
+                .targets
+                .get(&p.request_id)
+                .filter(|t| t.0 == stream_no)?
+                .clone();
+            if let Some(e) = p.error {
+                st.targets.remove(&p.request_id);
+                Err((Some(Some(e)), format!("target {instance} failed")))
+            } else if st.buffered.len() >= cap {
+                Err((
+                    Some(Some(error(
+                        &parent,
+                        proto::ErrorCode::ResourceExhausted,
+                        &format!("subscriber buffer ({cap}) exceeded"),
+                    ))),
+                    "subscriber buffer exceeded".to_string(),
+                ))
+            } else {
+                st.buffered.push_back((p.payload, service, instance));
+                if st.initial_done {
+                    Ok(Self::drain(&parent, st))
+                } else {
+                    Ok((vec![], false))
+                }
+            }
+        };
+        Some(match ended {
+            Ok((mut out, maxed)) => {
+                if maxed {
+                    out.extend(self.end_subscription(&parent, Some(None), Some("max results")));
+                }
+                out
+            }
+            Err((end, reason)) => self.end_subscription(&parent, end, Some(&reason)),
+        })
+    }
+
+    /// A target's `ReplyEnd` for `<id>#n` from stream `stream_no`: that target is done; the
+    /// last one's clean end ends the subscription once the buffer is out, an error ends it now.
+    fn on_sub_end(
+        &self,
+        stream_no: usize,
+        e: proto::ReplyEnd,
+    ) -> Option<Vec<(Outbound, ServerMessage)>> {
+        let parent = self
+            .sub_target_of
+            .lock()
+            .unwrap()
+            .get(&e.request_id)
+            .cloned()?;
+        let (instance, complete) = {
+            let mut subscriptions = self.subscriptions.lock().unwrap();
+            let st = subscriptions.get_mut(&parent)?;
+            let (_, _, instance, _) = st
+                .targets
+                .get(&e.request_id)
+                .filter(|t| t.0 == stream_no)?
+                .clone();
+            st.targets.remove(&e.request_id);
+            (
+                instance,
+                st.targets.is_empty() && st.initial_done && st.buffered.is_empty(),
+            )
+        };
+        self.sub_target_of.lock().unwrap().remove(&e.request_id);
+        Some(match e.error {
+            Some(error) => self.end_subscription(
+                &parent,
+                Some(Some(error)),
+                Some(&format!("target {instance} failed")),
+            ),
+            None if complete => self.end_subscription(&parent, Some(None), None),
+            None => vec![],
+        })
+    }
+
+    /// A sender's `Flow` for a subscription: more credit, the buffer drains (nothing to the
+    /// targets). `None` when `id` is no subscription of that sender.
+    fn on_sub_flow(
+        &self,
+        stream_no: usize,
+        f: &proto::Flow,
+    ) -> Option<Vec<(Outbound, ServerMessage)>> {
+        let (mut out, maxed, complete) = {
+            let mut subscriptions = self.subscriptions.lock().unwrap();
+            let st = subscriptions
+                .get_mut(&f.request_id)
+                .filter(|s| s.sender_no == stream_no)?;
+            st.credit = st.credit.saturating_add(f.credits);
+            let (out, maxed) = if st.initial_done {
+                Self::drain(&f.request_id, st)
+            } else {
+                (vec![], false)
+            };
+            (
+                out,
+                maxed,
+                st.targets.is_empty() && st.initial_done && st.buffered.is_empty(),
+            )
+        };
+        if maxed {
+            out.extend(self.end_subscription(&f.request_id, Some(None), Some("max results")));
+        } else if complete {
+            out.extend(self.end_subscription(&f.request_id, Some(None), None));
+        }
+        Some(out)
+    }
+
+    /// A sender's `Cancel` for a subscription: every target is cancelled, nothing more to the
+    /// sender. `None` when `id` is no subscription of that sender.
+    fn on_sub_cancel(
+        &self,
+        stream_no: usize,
+        c: &proto::Cancel,
+    ) -> Option<Vec<(Outbound, ServerMessage)>> {
+        if !self
+            .subscriptions
+            .lock()
+            .unwrap()
+            .get(&c.request_id)
+            .is_some_and(|s| s.sender_no == stream_no)
+        {
+            return None;
+        }
+        Some(self.end_subscription(&c.request_id, None, Some(&c.reason)))
+    }
+
+    /// Stream `stream_no` ended: the subscriptions it sent are cancelled at their targets; the
+    /// ones it served lose that target (silently, unless it was the last one or the initial's
+    /// handler before the initial part).
+    fn subscriber_or_target_closed(&self, stream_no: usize) -> Vec<(Outbound, ServerMessage)> {
+        let mut out = vec![];
+        let sent: Vec<String> = self
+            .subscriptions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, s)| s.sender_no == stream_no)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in sent {
+            out.extend(self.end_subscription(&id, None, Some("sender disconnected")));
+        }
+        let served: Vec<String> = self
+            .subscriptions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, s)| {
+                s.targets.values().any(|t| t.0 == stream_no)
+                    || s.initial.as_ref().is_some_and(|i| i.0 == stream_no)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in served {
+            let (instance, initial_lost, last) = {
+                let mut subscriptions = self.subscriptions.lock().unwrap();
+                let Some(st) = subscriptions.get_mut(&id) else {
+                    continue;
+                };
+                let gone: Vec<String> = st
+                    .targets
+                    .iter()
+                    .filter(|(_, t)| t.0 == stream_no)
+                    .map(|(t, _)| t.clone())
+                    .collect();
+                let mut instance = String::new();
+                for t in &gone {
+                    if let Some((_, _, i, _)) = st.targets.remove(t) {
+                        instance = i;
+                    }
+                    self.sub_target_of.lock().unwrap().remove(t);
+                }
+                let initial_lost = st.initial.as_ref().is_some_and(|i| i.0 == stream_no);
+                if initial_lost {
+                    st.initial = None;
+                }
+                (instance, initial_lost, st.targets.is_empty())
+            };
+            let error = error(
+                &id,
+                proto::ErrorCode::HandlerDisconnected,
+                &format!("handler instance {instance} disconnected"),
+            );
+            if initial_lost {
+                out.extend(self.end_subscription(
+                    &id,
+                    Some(Some(error)),
+                    Some("initial result failed"),
+                ));
+            } else if last {
+                out.extend(self.end_subscription(&id, Some(Some(error)), None));
             }
         }
         out
@@ -632,7 +1239,6 @@ impl State {
 
     /// A handler's `ReplyPart` for `<id>#1` from stream `stream_no`: relayed under the credit.
     fn on_part(&self, stream_no: usize, p: proto::ReplyPart) -> Vec<(Outbound, ServerMessage)> {
-        self.parts.lock().unwrap().push((stream_no, p.clone()));
         let Some(parent) = self
             .stream_target_of
             .lock()
@@ -691,7 +1297,6 @@ impl State {
 
     /// A handler's `ReplyEnd` for `<id>#1` from stream `stream_no`: relayed.
     fn on_end(&self, stream_no: usize, e: proto::ReplyEnd) -> Vec<(Outbound, ServerMessage)> {
-        self.ends.lock().unwrap().push((stream_no, e.clone()));
         let Some(parent) = self
             .stream_target_of
             .lock()
@@ -715,7 +1320,6 @@ impl State {
 
     /// A sender's `Flow` from stream `stream_no`: more credit, relayed to the handler.
     fn on_flow(&self, stream_no: usize, f: proto::Flow) -> Vec<(Outbound, ServerMessage)> {
-        self.flows.lock().unwrap().push((stream_no, f.clone()));
         if f.credits == 0 {
             return vec![];
         }
@@ -742,7 +1346,6 @@ impl State {
     /// A sender's `Cancel` from stream `stream_no`: the handler is cancelled, nothing more to
     /// the sender.
     fn on_cancel(&self, stream_no: usize, c: proto::Cancel) -> Vec<(Outbound, ServerMessage)> {
-        self.cancels.lock().unwrap().push((stream_no, c.clone()));
         if !self
             .open_streams
             .lock()
@@ -809,6 +1412,10 @@ impl State {
             if !dropped {
                 deliver(msgs).await;
             }
+        }
+        let msgs = self.subscriber_or_target_closed(stream_no);
+        if !dropped {
+            deliver(msgs).await;
         }
         if dropped {
             return;
@@ -889,9 +1496,11 @@ impl Hub for Service {
                                 let wants_status = r.capabilities.iter().any(|c| c == "instance-status");
                                 let wants_scatter = r.capabilities.iter().any(|c| c == "scatter-gather");
                                 let wants_streaming = r.capabilities.iter().any(|c| c == "streaming");
+                                let wants_subscription = r.capabilities.iter().any(|c| c == "subscription");
                                 state.log(Event::Register { stream: stream_no, types: r.command_types.len() + r.query_types.len() + r.shared_query_types.len() });
                                 let scatter = wants_scatter && v2 && state.scatter_gather.load(Ordering::SeqCst) && state.ack.lock().unwrap().is_some();
                                 let streaming = wants_streaming && v2 && state.streaming.load(Ordering::SeqCst) && state.ack.lock().unwrap().is_some();
+                                let subscription = wants_subscription && v2 && state.subscription.load(Ordering::SeqCst) && state.ack.lock().unwrap().is_some();
                                 state.routes.lock().unwrap().insert(stream_no, Route {
                                     service: r.service_name.clone(),
                                     instance: r.instance_id.clone(),
@@ -899,6 +1508,7 @@ impl Hub for Service {
                                     queries: r.query_types.iter().chain(&r.shared_query_types).cloned().collect(),
                                     scatter,
                                     streaming,
+                                    subscription,
                                     tx: tx.clone(),
                                 });
                                 instance = Some(r.instance_id.clone());
@@ -931,6 +1541,9 @@ impl Hub for Service {
                                     if wants_streaming && state.streaming.load(Ordering::SeqCst) {
                                         ack.capabilities.push("streaming".to_string());
                                     }
+                                    if wants_subscription && state.subscription.load(Ordering::SeqCst) {
+                                        ack.capabilities.push("subscription".to_string());
+                                    }
                                     ack
                                 });
                                 if let (true, Some(ack)) = (v2, ack) {
@@ -952,7 +1565,8 @@ impl Hub for Service {
                                     Some(proto::reply::Result::Payload(p)) => Ok(p),
                                     None => Ok(b"{}".to_vec()),
                                 };
-                                state.answer(&r.request_id, result).await;
+                                state.answer(&r.request_id, result.clone()).await;
+                                state.initial_reply(stream_no, &r.request_id, result).await;
                             }
                             client_message::Message::Permits(p) => {
                                 state.permits.lock().unwrap().push((stream_no, p.count, std::time::Instant::now()));
@@ -974,16 +1588,46 @@ impl Hub for Service {
                                     && state.scatter(stream_no, &req, &tx).await;
                                 let streamed = req.mode == proto::RequestMode::Streaming as i32
                                     && state.open_stream(stream_no, &req, &tx).await;
-                                if !scattered && !streamed {
+                                let subscribed = req.mode == proto::RequestMode::Subscription as i32
+                                    && state.open_subscription(stream_no, &req, &tx).await;
+                                if !scattered && !streamed && !subscribed {
                                     let response = state.responder.lock().await.as_ref().and_then(|f| f(req));
                                     if let Some(resp) = response && tx.send(Ok(resp)).await.is_err() { break; }
                                 }
                             }
-                            // Multi-part messages of streaming queries (ADR 0017, P4b).
-                            client_message::Message::Part(p) => deliver(state.on_part(stream_no, p)).await,
-                            client_message::Message::End(e) => deliver(state.on_end(stream_no, e)).await,
-                            client_message::Message::Flow(f) => deliver(state.on_flow(stream_no, f)).await,
-                            client_message::Message::Cancel(c) => deliver(state.on_cancel(stream_no, c)).await,
+                            // Multi-part messages of streaming queries (P4b) and subscriptions (P4c).
+                            client_message::Message::Part(p) => {
+                                state.parts.lock().unwrap().push((stream_no, p.clone()));
+                                let msgs = match state.on_sub_part(stream_no, p.clone()) {
+                                    Some(msgs) => msgs,
+                                    None => state.on_part(stream_no, p),
+                                };
+                                deliver(msgs).await
+                            }
+                            client_message::Message::End(e) => {
+                                state.ends.lock().unwrap().push((stream_no, e.clone()));
+                                let msgs = match state.on_sub_end(stream_no, e.clone()) {
+                                    Some(msgs) => msgs,
+                                    None => state.on_end(stream_no, e),
+                                };
+                                deliver(msgs).await
+                            }
+                            client_message::Message::Flow(f) => {
+                                state.flows.lock().unwrap().push((stream_no, f.clone()));
+                                let msgs = match state.on_sub_flow(stream_no, &f) {
+                                    Some(msgs) => msgs,
+                                    None => state.on_flow(stream_no, f),
+                                };
+                                deliver(msgs).await
+                            }
+                            client_message::Message::Cancel(c) => {
+                                state.cancels.lock().unwrap().push((stream_no, c.clone()));
+                                let msgs = match state.on_sub_cancel(stream_no, &c) {
+                                    Some(msgs) => msgs,
+                                    None => state.on_cancel(stream_no, c),
+                                };
+                                deliver(msgs).await
+                            }
                         },
                         Some(Ok(ClientMessage { message: None })) => {}
                     }
@@ -1056,6 +1700,13 @@ impl FakeHub {
             open_streams: StdMutex::new(HashMap::new()),
             stream_target_of: StdMutex::new(HashMap::new()),
             rotation: AtomicUsize::new(0),
+            subscription: AtomicBool::new(true),
+            subscriptions: StdMutex::new(HashMap::new()),
+            sub_target_of: StdMutex::new(HashMap::new()),
+            sub_rotation: AtomicUsize::new(0),
+            subscription_buffer: AtomicUsize::new(256),
+            max_subscriptions_per_instance: AtomicUsize::new(1024),
+            subscription_max_duration: StdMutex::new(None),
             parts: StdMutex::new(vec![]),
             ends: StdMutex::new(vec![]),
             flows: StdMutex::new(vec![]),
@@ -1148,6 +1799,48 @@ impl FakeHub {
     /// Whether the ack shares "streaming" with clients that declare it (`false`: a P4a hub).
     pub fn set_streaming(&self, on: bool) {
         self.state.streaming.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether the ack shares "subscription" with clients that declare it (`false`: a P4b hub).
+    pub fn set_subscription(&self, on: bool) {
+        self.state.subscription.store(on, Ordering::SeqCst);
+    }
+
+    /// Updates held per subscription while its sender owes credit (default 256, as kraken-hub).
+    pub fn set_subscription_buffer(&self, updates: usize) {
+        self.state
+            .subscription_buffer
+            .store(updates, Ordering::SeqCst);
+    }
+
+    /// Subscription targets one handler instance serves at once (default 1024, as kraken-hub).
+    pub fn set_max_subscriptions_per_instance(&self, max: usize) {
+        self.state
+            .max_subscriptions_per_instance
+            .store(max, Ordering::SeqCst);
+    }
+
+    /// `KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION` (default `None`: unlimited) for subscriptions
+    /// opened from now on.
+    pub fn set_subscription_max_duration(&self, max: Option<Duration>) {
+        *self.state.subscription_max_duration.lock().unwrap() = max;
+    }
+
+    /// Subscriptions still open.
+    pub fn open_subscriptions(&self) -> usize {
+        self.state.subscriptions.lock().unwrap().len()
+    }
+
+    /// Update targets still serving, over every open subscription (the hub's
+    /// `kraken_hub_subscriptions_open` summed over the instances).
+    pub fn subscription_targets_open(&self) -> usize {
+        self.state
+            .subscriptions
+            .lock()
+            .unwrap()
+            .values()
+            .map(|s| s.targets.len())
+            .sum()
     }
 
     /// Scatter-gathers still open.
