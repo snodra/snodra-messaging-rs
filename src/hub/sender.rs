@@ -21,7 +21,9 @@
 //! and the initial credit to one hub whose ack lists `streaming`, answered by one handler's
 //! `ReplyPart`s and one `ReplyEnd`. The pending entry lives until the end; the caller's stream
 //! refills credit as it consumes (`Flow`), and dropping it before the end sends `Cancel`. The
-//! local guard is an idle guard (reset by every part), like the hub's idle timeout.
+//! local guard is an idle guard (reset by every part), like the hub's idle timeout, with twice
+//! the bound for the first part (the hub bounds a queue wait by the timeout, then restarts the
+//! idle clock at the forward); when it fires the stream is cancelled at the hub, best effort.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -105,6 +107,14 @@ pub fn request_timing(
     }
 }
 
+/// The local guard of a streaming query's first part, from its idle guard (the hub's bound plus
+/// [`LOCAL_GUARD_MARGIN`]): twice the bound plus the margin. The hub bounds a queue wait by the
+/// request's timeout and restarts the idle clock at the forward (ADR 0017, P4b), so the first
+/// part may legitimately take up to twice the timeout.
+fn first_part_guard(idle_guard: Duration) -> Duration {
+    idle_guard + idle_guard.saturating_sub(LOCAL_GUARD_MARGIN)
+}
+
 /// The timeout the caller chose: the per-call one, else the configured default. A zero duration
 /// counts as not chosen (it would mean an instant local guard).
 pub(crate) fn chosen_timeout(
@@ -178,7 +188,8 @@ pub struct StreamOptions {
     /// The idle timeout: the longest the hub waits for the next part (from the forward, reset by
     /// every part), sent as `timeout_ms` under the rules of [`SendOptions::timeout`] (without
     /// one, `Config.hub_request_timeout`, else the hub's per-type override or default). The
-    /// local guard (the hub's bound plus [`LOCAL_GUARD_MARGIN`]) is an idle guard too.
+    /// local guard (the hub's bound plus [`LOCAL_GUARD_MARGIN`]) is an idle guard too; the
+    /// first part gets twice the bound plus the margin (a queue wait, then the idle clock).
     pub timeout: Option<Duration>,
     /// End the stream after this many parts (the hub cancels the handler); 0 is no limit.
     pub max_results: u32,
@@ -490,8 +501,11 @@ struct Streaming<'a> {
     /// The hub stream the request was written to: `Flow` and `Cancel` go there.
     stream: StreamId,
     events: mpsc::UnboundedReceiver<GatherEvent>,
-    /// The idle guard: the hub's bound for the request plus [`LOCAL_GUARD_MARGIN`].
+    /// The idle guard: the hub's bound for the request plus [`LOCAL_GUARD_MARGIN`]; the first
+    /// part gets [`first_part_guard`] of it.
     guard: Duration,
+    /// No part arrived yet.
+    first: bool,
     moves: usize,
     written: bool,
     done: bool,
@@ -517,18 +531,30 @@ impl Streaming<'_> {
             return None;
         }
         loop {
-            let event = match tokio::time::timeout(self.guard, self.events.recv()).await {
+            let guard = if self.first {
+                first_part_guard(self.guard)
+            } else {
+                self.guard
+            };
+            let event = match tokio::time::timeout(guard, self.events.recv()).await {
                 Ok(Some(event)) => event,
                 Ok(None) => GatherEvent::Ended(Outcome::Done(Err(MessagingError::HubUnavailable(
                     "sender closed".into(),
                 )))),
-                // The hub ends an idle stream itself; the guard covers a hub that never does.
-                Err(_) => GatherEvent::Ended(Outcome::Done(Err(MessagingError::Timeout(
-                    self.call.type_name.to_string(),
-                )))),
+                // The hub ends an idle stream itself; the guard covers a hub that never does
+                // (told to cancel, best effort, so a handler stops holding its permit).
+                Err(_) => {
+                    self.cancel("local guard timeout").await;
+                    return Some(Err(MessagingError::Timeout(
+                        self.call.type_name.to_string(),
+                    )));
+                }
             };
             match event {
-                GatherEvent::Part(part) => return Some(Ok(part)),
+                GatherEvent::Part(part) => {
+                    self.first = false;
+                    return Some(Ok(part));
+                }
                 GatherEvent::End(end) => {
                     self.done = true;
                     return match end.error {
@@ -1100,6 +1126,7 @@ impl Sender {
             stream: 0,
             events,
             guard: Duration::ZERO,
+            first: true,
             moves: 0,
             written: false,
             done: false,
@@ -1707,6 +1734,19 @@ mod tests {
         // Flow and Cancel are the dispatcher's: ignored here.
         sender.on_inbound(Inbound::Flow(proto::Flow::default()));
         sender.on_inbound(Inbound::Cancel(proto::Cancel::default()));
+    }
+
+    #[test]
+    fn the_first_part_guard_is_twice_the_hub_bound_plus_the_margin() {
+        // The idle guard is the hub's bound plus the margin; the first part may take a queue
+        // wait of the bound and then the bound again from the forward.
+        assert_eq!(first_part_guard(S(6)), S(11));
+        assert_eq!(first_part_guard(MS(1_300)), MS(1_600));
+        assert_eq!(
+            first_part_guard(LOCAL_GUARD_MARGIN),
+            LOCAL_GUARD_MARGIN,
+            "a zero bound stays the margin"
+        );
     }
 
     #[test]

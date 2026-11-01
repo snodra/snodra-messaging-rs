@@ -923,6 +923,90 @@ async fn the_idle_timeout_ends_the_stream_with_timeout() {
     c.shutdown().await;
 }
 
+/// The hub bounds a queue wait by `timeout_ms` and restarts the idle clock at the forward, so
+/// the first part may take up to twice the timeout: the local guard allows 2 x the hub's bound
+/// plus 1 s for it, then the bound plus 1 s reset by every part. (A hub that never ends an idle
+/// stream shows which guard fired; the guard cancels the stream at the hub.)
+#[tokio::test]
+async fn the_local_guard_allows_twice_the_hub_bound_for_the_first_part_then_the_bound() {
+    let hub = FakeHub::start().await;
+    hub.set_stream_timeouts(false);
+    let probe = Arc::new(Probe::default());
+    let h = handler(&hub.address(), "svc-h", "h1", &probe, 2).await;
+    let c = caller(&hub.address()).await;
+    let options = StreamOptions {
+        timeout: Some(Duration::from_millis(300)),
+        ..StreamOptions::default()
+    };
+    // No first part ever: the open fails at 2 x 300 ms + 1 s.
+    let hang = Arc::new(Probe::default());
+    let slow = node_with(
+        &hub.address(),
+        "svc-slow",
+        "s1",
+        {
+            let mut r = HandlerRegistry::new();
+            let probe = Arc::clone(&hang);
+            r.shared_streaming_query::<SharedExport, _, _, _>(move |_, _| {
+                let probe = Arc::clone(&probe);
+                async move {
+                    Ok(Watched {
+                        inner: Box::pin(tokio_stream::pending()),
+                        probe,
+                    })
+                }
+            });
+            r
+        },
+        2,
+        SenderSettings::default(),
+    )
+    .await;
+    let started = Instant::now();
+    let e = c
+        .sender
+        .stream(&SharedExport {}, options.clone())
+        .await
+        .err()
+        .expect("the local guard");
+    let took = started.elapsed();
+    assert!(matches!(e, MessagingError::Timeout(_)), "{e:?}");
+    assert!(
+        took >= Duration::from_millis(1_550) && took < Duration::from_millis(2_500),
+        "the first-part guard is 2 x bound + 1 s, took {took:?}"
+    );
+    eventually("the slow handler cancelled by the guard", async || {
+        hang.dropped.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(c.sender.in_flight(), 0);
+    // A first part at once, then nothing: the idle guard is the bound + 1 s.
+    let mut stream = c
+        .sender
+        .stream(&export(3, 30_000, None), options)
+        .await
+        .unwrap();
+    assert_eq!(stream.next().await.unwrap().unwrap().i, 0);
+    let started = Instant::now();
+    let e = stream.next().await.unwrap().unwrap_err();
+    let took = started.elapsed();
+    assert!(matches!(e, MessagingError::Timeout(_)), "{e:?}");
+    assert!(
+        took >= Duration::from_millis(1_250) && took < Duration::from_millis(1_550),
+        "the idle guard is bound + 1 s, took {took:?}"
+    );
+    assert!(stream.next().await.is_none());
+    eventually("the handler cancelled by the guard", async || {
+        probe.dropped.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(c.sender.in_flight(), 0);
+    drop(stream);
+    h.shutdown().await;
+    slow.shutdown().await;
+    c.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_handler_error_item_is_the_last_item() {
     let hub = FakeHub::start().await;

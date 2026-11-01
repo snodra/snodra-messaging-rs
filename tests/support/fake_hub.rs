@@ -203,6 +203,8 @@ pub struct State {
     events: StdMutex<Vec<(Event, std::time::Instant)>>,
     scatter_gather: AtomicBool,
     streaming: AtomicBool,
+    /// Whether idle streams end with TIMEOUT (`false`: a hub that never does, for local-guard tests).
+    stream_timeouts: AtomicBool,
     /// stream number → its registration.
     routes: StdMutex<HashMap<usize, Route>>,
     /// gather id → the gather; target id → gather id.
@@ -557,6 +559,9 @@ impl State {
                 else {
                     return;
                 };
+                if !me.stream_timeouts.load(Ordering::SeqCst) {
+                    return;
+                }
                 if Instant::now() >= deadline {
                     let end = me.end_stream(
                         &id,
@@ -1034,6 +1039,7 @@ impl FakeHub {
             events: StdMutex::new(vec![]),
             scatter_gather: AtomicBool::new(true),
             streaming: AtomicBool::new(true),
+            stream_timeouts: AtomicBool::new(true),
             routes: StdMutex::new(HashMap::new()),
             gathers: StdMutex::new(HashMap::new()),
             target_of: StdMutex::new(HashMap::new()),
@@ -1137,6 +1143,12 @@ impl FakeHub {
     /// Scatter-gathers still open.
     pub fn open_gathers(&self) -> usize {
         self.state.gathers.lock().unwrap().len()
+    }
+
+    /// Whether idle streams end with `TIMEOUT` (default `true`, as kraken-hub); `false` is a hub
+    /// that never ends them, so the client's local guard is what fires.
+    pub fn set_stream_timeouts(&self, on: bool) {
+        self.state.stream_timeouts.store(on, Ordering::SeqCst);
     }
 
     /// Streaming queries still open.

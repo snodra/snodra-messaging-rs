@@ -416,7 +416,10 @@ while let Some(row) = rows.next().await { let row = row?; /* in the handler's or
   `HandlerDisconnected` (the handler left), `Cancelled` (`KRAKEN_HUB_MAX_STREAM_DURATION`). A hub
   stream lost after the first item is `HubConnectionLost`, a part that does not decode
   `Serialization` (the handler is cancelled). After `max_results` items the hub ends the stream
-  and cancels the handler. The local guard (the hub's bound plus 1 s) is an idle guard.
+  and cancels the handler. The local guard (for a hub that never answers; it cancels the stream,
+  best effort) allows 2 x the hub's bound plus 1 s for the first part (the hub bounds a queue
+  wait by the timeout and then restarts the idle clock at the forward) and the bound plus 1 s,
+  reset by every part, after it.
 - **Cancel.** Dropping the stream before its end sends `Cancel{id, "dropped by the sender"}`
   (best effort, from the drop) and forgets the request, also when the open is dropped while its
   write is still blocked. A handler whose stream is cancelled by the hub (the sender dropped it or
