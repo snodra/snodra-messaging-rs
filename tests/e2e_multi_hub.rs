@@ -1,0 +1,305 @@
+//! End to end with two real P3 hubs (`kraken-hub:p3-hub`, ADR 0016): every instance registers on
+//! both, reports its connected hubs to both, spreads unkeyed requests over both, survives one hub
+//! stopping mid-traffic and is back on it within the backoff cap once it restarts.
+mod support;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use kraken_messaging::hub::SendOptions;
+use kraken_messaging::{Command, Config, KrakenMessaging, MessagingError, message_type};
+use serde::{Deserialize, Serialize};
+use support::containers::{
+    HubContainer, HubImage, HubOptions, free_port, hub_with, mongo, wait_until_reachable,
+};
+
+macro_rules! require_docker {
+    () => {
+        if !support::docker_available() {
+            eprintln!("docker not available, skipping");
+            return;
+        }
+    };
+}
+
+#[derive(Serialize, Deserialize)]
+struct Work {}
+message_type!(Work, "e2e.Work");
+impl Command for Work {
+    type Reply = ();
+}
+
+const IDS: [&str; 2] = ["e2e-hub-1", "e2e-hub-2"];
+
+/// Two P3 hubs with fixed ids, on fixed host ports (a restart keeps the address).
+async fn two_hubs() -> (HubContainer, HubContainer) {
+    let start = |id: &'static str| {
+        hub_with(
+            HubOptions::new(HubImage::P3)
+                .port(free_port())
+                .env("KRAKEN_HUB_ID", id),
+        )
+    };
+    tokio::join!(start(IDS[0]), start(IDS[1]))
+}
+
+fn config(service: &str, hubs: &str, mongo: &str) -> Config {
+    let mut c = Config::new(service, hubs, "127.0.0.1:1", mongo);
+    c.outbox_enabled = false;
+    c.consumer_enabled = false;
+    c.reconnect_backoff_min = Duration::from_millis(100);
+    c.max_concurrent_handlers = 8;
+    c
+}
+
+/// The handler side: `e2e.Work` takes 20 ms.
+async fn worker(cfg: Config) -> KrakenMessaging {
+    KrakenMessaging::builder(cfg)
+        .await
+        .unwrap()
+        .command::<Work, _, _>(|_, _| async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(())
+        })
+        .start()
+        .await
+        .unwrap()
+}
+
+async fn caller(cfg: Config) -> KrakenMessaging {
+    KrakenMessaging::builder(cfg)
+        .await
+        .unwrap()
+        .start()
+        .await
+        .unwrap()
+}
+
+/// Waits (bounded by `limit`) until the app is registered on exactly `ids`; returns how long it took.
+async fn registered_on(app: &KrakenMessaging, ids: &[&str], limit: Duration) -> Duration {
+    let started = Instant::now();
+    loop {
+        let mut now = app.hub_ids();
+        now.sort();
+        if now == ids {
+            return started.elapsed();
+        }
+        assert!(
+            started.elapsed() < limit,
+            "registered on {now:?}, not {ids:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn get(hub: &HubContainer, path: &str) -> serde_json::Value {
+    reqwest::get(format!("{}{path}", hub.http))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// `service`'s instance in the hub's `/topology`, if listed.
+async fn instance(hub: &HubContainer, service: &str) -> Option<serde_json::Value> {
+    let t = get(hub, "/topology").await;
+    t["services"]
+        .as_array()?
+        .iter()
+        .find(|s| s["serviceName"] == service)
+        .map(|s| s["instances"][0].clone())
+}
+
+/// Requests of `type_name` the hub forwarded in its statistics window.
+async fn traffic(hub: &HubContainer, type_name: &str) -> u64 {
+    let t = get(hub, "/api/v1/types").await;
+    t["types"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["type"] == type_name)
+        .and_then(|t| t["traffic"]["count"].as_u64())
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn both_hubs_list_the_instance_with_both_ids_and_share_unkeyed_requests() {
+    require_docker!();
+    let ((h1, h2), db) = tokio::join!(two_hubs(), mongo());
+    let hubs = format!("{},{}", h1.address, h2.address);
+    let b = worker(config("e2e-b", &hubs, &db.uri_for("b"))).await;
+    let a = caller(config("e2e-a", &hubs, &db.uri_for("a"))).await;
+    registered_on(&b, &IDS, Duration::from_secs(15)).await;
+    let registered = Instant::now();
+    registered_on(&a, &IDS, Duration::from_secs(15)).await;
+
+    // Both hubs list the instance with both hub ids once its first report (5 s) is in.
+    for hub in [&h1, &h2] {
+        loop {
+            let view = instance(hub, "e2e-b").await;
+            let mut ids: Vec<String> = view
+                .as_ref()
+                .and_then(|v| v["connectedHubIds"].as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            ids.sort();
+            if ids == IDS {
+                let view = view.unwrap();
+                assert!(view["statusAgeMs"].as_i64().unwrap() >= 0, "{view}");
+                // ceil(8 / 2) permits offered to each hub.
+                assert_eq!(view["permitsAvailable"], 4, "{view}");
+                break;
+            }
+            assert!(
+                registered.elapsed() < Duration::from_millis(6_500),
+                "{} still shows {view:?}",
+                hub.http
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    eprintln!(
+        "both hubs show both ids {:?} after the registration",
+        registered.elapsed()
+    );
+
+    for _ in 0..50 {
+        a.commands()
+            .send_command(&Work {}, SendOptions::default())
+            .await
+            .expect("round trip over one of the hubs");
+    }
+    let (c1, c2) = (
+        traffic(&h1, "e2e.Work").await,
+        traffic(&h2, "e2e.Work").await,
+    );
+    eprintln!(
+        "50 unkeyed requests: {c1} through {}, {c2} through {}",
+        IDS[0], IDS[1]
+    );
+    assert_eq!(c1 + c2, 50);
+    assert!(c1 >= 20 && c2 >= 20, "not spread: {c1} / {c2}");
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_hub_stopped_mid_traffic_fails_over_and_is_rejoined_after_its_restart() {
+    require_docker!();
+    support::init_tracing();
+    let ((h1, h2), db) = tokio::join!(two_hubs(), mongo());
+    let hubs = format!("{},{}", h1.address, h2.address);
+    let b = worker(config("e2e-b", &hubs, &db.uri_for("b"))).await;
+    let a = Arc::new(caller(config("e2e-a", &hubs, &db.uri_for("a"))).await);
+    registered_on(&b, &IDS, Duration::from_secs(15)).await;
+    registered_on(&a, &IDS, Duration::from_secs(15)).await;
+
+    let timeout = Duration::from_secs(2);
+    let finish = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicUsize::new(0));
+    let t0 = Instant::now();
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let (a, finish, done) = (Arc::clone(&a), Arc::clone(&finish), Arc::clone(&done));
+            tokio::spawn(async move {
+                let mut results = Vec::new();
+                while !finish.load(Ordering::SeqCst) {
+                    let started = t0.elapsed();
+                    let opts = SendOptions {
+                        timeout: Some(timeout),
+                        ..Default::default()
+                    };
+                    let result = a.commands().send_command(&Work {}, opts).await;
+                    results.push((started, t0.elapsed() - started, result));
+                    done.fetch_add(1, Ordering::SeqCst);
+                }
+                results
+            })
+        })
+        .collect();
+    while done.load(Ordering::SeqCst) < 60 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let stop_at = t0.elapsed();
+    h2.container.stop().await.unwrap();
+    let stopped = t0.elapsed();
+    eprintln!("hub 2 stopped between {stop_at:?} and {stopped:?}");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    finish.store(true, Ordering::SeqCst);
+
+    let mut results = Vec::new();
+    for w in workers {
+        results.extend(w.await.unwrap());
+    }
+    results.sort_by_key(|(started, _, _)| *started);
+    let failures: Vec<_> = results.iter().filter(|(_, _, r)| r.is_err()).collect();
+    for (started, took, r) in &failures {
+        eprintln!("failed: started {started:?}, took {took:?}: {r:?}");
+    }
+    let slowest = results.iter().map(|(_, took, _)| *took).max().unwrap();
+    eprintln!(
+        "{} requests, {} failed, slowest {slowest:?}",
+        results.len(),
+        failures.len()
+    );
+    // Only requests in flight through hub 2 when it went away fail (at most one per worker, plus
+    // any written before the loss was noticed), with an unknown outcome: the stopping hub answers
+    // HANDLER_DISCONNECTED when the worker's stream closes first, else the stream to it breaks.
+    assert!(failures.len() <= 8, "{} failures", failures.len());
+    for (started, took, r) in &failures {
+        assert!(
+            matches!(
+                r,
+                Err(MessagingError::HubConnectionLost(_) | MessagingError::HandlerDisconnected(_))
+            ),
+            "{r:?}"
+        );
+        assert!(
+            *started + *took >= stop_at && *started <= stopped + Duration::from_secs(1),
+            "not in flight while hub 2 stopped: started {started:?}, took {took:?}"
+        );
+    }
+    // Nothing waits beyond the request timeout (plus the 1 s local guard margin).
+    assert!(
+        slowest <= timeout + Duration::from_millis(1_500),
+        "{slowest:?}"
+    );
+    // Everything sent once the loss is known goes to hub 1.
+    let after: Vec<_> = results
+        .iter()
+        .filter(|(started, _, _)| *started > stopped + Duration::from_secs(1))
+        .collect();
+    assert!(after.len() > 100, "{} requests after the stop", after.len());
+    assert!(after.iter().all(|(_, _, r)| r.is_ok()));
+    assert_eq!(a.hub_ids(), [IDS[0]]);
+
+    h2.container.start().await.unwrap();
+    wait_until_reachable(&h2.address).await;
+    let (ta, tb) = tokio::join!(
+        registered_on(&a, &IDS, Duration::from_secs(15)),
+        registered_on(&b, &IDS, Duration::from_secs(15)),
+    );
+    eprintln!("re-registered on the restarted hub after {ta:?} (caller) and {tb:?} (worker)");
+    assert!(
+        ta.max(tb) <= Duration::from_millis(5_500),
+        "re-registered only after {:?}",
+        ta.max(tb)
+    );
+    let before = traffic(&h2, "e2e.Work").await;
+    for _ in 0..10 {
+        a.commands()
+            .send_command(&Work {}, SendOptions::default())
+            .await
+            .expect("round trip after the restart");
+    }
+    assert!(
+        traffic(&h2, "e2e.Work").await > before,
+        "the restarted hub is used again"
+    );
+    Arc::into_inner(a).unwrap().shutdown().await;
+    b.shutdown().await;
+}

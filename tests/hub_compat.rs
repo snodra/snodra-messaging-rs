@@ -15,10 +15,13 @@
 //!   P0, reconnect included.
 //! - `kraken-hub:v1-baseline` (`KRAKEN_HUB_BASELINE_IMAGE`): the hub before protocol v2. The client
 //!   detects it (echo without ack) and works exactly as before, without `Permits`.
+//! - P3 (ADR 0016), one target through a `HubPool`: `kraken-hub:p3-hub` (`KRAKEN_HUB_P3_IMAGE`)
+//!   shares `instance-status` and gets `InstanceStatus` reports; `kraken-hub:p2`
+//!   (`KRAKEN_HUB_P2_IMAGE`) and the v1 baseline do not share it and get none, and work as before.
 //!
 //! A missing image fails the test with the command that builds it. No Kafka or MongoDB: the
 //! participants are a `HubConnection` and a `Sender` each; a pass-through (`PermitTap`) records the
-//! `Permits` a participant writes.
+//! `Permits` and `InstanceStatus` messages a participant writes.
 mod support;
 
 use std::pin::Pin;
@@ -27,7 +30,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use kraken_messaging::hub::{
-    CLIENT_VERSION, Handshake, HubConnection, HubSettings, Inbound, PERMIT_FLUSH_AFTER,
+    CLIENT_VERSION, Handshake, HubConnection, HubPool, HubSettings, Inbound, PERMIT_FLUSH_AFTER,
     SendOptions, Sender, SenderSettings,
 };
 use kraken_messaging::proto::{self, ClientMessage, client_message, reply};
@@ -195,7 +198,7 @@ async fn new_hub_acks_with_its_configured_values_and_applies_type_overrides() {
     assert_eq!(ack.protocol_version, 2);
     assert_eq!(
         ack.capabilities,
-        ["flow-control"],
+        ["flow-control", "instance-status"],
         "the hub shares what we declared"
     );
     assert_eq!(ack.heartbeat_interval_ms, 3_000);
@@ -647,6 +650,7 @@ impl FlowPeer {
 struct PermitTap {
     address: String,
     permits: Arc<AtomicU64>,
+    statuses: Arc<AtomicU64>,
 }
 
 impl PermitTap {
@@ -656,8 +660,9 @@ impl PermitTap {
         let tap = Tap {
             upstream: upstream.replace("static://", "http://"),
             permits: Arc::default(),
+            statuses: Arc::default(),
         };
-        let permits = Arc::clone(&tap.permits);
+        let (permits, statuses) = (Arc::clone(&tap.permits), Arc::clone(&tap.statuses));
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(proto::hub_server::HubServer::new(tap))
@@ -668,6 +673,7 @@ impl PermitTap {
         PermitTap {
             address: format!("static://{addr}"),
             permits,
+            statuses,
         }
     }
 
@@ -675,12 +681,18 @@ impl PermitTap {
     fn permits(&self) -> u64 {
         self.permits.load(Ordering::SeqCst)
     }
+
+    /// `InstanceStatus` messages written so far.
+    fn statuses(&self) -> u64 {
+        self.statuses.load(Ordering::SeqCst)
+    }
 }
 
 #[derive(Clone)]
 struct Tap {
     upstream: String,
     permits: Arc<AtomicU64>,
+    statuses: Arc<AtomicU64>,
 }
 
 impl Tap {
@@ -704,10 +716,16 @@ impl proto::hub_server::Hub for Tap {
         &self,
         request: tonic::Request<tonic::Streaming<ClientMessage>>,
     ) -> Result<tonic::Response<Self::ConnectStream>, Status> {
-        let permits = Arc::clone(&self.permits);
+        let (permits, statuses) = (Arc::clone(&self.permits), Arc::clone(&self.statuses));
         let outbound = request.into_inner().map_while(Result::ok).map(move |m| {
-            if let Some(client_message::Message::Permits(p)) = &m.message {
-                permits.fetch_add(p.count.into(), Ordering::SeqCst);
+            match &m.message {
+                Some(client_message::Message::Permits(p)) => {
+                    permits.fetch_add(p.count.into(), Ordering::SeqCst);
+                }
+                Some(client_message::Message::Status(_)) => {
+                    statuses.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
             }
             m
         });
@@ -1101,4 +1119,90 @@ async fn p0_hub_acks_without_flow_control_and_works_as_before() {
 async fn baseline_hub_works_as_before_without_flow_control() {
     require_docker!();
     older_hub_works_as_before(HubImage::Baseline).await;
+}
+
+// ---- P3: multi-hub client against one hub ----
+
+/// One target through a `HubPool` (what `KrakenMessaging` now uses) behaves as the single-hub
+/// client: registered in the hub's mode, round trips work, and `InstanceStatus` is written only to
+/// a hub that shares `instance-status` (the P3 hub; not P2, not v1).
+async fn single_target_pool(image: HubImage) {
+    let hub = hub_with(HubOptions::new(image)).await;
+    let tap = PermitTap::start(&hub.address).await;
+    let b = peer(&hub.address, "compat-b", &["compat.Fast"]).await;
+    let (tx, mut rx) = mpsc::channel::<Inbound>(64);
+    let pool = HubPool::new(
+        HubSettings {
+            address: tap.address.clone(),
+            status_interval: Duration::from_millis(100),
+            ..HubSettings::default()
+        },
+        "compat-pool".into(),
+        uuid::Uuid::new_v4().to_string(),
+        tx,
+    )
+    .unwrap();
+    let sender = Sender::with_pool(Arc::clone(&pool), SenderSettings::default());
+    let forward = Arc::clone(&sender);
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            forward.on_inbound(msg);
+        }
+    });
+    pool.start();
+    assert!(pool.await_registered(Duration::from_secs(15)).await);
+    let handshake = pool.connections()[0].handshake().unwrap();
+    let shares_status = image == HubImage::P3;
+    assert_eq!(
+        handshake.is_legacy(),
+        image == HubImage::Baseline,
+        "{handshake:?}"
+    );
+    assert_eq!(handshake.instance_status(), shares_status, "{handshake:?}");
+    let expected_id = match &handshake {
+        Handshake::V2(ack) => ack.hub_id.clone(),
+        Handshake::Legacy => tap.address.clone(),
+    };
+    assert_eq!(pool.hub_ids(), [expected_id]);
+    sender
+        .send_command(&Fast {}, SendOptions::default())
+        .await
+        .expect("round trip through the single hub");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    if shares_status {
+        assert!(
+            tap.statuses() >= 3,
+            "{} reports to the P3 hub",
+            tap.statuses()
+        );
+        let view = instance_view(&hub, "compat-pool").await;
+        assert!(view["statusAgeMs"].as_i64().unwrap() >= 0, "{view}");
+        assert_eq!(
+            view["connectedHubIds"].as_array().unwrap().len(),
+            1,
+            "{view}"
+        );
+    } else {
+        assert_eq!(tap.statuses(), 0, "InstanceStatus written to {image:?}");
+    }
+    pool.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
+async fn p3_hub_single_target_gets_instance_status() {
+    require_docker!();
+    single_target_pool(HubImage::P3).await;
+}
+
+#[tokio::test]
+async fn p2_hub_single_target_works_and_gets_no_instance_status() {
+    require_docker!();
+    single_target_pool(HubImage::P2).await;
+}
+
+#[tokio::test]
+async fn baseline_hub_single_target_pool_runs_in_legacy_mode_without_instance_status() {
+    require_docker!();
+    single_target_pool(HubImage::Baseline).await;
 }

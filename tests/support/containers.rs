@@ -54,6 +54,12 @@ pub enum HubImage {
     /// The merged P0 hub (protocol v2 without flow control): `KRAKEN_HUB_P0_IMAGE`, default
     /// `kraken-hub:p0`.
     P0,
+    /// The merged P2 hub (flow control, no `instance-status`): `KRAKEN_HUB_P2_IMAGE`, default
+    /// `kraken-hub:p2`.
+    P2,
+    /// The P3 hub (multi-hub, `instance-status`): `KRAKEN_HUB_P3_IMAGE`, default
+    /// `kraken-hub:p3-hub`.
+    P3,
 }
 
 impl HubImage {
@@ -67,6 +73,11 @@ impl HubImage {
             HubImage::P0 => {
                 std::env::var("KRAKEN_HUB_P0_IMAGE").unwrap_or_else(|_| "kraken-hub:p0".to_string())
             }
+            HubImage::P2 => {
+                std::env::var("KRAKEN_HUB_P2_IMAGE").unwrap_or_else(|_| "kraken-hub:p2".to_string())
+            }
+            HubImage::P3 => std::env::var("KRAKEN_HUB_P3_IMAGE")
+                .unwrap_or_else(|_| "kraken-hub:p3-hub".to_string()),
         }
     }
 
@@ -80,6 +91,12 @@ impl HubImage {
             }
             HubImage::P0 => {
                 "build the merged P0 hub and tag it `kraken-hub:p0` (or set KRAKEN_HUB_P0_IMAGE)"
+            }
+            HubImage::P2 => {
+                "build the merged P2 hub and tag it `kraken-hub:p2` (or set KRAKEN_HUB_P2_IMAGE)"
+            }
+            HubImage::P3 => {
+                "build the P3 hub and tag it `kraken-hub:p3-hub` (or set KRAKEN_HUB_P3_IMAGE)"
             }
         }
     }
@@ -221,4 +238,37 @@ pub fn free_port() -> u16 {
 /// The hub published on a fixed host port, so `stop`/`start` keeps the address the clients use.
 pub async fn hub_on(port: u16) -> HubContainer {
     hub_with(HubOptions::new(HubImage::Current).port(port)).await
+}
+
+/// Returns once a `Topology` RPC on `address` succeeds (bounded by 30 s). After `start` the host
+/// port forwarding can take seconds to work again (Rancher Desktop).
+pub async fn wait_until_reachable(address: &str) {
+    let target = address.replace("static://", "http://");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let attempt = async {
+            let channel = tonic::transport::Endpoint::from_shared(target.clone())
+                .ok()?
+                .connect()
+                .await
+                .ok()?;
+            kraken_messaging::proto::hub_client::HubClient::new(channel)
+                .topology(kraken_messaging::proto::TopologyRequest {})
+                .await
+                .ok()
+        };
+        if tokio::time::timeout(std::time::Duration::from_millis(500), attempt)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "hub at {address} never became reachable"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }

@@ -24,6 +24,7 @@ indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
 | Capability | Where |
 |---|---|
 | Register with the hub, handle commands and queries, reconnect with backoff | `hub::HubConnection`, `hub::Dispatcher` |
+| Connect to every hub of a list or a DNS name, route and fail over between them | `hub::HubPool` |
 | Send commands and queries, typed replies, timeouts, error mapping | `hub::Sender` (`app.commands()`, `app.queries()`) |
 | Publish events through the Mongo outbox, relay to Kafka | `kafka::EventBus`, `kafka::OutboxPublisher` |
 | Consume events idempotently (marker + handler in one transaction) | `kafka::EventConsumer` |
@@ -35,6 +36,7 @@ indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
 - [Usage](#usage)
 - [Configuration (`Config::from_env`)](#configuration-configfromenv)
 - [Semantics worth knowing](#semantics-worth-knowing)
+- [Multiple hubs](#multiple-hubs)
 - [Build and test](#build-and-test)
 - [Example](#example)
 - [CI/CD pipeline](#cicd-pipeline)
@@ -99,7 +101,8 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 |---|---|---|
 | `KRAKEN_SERVICE_NAME` | required | hub `service_name`, Kafka consumer group, event `source` |
 | `KRAKEN_MONGODB_URI` | required | must name a database, e.g. `mongodb://mongodb:27017/service-c?replicaSet=rs0` |
-| `KRAKEN_HUB_ADDRESS` | `static://kraken-hub:7000` | gRPC target (`static://` optional) |
+| `KRAKEN_HUB_ADDRESS` | `static://kraken-hub:7000` | the hub's gRPC target (`static://` optional), a comma-separated list of them, or one `dns:///name:port` re-resolved every 30 s (see [Multiple hubs](#multiple-hubs)); one target is the single-hub setup |
+| `KRAKEN_HUB_STATUS_INTERVAL_MS` | 5000 | how often `InstanceStatus` goes to every hub that shares `instance-status` (at least 1) |
 | `KRAKEN_KAFKA_BOOTSTRAP` | `kafka:19092` | |
 | `KRAKEN_KAFKA_TOPIC` | `kraken.events` | |
 | `KRAKEN_JWKS_URL`, `KRAKEN_ISSUER` | unset | set both to verify forwarded tokens (RS256, `exp`, `iss`); unset = read signed tokens unverified, warned once |
@@ -144,11 +147,12 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
   `events.publish_in` must come from it (the driver rejects sessions of another client).
 - **Verified identity** checks signature, `exp`, `nbf` and `iss`; `aud` is not validated (Keycloak sets it, Spring's
   decoder ignores it too). A JWKS outage is `UNAUTHENTICATED` for the caller, never an internal error with a URL.
-- **Shutdown** drains in-flight handlers (10 s bound), closes the hub stream, fails this instance's outgoing requests still in flight with `HubConnectionLost`, stops the publisher and the consumer.
+- **Shutdown** drains in-flight handlers (10 s bound), closes every hub stream, fails this instance's outgoing requests still in flight with `HubConnectionLost`, stops the publisher and the consumer.
 - **Start** does not wait for the hub. `await_hub(timeout)` tells you when the registration was
-  confirmed; sends before that fail with `HubUnavailable`.
+  confirmed (with several hubs: by at least one; `app.hub_ids()` lists them); sends before that
+  fail with `HubUnavailable`.
 - **Handshake** (hub protocol v2, ADR 0013): `Register` carries `protocol_version = 2`, the
-  capabilities (`flow-control`) and `client_version = kraken-messaging-rs/<version>`. A v2 hub answers with a
+  capabilities (`flow-control`, `instance-status`) and `client_version = kraken-messaging-rs/<version>`. A v2 hub answers with a
   `RegisterAck` before it echoes the first heartbeat; the client then heartbeats at the announced
   interval (3 s; the hub evicts after 10 s) and sends `timeout_ms = 0` unless a timeout was chosen,
   guarding locally with the ack's per-type or maximum timeout plus 1 s. When the echo arrives without
@@ -189,6 +193,56 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
   the old stream was still registered. A hub from before that fix leaves such a request to its
   `TIMEOUT` instead.
 
+## Multiple hubs
+
+High availability without hub-to-hub traffic ([ADR 0016](../kraken/docs/adr/0016-multi-hub-ha-without-hub-to-hub-traffic.md)):
+every instance registers on every hub, and the client picks a hub per request.
+
+- **Targets.** `KRAKEN_HUB_ADDRESS=static://hub:7000,hub-2:7000` lists the hubs (blanks and
+  repeats of the same target are ignored). `KRAKEN_HUB_ADDRESS=dns:///kraken-hub:7000` connects to
+  every address the name resolves to; it is resolved at start and every 30 s: a new address gets a
+  connection, a vanished one leaves the routing at once and is closed once idle (no request of
+  ours written to it unanswered, no handler of its requests running; at most 65 s later). A
+  failed or empty resolution keeps the current hubs. `dns:///` must be the only target and needs a
+  port; `dns://server/...` is not supported. An address that names no hub fails `Config::validate`.
+- **Connections.** One stream per hub, each with its own handshake, heartbeat, reconnect backoff
+  and legacy detection, all with the identical `Register`. Two targets whose acks carry the same
+  `hub_id` are one hub: the connection acknowledged first keeps it and the other is closed for
+  good (logged once). The hub replaces a session when the same instance registers again, so the
+  kept connection reconnects once. A legacy (v1) hub has no id; its target stands for it.
+- **Routing.** An unkeyed request goes round-robin over the hubs whose stream is acknowledged
+  (reconnecting hubs are skipped). A request with a `routing_key` goes to the live hub with the
+  highest rendezvous score, so a key keeps its hub while the hubs are stable and only the keys of a
+  hub that leaves move (every hub's ring then picks the same instance):
+
+  ```text
+  score(hub_id, key) = fmix64(fnv1a64(utf8(hub_id) ++ [0x00] ++ utf8(key)))
+  fnv1a64: h = 0xcbf29ce484222325; for each byte b: h = (h ^ b) * 0x100000001b3   (wrapping)
+  fmix64:  k ^= k >> 33; k *= 0xff51afd7ed558ccd; k ^= k >> 33; k *= 0xc4ceb9fe1a85ec53; k ^= k >> 33
+  ```
+
+  `hub::rendezvous_score` implements it; test vectors: `("", "")` → `0xb9034ad37056f5fb`,
+  `("hub-1", "order-42")` → `0x5c855509f5ad7c8d`, `("hub-2", "order-42")` → `0xd109ca177e04ae14`.
+  The finalizer is there because plain FNV-1a sent 80 % of the keys `order-0` … `order-999` to one
+  of three hubs.
+- **Failover.** A request that could not be written to its hub's stream (the stream dropped
+  before the client noticed) goes to the next hub in the same order with the same request id: it
+  was never sent. `HubUnavailable` means no hub took it. A request already written fails with
+  `HubConnectionLost` when its stream drops (outcome unknown); the retry policy then decides
+  (queries are retried, commands are not). Replies go on the stream the request arrived on.
+- **Permits.** A stream offers `ceil(max_concurrent_handlers / N)` permits, N being the hubs live
+  when its `Register` is written, itself included (a hub still on its first connect attempt counts
+  as live, so hubs that start together split from the start). Permits are never revoked when N
+  changes; a stream opened while another hub is down offers the larger share. The local
+  concurrency limit stays `max_concurrent_handlers` over all hubs.
+- **Status.** Every `KRAKEN_HUB_STATUS_INTERVAL_MS` the instance sends `InstanceStatus` to every
+  hub whose ack lists `instance-status`: `connected_hub_ids` (the acknowledged hubs; a legacy hub
+  has no id and is left out) and `handlers_in_flight` (handlers running over all hubs). A hub
+  without the capability (P2 and older) never gets one. Each hub shows the report in its topology
+  (`connectedHubIds`, `statusAgeMs`) and its dashboard flags instances missing a hub.
+- **Logs** of each connection carry its `address` (and the `hub` id once acknowledged). The crate
+  has no metrics of its own.
+
 ## Build and test
 
 ```bash
@@ -201,8 +255,11 @@ Integration tests start Kafka (`apache/kafka`), MongoDB (replica set) and `krake
 testcontainers. The hub image is built from the sibling repo: `docker build -t kraken-hub:dev .` in
 `../kraken-hub` (override with `KRAKEN_HUB_IMAGE`). `tests/hub_compat.rs` also runs against the
 previous hub releases: `kraken-hub:p0` (protocol v2 without flow control, override with
-`KRAKEN_HUB_P0_IMAGE`) and `kraken-hub:v1-baseline` (override with `KRAKEN_HUB_BASELINE_IMAGE`), to
-prove the client behaves as before against both. Without Docker the integration tests print a notice and skip; with Docker but no hub
+`KRAKEN_HUB_P0_IMAGE`), `kraken-hub:p2` (flow control without `instance-status`, override with
+`KRAKEN_HUB_P2_IMAGE`) and `kraken-hub:v1-baseline` (override with `KRAKEN_HUB_BASELINE_IMAGE`), to
+prove the client behaves as before against them. `tests/e2e_multi_hub.rs` and the P3 compat test
+run two or one `kraken-hub:p3-hub` (override with `KRAKEN_HUB_P3_IMAGE`); `tests/hub_pool.rs` runs
+the multi-hub rules against in-process fake hubs. Without Docker the integration tests print a notice and skip; with Docker but no hub
 image they fail with the build command. On Rancher Desktop export
 `DOCKER_HOST=unix://$HOME/.rd/docker.sock` first. A unit test and `scripts/check-proto-sync.sh` (CI
 job `proto-sync`) check that `proto/hub.proto` is byte-identical to `../kraken/protocol/hub.proto`
