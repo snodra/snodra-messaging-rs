@@ -19,8 +19,9 @@ pub use dispatcher::Dispatcher;
 pub use pool::{DRAIN_LIMIT, HubPool, Resolver};
 pub use registry::{EventContext, HandlerRegistry};
 pub use sender::{
-    LEGACY_REQUEST_TIMEOUT, LOCAL_GUARD_MARGIN, RETRY_MIN_REMAINING, RemoteError, ScatterOptions,
-    ScatterPart, ScatterResult, SendOptions, Sender, SenderSettings, request_timing, retry_budget,
+    DEFAULT_CREDIT, LEGACY_REQUEST_TIMEOUT, LOCAL_GUARD_MARGIN, RETRY_MIN_REMAINING, RemoteError,
+    ScatterOptions, ScatterPart, ScatterResult, SendOptions, Sender, SenderSettings, StreamOptions,
+    request_timing, retry_budget,
 };
 pub use targets::{
     DNS_REFRESH, HubTargets, permit_share, rendezvous_score, resolved_targets, target_id,

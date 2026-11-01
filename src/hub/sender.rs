@@ -16,6 +16,12 @@
 //! those), answered by `ReplyPart`s in arrival order and one `ReplyEnd`. Its pending entry collects
 //! the parts until the end; the local guard covers the whole gather. If its stream breaks before
 //! the end, the gather fails with `HubConnectionLost` (parts already received are not kept).
+//!
+//! Streaming queries (ADR 0017 P4b, [`Sender::stream`]): one `Request` with `mode = STREAMING`
+//! and the initial credit to one hub whose ack lists `streaming`, answered by one handler's
+//! `ReplyPart`s and one `ReplyEnd`. The pending entry lives until the end; the caller's stream
+//! refills credit as it consumes (`Flow`), and dropping it before the end sends `Cancel`. The
+//! local guard is an idle guard (reset by every part), like the hub's idle timeout.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -23,6 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::Stream;
+use futures::stream::{BoxStream, StreamExt};
 use serde::de::DeserializeOwned;
 use tokio::sync::{mpsc, oneshot};
 
@@ -33,9 +40,9 @@ use crate::proto::{
     self, ClientMessage, ErrorCode, RequestKind, RequestMode, client_message, reply,
 };
 use crate::retry::{self, RetryPolicy};
-use crate::types::{Command, Query};
+use crate::types::{Command, Query, StreamingQuery};
 
-use super::connection::{Handshake, HubConnection, Inbound, SCATTER_GATHER, StreamId};
+use super::connection::{Handshake, HubConnection, Inbound, SCATTER_GATHER, STREAMING, StreamId};
 use super::pool::{HubPool, weak_probe};
 
 /// The timeout sent to a hub older than protocol v2 when the caller chose none (today's default).
@@ -49,6 +56,10 @@ const FALLBACK_MAX_TIMEOUT_MS: u32 = 60_000;
 pub const RETRY_MIN_REMAINING: Duration = Duration::from_millis(250);
 /// The smallest `timeout_ms` sent for a timeout that was chosen (0 would mean "the hub decides").
 const MIN_TIMEOUT: Duration = Duration::from_millis(1);
+/// The credit window of a streaming query when the caller chose none (what the hub reads 0 as).
+pub const DEFAULT_CREDIT: u32 = 64;
+/// How long the `Cancel` of a dropped stream may wait for room in the hub stream's buffer.
+const CANCEL_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// `Request.timeout_ms` and the local guard for a request of `type_name` on a stream with
 /// `handshake`, when the caller chose `chosen` (per call, or the configured default).
@@ -159,6 +170,36 @@ pub struct ScatterOptions {
     /// `Request.priority` of every target's request. Without one, `Config.hub_priorities` for the
     /// type, else 0.
     pub priority: Option<i32>,
+}
+
+/// Options of one streaming query ([`Sender::stream`]).
+#[derive(Clone, Debug)]
+pub struct StreamOptions {
+    /// The idle timeout: the longest the hub waits for the next part (from the forward, reset by
+    /// every part), sent as `timeout_ms` under the rules of [`SendOptions::timeout`] (without
+    /// one, `Config.hub_request_timeout`, else the hub's per-type override or default). The
+    /// local guard (the hub's bound plus [`LOCAL_GUARD_MARGIN`]) is an idle guard too.
+    pub timeout: Option<Duration>,
+    /// End the stream after this many parts (the hub cancels the handler); 0 is no limit.
+    pub max_results: u32,
+    /// `Request.priority` of the handler's request. Without one, `Config.hub_priorities` for
+    /// the type, else 0.
+    pub priority: Option<i32>,
+    /// The credit window: parts the handler may send before the first refill (`initial_credit`);
+    /// the stream refills half of it every time half was consumed. 0 reads as
+    /// [`DEFAULT_CREDIT`] (64), the default.
+    pub initial_credit: u32,
+}
+
+impl Default for StreamOptions {
+    fn default() -> Self {
+        StreamOptions {
+            timeout: None,
+            max_results: 0,
+            priority: None,
+            initial_credit: DEFAULT_CREDIT,
+        }
+    }
 }
 
 /// One target's answer to a scatter-gather.
@@ -285,6 +326,8 @@ enum Waiter {
     Unary(oneshot::Sender<Outcome>),
     /// A scatter-gather: its parts, then its end (or how it failed).
     Scatter(mpsc::UnboundedSender<GatherEvent>),
+    /// A streaming query: its parts, then its end (or how it failed).
+    Stream(mpsc::UnboundedSender<GatherEvent>),
 }
 
 impl Waiter {
@@ -294,9 +337,17 @@ impl Waiter {
             Waiter::Unary(tx) => {
                 let _ = tx.send(outcome);
             }
-            Waiter::Scatter(tx) => {
+            Waiter::Scatter(tx) | Waiter::Stream(tx) => {
                 let _ = tx.send(GatherEvent::Ended(outcome));
             }
+        }
+    }
+
+    /// The channel of a multi-part request (parts and end).
+    fn parts(&self) -> Option<&mpsc::UnboundedSender<GatherEvent>> {
+        match self {
+            Waiter::Unary(_) => None,
+            Waiter::Scatter(tx) | Waiter::Stream(tx) => Some(tx),
         }
     }
 }
@@ -400,6 +451,173 @@ impl Gathering<'_> {
                     unreachable!("a scatter-gather never ends with a reply")
                 }
             }
+        }
+    }
+
+    fn fail(&mut self, e: MessagingError) -> Option<Result<proto::ReplyPart, MessagingError>> {
+        self.done = true;
+        Some(Err(e))
+    }
+}
+
+/// What stays the same across the hubs and attempts of one streaming query.
+struct StreamCall {
+    type_name: &'static str,
+    payload: Vec<u8>,
+    headers: HashMap<String, String>,
+    priority: i32,
+    max_results: u32,
+    /// The credit window (`initial_credit`, never 0).
+    window: u32,
+}
+
+impl StreamCall {
+    /// The credit given back every time this many parts were consumed: half the window, at
+    /// least one.
+    fn refill(&self) -> u32 {
+        (self.window / 2).max(1)
+    }
+}
+
+/// One streaming query written (or being written) to a hub: its parts as they arrive, then the
+/// end. Dropping it before the end cancels the stream at the hub (once written) and forgets the
+/// request, from before the write on.
+struct Streaming<'a> {
+    sender: &'a Sender,
+    call: Arc<StreamCall>,
+    chosen: Option<Duration>,
+    id: String,
+    /// The hub stream the request was written to: `Flow` and `Cancel` go there.
+    stream: StreamId,
+    events: mpsc::UnboundedReceiver<GatherEvent>,
+    /// The idle guard: the hub's bound for the request plus [`LOCAL_GUARD_MARGIN`].
+    guard: Duration,
+    moves: usize,
+    written: bool,
+    done: bool,
+    /// Parts consumed since the last refill.
+    consumed: u32,
+}
+
+impl Drop for Streaming<'_> {
+    fn drop(&mut self) {
+        if self.written && !self.done {
+            self.sender
+                .cancel_later(self.stream, &self.id, "dropped by the sender");
+        }
+        self.sender.take(&self.id);
+    }
+}
+
+impl Streaming<'_> {
+    /// The next part; `None` once the end arrived. An error ends the stream (the hub's
+    /// `ReplyEnd{error}` as the unary error of its code).
+    async fn next(&mut self) -> Option<Result<proto::ReplyPart, MessagingError>> {
+        if self.done {
+            return None;
+        }
+        loop {
+            let event = match tokio::time::timeout(self.guard, self.events.recv()).await {
+                Ok(Some(event)) => event,
+                Ok(None) => GatherEvent::Ended(Outcome::Done(Err(MessagingError::HubUnavailable(
+                    "sender closed".into(),
+                )))),
+                // The hub ends an idle stream itself; the guard covers a hub that never does.
+                Err(_) => GatherEvent::Ended(Outcome::Done(Err(MessagingError::Timeout(
+                    self.call.type_name.to_string(),
+                )))),
+            };
+            match event {
+                GatherEvent::Part(part) => return Some(Ok(part)),
+                GatherEvent::End(end) => {
+                    self.done = true;
+                    return match end.error {
+                        Some(e) => Some(Err(MessagingError::from_hub(
+                            self.call.type_name,
+                            e.code,
+                            &e.message,
+                            &e.details,
+                        ))),
+                        None => None,
+                    };
+                }
+                GatherEvent::Ended(Outcome::NotWritten) => {
+                    self.moves += 1;
+                    if self.moves > MAX_UNWRITTEN_MOVES {
+                        return self.fail(MessagingError::HubUnavailable(format!(
+                            "'{}' not written: {} hub streams lost before it was",
+                            self.call.type_name, self.moves
+                        )));
+                    }
+                    self.written = false;
+                    tracing::debug!(r#type = self.call.type_name, request = %self.id, "stream lost before the streaming query was written; trying the next hub");
+                    match self
+                        .sender
+                        .write_stream(&self.id, &self.call, self.chosen)
+                        .await
+                    {
+                        Ok((events, guard, stream)) => {
+                            self.events = events;
+                            self.guard = guard;
+                            self.stream = stream;
+                            self.written = true;
+                        }
+                        Err(e) => return self.fail(e),
+                    }
+                }
+                GatherEvent::Ended(Outcome::Done(Err(e))) => return self.fail(e),
+                GatherEvent::Ended(Outcome::Done(Ok(_))) => {
+                    unreachable!("a streaming query never ends with a reply")
+                }
+            }
+        }
+    }
+
+    /// Decodes `part` for the caller and counts it as consumed: once half the window was, the
+    /// hub gets a `Flow` for that much. A part that does not decode ends the stream (the handler
+    /// is cancelled).
+    async fn item<R: DeserializeOwned + 'static>(
+        &mut self,
+        part: proto::ReplyPart,
+    ) -> Result<R, MessagingError> {
+        match codec::decode_reply::<R>(&part.payload) {
+            Ok(item) => {
+                self.consumed += 1;
+                let refill = self.call.refill();
+                if self.consumed >= refill {
+                    self.consumed -= refill;
+                    let flow = ClientMessage {
+                        message: Some(client_message::Message::Flow(proto::Flow {
+                            request_id: self.id.clone(),
+                            credits: refill,
+                        })),
+                    };
+                    if let Err(e) = self.sender.hubs.send_on(self.stream, flow).await {
+                        tracing::debug!(request = %self.id, "flow not written: {e}");
+                    }
+                }
+                Ok(item)
+            }
+            Err(e) => {
+                tracing::debug!(request = %self.id, seq = part.seq, "part of '{}' from {}/{} cannot be decoded: {e}", self.call.type_name, part.responder_service, part.responder_instance);
+                self.cancel("undecodable part").await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Ends the stream here and cancels it at the hub (the handler is told).
+    async fn cancel(&mut self, reason: &str) {
+        self.done = true;
+        self.sender.take(&self.id);
+        let cancel = ClientMessage {
+            message: Some(client_message::Message::Cancel(proto::Cancel {
+                request_id: self.id.clone(),
+                reason: reason.to_string(),
+            })),
+        };
+        if let Err(e) = self.sender.hubs.send_on(self.stream, cancel).await {
+            tracing::debug!(request = %self.id, "cancel not written: {e}");
         }
     }
 
@@ -541,21 +759,13 @@ impl Sender {
             // Parts and ends of an unknown request (or of a unary one) are ignored.
             Inbound::Part(p) => {
                 let pending = self.pending.lock().unwrap();
-                if let Some(Entry {
-                    waiter: Waiter::Scatter(tx),
-                    ..
-                }) = pending.get(&p.request_id)
-                {
+                if let Some(tx) = pending.get(&p.request_id).and_then(|e| e.waiter.parts()) {
                     let _ = tx.send(GatherEvent::Part(p));
                 }
             }
             Inbound::End(end) => {
-                let gather = self.take_if(&end.request_id, |w| matches!(w, Waiter::Scatter(_)));
-                if let Some(Entry {
-                    waiter: Waiter::Scatter(tx),
-                    ..
-                }) = gather
-                {
+                let multi = self.take_if(&end.request_id, |w| w.parts().is_some());
+                if let Some(tx) = multi.as_ref().and_then(|e| e.waiter.parts()) {
                     let _ = tx.send(GatherEvent::End(end));
                 }
             }
@@ -786,6 +996,203 @@ impl Sender {
                 StreamState::Done => None,
             }
         })
+    }
+
+    /// Streams the result of `Q` from one capable instance of an owner (ADR 0017, P4b): one
+    /// `Request` with `mode = STREAMING` to one hub whose `RegisterAck` lists `streaming` (unkeyed
+    /// round-robin over those; the capability is checked again on the stream the request is
+    /// written to), answered by the handler's parts under this caller's credits and one end.
+    ///
+    /// Opening waits for the first part (or the end, or a failure), so the errors before any part
+    /// are the call's: [`MessagingError::UnsupportedByHub`] when no hub lists the capability
+    /// (nothing is sent) or the hub answers `UNSUPPORTED` (no owner instance negotiated
+    /// `streaming`), `NoHandler` without an owner, `InvalidMessage` for a command type, `Timeout`
+    /// when the first part is not in time, the handler's error when it fails at once,
+    /// `HubUnavailable` / `HubConnectionLost` as for a unary query. `Config.hub_retry` applies
+    /// until then, for the same errors as a unary query (a retry is a new stream with a fresh
+    /// id); after the first part nothing is retried.
+    ///
+    /// The returned stream yields the items in the handler's order and ends on the hub's
+    /// `ReplyEnd`; a `ReplyEnd{error}` (the idle timeout, the handler's error or its leaving, the
+    /// hub's limits: `Timeout`, `RemoteHandler`, `HandlerDisconnected`, `Cancelled`, ...), a lost
+    /// hub stream (`HubConnectionLost`) or a part that does not decode (`Serialization`; the
+    /// handler is cancelled) is its last item. It refills credit as it is consumed: half the
+    /// window ([`StreamOptions::initial_credit`]) every time half of it was pulled, so a handler
+    /// never runs more than a window ahead of the consumer. Dropping it before the end cancels
+    /// the stream at the hub (the handler is told) and forgets the request.
+    pub async fn stream<'a, Q: StreamingQuery>(
+        &'a self,
+        query: &Q,
+        options: StreamOptions,
+    ) -> Result<BoxStream<'a, Result<Q::Item, MessagingError>>, MessagingError> {
+        let call = Arc::new(StreamCall {
+            type_name: Q::TYPE,
+            payload: codec::encode(query)?,
+            headers: self.headers(None),
+            priority: self.priority(Q::TYPE, options.priority),
+            max_results: options.max_results,
+            window: if options.initial_credit == 0 {
+                DEFAULT_CREDIT
+            } else {
+                options.initial_credit
+            },
+        });
+        let chosen = chosen_timeout(options.timeout, self.default_timeout);
+        // Retried (new streams, fresh ids) until the first part, the end or a final error. The
+        // idle timeout sent is the chosen one on every attempt; the budget bounds the retries.
+        let opened = self
+            .retrying(
+                RequestKind::Query,
+                Q::TYPE,
+                self.retry.clone(),
+                chosen,
+                "",
+                |_| {
+                    let call = Arc::clone(&call);
+                    async move {
+                        let mut streaming = self.open_stream(&call, chosen).await?;
+                        match streaming.next().await {
+                            Some(Ok(part)) => Ok(Some((streaming, part))),
+                            Some(Err(e)) => Err(e),
+                            None => Ok(None),
+                        }
+                    }
+                },
+            )
+            .await?;
+        let Some((streaming, first)) = opened else {
+            return Ok(futures::stream::empty().boxed());
+        };
+        let items = futures::stream::unfold(Some((streaming, Some(first))), |state| async move {
+            let (mut streaming, first) = state?;
+            let part = match first {
+                Some(part) => part,
+                None => match streaming.next().await {
+                    Some(Ok(part)) => part,
+                    Some(Err(e)) => return Some((Err(e), None)),
+                    None => return None,
+                },
+            };
+            match streaming.item::<Q::Item>(part).await {
+                Ok(item) => Some((Ok(item), Some((streaming, None)))),
+                Err(e) => Some((Err(e), None)),
+            }
+        });
+        Ok(items.boxed())
+    }
+
+    /// Writes a new streaming query of `call` (fresh id) to a hub that shares the capability.
+    async fn open_stream(
+        &self,
+        call: &Arc<StreamCall>,
+        chosen: Option<Duration>,
+    ) -> Result<Streaming<'_>, MessagingError> {
+        // The streaming exists before the write: its drop forgets the pending entry (recorded by
+        // the build, before the write) when the caller drops the future while the write still
+        // waits for room in the stream's outbound buffer; nothing was written, so no cancel.
+        let (_, events) = mpsc::unbounded_channel();
+        let mut streaming = Streaming {
+            sender: self,
+            call: Arc::clone(call),
+            chosen,
+            id: uuid::Uuid::new_v4().to_string(),
+            stream: 0,
+            events,
+            guard: Duration::ZERO,
+            moves: 0,
+            written: false,
+            done: false,
+            consumed: 0,
+        };
+        let (events, guard, stream) = self.write_stream(&streaming.id, call, chosen).await?;
+        streaming.events = events;
+        streaming.guard = guard;
+        streaming.stream = stream;
+        streaming.written = true;
+        Ok(streaming)
+    }
+
+    /// Writes streaming query `id` to a hub whose ack lists `streaming`, its pending entry
+    /// recorded while the stream is current. Returns its events, the idle guard and the stream.
+    async fn write_stream(
+        &self,
+        id: &str,
+        call: &StreamCall,
+        chosen: Option<Duration>,
+    ) -> Result<(mpsc::UnboundedReceiver<GatherEvent>, Duration, StreamId), MessagingError> {
+        let mut events = None;
+        let sent = self
+            .hubs
+            .send_where("", Some(STREAMING), |stream, handshake| {
+                // Ranked on a snapshot: the stream current now may belong to a re-handshake with
+                // an older hub, which would answer UNSUPPORTED (a P4a hub) or serve the request
+                // as a unary query (older). Refused, nothing written: the next capable hub is tried.
+                if !handshake.streaming() {
+                    return Err(MessagingError::UnsupportedByHub(format!(
+                        "the hub stream {stream} no longer lists the \"{STREAMING}\" capability"
+                    )));
+                }
+                let (timeout_ms, guard) = request_timing(handshake, call.type_name, chosen);
+                let (tx, rx) = mpsc::unbounded_channel();
+                events = Some(rx);
+                self.pending.lock().unwrap().insert(
+                    id.to_string(),
+                    Entry {
+                        type_name: call.type_name.to_string(),
+                        stream,
+                        waiter: Waiter::Stream(tx),
+                    },
+                );
+                let request = proto::Request {
+                    id: id.to_string(),
+                    kind: RequestKind::Query as i32,
+                    r#type: call.type_name.to_string(),
+                    payload: call.payload.clone(),
+                    headers: call.headers.clone(),
+                    timeout_ms,
+                    priority: call.priority,
+                    mode: RequestMode::Streaming as i32,
+                    initial_credit: call.window,
+                    max_results: call.max_results,
+                    ..proto::Request::default()
+                };
+                let msg = ClientMessage {
+                    message: Some(client_message::Message::Request(request)),
+                };
+                Ok((msg, guard))
+            })
+            .await;
+        match (sent, events) {
+            (Ok((stream, guard)), Some(events)) => Ok((events, guard, stream)),
+            (Err(e), _) => {
+                self.take(id);
+                Err(e)
+            }
+            (Ok(_), None) => unreachable!("a written request was built"),
+        }
+    }
+
+    /// Writes `Cancel{id, reason}` to hub stream `stream` from a drop (no await possible):
+    /// spawned on the current runtime, best effort, bounded by [`CANCEL_WRITE_TIMEOUT`].
+    fn cancel_later(&self, stream: StreamId, id: &str, reason: &str) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let hubs = Arc::clone(&self.hubs);
+        let cancel = ClientMessage {
+            message: Some(client_message::Message::Cancel(proto::Cancel {
+                request_id: id.to_string(),
+                reason: reason.to_string(),
+            })),
+        };
+        let id = id.to_string();
+        runtime.spawn(async move {
+            match tokio::time::timeout(CANCEL_WRITE_TIMEOUT, hubs.send_on(stream, cancel)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::debug!(request = %id, "cancel not written: {e}"),
+                Err(_) => tracing::debug!(request = %id, "cancel not written in time"),
+            }
+        });
     }
 
     fn scatter_call(
@@ -1270,6 +1677,56 @@ mod tests {
             ..Default::default()
         }));
         assert!(gather.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn parts_and_ends_reach_their_stream_and_a_reply_never_answers_one() {
+        let sender = idle_sender();
+        let (tx, mut stream) = mpsc::unbounded_channel();
+        pending(&sender, "s", Waiter::Stream(tx));
+        sender.on_inbound(Inbound::Reply(proto::Reply {
+            request_id: "s".into(),
+            result: None,
+        }));
+        assert!(stream.try_recv().is_err());
+        assert_eq!(sender.in_flight(), 1);
+        sender.on_inbound(Inbound::Part(proto::ReplyPart {
+            request_id: "s".into(),
+            seq: 1,
+            ..Default::default()
+        }));
+        sender.on_inbound(Inbound::End(proto::ReplyEnd {
+            request_id: "s".into(),
+            parts: 1,
+            ..Default::default()
+        }));
+        assert!(matches!(stream.try_recv(), Ok(GatherEvent::Part(p)) if p.seq == 1));
+        assert!(matches!(stream.try_recv(), Ok(GatherEvent::End(e)) if e.parts == 1));
+        assert_eq!(sender.in_flight(), 0, "the end takes the stream's entry");
+        // Flow and Cancel are the dispatcher's: ignored here.
+        sender.on_inbound(Inbound::Flow(proto::Flow::default()));
+        sender.on_inbound(Inbound::Cancel(proto::Cancel::default()));
+    }
+
+    #[test]
+    fn stream_options_default_to_a_window_of_64_and_refill_half_of_it() {
+        let options = StreamOptions::default();
+        assert_eq!(options.initial_credit, DEFAULT_CREDIT);
+        assert_eq!(
+            (options.timeout, options.max_results, options.priority),
+            (None, 0, None)
+        );
+        let call = |window| StreamCall {
+            type_name: "t.X",
+            payload: vec![],
+            headers: HashMap::new(),
+            priority: 0,
+            max_results: 0,
+            window,
+        };
+        assert_eq!(call(64).refill(), 32);
+        assert_eq!(call(3).refill(), 1);
+        assert_eq!(call(1).refill(), 1, "never 0: the stream would stall");
     }
 
     #[tokio::test]

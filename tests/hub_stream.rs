@@ -13,12 +13,12 @@ use std::time::{Duration, Instant};
 
 use futures::stream::BoxStream;
 use kraken_messaging::hub::{
-    Dispatcher, HandlerRegistry, HubPool, HubSettings, Inbound, RegisteredTypes, Sender,
-    SenderSettings,
+    Dispatcher, HandlerRegistry, HubPool, HubSettings, Inbound, RegisteredTypes, SendOptions,
+    Sender, SenderSettings, StreamOptions, rendezvous_score,
 };
 use kraken_messaging::identity::{Guard, IdentityResolver};
 use kraken_messaging::proto::{self, ErrorCode, ServerMessage, server_message};
-use kraken_messaging::{MessagingError, Query, StreamingQuery, message_type};
+use kraken_messaging::{Command, MessagingError, Query, RetryPolicy, StreamingQuery, message_type};
 use serde::{Deserialize, Serialize};
 use support::fake_hub::FakeHub;
 use tokio::sync::mpsc;
@@ -39,7 +39,8 @@ impl Query for SharedLookup {
     type Reply = ();
 }
 
-/// `n` rows, each after `delay_ms`; the handler fails at row `fail_at` (an error item).
+/// `n` rows, the first at once and every other one after `delay_ms`; the handler fails at row
+/// `fail_at` (an error item).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct Export {
     n: u32,
@@ -69,13 +70,25 @@ fn rows(export: Export) -> impl futures::Stream<Item = Result<Row, MessagingErro
         fail_at,
     } = export;
     tokio_stream::iter(0..n).then(move |i| async move {
-        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        if i > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
         if fail_at == Some(i) {
             Err(MessagingError::Storage("disk gone".into()))
         } else {
             Ok(Row { i })
         }
     })
+}
+
+/// A command of `size` bytes, used to fill a stream.
+#[derive(Serialize, Deserialize)]
+struct Fill {
+    data: String,
+}
+message_type!(Fill, "t.Fill");
+impl Command for Fill {
+    type Reply = ();
 }
 
 /// A unary query whose handler never answers (until cancelled).
@@ -190,7 +203,6 @@ fn registry(probe: &Arc<Probe>) -> HandlerRegistry {
 
 struct Node {
     pool: Arc<HubPool>,
-    #[allow(dead_code)] // the sender side of the tests
     sender: Arc<Sender>,
     dispatcher: Arc<Dispatcher>,
 }
@@ -277,6 +289,55 @@ async fn handler(
         SenderSettings::default(),
     )
     .await
+}
+
+/// An owner of the shared streaming query `t.SharedExport`, answering one row `Row { i: mark }`.
+async fn shared_owner(address: &str, service: &str, instance: &str, mark: u32) -> Node {
+    let mut r = HandlerRegistry::new();
+    r.shared_streaming_query::<SharedExport, _, _, _>(move |_, _| async move {
+        Ok(tokio_stream::once(Ok(Row { i: mark })))
+    });
+    node_with(address, service, instance, r, 4, SenderSettings::default()).await
+}
+
+/// A node without handlers, sending with `sender_settings`.
+async fn caller_with(address: &str, sender_settings: SenderSettings) -> Node {
+    node_with(
+        address,
+        "caller",
+        "c1",
+        HandlerRegistry::new(),
+        4,
+        sender_settings,
+    )
+    .await
+}
+
+async fn caller(address: &str) -> Node {
+    caller_with(address, SenderSettings::default()).await
+}
+
+/// Streaming requests the hub received from senders.
+async fn streams(hub: &FakeHub) -> Vec<proto::Request> {
+    hub.requests()
+        .await
+        .into_iter()
+        .filter(|r| r.mode == proto::RequestMode::Streaming as i32)
+        .collect()
+}
+
+/// The rows of a stream until its end or its first error.
+async fn collect(
+    stream: &mut (impl futures::Stream<Item = Result<Row, MessagingError>> + Unpin),
+) -> (Vec<u32>, Option<MessagingError>) {
+    let mut rows = vec![];
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(row) => rows.push(row.i),
+            Err(e) => return (rows, Some(e)),
+        }
+    }
+    (rows, None)
 }
 
 /// Polls `check` every 20 ms for at most 5 s.
@@ -579,4 +640,724 @@ fn a_streaming_type_cannot_be_exclusive_and_shared() {
     let mut r = HandlerRegistry::new();
     r.streaming_query::<Export, _, _, _>(|q, _| async move { Ok(rows(q)) });
     r.shared_streaming_query::<Export, _, _, _>(|q, _| async move { Ok(rows(q)) });
+}
+
+// Sender side: `Sender::stream` against handlers served by the dispatcher.
+
+#[tokio::test]
+async fn a_stream_yields_the_handlers_items_in_order_then_ends() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let h = handler(&hub.address(), "svc-h", "h1", &probe, 2).await;
+    let c = caller(&hub.address()).await;
+    let options = StreamOptions {
+        initial_credit: 8,
+        ..StreamOptions::default()
+    };
+    let mut stream = c
+        .sender
+        .stream(&export(200, 0, None), options)
+        .await
+        .unwrap();
+    let (rows, error) = collect(&mut stream).await;
+    assert!(error.is_none(), "{error:?}");
+    assert_eq!(rows, (0..200).collect::<Vec<_>>());
+    drop(stream);
+    // Half the window back every time half of it was consumed.
+    let flows = hub.flows();
+    assert!(flows.len() >= 49, "{} flows", flows.len());
+    assert!(flows.iter().all(|(_, f)| f.credits == 4), "{flows:?}");
+    assert_eq!(c.sender.in_flight(), 0);
+    assert_eq!(hub.open_streams(), 0);
+    assert!(hub.cancels().is_empty(), "nothing to cancel after the end");
+    eventually("the handler's permits released", async || {
+        h.dispatcher.available_permits() == 2 && probe.dropped.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    h.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn options_become_the_request_fields() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let h = handler(&hub.address(), "svc-h", "h1", &probe, 2).await;
+    let c = caller(&hub.address()).await;
+    for options in [
+        StreamOptions::default(),
+        StreamOptions {
+            timeout: Some(Duration::from_millis(2_500)),
+            max_results: 3,
+            priority: Some(7),
+            initial_credit: 16,
+        },
+        StreamOptions {
+            initial_credit: 0,
+            ..StreamOptions::default()
+        },
+    ] {
+        let mut stream = c.sender.stream(&export(1, 0, None), options).await.unwrap();
+        assert_eq!(collect(&mut stream).await.0, [0]);
+    }
+    let sent = streams(&hub).await;
+    assert_eq!(sent.len(), 3);
+    let (default, chosen, zero) = (&sent[0], &sent[1], &sent[2]);
+    assert_eq!(default.kind, proto::RequestKind::Query as i32);
+    assert_eq!(default.r#type, "t.Export");
+    assert_eq!(default.payload, br#"{"n":1,"delay_ms":0,"fail_at":null}"#);
+    assert_eq!(default.routing_key, "");
+    assert!(default.headers.contains_key("correlationId"));
+    assert_eq!(
+        (
+            default.timeout_ms,
+            default.max_results,
+            default.priority,
+            default.initial_credit
+        ),
+        (0, 0, 0, 64)
+    );
+    assert_eq!(chosen.mode, proto::RequestMode::Streaming as i32);
+    assert_eq!(
+        (
+            chosen.timeout_ms,
+            chosen.max_results,
+            chosen.priority,
+            chosen.initial_credit
+        ),
+        (2_500, 3, 7, 16)
+    );
+    assert_eq!(
+        zero.initial_credit, 64,
+        "0 reads as 64, as the hub reads it"
+    );
+    assert_ne!(default.id, chosen.id);
+    h.shutdown().await;
+    c.shutdown().await;
+}
+
+/// The handler stalls at credit 0 and resumes on the sender's refill, which comes once half of
+/// the window was consumed by the caller (back-pressure follows the consumer, not the arrival).
+#[tokio::test]
+async fn the_handler_stalls_at_zero_credit_until_the_consumer_pulls_half_the_window() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let h = handler(&hub.address(), "svc-h", "h1", &probe, 2).await;
+    let c = caller(&hub.address()).await;
+    let options = StreamOptions {
+        initial_credit: 4,
+        ..StreamOptions::default()
+    };
+    let mut stream = c
+        .sender
+        .stream(&export(100, 0, None), options)
+        .await
+        .unwrap();
+    assert_eq!(stream.next().await.unwrap().unwrap().i, 0);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        probe.polled.load(Ordering::SeqCst),
+        4,
+        "the handler sent its window and stalled"
+    );
+    assert!(
+        hub.flows().is_empty(),
+        "one consumed of a window of 4: no refill yet"
+    );
+    assert_eq!(stream.next().await.unwrap().unwrap().i, 1);
+    eventually("the refill", async || !hub.flows().is_empty()).await;
+    assert_eq!(hub.flows()[0].1.credits, 2);
+    eventually("the handler resumed", async || {
+        probe.polled.load(Ordering::SeqCst) == 6
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(probe.polled.load(Ordering::SeqCst), 6, "stalled again");
+    drop(stream);
+    eventually("the handler cancelled", async || {
+        probe.dropped.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    h.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn max_results_ends_the_stream_and_cancels_the_handler() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let h = handler(&hub.address(), "svc-h", "h1", &probe, 2).await;
+    let c = caller(&hub.address()).await;
+    let options = StreamOptions {
+        max_results: 3,
+        ..StreamOptions::default()
+    };
+    let mut stream = c
+        .sender
+        .stream(&export(100, 0, None), options)
+        .await
+        .unwrap();
+    let (rows, error) = collect(&mut stream).await;
+    assert!(error.is_none(), "{error:?}");
+    assert_eq!(rows, [0, 1, 2]);
+    assert_eq!(c.sender.in_flight(), 0);
+    eventually(
+        "the handler cancelled and its permits released",
+        async || probe.dropped.load(Ordering::SeqCst) == 1 && h.dispatcher.available_permits() == 2,
+    )
+    .await;
+    assert!(
+        hub.cancels().is_empty(),
+        "the hub cancelled, not the sender"
+    );
+    drop(stream);
+    h.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_idle_timeout_ends_the_stream_with_timeout() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let h = handler(&hub.address(), "svc-h", "h1", &probe, 2).await;
+    let c = caller(&hub.address()).await;
+    let options = StreamOptions {
+        timeout: Some(Duration::from_millis(300)),
+        ..StreamOptions::default()
+    };
+    // The first row comes at once, the second never in time: the error is the last item.
+    let mut stream = c
+        .sender
+        .stream(&export(3, 5_000, None), options.clone())
+        .await
+        .unwrap();
+    let (rows, error) = collect(&mut stream).await;
+    assert_eq!(rows, [0]);
+    assert!(
+        matches!(error, Some(MessagingError::Timeout(ref t)) if t == "t.Export"),
+        "{error:?}"
+    );
+    eventually("the handler cancelled", async || {
+        probe.dropped.load(Ordering::SeqCst) == 1 && h.dispatcher.available_permits() == 2
+    })
+    .await;
+    assert_eq!(c.sender.in_flight(), 0);
+    // Not even the first row in time: the open fails.
+    let hang = Arc::new(Probe::default());
+    let slow = node_with(
+        &hub.address(),
+        "svc-slow",
+        "s1",
+        {
+            let mut r = HandlerRegistry::new();
+            let probe = Arc::clone(&hang);
+            r.shared_streaming_query::<SharedExport, _, _, _>(move |_, _| {
+                let probe = Arc::clone(&probe);
+                async move {
+                    Ok(Watched {
+                        inner: Box::pin(tokio_stream::pending()),
+                        probe,
+                    })
+                }
+            });
+            r
+        },
+        2,
+        SenderSettings::default(),
+    )
+    .await;
+    let e = c
+        .sender
+        .stream(&SharedExport {}, options)
+        .await
+        .err()
+        .expect("no first part in time");
+    assert!(matches!(e, MessagingError::Timeout(_)), "{e:?}");
+    eventually("the slow handler cancelled", async || {
+        hang.dropped.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(c.sender.in_flight(), 0);
+    drop(stream);
+    h.shutdown().await;
+    slow.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_handler_error_item_is_the_last_item() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let h = handler(&hub.address(), "svc-h", "h1", &probe, 2).await;
+    let c = caller(&hub.address()).await;
+    let mut stream = c
+        .sender
+        .stream(&export(5, 0, Some(2)), StreamOptions::default())
+        .await
+        .unwrap();
+    let (rows, error) = collect(&mut stream).await;
+    assert_eq!(rows, [0, 1]);
+    assert!(
+        matches!(error, Some(MessagingError::RemoteHandler { ref message, ref type_name, .. }) if message.contains("disk gone") && type_name == "t.Export"),
+        "{error:?}"
+    );
+    assert!(stream.next().await.is_none(), "nothing after the error");
+    assert_eq!(c.sender.in_flight(), 0);
+    assert_eq!(hub.open_streams(), 0);
+    // An error before the first item fails the open.
+    let e = c
+        .sender
+        .stream(&export(5, 0, Some(0)), StreamOptions::default())
+        .await
+        .err()
+        .expect("the handler failed at once");
+    assert!(matches!(e, MessagingError::RemoteHandler { .. }), "{e:?}");
+    eventually("permits released", async || {
+        h.dispatcher.available_permits() == 2
+    })
+    .await;
+    drop(stream);
+    h.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn dropping_the_stream_cancels_the_handler() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let h = handler(&hub.address(), "svc-h", "h1", &probe, 2).await;
+    let c = caller(&hub.address()).await;
+    let options = StreamOptions {
+        initial_credit: 8,
+        ..StreamOptions::default()
+    };
+    let mut stream = c
+        .sender
+        .stream(&export(1_000, 0, None), options)
+        .await
+        .unwrap();
+    for i in 0..3 {
+        assert_eq!(stream.next().await.unwrap().unwrap().i, i);
+    }
+    drop(stream);
+    eventually("the cancel", async || !hub.cancels().is_empty()).await;
+    let id = streams(&hub).await[0].id.clone();
+    let (_, cancel) = &hub.cancels()[0];
+    assert_eq!(
+        (cancel.request_id.as_str(), cancel.reason.as_str()),
+        (id.as_str(), "dropped by the sender")
+    );
+    eventually(
+        "the handler cancelled and its permits released",
+        async || probe.dropped.load(Ordering::SeqCst) == 1 && h.dispatcher.available_permits() == 2,
+    )
+    .await;
+    assert_eq!(c.sender.in_flight(), 0);
+    assert_eq!(hub.open_streams(), 0);
+    h.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_undecodable_part_fails_the_stream_and_cancels_the_handler() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let h = handler(&hub.address(), "svc-h", "h1", &probe, 2).await;
+    let c = caller(&hub.address()).await;
+    let mut stream = c
+        .sender
+        .stream(&export(3, 5_000, None), StreamOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(stream.next().await.unwrap().unwrap().i, 0);
+    let id = streams(&hub).await[0].id.clone();
+    hub.send_to_clients(ServerMessage {
+        message: Some(server_message::Message::Part(proto::ReplyPart {
+            request_id: id.clone(),
+            payload: b"not a row".to_vec(),
+            seq: 2,
+            ..Default::default()
+        })),
+    })
+    .await;
+    let e = stream.next().await.unwrap().unwrap_err();
+    assert!(matches!(e, MessagingError::Serialization(_)), "{e:?}");
+    assert!(stream.next().await.is_none());
+    eventually("the cancel", async || !hub.cancels().is_empty()).await;
+    let (_, cancel) = &hub.cancels()[0];
+    assert_eq!(
+        (cancel.request_id.as_str(), cancel.reason.as_str()),
+        (id.as_str(), "undecodable part")
+    );
+    eventually("the handler cancelled", async || {
+        probe.dropped.load(Ordering::SeqCst) == 1 && h.dispatcher.available_permits() == 2
+    })
+    .await;
+    assert_eq!(c.sender.in_flight(), 0);
+    drop(stream);
+    h.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_hub_without_the_capability_is_unsupported_and_gets_nothing() {
+    for legacy in [false, true] {
+        let hub = FakeHub::start().await;
+        if legacy {
+            hub.set_ack(None);
+        } else {
+            hub.set_streaming(false);
+        }
+        let c = caller(&hub.address()).await;
+        assert!(!c.pool.handshake_for("").unwrap().streaming());
+        let e = c
+            .sender
+            .stream(&export(1, 0, None), StreamOptions::default())
+            .await
+            .err()
+            .expect("unsupported");
+        assert!(
+            matches!(e, MessagingError::UnsupportedByHub(_)),
+            "legacy {legacy}: {e:?}"
+        );
+        assert!(hub.requests().await.is_empty(), "nothing is sent");
+        assert_eq!(c.sender.in_flight(), 0);
+        c.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn gating_errors_map_to_the_unary_errors() {
+    let hub = FakeHub::start().await;
+    let c = caller(&hub.address()).await;
+    // No owner.
+    let e = c
+        .sender
+        .stream(&export(1, 0, None), StreamOptions::default())
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(e, MessagingError::NoHandler(ref t) if t == "t.Export"),
+        "{e:?}"
+    );
+    // An owner whose session did not negotiate streaming (an older library).
+    hub.set_streaming(false);
+    let probe = Arc::new(Probe::default());
+    let old = handler(&hub.address(), "svc-old", "o1", &probe, 2).await;
+    hub.set_streaming(true);
+    let e = c
+        .sender
+        .stream(&export(1, 0, None), StreamOptions::default())
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(e, MessagingError::UnsupportedByHub(ref m) if m.contains("svc-old")),
+        "{e:?}"
+    );
+    assert_eq!(probe.started.load(Ordering::SeqCst), 0);
+    old.shutdown().await;
+    // The type is a command.
+    let owner = node_with(
+        &hub.address(),
+        "svc-cmd",
+        "x1",
+        {
+            let mut r = HandlerRegistry::new();
+            r.command::<Fill, _, _>(|_, _| async move { Ok(()) });
+            r
+        },
+        2,
+        SenderSettings::default(),
+    )
+    .await;
+    #[derive(Serialize, Deserialize)]
+    struct AsStream {}
+    message_type!(AsStream, "t.Fill");
+    impl StreamingQuery for AsStream {
+        type Item = Row;
+    }
+    let e = c
+        .sender
+        .stream(&AsStream {}, StreamOptions::default())
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(e, MessagingError::InvalidMessage(_)), "{e:?}");
+    // The hub stopped sharing the capability after the handshake: it answers UNSUPPORTED.
+    hub.set_streaming(false);
+    let e = c
+        .sender
+        .stream(&export(1, 0, None), StreamOptions::default())
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(e, MessagingError::UnsupportedByHub(_)), "{e:?}");
+    assert_eq!(c.sender.in_flight(), 0);
+    owner.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_retry_policy_applies_until_the_first_part_only() {
+    let hub = FakeHub::start().await;
+    let c = caller_with(
+        &hub.address(),
+        SenderSettings {
+            retry: Some(RetryPolicy {
+                max_attempts: 20,
+                initial_backoff: Duration::from_millis(100),
+                multiplier: 1.0,
+                max_backoff: Duration::from_millis(100),
+            }),
+            default_timeout: Some(Duration::from_secs(5)),
+            ..SenderSettings::default()
+        },
+    )
+    .await;
+    let probe = Arc::new(Probe::default());
+    let query = export(1_000, 0, None);
+    // NO_HANDLER until a handler registers: retried with fresh ids.
+    let (opened, h) = tokio::join!(
+        c.sender.stream(
+            &query,
+            StreamOptions {
+                initial_credit: 8,
+                ..StreamOptions::default()
+            },
+        ),
+        async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            handler(&hub.address(), "svc-h", "h1", &probe, 2).await
+        }
+    );
+    let mut stream = opened.unwrap();
+    let sent = streams(&hub).await;
+    assert!(sent.len() >= 2, "{} attempts", sent.len());
+    let mut ids: Vec<&str> = sent.iter().map(|r| r.id.as_str()).collect();
+    ids.dedup();
+    assert_eq!(ids.len(), sent.len(), "each attempt has a fresh id");
+    for i in 0..3 {
+        assert_eq!(stream.next().await.unwrap().unwrap().i, i);
+    }
+    // After the first part a lost hub stream is the end: no new stream is opened.
+    let attempts = sent.len();
+    hub.drop_streams();
+    let (rows, error) = collect(&mut stream).await;
+    assert!(
+        matches!(error, Some(MessagingError::HubConnectionLost(_))),
+        "{error:?} after {} more rows",
+        rows.len()
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        streams(&hub).await.len(),
+        attempts,
+        "not retried after a part"
+    );
+    assert_eq!(c.sender.in_flight(), 0);
+    drop(stream);
+    h.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_shared_streaming_type_streams_from_one_owner_instance() {
+    let hub = FakeHub::start().await;
+    let a = shared_owner(&hub.address(), "svc-a", "a1", 1).await;
+    let b = shared_owner(&hub.address(), "svc-b", "b1", 2).await;
+    let c = caller(&hub.address()).await;
+    let registers = hub.registers().await;
+    let a1 = registers.iter().find(|r| r.instance_id == "a1").unwrap();
+    assert_eq!(a1.shared_query_types, ["t.SharedExport"]);
+    assert!(a1.query_types.is_empty());
+    let mut marks = vec![];
+    for _ in 0..2 {
+        let mut stream = c
+            .sender
+            .stream(&SharedExport {}, StreamOptions::default())
+            .await
+            .unwrap();
+        let (rows, error) = collect(&mut stream).await;
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(rows.len(), 1, "one instance answers");
+        marks.push(rows[0]);
+    }
+    marks.sort();
+    assert_eq!(marks, [1, 2], "one stream to each owner, round-robin");
+    a.shutdown().await;
+    b.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_pool_streams_to_one_capable_hub_only() {
+    // hub-3 is a P4a hub: every stream goes to hub-4.
+    let (h3, h4) = (
+        FakeHub::start_with_id("hub-3").await,
+        FakeHub::start_with_id("hub-4").await,
+    );
+    h3.set_streaming(false);
+    let both = format!("{},{}", h3.address(), h4.address());
+    let probe = Arc::new(Probe::default());
+    let h = handler(&both, "svc-h", "h1", &probe, 4).await;
+    let c = caller(&both).await;
+    for _ in 0..4 {
+        let mut stream = c
+            .sender
+            .stream(&export(2, 0, None), StreamOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(collect(&mut stream).await.0, [0, 1]);
+    }
+    assert_eq!((streams(&h3).await.len(), streams(&h4).await.len()), (0, 4));
+    h.shutdown().await;
+    c.shutdown().await;
+}
+
+/// A big streaming query, to fill a stream.
+#[derive(Serialize, Deserialize)]
+struct BigExport {
+    term: String,
+}
+message_type!(BigExport, "t.BigExport");
+impl StreamingQuery for BigExport {
+    type Item = Row;
+}
+
+/// A stream whose open is dropped while its write still waits for room in the stream's outbound
+/// buffer leaves no pending entry behind (as the gather path).
+#[tokio::test]
+async fn a_stream_dropped_while_its_write_is_blocked_leaves_nothing_pending() {
+    let hub = FakeHub::start().await;
+    let c = caller(&hub.address()).await;
+    hub.set_stall_reads(true);
+    let calls: Vec<_> = (0..324)
+        .map(|i| {
+            let sender = Arc::clone(&c.sender);
+            let size = if i < 24 { 256 * 1024 } else { 1 };
+            tokio::spawn(async move {
+                let query = BigExport {
+                    term: "x".repeat(size),
+                };
+                sender
+                    .stream(&query, StreamOptions::default())
+                    .await
+                    .map(|_| ())
+            })
+        })
+        .collect();
+    eventually("every stream recorded its pending entry", async || {
+        let finished = calls.iter().filter(|c| c.is_finished()).count();
+        c.sender.in_flight() + finished == calls.len()
+    })
+    .await;
+    for call in &calls {
+        call.abort();
+    }
+    for call in calls {
+        let _ = call.await;
+    }
+    assert_eq!(
+        c.sender.in_flight(),
+        0,
+        "a dropped open leaves nothing pending"
+    );
+    hub.drop_streams();
+    c.shutdown().await;
+}
+
+/// The capable hubs are ranked on a snapshot; the write refuses a stream that lost `streaming`
+/// in between (a reconnect to an older hub) and the open moves on (`UnsupportedByHub` when no
+/// capable hub is left), as the gather path does.
+#[tokio::test]
+async fn a_stream_is_not_written_to_a_hub_that_lost_the_capability_after_ranking() {
+    let (h1, h2) = (
+        FakeHub::start_with_id("hub-1").await,
+        FakeHub::start_with_id("hub-2").await,
+    );
+    let both = format!("{},{}", h1.address(), h2.address());
+    let c = caller(&both).await;
+    assert_eq!(c.pool.hub_ids(), ["hub-1", "hub-2"]);
+    h1.set_stall_reads(true);
+    let key_on_1 = (0..)
+        .map(|i| format!("k{i}"))
+        .find(|k| rendezvous_score("hub-1", k) > rendezvous_score("hub-2", k))
+        .unwrap();
+    let fillers: Vec<_> = (0..324)
+        .map(|i| {
+            let sender = Arc::clone(&c.sender);
+            let opts = SendOptions {
+                routing_key: Some(key_on_1.clone()),
+                retry: Some(RetryPolicy::NONE),
+                timeout: Some(Duration::from_secs(30)),
+                ..SendOptions::default()
+            };
+            let size = if i < 24 { 256 * 1024 } else { 1 };
+            tokio::spawn(async move {
+                let fill = Fill {
+                    data: "x".repeat(size),
+                };
+                sender.send_command(&fill, opts).await
+            })
+        })
+        .collect();
+    eventually("every filler handed to hub-1's stream", async || {
+        c.sender.in_flight() == fillers.len()
+    })
+    .await;
+    for filler in &fillers {
+        filler.abort();
+    }
+    for filler in fillers {
+        let _ = filler.await;
+    }
+    // Streams go round-robin: the one ranked [hub-1, hub-2] waits in the write to hub-1 (the one
+    // ranked the other way round ends at once with NO_HANDLER on hub-2).
+    let mut probes = 0;
+    let waiting = loop {
+        probes += 1;
+        assert!(probes <= 3, "no stream went to hub-1 first");
+        let sender = Arc::clone(&c.sender);
+        let call = tokio::spawn(async move {
+            sender
+                .stream(&export(1, 0, None), StreamOptions::default())
+                .await
+                .map(|_| ())
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if !call.is_finished() {
+            break call;
+        }
+        let e = call.await.unwrap().unwrap_err();
+        assert!(matches!(e, MessagingError::NoHandler(_)), "{e:?}");
+    };
+    assert!(
+        streams(&h2).await.len() < probes,
+        "the waiting stream reached no hub"
+    );
+    h2.set_streaming(false);
+    h2.drop_streams();
+    eventually("hub-2 re-handshaken without the capability", async || {
+        c.pool.connections().iter().any(|conn| {
+            conn.address() == h2.address() && conn.handshake().is_some_and(|h| !h.streaming())
+        })
+    })
+    .await;
+    let on_h2_before = streams(&h2).await.len();
+    h1.drop_streams();
+    let e = tokio::time::timeout(Duration::from_secs(3), waiting)
+        .await
+        .expect("the open ends at once, not at the local guard")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(e, MessagingError::UnsupportedByHub(_)), "{e:?}");
+    assert_eq!(
+        streams(&h2).await.len(),
+        on_h2_before,
+        "the stream was not written to hub-2's stream"
+    );
+    assert_eq!(c.sender.in_flight(), 0);
+    c.shutdown().await;
 }
