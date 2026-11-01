@@ -1341,6 +1341,79 @@ async fn the_retry_policy_applies_until_the_first_part_only() {
     c.shutdown().await;
 }
 
+/// A `ReplyEnd{error}` before the first part is retried like an `Error` with that code: the
+/// handler leaves (HANDLER_DISCONNECTED, retryable) before its first part, then NO_HANDLER until
+/// another owner registers and serves the stream. (Nothing is retried after the first part:
+/// `the_retry_policy_applies_until_the_first_part_only`.)
+#[tokio::test]
+async fn a_reply_end_error_before_the_first_part_is_retried_like_an_error() {
+    let hub = FakeHub::start().await;
+    let c = caller_with(
+        &hub.address(),
+        SenderSettings {
+            retry: Some(RetryPolicy {
+                max_attempts: 20,
+                initial_backoff: Duration::from_millis(100),
+                multiplier: 1.0,
+                max_backoff: Duration::from_millis(100),
+            }),
+            default_timeout: Some(Duration::from_secs(5)),
+            ..SenderSettings::default()
+        },
+    )
+    .await;
+    // An owner that never sends its first part.
+    let hang = Arc::new(Probe::default());
+    let mute = node_with(
+        &hub.address(),
+        "svc-mute",
+        "m1",
+        {
+            let mut r = HandlerRegistry::new();
+            let probe = Arc::clone(&hang);
+            r.shared_streaming_query::<SharedExport, _, _, _>(move |_, _| {
+                let probe = Arc::clone(&probe);
+                async move {
+                    probe.started.fetch_add(1, Ordering::SeqCst);
+                    Ok(Watched {
+                        inner: Box::pin(tokio_stream::pending()),
+                        probe,
+                    })
+                }
+            });
+            r
+        },
+        2,
+        SenderSettings::default(),
+    )
+    .await;
+    let (opened, owner) = tokio::join!(
+        c.sender.stream(&SharedExport {}, StreamOptions::default()),
+        async {
+            eventually("the mute owner got the stream", async || {
+                hang.started.load(Ordering::SeqCst) == 1
+            })
+            .await;
+            // It leaves: ReplyEnd{HANDLER_DISCONNECTED} to the sender, retried; then NO_HANDLER
+            // (retried) until another owner registers.
+            mute.shutdown().await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            shared_owner(&hub.address(), "svc-b", "b1", 7).await
+        }
+    );
+    let mut stream = opened.unwrap();
+    assert_eq!(collect(&mut stream).await.0, [7]);
+    let sent = streams(&hub).await;
+    assert!(sent.len() >= 3, "{} attempts", sent.len());
+    let mut ids: Vec<&str> = sent.iter().map(|r| r.id.as_str()).collect();
+    ids.dedup();
+    assert_eq!(ids.len(), sent.len(), "each attempt has a fresh id");
+    assert_eq!(c.sender.in_flight(), 0);
+    drop(stream);
+    owner.shutdown().await;
+    c.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_shared_streaming_type_streams_from_one_owner_instance() {
     let hub = FakeHub::start().await;
