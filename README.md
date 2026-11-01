@@ -27,7 +27,7 @@ indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
 | Connect to every hub of a list or a DNS name, route and fail over between them | `hub::HubPool` |
 | Send commands and queries, typed replies, timeouts, error mapping | `hub::Sender` (`app.commands()`, `app.queries()`) |
 | Shared query types and scatter-gather queries | `shared_query`, `Sender::scatter_gather` (see [Scatter-gather](#scatter-gather)) |
-| Streaming queries under the caller's credits | `streaming_query`, `Sender::stream` (see [Streaming queries](#streaming-queries)) |
+| Streaming queries under the caller's credits | `streaming_query`, `Sender::stream` / `stream_owned` (see [Streaming queries](#streaming-queries)) |
 | Publish events through the Mongo outbox, relay to Kafka | `kafka::EventBus`, `kafka::OutboxPublisher` |
 | Consume events idempotently (marker + handler in one transaction) | `kafka::EventConsumer` |
 | Identity from the forwarded JWT: JWKS verification or unverified parsing; handler guards | `identity::{IdentityResolver, JwksVerifier, Guard}` |
@@ -373,6 +373,11 @@ let mut rows = app.queries().stream(&Export { since }, StreamOptions {
     initial_credit: 64,    // the credit window; half of it is refilled every time half was consumed
 }).await?;
 while let Some(row) = rows.next().await { let row = row?; /* in the handler's order */ }
+
+// `stream` borrows the sender: its stream cannot leave the scope of `app.queries()`. For an
+// HTTP streaming body or a spawned task, `stream_owned` on the shared sender is `'static`.
+let rows = app.sender().stream_owned(&Export { since }, StreamOptions::default()).await?;
+tokio::spawn(async move { rows.try_for_each(|row| async { Ok(()) }).await });
 ```
 
 | API | Signature |
@@ -380,7 +385,8 @@ while let Some(row) = rows.next().await { let row = row?; /* in the handler's or
 | Trait | `trait StreamingQuery: MessageType + Serialize + DeserializeOwned + Send + Sync + 'static { type Item: Serialize + DeserializeOwned + Send + 'static; }` |
 | Register a handler | `KrakenMessagingBuilder::streaming_query::<Q, F, Fut, S>(handler) -> Self` and `shared_streaming_query` (also on `HandlerRegistry`), with `F: Fn(Q, MessageContext) -> Fut`, `Fut: Future<Output = Result<S, MessagingError>>`, `S: Stream<Item = Result<Q::Item, MessagingError>> + Send + 'static` (a `BoxStream` fits) |
 | Registered types | `HandlerRegistry::streaming_query_types()` (exclusive and shared); `registered_types() -> RegisteredTypes { commands, queries, shared_queries, streaming_queries }`: `streaming_queries` are the exclusive streaming types, announced in `Register.query_types` with `queries`; a shared streaming type is in `shared_queries` like any shared query (the hub does not tell a streaming type from a unary one: the mode is the sender's choice) |
-| Stream | `Sender::stream<Q: StreamingQuery>(&self, &Q, StreamOptions) -> Result<BoxStream<'_, Result<Q::Item, MessagingError>>, MessagingError>` (`async`) |
+| Stream | `Sender::stream<Q: StreamingQuery>(&self, &Q, StreamOptions) -> Result<BoxStream<'_, Result<Q::Item, MessagingError>>, MessagingError>` (`async`): the stream borrows the sender |
+| Owned stream | `Sender::stream_owned<Q: StreamingQuery>(self: &Arc<Self>, &Q, StreamOptions) -> Result<BoxStream<'static, Result<Q::Item, MessagingError>>, MessagingError>` (`async`): the stream holds a clone of the `Arc<Sender>`, so it can be returned or moved into a task; `KrakenMessaging::sender()` (and the builder's `sender()`) is that `Arc`. Same behaviour otherwise |
 | Options | `StreamOptions { timeout: Option<Duration>, max_results: u32, priority: Option<i32>, initial_credit: u32 }` (`Default`: `initial_credit` 64, `hub::DEFAULT_CREDIT`; 0 reads as 64) |
 | Errors | `MessagingError::UnsupportedByHub`, `NoHandler`, `InvalidMessage`, `Timeout`, `RemoteHandler`, `HandlerDisconnected`, `HandlerBusy`, `Cancelled` (the hub's max stream duration), `HubUnavailable`, `HubConnectionLost`, `Serialization` |
 
@@ -407,6 +413,11 @@ while let Some(row) = rows.next().await { let row = row?; /* in the handler's or
   time that many items were pulled by the caller (not on arrival), so a handler never runs more
   than a window (plus the held item) ahead of the consumer. Items use the unary reply codec
   (`()` accepts `{}`).
+- **Borrow or share.** `stream` returns `BoxStream<'a>` borrowing the `&'a Sender`: the stream
+  lives inside that borrow, so it cannot be returned from a handler that only borrowed the app
+  (an HTTP streaming body) or moved into `tokio::spawn`. `stream_owned` takes `&Arc<Sender>` and
+  returns `BoxStream<'static>` holding a clone of it: the sender outlives the stream, and the
+  drop guard (`Cancel` on drop before the end) works the same.
 - **Open.** `stream().await` returns once the first item is in (or the end: an empty stream), so
   everything before that is the call's error: `UnsupportedByHub`, `NoHandler` (no owner),
   `InvalidMessage` (a command type), `Timeout` (no first item within the idle timeout), the

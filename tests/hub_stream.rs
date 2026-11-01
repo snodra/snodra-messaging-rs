@@ -846,6 +846,59 @@ async fn a_stream_yields_the_handlers_items_in_order_then_ends() {
     c.shutdown().await;
 }
 
+/// `Sender::stream` borrows the sender, so its stream cannot leave the scope that holds the
+/// `&Sender` (an HTTP streaming body, a spawned task). `stream_owned` shares the `Arc<Sender>`
+/// instead: a `'static` stream with the same behaviour.
+#[tokio::test]
+async fn an_owned_stream_moves_into_a_spawned_task_and_yields_every_item() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let h = handler(&hub.address(), "svc-h", "h1", &probe, 2).await;
+    let c = caller(&hub.address()).await;
+    let options = StreamOptions {
+        initial_credit: 8,
+        ..StreamOptions::default()
+    };
+    let stream: BoxStream<'static, Result<Row, MessagingError>> = c
+        .sender
+        .stream_owned(&export(100, 0, None), options.clone())
+        .await
+        .unwrap();
+    let (rows, error) = tokio::spawn(async move {
+        let mut stream = stream;
+        collect(&mut stream).await
+    })
+    .await
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    assert_eq!(rows, (0..100).collect::<Vec<_>>());
+    assert!(hub.flows().len() >= 24, "{} flows", hub.flows().len());
+    assert_eq!(c.sender.in_flight(), 0);
+    assert_eq!(hub.open_streams(), 0);
+    // Dropped in the task before its end: cancelled at the hub, like a borrowed stream.
+    let stream = c
+        .sender
+        .stream_owned(&export(100, 5_000, None), options)
+        .await
+        .unwrap();
+    let first = tokio::spawn(async move {
+        let mut stream = stream;
+        stream.next().await.unwrap().unwrap().i
+    })
+    .await
+    .unwrap();
+    assert_eq!(first, 0);
+    eventually("the cancel", async || hub.cancels().len() == 1).await;
+    assert_eq!(hub.cancels()[0].1.reason, "dropped by the sender");
+    eventually("both handlers done", async || {
+        probe.dropped.load(Ordering::SeqCst) == 2 && h.dispatcher.available_permits() == 2
+    })
+    .await;
+    assert_eq!(c.sender.in_flight(), 0);
+    h.shutdown().await;
+    c.shutdown().await;
+}
+
 #[tokio::test]
 async fn options_become_the_request_fields() {
     let hub = FakeHub::start().await;

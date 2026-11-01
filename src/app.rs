@@ -115,6 +115,13 @@ impl KrakenMessaging {
         &self.sender
     }
 
+    /// The same sender as [`commands`](Self::commands) and [`queries`](Self::queries), shared:
+    /// for [`Sender::stream_owned`] (a `'static` stream, e.g. an HTTP streaming body) and for
+    /// tasks that outlive a borrow of the app. The builder's `sender()` is the same `Arc`.
+    pub fn sender(&self) -> Arc<Sender> {
+        Arc::clone(&self.sender)
+    }
+
     /// Publishes events through the outbox.
     pub fn events(&self) -> &EventBus {
         &self.events

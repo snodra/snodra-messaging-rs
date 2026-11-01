@@ -17,7 +17,7 @@
 //! the parts until the end; the local guard covers the whole gather. If its stream breaks before
 //! the end, the gather fails with `HubConnectionLost` (parts already received are not kept).
 //!
-//! Streaming queries (ADR 0017 P4b, [`Sender::stream`]): one `Request` with `mode = STREAMING`
+//! Streaming queries (ADR 0017 P4b, [`Sender::stream`], [`Sender::stream_owned`]): one `Request` with `mode = STREAMING`
 //! and the initial credit to one hub whose ack lists `streaming`, answered by one handler's
 //! `ReplyPart`s and one `ReplyEnd`. The pending entry lives until the end; the caller's stream
 //! refills credit as it consumes (`Flow`), and dropping it before the end sends `Cancel`. The
@@ -27,6 +27,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -490,11 +491,38 @@ impl StreamCall {
     }
 }
 
+/// The sender a [`Streaming`] runs on: borrowed ([`Sender::stream`]) or shared
+/// ([`Sender::stream_owned`], a `'static` stream).
+enum SenderRef<'a> {
+    Borrowed(&'a Sender),
+    Shared(Arc<Sender>),
+}
+
+impl Clone for SenderRef<'_> {
+    fn clone(&self) -> Self {
+        match self {
+            SenderRef::Borrowed(s) => SenderRef::Borrowed(s),
+            SenderRef::Shared(s) => SenderRef::Shared(Arc::clone(s)),
+        }
+    }
+}
+
+impl Deref for SenderRef<'_> {
+    type Target = Sender;
+
+    fn deref(&self) -> &Sender {
+        match self {
+            SenderRef::Borrowed(s) => s,
+            SenderRef::Shared(s) => s,
+        }
+    }
+}
+
 /// One streaming query written (or being written) to a hub: its parts as they arrive, then the
 /// end. Dropping it before the end cancels the stream at the hub (once written) and forgets the
 /// request, from before the write on.
 struct Streaming<'a> {
-    sender: &'a Sender,
+    sender: SenderRef<'a>,
     call: Arc<StreamCall>,
     chosen: Option<Duration>,
     id: String,
@@ -1084,16 +1112,42 @@ impl Sender {
     /// never runs more than a window (plus the one item it may hold) ahead of the consumer.
     /// Dropping it before the end cancels
     /// the stream at the hub (the handler is told) and forgets the request.
+    ///
+    /// The stream borrows this sender (`BoxStream<'a>`): it cannot outlive the borrow, so it
+    /// cannot be returned as an HTTP streaming body or moved into a spawned task. For that use
+    /// [`stream_owned`](Self::stream_owned), which shares the `Arc<Sender>` instead.
     pub async fn stream<'a, Q: StreamingQuery>(
         &'a self,
+        query: &Q,
+        options: StreamOptions,
+    ) -> Result<BoxStream<'a, Result<Q::Item, MessagingError>>, MessagingError> {
+        Self::stream_with(SenderRef::Borrowed(self), query, options).await
+    }
+
+    /// [`stream`](Self::stream) as a `'static` stream: it holds a clone of this `Arc<Sender>`
+    /// instead of a borrow, so it can be returned (an HTTP streaming body) or moved into a
+    /// spawned task. Same open, items, credits, endings, retry and drop guard; the sender lives
+    /// at least as long as the stream (`KrakenMessaging::sender()` is the app's `Arc`).
+    pub async fn stream_owned<Q: StreamingQuery>(
+        self: &Arc<Self>,
+        query: &Q,
+        options: StreamOptions,
+    ) -> Result<BoxStream<'static, Result<Q::Item, MessagingError>>, MessagingError> {
+        Self::stream_with(SenderRef::Shared(Arc::clone(self)), query, options).await
+    }
+
+    /// The one implementation of [`stream`](Self::stream) and [`stream_owned`](Self::stream_owned):
+    /// the returned stream owns `sender`, whichever kind it is.
+    async fn stream_with<'a, Q: StreamingQuery>(
+        sender: SenderRef<'a>,
         query: &Q,
         options: StreamOptions,
     ) -> Result<BoxStream<'a, Result<Q::Item, MessagingError>>, MessagingError> {
         let call = Arc::new(StreamCall {
             type_name: Q::TYPE,
             payload: codec::encode(query)?,
-            headers: self.headers(None),
-            priority: self.priority(Q::TYPE, options.priority),
+            headers: sender.headers(None),
+            priority: sender.priority(Q::TYPE, options.priority),
             max_results: options.max_results,
             window: if options.initial_credit == 0 {
                 DEFAULT_CREDIT
@@ -1101,20 +1155,21 @@ impl Sender {
                 options.initial_credit
             },
         });
-        let chosen = chosen_timeout(options.timeout, self.default_timeout);
+        let chosen = chosen_timeout(options.timeout, sender.default_timeout);
         // Retried (new streams, fresh ids) until the first part, the end or a final error. The
         // idle timeout sent is the chosen one on every attempt; the budget bounds the retries.
-        let opened = self
+        let opened = sender
             .retrying(
                 RequestKind::Query,
                 Q::TYPE,
-                self.retry.clone(),
+                sender.retry.clone(),
                 chosen,
                 "",
                 |_| {
                     let call = Arc::clone(&call);
+                    let sender = sender.clone();
                     async move {
-                        let mut streaming = self.open_stream(&call, chosen).await?;
+                        let mut streaming = Self::open_stream(sender, &call, chosen).await?;
                         match streaming.next().await {
                             Some(Ok(part)) => Ok(Some((streaming, part))),
                             Some(Err(e)) => Err(e),
@@ -1146,17 +1201,17 @@ impl Sender {
     }
 
     /// Writes a new streaming query of `call` (fresh id) to a hub that shares the capability.
-    async fn open_stream(
-        &self,
+    async fn open_stream<'a>(
+        sender: SenderRef<'a>,
         call: &Arc<StreamCall>,
         chosen: Option<Duration>,
-    ) -> Result<Streaming<'_>, MessagingError> {
+    ) -> Result<Streaming<'a>, MessagingError> {
         // The streaming exists before the write: its drop forgets the pending entry (recorded by
         // the build, before the write) when the caller drops the future while the write still
         // waits for room in the stream's outbound buffer; nothing was written, so no cancel.
         let (_, events) = mpsc::unbounded_channel();
         let mut streaming = Streaming {
-            sender: self,
+            sender,
             call: Arc::clone(call),
             chosen,
             id: uuid::Uuid::new_v4().to_string(),
@@ -1170,7 +1225,10 @@ impl Sender {
             consumed: 0,
             received: 0,
         };
-        let (events, guard, stream) = self.write_stream(&streaming.id, call, chosen).await?;
+        let (events, guard, stream) = streaming
+            .sender
+            .write_stream(&streaming.id, call, chosen)
+            .await?;
         streaming.events = events;
         streaming.guard = guard;
         streaming.stream = stream;
