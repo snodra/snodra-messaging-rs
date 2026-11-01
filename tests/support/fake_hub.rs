@@ -20,7 +20,10 @@
 //!
 //! Scatter-gather like kraken-hub (ADR 0017): the ack lists "scatter-gather" when the client
 //! declared it, unless `set_scatter_gather(false)` (a P3 hub). A `Request` with
-//! `mode = SCATTER_GATHER` goes to every stream whose `Register` lists the type in `query_types` or
+//! `mode = SCATTER_GATHER` on a stream whose ack never listed it is served like a unary request
+//! (a P3 hub does not know `mode`: the responder answers, or nobody); on a stream whose ack listed
+//! it while the flag is off now it is rejected with `UNSUPPORTED`. Otherwise it
+//! goes to every stream whose `Register` lists the type in `query_types` or
 //! `shared_query_types` (ordered by service, then instance id) as a unary request `<id>#<n>`; each
 //! answer goes back to the sender as a `ReplyPart` in arrival order, then one `ReplyEnd` once every
 //! target answered, after `max_results` successful parts, or at the deadline (`timeout_ms`, else
@@ -159,24 +162,34 @@ impl State {
             .push((event, std::time::Instant::now()));
     }
 
-    /// A scatter-gather `Request` from stream `stream_no`: rejected, or fanned out.
-    async fn scatter(self: &Arc<Self>, stream_no: usize, req: proto::Request, tx: &Outbound) {
+    /// A scatter-gather `Request` from stream `stream_no`: rejected, or fanned out. `false` when
+    /// that stream's ack never listed the capability: the request is to be served as unary (an
+    /// older hub does not know `mode`).
+    async fn scatter(
+        self: &Arc<Self>,
+        stream_no: usize,
+        req: &proto::Request,
+        tx: &Outbound,
+    ) -> bool {
         use proto::ErrorCode;
         let reject = |code, message: &str| hub_error(&req.id, code, message);
-        let declared = self
+        let listed = self
             .routes
             .lock()
             .unwrap()
             .get(&stream_no)
             .is_some_and(|r| r.scatter);
-        if !declared || !self.scatter_gather.load(Ordering::SeqCst) {
+        if !listed {
+            return false;
+        }
+        if !self.scatter_gather.load(Ordering::SeqCst) {
             let _ = tx
                 .send(Ok(reject(
                     ErrorCode::Unsupported,
                     "scatter-gather not supported",
                 )))
                 .await;
-            return;
+            return true;
         }
         let (is_command, mut targets) = {
             let routes = self.routes.lock().unwrap();
@@ -196,13 +209,13 @@ impl State {
                     "invalid request: a command",
                 )))
                 .await;
-            return;
+            return true;
         }
         if targets.is_empty() {
             let _ = tx
                 .send(Ok(reject(ErrorCode::NoHandler, "no handler")))
                 .await;
-            return;
+            return true;
         }
         targets.sort_by(|a, b| (&a.1, &a.2).cmp(&(&b.1, &b.2)));
         let ids: Vec<String> = (0..targets.len())
@@ -255,6 +268,7 @@ impl State {
                 .send(Ok(server(server_message::Message::Request(forwarded))))
                 .await;
         }
+        true
     }
 
     /// The answer of scatter-gather target `id`, if it is one: its part, and the end when done.
@@ -497,14 +511,14 @@ impl Hub for Service {
                                 }
                             }
                             client_message::Message::Status(st) => state.statuses.lock().unwrap().push((stream_no, st)),
-                            client_message::Message::Request(req) if req.mode == proto::RequestMode::ScatterGather as i32 => {
-                                state.requests.lock().await.push(req.clone());
-                                state.scatter(stream_no, req, &tx).await;
-                            }
                             client_message::Message::Request(req) => {
                                 state.requests.lock().await.push(req.clone());
-                                let response = state.responder.lock().await.as_ref().and_then(|f| f(req));
-                                if let Some(resp) = response && tx.send(Ok(resp)).await.is_err() { break; }
+                                let scattered = req.mode == proto::RequestMode::ScatterGather as i32
+                                    && state.scatter(stream_no, &req, &tx).await;
+                                if !scattered {
+                                    let response = state.responder.lock().await.as_ref().and_then(|f| f(req));
+                                    if let Some(resp) = response && tx.send(Ok(resp)).await.is_err() { break; }
+                                }
                             }
                             // Multi-part messages (ADR 0017): this client sends none yet.
                             client_message::Message::Part(_)

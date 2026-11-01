@@ -344,25 +344,28 @@ impl HubPool {
     }
 
     /// Writes a message built for the chosen hub's stream: round-robin without a `routing_key`,
-    /// rendezvous with one. When the write fails (nothing was written) the next hub in that order
-    /// is tried, so `build` may run more than once, each time for another stream; the last
-    /// `HubUnavailable` is returned when no hub took it.
+    /// rendezvous with one. When the write fails or `build` refuses the stream (nothing was
+    /// written) the next hub in that order is tried, so `build` may run more than once, each time
+    /// for another stream; the last error (`HubUnavailable`, or `build`'s) is returned when no hub
+    /// took it.
     pub(crate) async fn send_with<T>(
         &self,
         routing_key: &str,
-        build: impl FnMut(StreamId, &Handshake) -> (ClientMessage, T),
+        build: impl FnMut(StreamId, &Handshake) -> Result<(ClientMessage, T), MessagingError>,
     ) -> Result<(StreamId, T), MessagingError> {
         self.send_where(routing_key, None, build).await
     }
 
     /// [`send_with`](Self::send_with) over the live hubs whose ack lists `capability` only
     /// (`None`: every live hub). `UnsupportedByHub` when hubs are live but none lists it (nothing
-    /// was written); `HubUnavailable` when none is live.
+    /// was written); `HubUnavailable` when none is live. The hubs are ranked on a snapshot of
+    /// their handshakes; `build` sees the handshake of the stream current at the write and should
+    /// check the capability again (a hub re-handshaken in between may have lost it).
     pub(crate) async fn send_where<T>(
         &self,
         routing_key: &str,
         capability: Option<&str>,
-        mut build: impl FnMut(StreamId, &Handshake) -> (ClientMessage, T),
+        mut build: impl FnMut(StreamId, &Handshake) -> Result<(ClientMessage, T), MessagingError>,
     ) -> Result<(StreamId, T), MessagingError> {
         let mut last = None;
         let ranked = self.ranked(routing_key, capability);

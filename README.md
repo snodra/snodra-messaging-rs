@@ -313,9 +313,11 @@ while let Some(part) = parts.next().await { let part = part?; /* ... */ }
 - **Point queries still work.** `send_query` on a shared type goes to one live instance of any
   owner (one round-robin pool over all owners at the hub).
 - **Capability.** The client declares `scatter-gather`; a gather goes only to a hub whose
-  `RegisterAck` lists it (`Handshake::scatter_gather`). With none (a P3 or older hub, a legacy
-  hub) it fails at once with `MessagingError::UnsupportedByHub`, nothing sent. An older hub also
-  ignores `shared_query_types`: the type is simply not registered there (a point query to it is
+  `RegisterAck` lists it (`Handshake::scatter_gather`), checked again on the very stream it is
+  written to (a hub re-handshaken without it in between is skipped, like one whose write fails).
+  With none (a P3 or older hub, a legacy hub) it fails at once with
+  `MessagingError::UnsupportedByHub`, nothing sent. An older hub also ignores
+  `shared_query_types`: the type is simply not registered there (a point query to it is
   `NoHandler`).
 - **Answers.** One part per target answer, in arrival order; a failed target is a part whose
   `outcome` is a `RemoteError` (the handler's error, or `HANDLER_DISCONNECTED`,

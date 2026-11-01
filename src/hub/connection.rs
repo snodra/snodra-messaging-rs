@@ -670,17 +670,19 @@ impl HubConnection {
     /// Writes to the current handshaken stream and returns its id; `HubUnavailable` when there is
     /// none or the write fails.
     pub async fn send(&self, msg: ClientMessage) -> Result<StreamId, MessagingError> {
-        self.send_with(|_, _| (msg, ())).await.map(|(s, ())| s)
+        self.send_with(|_, _| Ok((msg, ()))).await.map(|(s, ())| s)
     }
 
     /// Builds a message for the current handshaken stream and writes it there. `build` runs while
     /// the stream is still current, with its id and handshake, so whatever it records (a pending
     /// request tagged with the stream id) happens before that stream's
-    /// [`Inbound::Disconnected`] can be emitted. Returns the stream id and `build`'s extra value;
-    /// `HubUnavailable` when there is no handshaken stream or the write fails (nothing was written).
+    /// [`Inbound::Disconnected`] can be emitted; it may refuse the stream (its handshake lacks
+    /// what the message needs) with an error, which is returned and nothing is written. Returns
+    /// the stream id and `build`'s extra value; `HubUnavailable` when there is no handshaken
+    /// stream or the write fails (nothing was written).
     pub async fn send_with<T>(
         &self,
-        build: impl FnOnce(StreamId, &Handshake) -> (ClientMessage, T),
+        build: impl FnOnce(StreamId, &Handshake) -> Result<(ClientMessage, T), MessagingError>,
     ) -> Result<(StreamId, T), MessagingError> {
         let (stream, tx, msg, extra) = {
             let live = self.live.lock().unwrap();
@@ -689,7 +691,7 @@ impl HubConnection {
                     "not connected to the hub".into(),
                 ));
             };
-            let (msg, extra) = build(live.stream, &live.handshake);
+            let (msg, extra) = build(live.stream, &live.handshake)?;
             (live.stream, live.tx.clone(), msg, extra)
         };
         tx.send(msg)

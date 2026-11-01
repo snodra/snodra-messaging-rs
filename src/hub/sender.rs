@@ -695,9 +695,10 @@ impl Sender {
     /// some targets failed or timed out still succeeds.
     ///
     /// Sent to one hub whose `RegisterAck` lists `scatter-gather` (unkeyed round-robin over
-    /// those). Fails at once, without sending anything, with
-    /// [`MessagingError::UnsupportedByHub`] when no hub lists it (a P3 or older hub, or a legacy
-    /// hub). Before any target: no live target is `NoHandler`, a command type `InvalidMessage`, a
+    /// those; the capability is checked again on the stream the gather is written to, so a hub
+    /// re-handshaken without it in between is skipped). Fails at once, without sending anything,
+    /// with [`MessagingError::UnsupportedByHub`] when no hub lists it (a P3 or older hub, or a
+    /// legacy hub). Before any target: no live target is `NoHandler`, a command type `InvalidMessage`, a
     /// hub `UNSUPPORTED` answer `UnsupportedByHub`. A hub stream lost before the end fails the
     /// call with `HubConnectionLost` (the parts received are dropped), the local guard (the hub's
     /// bound plus [`LOCAL_GUARD_MARGIN`]) with `Timeout`.
@@ -840,6 +841,15 @@ impl Sender {
         let sent = self
             .hubs
             .send_where("", Some(SCATTER_GATHER), |stream, handshake| {
+                // The hubs were ranked on a snapshot: the stream current now may belong to a
+                // re-handshake with an older hub, which would serve the gather as a unary query
+                // (its reply ignored here, the local guard the only end). Refused, nothing
+                // written: the next capable hub is tried.
+                if !handshake.scatter_gather() {
+                    return Err(MessagingError::UnsupportedByHub(format!(
+                        "the hub stream {stream} no longer lists the \"{SCATTER_GATHER}\" capability"
+                    )));
+                }
                 let (timeout_ms, guard) = request_timing(handshake, call.type_name, chosen);
                 let (tx, rx) = mpsc::unbounded_channel();
                 events = Some(rx);
@@ -866,7 +876,7 @@ impl Sender {
                 let msg = ClientMessage {
                     message: Some(client_message::Message::Request(request)),
                 };
-                (msg, guard)
+                Ok((msg, guard))
             })
             .await;
         match (sent, events) {
@@ -961,7 +971,7 @@ impl Sender {
                     let msg = ClientMessage {
                         message: Some(client_message::Message::Request(request)),
                     };
-                    (msg, guard)
+                    Ok((msg, guard))
                 })
                 .await;
             let (guard, rx) = match (sent, answer) {
