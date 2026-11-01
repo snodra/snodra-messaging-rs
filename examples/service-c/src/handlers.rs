@@ -43,10 +43,13 @@ pub fn rows(
 ) -> BoxStream<'static, Result<Row, MessagingError>> {
     let service = service.to_string();
     let instance = instance.to_string();
-    Box::pin(futures::stream::unfold(1, move |n| {
+    // The state is the next row, `None` once there is none: after the error item, and past
+    // `i32::MAX` (`checked_add`), which `count + 1` could not express without overflowing.
+    Box::pin(futures::stream::unfold(Some(1), move |n| {
         let service = service.clone();
         let instance = instance.clone();
         async move {
+            let n = n?;
             if n > count {
                 None
             } else if fail_at > 0 && n == fail_at {
@@ -55,7 +58,7 @@ pub fn rows(
                     message: format!("Rows failed at row {n}"),
                     details: vec![],
                 };
-                Some((Err(error), count + 1)) // the next pull finds the end
+                Some((Err(error), None)) // the next pull finds the end
             } else {
                 Some((
                     Ok(Row {
@@ -63,7 +66,7 @@ pub fn rows(
                         instance,
                         n,
                     }),
-                    n + 1,
+                    n.checked_add(1),
                 ))
             }
         }
@@ -134,6 +137,15 @@ mod tests {
         assert!(
             matches!(error, MessagingError::RemoteHandler { .. }),
             "{error:?}"
+        );
+    }
+
+    #[test]
+    fn fail_at_on_the_largest_count_ends_without_overflowing() {
+        // The state after the error must say "done" even when `count + 1` does not exist.
+        assert_eq!(
+            collected(i32::MAX, 1),
+            vec![Err("Rows failed at row 1".to_string())]
         );
     }
 
