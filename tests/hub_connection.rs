@@ -342,7 +342,7 @@ async fn reply_goes_to_the_arrival_stream_and_never_to_a_newer_one() {
     hub.drop_streams();
     timeout(Duration::from_secs(3), async {
         loop {
-            if let Some(Inbound::Disconnected { stream }) = rx.recv().await {
+            if let Some(Inbound::Disconnected { stream, .. }) = rx.recv().await {
                 assert_eq!(stream, first);
                 break;
             }

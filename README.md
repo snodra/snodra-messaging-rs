@@ -237,9 +237,11 @@ every instance registers on every hub, and the client picks a hub per request.
   of three hubs.
 - **Failover.** A request that could not be written to its hub's stream (the stream dropped
   before the client noticed) goes to the next hub in the same order with the same request id: it
-  was never sent. `HubUnavailable` means no hub took it. A request already written fails with
-  `HubConnectionLost` when its stream drops (outcome unknown); the retry policy then decides
-  (queries are retried, commands are not). Replies go on the stream the request arrived on.
+  was never sent. So does one still waiting in the stream's outbound buffer (up to 256 messages)
+  when the stream drops: the transport never took it, so it was never written (as in
+  kraken-messaging). `HubUnavailable` means no hub took it. A request the transport had already
+  taken fails with `HubConnectionLost` when its stream drops (outcome unknown: it may be on the
+  wire); the retry policy then decides (queries are retried, commands are not). Replies go on the stream the request arrived on.
 - **Permits.** A stream offers `ceil(max_concurrent_handlers / N)` permits, N being the hubs live
   when its `Register` is written, itself included (a hub still on its first connect attempt counts
   as live, so hubs that start together split from the start). When N shrinks from N_old to N_new

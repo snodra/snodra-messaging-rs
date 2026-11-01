@@ -471,6 +471,84 @@ async fn a_request_written_before_its_hub_drops_is_connection_lost() {
     c.shutdown().await;
 }
 
+#[derive(Serialize, Deserialize)]
+struct Blob {
+    data: String,
+}
+message_type!(Blob, "t.Blob");
+impl Command for Blob {
+    type Reply = ();
+}
+
+/// A request still in the connection's outbound buffer when its stream is lost was never written:
+/// it goes to another hub with the same id (as kraken-messaging does), not `HubConnectionLost`.
+/// Only the few the transport had taken (possibly on the wire) have an unknown outcome.
+#[tokio::test]
+async fn requests_still_buffered_when_a_stream_is_lost_go_to_another_hub() {
+    let a = FakeHub::start_with_id("hub-a").await;
+    let b = answering("hub-b").await;
+    let c = client(settings(addresses(&[&a, &b]))).await;
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    let key_on_a = (0..)
+        .map(|i| format!("k{i}"))
+        .find(|k| rendezvous_score("hub-a", k) > rendezvous_score("hub-b", k))
+        .unwrap();
+    // hub-a stops reading: after a few 256 KiB requests its HTTP/2 windows are full and the rest
+    // wait in the client's outbound buffer.
+    a.set_stall_reads(true);
+    let calls: Vec<_> = (0..40)
+        .map(|_| {
+            let sender = Arc::clone(&c.sender);
+            let opts = SendOptions {
+                routing_key: Some(key_on_a.clone()),
+                retry: Some(RetryPolicy::NONE),
+                timeout: Some(Duration::from_secs(10)),
+                ..Default::default()
+            };
+            tokio::spawn(async move {
+                let blob = Blob {
+                    data: "x".repeat(256 * 1024),
+                };
+                sender.send_command(&blob, opts).await
+            })
+        })
+        .collect();
+    eventually("all 40 handed to hub-a's stream", async || {
+        c.sender.in_flight() == 40
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await; // the transport takes what fits
+    a.drop_streams();
+    let mut lost = 0;
+    for call in calls {
+        match tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("every call ends at once")
+            .unwrap()
+        {
+            Ok(()) => {}
+            Err(MessagingError::HubConnectionLost(_)) => lost += 1,
+            Err(e) => panic!("unexpected {e:?}"),
+        }
+    }
+    let on_b = b.requests().await;
+    eprintln!(
+        "{} moved to hub-b, {lost} lost with hub-a's stream",
+        on_b.len()
+    );
+    assert_eq!(on_b.len() + lost, 40);
+    assert!(
+        lost <= 12,
+        "{lost} of 40 lost: the buffered ones were failed, not moved"
+    );
+    let mut ids: Vec<String> = on_b.into_iter().map(|r| r.id).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len() + lost, 40, "each moved request sent once");
+    assert_eq!(c.sender.in_flight(), 0);
+    c.shutdown().await;
+}
+
 #[tokio::test]
 async fn two_addresses_of_one_hub_keep_one_connection() {
     // Two hubs answering the same id stand for two addresses of one hub.

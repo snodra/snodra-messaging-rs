@@ -67,6 +67,7 @@ pub struct State {
     statuses: StdMutex<Vec<(usize, proto::InstanceStatus)>>,
     down: AtomicBool,
     replace_sessions: AtomicBool,
+    stall_reads: AtomicBool,
     /// instance id → (stream number, that stream's cancel token).
     sessions: StdMutex<HashMap<String, (usize, CancellationToken)>>,
     evictions: AtomicUsize,
@@ -132,7 +133,8 @@ impl Hub for Service {
                         let _ = tx.send(Err(Status::unavailable("dropped by test"))).await;
                         break;
                     }
-                    msg = inbound.next() => match msg {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)), if state.stall_reads.load(Ordering::SeqCst) => {}
+                    msg = inbound.next(), if !state.stall_reads.load(Ordering::SeqCst) => match msg {
                         None | Some(Err(_)) => break,
                         Some(Ok(ClientMessage { message: Some(m) })) => match m {
                             client_message::Message::Register(r) => {
@@ -235,6 +237,7 @@ impl FakeHub {
             statuses: StdMutex::new(vec![]),
             down: AtomicBool::new(false),
             replace_sessions: AtomicBool::new(true),
+            stall_reads: AtomicBool::new(false),
             sessions: StdMutex::new(HashMap::new()),
             evictions: AtomicUsize::new(0),
             events: StdMutex::new(vec![]),
@@ -391,6 +394,12 @@ impl FakeHub {
     /// default, as kraken-hub does) or both streams stay (`false`).
     pub fn set_replace_sessions(&self, on: bool) {
         self.state.replace_sessions.store(on, Ordering::SeqCst);
+    }
+
+    /// Stops reading what clients write (`true`): once the HTTP/2 windows are full, a client's
+    /// messages stay in its own outbound buffer, never written.
+    pub fn set_stall_reads(&self, on: bool) {
+        self.state.stall_reads.store(on, Ordering::SeqCst);
     }
 
     /// Sessions replaced by a newer stream of the same instance id so far.

@@ -1,9 +1,11 @@
 //! Outgoing commands and queries: one `Request` per call, correlated reply, timeout, error mapping.
 //!
 //! Failure split: a request that was never accepted by a handshaken stream fails with
-//! `HubUnavailable` (the hub never saw it, a retry is always safe); one that was accepted by a
-//! stream's outbound queue and whose stream then broke fails with `HubConnectionLost` (outcome
-//! unknown, the handler may have run).
+//! `HubUnavailable` (the hub never saw it, a retry is always safe). One whose stream broke while
+//! it still waited in that stream's outbound buffer was never written either: it goes to the next
+//! hub with the same id (and fails with `HubUnavailable` if there is none). One the transport had
+//! taken from the buffer fails with `HubConnectionLost` when its stream breaks (outcome unknown,
+//! the handler may have run).
 //!
 //! With several hubs ([`HubPool`]) a request goes to one of them (round-robin, or rendezvous by
 //! routing key); one that could not be written to that hub's stream is written to the next hub
@@ -167,7 +169,19 @@ struct Attempt<'a> {
     priority: i32,
 }
 
-type Pending = oneshot::Sender<Result<Vec<u8>, MessagingError>>;
+/// How a pending request ended.
+enum Outcome {
+    Done(Result<Vec<u8>, MessagingError>),
+    /// Its stream was lost while the request was still in the outbound buffer: never written, it
+    /// may go to another hub with the same id.
+    NotWritten,
+}
+
+type Pending = oneshot::Sender<Outcome>;
+
+/// How often one attempt moves to another hub because its stream was lost before the request was
+/// written; past that it fails with `HubUnavailable` (nothing was written).
+const MAX_UNWRITTEN_MOVES: usize = 8;
 
 /// Removes a request's pending entry when the call ends, however it ends: a reply, an error, the
 /// local guard, or the caller dropping the future (while the write is blocked or while it awaits
@@ -281,31 +295,38 @@ impl Sender {
                         )),
                         None => Ok(b"{}".to_vec()),
                     };
-                    let _ = tx.send(result);
+                    let _ = tx.send(Outcome::Done(result));
                 }
             }
             Inbound::Error(e) => {
                 if let Some(Entry { type_name, tx, .. }) = self.take(&e.request_id) {
-                    let _ = tx.send(Err(MessagingError::from_hub(
+                    let _ = tx.send(Outcome::Done(Err(MessagingError::from_hub(
                         &type_name, e.code, &e.message, &e.details,
-                    )));
+                    ))));
                 }
             }
-            Inbound::Disconnected { stream } => {
-                let lost: Vec<Entry> = {
+            Inbound::Disconnected { stream, unsent } => {
+                let lost: Vec<(String, Entry)> = {
                     let mut pending = self.pending.lock().unwrap();
                     let ids: Vec<String> = pending
                         .iter()
                         .filter(|(_, e)| e.stream == stream)
                         .map(|(id, _)| id.clone())
                         .collect();
-                    ids.iter().filter_map(|id| pending.remove(id)).collect()
+                    ids.into_iter()
+                        .filter_map(|id| pending.remove(&id).map(|e| (id, e)))
+                        .collect()
                 };
-                for e in lost {
-                    let _ = e.tx.send(Err(MessagingError::HubConnectionLost(format!(
-                        "hub stream closed before the reply to '{}'; the outcome is unknown",
-                        e.type_name
-                    ))));
+                for (id, e) in lost {
+                    let outcome = if unsent.contains(&id) {
+                        Outcome::NotWritten
+                    } else {
+                        Outcome::Done(Err(MessagingError::HubConnectionLost(format!(
+                            "hub stream closed before the reply to '{}'; the outcome is unknown",
+                            e.type_name
+                        ))))
+                    };
+                    let _ = e.tx.send(outcome);
                 }
             }
             Inbound::Request { .. } => {} // the dispatcher's business
@@ -422,7 +443,8 @@ impl Sender {
 
     /// One `Request` with a fresh id: written, then awaited until the reply, the hub's error or
     /// the local guard. A hub whose stream does not take the write is skipped for the next one
-    /// (same id: nothing was written).
+    /// (same id: nothing was written); so is one whose stream is lost while the request still
+    /// waits in its outbound buffer ([`Inbound::Disconnected`]'s `unsent`).
     async fn attempt(
         &self,
         call: &Attempt<'_>,
@@ -439,52 +461,64 @@ impl Sender {
         // Disconnected always finds it. A failed write leaves it to the next hub's build, which
         // replaces it (new stream, new channel: a late Disconnected of the failed stream finds
         // nothing of it); when no hub takes the write it is removed (never written).
-        let mut answer = None;
-        let sent = self
-            .hubs
-            .send_with(call.routing_key, |stream, handshake| {
-                let (timeout_ms, guard) = request_timing(handshake, type_name, chosen);
-                let (tx, rx) = oneshot::channel();
-                answer = Some(rx);
-                self.pending.lock().unwrap().insert(
-                    id.clone(),
-                    Entry {
-                        type_name: type_name.to_string(),
-                        stream,
-                        tx,
-                    },
-                );
-                let request = proto::Request {
-                    id: id.clone(),
-                    kind: call.kind as i32,
-                    r#type: type_name.to_string(),
-                    routing_key: call.routing_key.to_string(),
-                    payload: payload.to_vec(),
-                    headers: call.headers.clone(),
-                    timeout_ms,
-                    priority: call.priority,
-                };
-                let msg = ClientMessage {
-                    message: Some(client_message::Message::Request(request)),
-                };
-                (msg, guard)
-            })
-            .await;
-        let (guard, rx) = match (sent, answer) {
-            (Ok((_, guard)), Some(rx)) => (guard, rx),
-            (Err(e), _) => {
-                self.take(&id);
-                return Err(e);
-            }
-            (Ok(_), None) => unreachable!("a written request was built"),
-        };
-        // The hub emits TIMEOUT itself; the guard covers a hub that never answers at all.
-        match tokio::time::timeout(guard, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(MessagingError::HubUnavailable("sender closed".into())),
-            Err(_) => {
-                self.take(&id);
-                Err(MessagingError::Timeout(type_name.to_string()))
+        let mut moves = 0;
+        loop {
+            let mut answer = None;
+            let sent = self
+                .hubs
+                .send_with(call.routing_key, |stream, handshake| {
+                    let (timeout_ms, guard) = request_timing(handshake, type_name, chosen);
+                    let (tx, rx) = oneshot::channel();
+                    answer = Some(rx);
+                    self.pending.lock().unwrap().insert(
+                        id.clone(),
+                        Entry {
+                            type_name: type_name.to_string(),
+                            stream,
+                            tx,
+                        },
+                    );
+                    let request = proto::Request {
+                        id: id.clone(),
+                        kind: call.kind as i32,
+                        r#type: type_name.to_string(),
+                        routing_key: call.routing_key.to_string(),
+                        payload: payload.to_vec(),
+                        headers: call.headers.clone(),
+                        timeout_ms,
+                        priority: call.priority,
+                    };
+                    let msg = ClientMessage {
+                        message: Some(client_message::Message::Request(request)),
+                    };
+                    (msg, guard)
+                })
+                .await;
+            let (guard, rx) = match (sent, answer) {
+                (Ok((_, guard)), Some(rx)) => (guard, rx),
+                (Err(e), _) => {
+                    self.take(&id);
+                    return Err(e);
+                }
+                (Ok(_), None) => unreachable!("a written request was built"),
+            };
+            // The hub emits TIMEOUT itself; the guard covers a hub that never answers at all.
+            match tokio::time::timeout(guard, rx).await {
+                Ok(Ok(Outcome::Done(result))) => return result,
+                Ok(Ok(Outcome::NotWritten)) => {
+                    moves += 1;
+                    if moves > MAX_UNWRITTEN_MOVES {
+                        return Err(MessagingError::HubUnavailable(format!(
+                            "'{type_name}' not written: {moves} hub streams lost before it was"
+                        )));
+                    }
+                    tracing::debug!(r#type = type_name, request = %id, "stream lost before the request was written; trying the next hub");
+                }
+                Ok(Err(_)) => return Err(MessagingError::HubUnavailable("sender closed".into())),
+                Err(_) => {
+                    self.take(&id);
+                    return Err(MessagingError::Timeout(type_name.to_string()));
+                }
             }
         }
     }
@@ -500,10 +534,13 @@ impl Sender {
             .map(|(_, e)| e)
             .collect();
         for e in lost {
-            let _ = e.tx.send(Err(MessagingError::HubConnectionLost(format!(
-                "{reason} before the reply to '{}'; the outcome is unknown",
-                e.type_name
-            ))));
+            let _ =
+                e.tx.send(Outcome::Done(Err(MessagingError::HubConnectionLost(
+                    format!(
+                        "{reason} before the reply to '{}'; the outcome is unknown",
+                        e.type_name
+                    ),
+                ))));
         }
     }
 

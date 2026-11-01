@@ -14,7 +14,7 @@
 //! handshaken stream fails with `HubUnavailable`.
 //!
 //! Any failure closes the stream, notifies the owner with [`Inbound::Disconnected`] (carrying the
-//! stream id) and reconnects with exponential backoff (`backoff_min` doubling up to `backoff_max`,
+//! stream id and the requests still in its outbound buffer, never written) and reconnects with exponential backoff (`backoff_min` doubling up to `backoff_max`,
 //! each wait jittered by ±20 % and clamped to `backoff_max`; at the cap 80-100 % of it), reset to `backoff_min` once an attempt
 //! reached the handshake. An `ALREADY_EXISTS` or `INVALID_ARGUMENT` rejection is kept in
 //! [`HubConnection::last_rejection`] and retried at `backoff_max`.
@@ -41,7 +41,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Endpoint;
 use tonic::{Code, Status};
@@ -416,9 +415,12 @@ pub enum Inbound {
     },
     Reply(proto::Reply),
     Error(proto::Error),
-    /// That stream was lost; every request written to it and still pending should fail.
+    /// That stream was lost. `unsent`: the ids of requests still in its outbound buffer when it
+    /// was lost (never taken by the transport, so never written): they may go to another hub with
+    /// the same id. Every other request written to it and still pending has an unknown outcome.
     Disconnected {
         stream: StreamId,
+        unsent: Vec<String>,
     },
 }
 
@@ -433,7 +435,9 @@ impl std::fmt::Debug for Inbound {
             ),
             Inbound::Reply(r) => write!(f, "Reply(request_id={})", r.request_id),
             Inbound::Error(e) => write!(f, "Error(request_id={}, code={})", e.request_id, e.code),
-            Inbound::Disconnected { stream } => write!(f, "Disconnected(stream={stream})"),
+            Inbound::Disconnected { stream, unsent } => {
+                write!(f, "Disconnected(stream={stream}, unsent={})", unsent.len())
+            }
         }
     }
 }
@@ -462,8 +466,28 @@ pub struct HubConnection {
     in_flight: Arc<AtomicUsize>,
     hooks: OnceLock<Hooks>,
     reregistering: tokio::sync::Mutex<()>,
+    /// The outbound buffer of the current stream, also read by the transport ([`Outbound`]).
+    outbound: Mutex<Option<OutboundBuffer>>,
     cancel: CancellationToken,
     task: Mutex<Option<JoinHandle<()>>>,
+}
+
+type OutboundBuffer = Arc<Mutex<mpsc::Receiver<ClientMessage>>>;
+
+/// The request body of a stream: the messages of its outbound buffer, taken one at a time by the
+/// transport. The buffer is shared so that, once the stream is lost, what the transport never
+/// took can be told apart ([`HubConnection::take_unsent`]).
+struct Outbound(OutboundBuffer);
+
+impl tokio_stream::Stream for Outbound {
+    type Item = ClientMessage;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<ClientMessage>> {
+        self.0.lock().unwrap().poll_recv(cx)
+    }
 }
 
 /// How a [`super::HubPool`] takes part in a member connection's handshake.
@@ -501,6 +525,7 @@ impl HubConnection {
             in_flight: Arc::new(AtomicUsize::new(0)),
             hooks: OnceLock::new(),
             reregistering: tokio::sync::Mutex::new(()),
+            outbound: Mutex::new(None),
             cancel: CancellationToken::new(),
             task: Mutex::new(None),
         })
@@ -720,8 +745,12 @@ impl HubConnection {
             // Clear the live stream before announcing the loss: a request is tagged with a stream
             // only while that stream is live, so it is always failed by this Disconnected.
             *self.live.lock().unwrap() = None;
+            let unsent = self.take_unsent();
             let reached_handshake = self.handshake.send_replace(None).is_some();
-            let _ = self.inbound.send(Inbound::Disconnected { stream }).await;
+            let _ = self
+                .inbound
+                .send(Inbound::Disconnected { stream, unsent })
+                .await;
             if reached_handshake || first_failure {
                 self.changed();
             }
@@ -776,10 +805,12 @@ impl HubConnection {
             .map_err(|e| Status::unavailable(e.to_string()))?;
         let mut client = HubClient::new(channel);
         let (tx, rx) = mpsc::channel::<ClientMessage>(256);
+        let rx = Arc::new(Mutex::new(rx));
+        *self.outbound.lock().unwrap() = Some(Arc::clone(&rx));
         // A peer that accepts TCP but never answers the HTTP/2 handshake must not hang the loop.
         let mut stream = tokio::time::timeout(
             self.settings.handshake_timeout,
-            client.connect(ReceiverStream::new(rx)),
+            client.connect(Outbound(rx)),
         )
         .await
         .map_err(|_| {
@@ -880,6 +911,24 @@ impl HubConnection {
                 },
             }
         }
+    }
+
+    /// Closes the lost stream's outbound buffer (later writes fail and go to another hub) and
+    /// returns the ids of the requests still in it: the transport never took them, so they were
+    /// never written. One the transport took may be on the wire or lost with it: unknown.
+    fn take_unsent(&self) -> Vec<String> {
+        let Some(buffer) = self.outbound.lock().unwrap().take() else {
+            return vec![];
+        };
+        let mut rx = buffer.lock().unwrap();
+        rx.close();
+        let mut unsent = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let Some(client_message::Message::Request(r)) = msg.message {
+                unsent.push(r.id);
+            }
+        }
+        unsent
     }
 
     /// The `Register` of this instance with the types set now.

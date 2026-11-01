@@ -419,14 +419,23 @@ async fn disconnect_of_another_stream_leaves_a_pending_request_alone() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     // A late notification about an older stream must not fail a request written to the current one.
-    sender.on_inbound(Inbound::Disconnected { stream: stream - 1 });
-    sender.on_inbound(Inbound::Disconnected { stream: stream + 7 });
+    sender.on_inbound(Inbound::Disconnected {
+        stream: stream - 1,
+        unsent: vec![],
+    });
+    sender.on_inbound(Inbound::Disconnected {
+        stream: stream + 7,
+        unsent: vec![],
+    });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         !pending.is_finished(),
         "failed by another stream's Disconnected"
     );
-    sender.on_inbound(Inbound::Disconnected { stream });
+    sender.on_inbound(Inbound::Disconnected {
+        stream,
+        unsent: vec![],
+    });
     let err = tokio::time::timeout(Duration::from_secs(2), pending)
         .await
         .expect("not failed by its own stream's Disconnected")
