@@ -911,6 +911,14 @@ impl HubConnection {
                         }
                         server_message::Message::Reply(r) => self.forward(Inbound::Reply(r)).await?,
                         server_message::Message::Error(e) => self.forward(Inbound::Error(e)).await?,
+                        // Multi-part messages (ADR 0017) answer request modes this client never
+                        // sends yet (it declares no scatter-gather, streaming or subscription).
+                        server_message::Message::Part(_)
+                        | server_message::Message::End(_)
+                        | server_message::Message::Flow(_)
+                        | server_message::Message::Cancel(_) => {
+                            tracing::debug!(service = %self.service_name, "multi-part message ignored");
+                        }
                     },
                 },
             }
@@ -950,6 +958,7 @@ impl HubConnection {
             initial_permits,
             load_factor: self.settings.load_factor,
             tags: self.settings.tags.clone(),
+            shared_query_types: Vec::new(),
         };
         ClientMessage {
             message: Some(client_message::Message::Register(register)),

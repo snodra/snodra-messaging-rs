@@ -146,6 +146,7 @@ fn request(kind: RequestKind, type_name: &str, payload: &str, headers: &[(&str, 
             .collect::<HashMap<_, _>>(),
         timeout_ms: 0,
         priority: 0,
+        ..Request::default()
     }
 }
 

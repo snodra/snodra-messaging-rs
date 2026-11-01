@@ -487,6 +487,7 @@ impl Sender {
                         headers: call.headers.clone(),
                         timeout_ms,
                         priority: call.priority,
+                        ..proto::Request::default()
                     };
                     let msg = ClientMessage {
                         message: Some(client_message::Message::Request(request)),

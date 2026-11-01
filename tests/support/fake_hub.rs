@@ -214,6 +214,11 @@ impl Hub for Service {
                                 let response = state.responder.lock().await.as_ref().and_then(|f| f(req));
                                 if let Some(resp) = response && tx.send(Ok(resp)).await.is_err() { break; }
                             }
+                            // Multi-part messages (ADR 0017): this client sends none yet.
+                            client_message::Message::Part(_)
+                            | client_message::Message::End(_)
+                            | client_message::Message::Flow(_)
+                            | client_message::Message::Cancel(_) => {}
                         },
                         Some(Ok(ClientMessage { message: None })) => {}
                     }
