@@ -425,8 +425,11 @@ while let Some(row) = rows.next().await { let row = row?; /* in the handler's or
   write is still blocked. A handler whose stream is cancelled by the hub (the sender dropped it or
   left, `max_results`, the idle timeout, the hub's limits) has its stream dropped and sends
   nothing more; the hub's `Cancel` for a unary or scatter-gather target (a gather that ended
-  early) aborts that handler too. The handler permit (`max_concurrent_handlers`, and the hub's)
-  is held for the whole stream and released on every ending path.
+  early) aborts that handler too. When the hub stream a streaming request arrived on is lost,
+  its handler is aborted as well (the hub forgot the stream with the session; it would wait for
+  credit for ever), while a unary handler runs on with its reply dropped, as before. The handler
+  permit (`max_concurrent_handlers`, and the hub's) is held for the whole stream and released on
+  every ending path.
 - **Retry.** `Config.hub_retry` applies until the first item, for the same errors as a unary query
   (`HubUnavailable`, `NoHandler`, `HandlerBusy`, `HandlerDisconnected`, `Timeout`,
   `HubConnectionLost`): a retry is a new stream with a fresh id; a hub stream lost while the

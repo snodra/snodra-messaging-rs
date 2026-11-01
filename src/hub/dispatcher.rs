@@ -18,13 +18,17 @@ use crate::proto::{
     self, ClientMessage, ErrorCode, Reply, RequestKind, RequestMode, client_message, reply,
 };
 
-use super::connection::ReplyTo;
+use super::connection::{ReplyTo, StreamId};
 use super::registry::{HandlerRegistry, Invocation, ItemStream};
 
 /// How the hub reaches a running request: its cancel token and, for a stream, its credits.
 struct Control {
     cancel: CancellationToken,
     credits: mpsc::UnboundedSender<u32>,
+    /// The hub stream the request arrived on.
+    stream: StreamId,
+    /// A streaming query (aborted when its stream is lost; a unary one runs on).
+    streaming: bool,
 }
 
 /// A request registered as running ([`Dispatcher::serve`]); unregistered on drop.
@@ -115,6 +119,27 @@ impl Dispatcher {
         }
     }
 
+    /// The hub stream `stream` was lost: the streaming queries that arrived on it are cancelled
+    /// (the hub forgot them with the session; their handlers would otherwise wait for credit for
+    /// ever, holding their permits). Unary handlers run on, their reply dropped, as before.
+    pub fn stream_lost(&self, stream: StreamId) {
+        let lost: Vec<(String, Control)> = {
+            let mut running = self.running.lock().unwrap();
+            let ids: Vec<String> = running
+                .iter()
+                .filter(|(_, c)| c.stream == stream && c.streaming)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| running.remove(&id).map(|c| (id, c)))
+                .collect()
+        };
+        for (id, control) in lost {
+            tracing::debug!(request = %id, stream, "streaming query cancelled: its hub stream was lost");
+            control.cancel.cancel();
+        }
+    }
+
     /// Serves `request` on `reply_to`, the stream it arrived on (never on whatever stream is
     /// current: a reply on another stream, after a reconnect or to another hub, would be ignored
     /// by the hub). The request is registered before the returned future runs, so a `Flow` or
@@ -126,11 +151,12 @@ impl Dispatcher {
         request: proto::Request,
         reply_to: ReplyTo,
     ) -> impl Future<Output = ()> + Send + 'static {
-        let (running, credits) = self.accept(&request.id);
+        let streaming = request.mode == RequestMode::Streaming as i32;
+        let (running, credits) = self.accept(&request.id, reply_to.stream(), streaming);
         let me = Arc::clone(self);
         async move {
             let request_id = request.id.clone();
-            if request.mode == RequestMode::Streaming as i32 {
+            if streaming {
                 me.stream(&running, request, credits, &reply_to).await;
             } else if let Some(reply) = me.unary(request, Some(&running.cancel)).await
                 && let Err(e) = reply_to
@@ -156,7 +182,12 @@ impl Dispatcher {
 
     /// Registers `request_id` as running: its control for [`flow`](Self::flow) and
     /// [`cancel`](Self::cancel), and the receiving end of its credits.
-    fn accept(self: &Arc<Self>, request_id: &str) -> (Running, mpsc::UnboundedReceiver<u32>) {
+    fn accept(
+        self: &Arc<Self>,
+        request_id: &str,
+        stream: StreamId,
+        streaming: bool,
+    ) -> (Running, mpsc::UnboundedReceiver<u32>) {
         let cancel = CancellationToken::new();
         let (tx, rx) = mpsc::unbounded_channel();
         self.running.lock().unwrap().insert(
@@ -164,6 +195,8 @@ impl Dispatcher {
             Control {
                 cancel: cancel.clone(),
                 credits: tx,
+                stream,
+                streaming,
             },
         );
         (

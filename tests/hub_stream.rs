@@ -260,6 +260,10 @@ async fn node_with(
                 }
                 Inbound::Flow(f) => serve.flow(&f.request_id, f.credits),
                 Inbound::Cancel(c) => serve.cancel(&c.request_id, &c.reason),
+                Inbound::Disconnected { stream, .. } => {
+                    serve.stream_lost(stream);
+                    forward.on_inbound(msg);
+                }
                 other => forward.on_inbound(other),
             }
         }
@@ -551,6 +555,58 @@ async fn a_hub_cancel_aborts_a_unary_handler() {
     hub.send_to_clients(cancel("nobody", "x")).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(h.dispatcher.available_permits(), 2);
+    h.shutdown().await;
+}
+
+/// The hub stream a streaming request arrived on closes: its handler would wait for credit for
+/// ever, holding its permit, so it is aborted (the hub forgot the stream with the session). A
+/// unary handler keeps running; its reply is dropped, as before.
+#[tokio::test]
+async fn a_lost_hub_stream_cancels_the_streaming_handlers_it_carried_but_not_the_unary_ones() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let h = handler(&hub.address(), "svc-h", "h1", &probe, 3).await;
+    let payload = serde_json::to_vec(&export(1_000, 20, None)).unwrap();
+    hub.send_to_clients(forwarded("s#1", "t.Export", &payload, 4))
+        .await;
+    hub.send_to_clients(forwarded("g#0", "t.Hang", b"{}", 0))
+        .await;
+    eventually("both handlers running", async || {
+        hub.parts().len() == 4 && probe.hanging.load(Ordering::SeqCst)
+    })
+    .await;
+    assert_eq!(h.dispatcher.available_permits(), 1);
+    hub.drop_streams();
+    eventually("the streaming handler aborted", async || {
+        probe.dropped.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    eventually(
+        "its permit released, the unary handler's held",
+        async || h.dispatcher.available_permits() == 2,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        probe.aborted.load(Ordering::SeqCst),
+        0,
+        "the unary handler runs on"
+    );
+    assert_eq!(h.dispatcher.available_permits(), 2);
+    assert!(
+        hub.ends().is_empty(),
+        "nothing is sent for a cancelled stream"
+    );
+    // The instance is back on a new stream and serves again.
+    assert!(h.pool.await_all_registered(Duration::from_secs(5)).await);
+    hub.send_to_clients(forwarded("s#2", "t.Export", &payload, 4))
+        .await;
+    eventually("parts on the new stream", async || {
+        hub.parts()
+            .iter()
+            .any(|(stream, p)| *stream > 1 && p.request_id == "s#2")
+    })
+    .await;
     h.shutdown().await;
 }
 

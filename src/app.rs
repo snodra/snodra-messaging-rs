@@ -336,6 +336,12 @@ impl KrakenMessagingBuilder {
                     }
                     Inbound::Flow(f) => dispatcher.flow(&f.request_id, f.credits),
                     Inbound::Cancel(c) => dispatcher.cancel(&c.request_id, &c.reason),
+                    // A lost stream fails what was sent on it and cancels the streaming
+                    // queries that arrived on it.
+                    Inbound::Disconnected { stream, .. } => {
+                        dispatcher.stream_lost(stream);
+                        loop_sender.on_inbound(msg);
+                    }
                     other => loop_sender.on_inbound(other),
                 }
             }
