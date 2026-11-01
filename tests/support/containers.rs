@@ -63,6 +63,8 @@ pub enum HubImage {
     /// The P4a hub (scatter-gather, shared query types): `KRAKEN_HUB_P4A_IMAGE`, default
     /// `kraken-hub:p4a-hub`.
     P4a,
+    /// The P4b hub (streaming queries): `KRAKEN_HUB_P4B_IMAGE`, default `kraken-hub:p4b-hub`.
+    P4b,
 }
 
 impl HubImage {
@@ -83,6 +85,8 @@ impl HubImage {
                 .unwrap_or_else(|_| "kraken-hub:p3-hub".to_string()),
             HubImage::P4a => std::env::var("KRAKEN_HUB_P4A_IMAGE")
                 .unwrap_or_else(|_| "kraken-hub:p4a-hub".to_string()),
+            HubImage::P4b => std::env::var("KRAKEN_HUB_P4B_IMAGE")
+                .unwrap_or_else(|_| "kraken-hub:p4b-hub".to_string()),
         }
     }
 
@@ -105,6 +109,9 @@ impl HubImage {
             }
             HubImage::P4a => {
                 "build the P4a hub and tag it `kraken-hub:p4a-hub` (or set KRAKEN_HUB_P4A_IMAGE)"
+            }
+            HubImage::P4b => {
+                "build the P4b hub and tag it `kraken-hub:p4b-hub` (or set KRAKEN_HUB_P4B_IMAGE)"
             }
         }
     }

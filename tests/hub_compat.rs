@@ -23,6 +23,9 @@
 //!   (`KRAKEN_HUB_P3_IMAGE`) and the v1 baseline a scatter-gather fails with `UnsupportedByHub`
 //!   (nothing is sent), a unary query still works, and a shared query type is not registered
 //!   there (the field is ignored: a point query to it is `NoHandler`).
+//! - P4b (ADR 0017): the new hub shares `streaming`. Against `kraken-hub:p4a-hub`
+//!   (`KRAKEN_HUB_P4A_IMAGE`) a streaming query fails with `UnsupportedByHub` (nothing is sent)
+//!   while a unary query and a scatter-gather keep working.
 //!
 //! A missing image fails the test with the command that builds it. No Kafka or MongoDB: the
 //! participants are a `HubConnection` and a `Sender` each; a pass-through (`PermitTap`) records the
@@ -36,10 +39,10 @@ use std::time::{Duration, Instant};
 
 use kraken_messaging::hub::{
     CLIENT_VERSION, Handshake, HubConnection, HubPool, HubSettings, Inbound, PERMIT_FLUSH_AFTER,
-    RegisteredTypes, ScatterOptions, SendOptions, Sender, SenderSettings,
+    RegisteredTypes, ScatterOptions, SendOptions, Sender, SenderSettings, StreamOptions,
 };
 use kraken_messaging::proto::{self, ClientMessage, client_message, reply};
-use kraken_messaging::{Command, MessagingError, Query, RetryPolicy, message_type};
+use kraken_messaging::{Command, MessagingError, Query, RetryPolicy, StreamingQuery, message_type};
 use serde::{Deserialize, Serialize};
 use support::containers::{HubContainer, HubImage, HubOptions, free_port, hub_with};
 use tokio::sync::mpsc;
@@ -217,7 +220,12 @@ async fn new_hub_acks_with_its_configured_values_and_applies_type_overrides() {
     assert_eq!(ack.protocol_version, 2);
     assert_eq!(
         ack.capabilities,
-        ["flow-control", "instance-status", "scatter-gather"],
+        [
+            "flow-control",
+            "instance-status",
+            "scatter-gather",
+            "streaming"
+        ],
         "the hub shares what we declared"
     );
     assert_eq!(ack.heartbeat_interval_ms, 3_000);
@@ -1298,4 +1306,56 @@ async fn p3_hub_scatter_gather_is_unsupported_by_hub_and_unary_still_works() {
 async fn baseline_hub_scatter_gather_is_unsupported_by_hub_and_unary_still_works() {
     require_docker!();
     scatter_gather_unsupported(HubImage::Baseline).await;
+}
+
+/// `compat.Lookup` as a streaming query: the P4a hub knows the mode and rejects it.
+#[derive(Serialize, Deserialize)]
+struct StreamLookup {}
+message_type!(StreamLookup, "compat.Lookup");
+impl StreamingQuery for StreamLookup {
+    type Item = ();
+}
+
+/// A P4a hub (ADR 0017, P4b): it shares `scatter-gather` but not `streaming`, so a streaming
+/// query fails with `UnsupportedByHub` before anything is sent, while a unary query and a
+/// scatter-gather to the same owner work as before.
+#[tokio::test]
+async fn p4a_hub_streaming_is_unsupported_by_hub_and_unary_and_gathers_still_work() {
+    require_docker!();
+    let hub = hub_with(HubOptions::new(HubImage::P4a)).await;
+    let owner = peer_with(
+        &hub.address,
+        "compat-owner",
+        RegisteredTypes {
+            queries: vec!["compat.Lookup".into()],
+            ..RegisteredTypes::default()
+        },
+    )
+    .await;
+    let a = peer(&hub.address, "compat-a", &[]).await;
+    let handshake = a.conn.handshake().unwrap();
+    assert!(handshake.scatter_gather(), "{handshake:?}");
+    assert!(!handshake.streaming(), "{handshake:?}");
+
+    let e = a
+        .sender
+        .stream(&StreamLookup {}, StreamOptions::default())
+        .await
+        .err()
+        .expect("unsupported by a P4a hub");
+    assert!(matches!(e, MessagingError::UnsupportedByHub(_)), "{e:?}");
+    assert_eq!(a.sender.in_flight(), 0);
+    a.sender
+        .send_query(&Lookup {}, SendOptions::default())
+        .await
+        .expect("unary query on a P4a hub");
+    let gathered = a
+        .sender
+        .scatter_gather(&Lookup {}, ScatterOptions::default())
+        .await
+        .expect("scatter-gather on a P4a hub");
+    assert_eq!(gathered.parts.len(), 1);
+    assert_eq!(a.sender.in_flight(), 0);
+    a.shutdown().await;
+    owner.shutdown().await;
 }
