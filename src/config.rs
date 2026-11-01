@@ -8,6 +8,11 @@ use crate::error::MessagingError;
 use crate::hub::HubTargets;
 use crate::retry::RetryPolicy;
 
+/// `Config.hub_stream_credit_timeout` when nothing sets it: the hub's default maximum stream
+/// duration (`KRAKEN_HUB_MAX_STREAM_DURATION`, 10 minutes), after which the hub ends any stream
+/// itself.
+pub const DEFAULT_STREAM_CREDIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Hub `Register.service_name`, Kafka consumer group and event `source`.
@@ -47,6 +52,11 @@ pub struct Config {
     /// force as written; `SendOptions.retry` wins per call. Its `max_attempts` must be at least 1
     /// and its multiplier a finite number >= 1 ([`Config::validate`]).
     pub hub_retry: Option<RetryPolicy>,
+    /// How long a streaming query handler waits for credit before ending its stream with
+    /// `TIMEOUT` "no credit within <d>" and releasing its permits (a hub that forgot the stream
+    /// would otherwise leave the handler task waiting for ever). Default 10 minutes, the hub's
+    /// default `KRAKEN_HUB_MAX_STREAM_DURATION`; at least 1 ms ([`Config::validate`]).
+    pub hub_stream_credit_timeout: Duration,
     pub kafka_bootstrap: String,
     pub kafka_topic: String,
     pub consumer_enabled: bool,
@@ -86,6 +96,7 @@ impl Config {
             hub_tags: HashMap::new(),
             hub_priorities: HashMap::new(),
             hub_retry: None,
+            hub_stream_credit_timeout: DEFAULT_STREAM_CREDIT_TIMEOUT,
             kafka_bootstrap: kafka_bootstrap.to_string(),
             kafka_topic: crate::kafka::EVENTS_TOPIC.to_string(),
             consumer_enabled: true,
@@ -113,7 +124,8 @@ impl Config {
     /// `KRAKEN_HUB_TAGS` (`k=v,k=v`), `KRAKEN_HUB_PRIORITIES` (`type=n,type=n`),
     /// `KRAKEN_HUB_RETRY_ENABLED`, `KRAKEN_HUB_RETRY_MAX_ATTEMPTS`,
     /// `KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS`, `KRAKEN_HUB_RETRY_MULTIPLIER`,
-    /// `KRAKEN_HUB_RETRY_MAX_BACKOFF_MS`. `KRAKEN_HUB_RETRY_ENABLED=true` sets `hub_retry` to the
+    /// `KRAKEN_HUB_RETRY_MAX_BACKOFF_MS`, `KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS`.
+    /// `KRAKEN_HUB_RETRY_ENABLED=true` sets `hub_retry` to the
     /// policy the other `KRAKEN_HUB_RETRY_*` variables describe (defaults: 3 attempts, 100 ms
     /// doubling to 2 s); those are validated whether or not retry is enabled.
     pub fn from_env() -> Result<Config, MessagingError> {
@@ -203,6 +215,9 @@ impl Config {
         }
         retry.validate()?;
         c.hub_retry = retry_enabled.then_some(retry);
+        if let Some(v) = optional("KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS") {
+            c.hub_stream_credit_timeout = millis("KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS", &v)?;
+        }
         if let Some(v) = optional("KRAKEN_CONSUMER_ENABLED") {
             c.consumer_enabled = flag("KRAKEN_CONSUMER_ENABLED", &v)?;
         }
@@ -230,8 +245,8 @@ impl Config {
 
     /// Rejects what cannot work: an empty service name, a `hub_address` that names no hub (or a
     /// malformed `dns:///` target), a zero `hub_status_interval`, `jwks_url` without `issuer`,
-    /// `max_concurrent_handlers` 0, an invalid `hub_retry` policy. Called by `from_env` and by
-    /// `KrakenMessaging::builder`.
+    /// `max_concurrent_handlers` 0, an invalid `hub_retry` policy, a zero
+    /// `hub_stream_credit_timeout`. Called by `from_env` and by `KrakenMessaging::builder`.
     pub fn validate(&self) -> Result<(), MessagingError> {
         if self.service_name.trim().is_empty() {
             return Err(MessagingError::InvalidMessage(
@@ -257,6 +272,12 @@ impl Config {
         }
         if let Some(retry) = &self.hub_retry {
             retry.validate()?;
+        }
+        if self.hub_stream_credit_timeout.is_zero() {
+            return Err(MessagingError::InvalidMessage(
+                "hub_stream_credit_timeout (KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS) must be at least 1 ms"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -344,6 +365,31 @@ mod tests {
             from(&[("KRAKEN_HUB_REQUEST_TIMEOUT_MS", "2500")]).hub_request_timeout,
             Some(Duration::from_millis(2500))
         );
+    }
+
+    #[test]
+    fn stream_credit_timeout_defaults_to_the_hubs_max_stream_duration() {
+        assert_eq!(
+            code_config().hub_stream_credit_timeout,
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            from(&[]).hub_stream_credit_timeout,
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            from(&[("KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS", "2500")]).hub_stream_credit_timeout,
+            Duration::from_millis(2500)
+        );
+        let e = try_from(&[("KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS", "0")]).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS"),
+            "{e}"
+        );
+        let mut c = code_config();
+        c.hub_stream_credit_timeout = Duration::ZERO;
+        assert!(c.validate().is_err(), "zero rejected in code too");
     }
 
     #[test]

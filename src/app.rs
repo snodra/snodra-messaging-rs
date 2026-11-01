@@ -308,11 +308,14 @@ impl KrakenMessagingBuilder {
             (Some(url), Some(issuer)) => Some(JwksVerifier::new(url.clone(), issuer.clone())),
             _ => None,
         };
-        let dispatcher = Arc::new(Dispatcher::new(
-            Arc::clone(&registry),
-            Arc::new(IdentityResolver::new(verifier)),
-            config.max_concurrent_handlers,
-        ));
+        let dispatcher = Arc::new(
+            Dispatcher::new(
+                Arc::clone(&registry),
+                Arc::new(IdentityResolver::new(verifier)),
+                config.max_concurrent_handlers,
+            )
+            .stream_credit_timeout(config.hub_stream_credit_timeout),
+        );
         let cancel = CancellationToken::new();
         let handlers = TaskTracker::new();
         let mut tasks = Vec::new();

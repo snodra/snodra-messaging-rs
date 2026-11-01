@@ -120,6 +120,7 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 | `KRAKEN_HUB_RETRY_ENABLED` | false | caller-side retry of transient failures (see Retry): `true` sets `Config.hub_retry` to the policy the variables below describe, `false` leaves it `None` (no retry unless a call sets `SendOptions.retry`, which wins per call) |
 | `KRAKEN_HUB_RETRY_MAX_ATTEMPTS` | 3 | attempts in total, the first included; at least 1 (`0` is rejected at startup, also while retry is disabled) |
 | `KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS`, `_MULTIPLIER`, `_MAX_BACKOFF_MS` | 100, 2, 2000 | wait before the second attempt, growth factor (a finite number >= 1, else rejected at startup), cap of one wait; each wait is jittered by ±20 % and never above the cap (at the cap: 80-100 % of it), like the reconnect backoff |
+| `KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS` | 600000 | how long a streaming query handler waits for credit before it ends its stream with `TIMEOUT` "no credit within <d>" and releases its permits (see [Streaming queries](#streaming-queries)); the default is the hub's default `KRAKEN_HUB_MAX_STREAM_DURATION` (10 min); at least 1 (`0` is rejected at startup, also when set in code) |
 | `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS` | true, 5 | consumer starts only when event handlers are registered |
 | `KRAKEN_OUTBOX_ENABLED`, `KRAKEN_OUTBOX_POLL_INTERVAL_MS`, `KRAKEN_OUTBOX_BATCH_SIZE`, `KRAKEN_OUTBOX_MAX_ATTEMPTS` | true, 200, 100, 10 | |
 | `KRAKEN_FORWARD_JWT` | true | |
@@ -431,7 +432,11 @@ while let Some(row) = rows.next().await { let row = row?; /* in the handler's or
   nothing more; the hub's `Cancel` for a unary or scatter-gather target (a gather that ended
   early) aborts that handler too. When the hub stream a streaming request arrived on is lost,
   its handler is aborted as well (the hub forgot the stream with the session; it would wait for
-  credit for ever), while a unary handler runs on with its reply dropped, as before. The handler
+  credit for ever), while a unary handler runs on with its reply dropped, as before. A handler
+  that waits for credit longer than `Config.hub_stream_credit_timeout`
+  (`KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS`, 10 min: the hub's default maximum stream duration)
+  ends its stream with `ReplyEnd{error = TIMEOUT "no credit within <d>"}`: a hub that forgot the
+  stream (a race, a lost `Flow` or `Cancel`) cannot leak the handler task. The handler
   permit (`max_concurrent_handlers`, and the hub's) is held for the whole stream and released on
   every ending path.
 - **Retry.** `Config.hub_retry` applies until the first item, for the same errors as a unary query

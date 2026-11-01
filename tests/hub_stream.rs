@@ -234,6 +234,7 @@ async fn node_with(
     registry: HandlerRegistry,
     max_handlers: usize,
     sender_settings: SenderSettings,
+    stream_credit_timeout: Option<Duration>,
 ) -> Node {
     let (tx, mut rx) = mpsc::channel::<Inbound>(64);
     let pool = HubPool::new(
@@ -245,11 +246,15 @@ async fn node_with(
     .unwrap();
     pool.set_registered_types(registry.registered_types());
     let sender = Sender::with_pool(Arc::clone(&pool), sender_settings);
-    let dispatcher = Arc::new(Dispatcher::new(
+    let mut dispatcher = Dispatcher::new(
         Arc::new(registry),
         Arc::new(IdentityResolver::new(None)),
         max_handlers,
-    ));
+    );
+    if let Some(timeout) = stream_credit_timeout {
+        dispatcher = dispatcher.stream_credit_timeout(timeout);
+    }
+    let dispatcher = Arc::new(dispatcher);
     pool.start();
     let (forward, serve) = (Arc::clone(&sender), Arc::clone(&dispatcher));
     tokio::spawn(async move {
@@ -291,6 +296,7 @@ async fn handler(
         registry(probe),
         max_handlers,
         SenderSettings::default(),
+        None,
     )
     .await
 }
@@ -301,7 +307,16 @@ async fn shared_owner(address: &str, service: &str, instance: &str, mark: u32) -
     r.shared_streaming_query::<SharedExport, _, _, _>(move |_, _| async move {
         Ok(tokio_stream::once(Ok(Row { i: mark })))
     });
-    node_with(address, service, instance, r, 4, SenderSettings::default()).await
+    node_with(
+        address,
+        service,
+        instance,
+        r,
+        4,
+        SenderSettings::default(),
+        None,
+    )
+    .await
 }
 
 /// A node without handlers, sending with `sender_settings`.
@@ -313,6 +328,7 @@ async fn caller_with(address: &str, sender_settings: SenderSettings) -> Node {
         HandlerRegistry::new(),
         4,
         sender_settings,
+        None,
     )
     .await
 }
@@ -455,6 +471,63 @@ async fn a_streaming_handler_sends_parts_under_credit_then_the_end() {
     .await;
     assert_eq!(probe.dropped.load(Ordering::SeqCst), 1);
     assert_eq!(hub.replies().await.len(), 0, "no unary reply for a stream");
+    h.shutdown().await;
+}
+
+/// A hub that forgot the stream (a race on the hub, a lost `Flow` or `Cancel`) never sends
+/// credit: without a bound the handler task and its permits would leak for ever. After
+/// `Config.hub_stream_credit_timeout` without credit the stream ends with `TIMEOUT` and both
+/// permits go back.
+#[tokio::test]
+async fn a_handler_waiting_for_credit_longer_than_the_credit_timeout_ends_with_timeout() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let h = node_with(
+        &hub.address(),
+        "svc-h",
+        "h1",
+        registry(&probe),
+        2,
+        SenderSettings::default(),
+        Some(Duration::from_millis(200)),
+    )
+    .await;
+    let payload = serde_json::to_vec(&export(5, 0, None)).unwrap();
+    hub.send_to_clients(forwarded("s#1", "t.Export", &payload, 1))
+        .await;
+    eventually("one part", async || hub.parts().len() == 1).await;
+    assert_eq!(h.dispatcher.available_permits(), 1, "the permit is held");
+    assert_eq!(hub.permits_held(1), Some(1));
+    // Never a `Flow`: the handler holds its second item and waits for credit.
+    let started = Instant::now();
+    eventually("the end", async || !hub.ends().is_empty()).await;
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(150) && took < Duration::from_secs(2),
+        "the credit timeout, took {took:?}"
+    );
+    let (_, end) = &hub.ends()[0];
+    assert_eq!(end.request_id, "s#1");
+    assert_eq!(end_code(end), Some(ErrorCode::Timeout), "{end:?}");
+    assert_eq!(
+        end.error.as_ref().unwrap().message,
+        "no credit within 200ms",
+        "{end:?}"
+    );
+    assert_eq!(hub.parts().len(), 1, "nothing after the end");
+    eventually("both permits released", async || {
+        h.dispatcher.available_permits() == 2 && hub.permits_held(1) == Some(2)
+    })
+    .await;
+    assert_eq!(
+        probe.dropped.load(Ordering::SeqCst),
+        1,
+        "the handler's stream dropped"
+    );
+    // Credit that arrives too late is ignored: the request is gone.
+    hub.send_to_clients(flow("s#1", 10)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(hub.parts().len(), 1);
     h.shutdown().await;
 }
 
@@ -959,6 +1032,7 @@ async fn the_idle_timeout_ends_the_stream_with_timeout() {
         },
         2,
         SenderSettings::default(),
+        None,
     )
     .await;
     let e = c
@@ -1019,6 +1093,7 @@ async fn the_local_guard_allows_twice_the_hub_bound_for_the_first_part_then_the_
         },
         2,
         SenderSettings::default(),
+        None,
     )
     .await;
     // No first part ever: the open fails at 2 x 1 s + 1 s.
@@ -1347,6 +1422,7 @@ async fn gating_errors_map_to_the_unary_errors() {
         },
         2,
         SenderSettings::default(),
+        None,
     )
     .await;
     #[derive(Serialize, Deserialize)]
@@ -1483,6 +1559,7 @@ async fn a_reply_end_error_before_the_first_part_is_retried_like_an_error() {
         },
         2,
         SenderSettings::default(),
+        None,
     )
     .await;
     let (opened, owner) = tokio::join!(

@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures::StreamExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -63,6 +64,8 @@ pub struct Dispatcher {
     permits: Arc<Semaphore>,
     /// Requests being served, by id.
     running: Mutex<HashMap<String, Control>>,
+    /// The longest a streaming handler waits for credit (`Config.hub_stream_credit_timeout`).
+    stream_credit_timeout: Duration,
 }
 
 impl Dispatcher {
@@ -76,7 +79,17 @@ impl Dispatcher {
             resolver,
             permits: Arc::new(Semaphore::new(max_concurrent_handlers.max(1))),
             running: Mutex::new(HashMap::new()),
+            stream_credit_timeout: crate::config::DEFAULT_STREAM_CREDIT_TIMEOUT,
         }
+    }
+
+    /// The longest a streaming handler waits for credit before its stream ends with `TIMEOUT`
+    /// "no credit within <d>" and its permits go back (`Config.hub_stream_credit_timeout`;
+    /// default [`crate::config::DEFAULT_STREAM_CREDIT_TIMEOUT`]). A hub that forgot the stream
+    /// (a lost `Flow` or `Cancel`) would otherwise leave the handler task waiting for ever.
+    pub fn stream_credit_timeout(mut self, timeout: Duration) -> Dispatcher {
+        self.stream_credit_timeout = timeout;
+        self
     }
 
     /// Handler permits not held now (`max_concurrent_handlers` at rest). A streaming query holds
@@ -317,8 +330,9 @@ impl Dispatcher {
 
     /// A streaming request: its parts under the credits (`initial_credit` plus every `Flow`;
     /// the handler's stream is pulled at most one item ahead of the credit), then its end. A hub
-    /// `Cancel` aborts the pump (the handler's stream is dropped, nothing more is sent). The
-    /// handler permit is held until the end, whatever the end.
+    /// `Cancel` aborts the pump (the handler's stream is dropped, nothing more is sent); no
+    /// credit within [`stream_credit_timeout`](Self::stream_credit_timeout) ends it with
+    /// `TIMEOUT`. The handler permit is held until the end, whatever the end.
     async fn stream(
         self: &Arc<Self>,
         running: &Running,
@@ -360,6 +374,7 @@ impl Dispatcher {
         let request_id = req.id.clone();
         let type_name = req.r#type.clone();
         let mut credit = req.initial_credit;
+        let credit_timeout = self.stream_credit_timeout;
         let (_permit, ctx, mut items) = match self.open(req).await {
             Ok(opened) => opened,
             Err(e) => {
@@ -386,10 +401,24 @@ impl Dispatcher {
                     }
                     Some(Ok(payload)) => payload,
                 };
+                // Bounded: a hub that forgot the stream never sends credit, and the permits
+                // (and the held item) must not be kept for ever. The error is the hub's own
+                // idle code, so the sender (if any still listens) sees a `Timeout`.
                 while credit == 0 {
-                    match credits.recv().await {
-                        Some(more) => credit = credit.saturating_add(more),
-                        None => return,
+                    match tokio::time::timeout(credit_timeout, credits.recv()).await {
+                        Ok(Some(more)) => credit = credit.saturating_add(more),
+                        Ok(None) => return,
+                        Err(_) => {
+                            tracing::debug!(request = %request_id, "stream ended: no credit within {credit_timeout:?}");
+                            let error = proto::Error {
+                                request_id: request_id.clone(),
+                                code: ErrorCode::Timeout as i32,
+                                message: format!("no credit within {credit_timeout:?}"),
+                                details: vec![],
+                            };
+                            send_end(&reply_to, &request_id, Some(error)).await;
+                            return;
+                        }
                     }
                 }
                 while let Ok(more) = credits.try_recv() {
