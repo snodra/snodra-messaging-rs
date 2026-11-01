@@ -41,6 +41,7 @@ indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
 - [Multiple hubs](#multiple-hubs)
 - [Scatter-gather](#scatter-gather)
 - [Streaming queries](#streaming-queries)
+- [Upgrading](#upgrading)
 - [Build and test](#build-and-test)
 - [Example](#example)
 - [CI/CD pipeline](#cicd-pipeline)
@@ -459,6 +460,34 @@ tokio::spawn(async move { rows.try_for_each(|row| async { Ok(()) }).await });
   budget only bounds how many attempts there are. Nothing is retried after the first item.
 - **Compat.** Against a P3 / P4a hub `stream` fails with `UnsupportedByHub` (`tests/hub_compat.rs`);
   the P4b hub serves it (`tests/e2e_stream.rs`, image `kraken-hub:p4b-hub`, `KRAKEN_HUB_P4B_IMAGE`).
+
+## Upgrading
+
+What changes for a service moving to this version (P4b):
+
+- **Handlers are aborted by a hub `Cancel`.** A unary command or query handler, and a
+  scatter-gather target, used to run to completion whatever happened; now any hub `Cancel` for
+  the request drops the handler's future (`AbortOnDrop`), as a streaming handler's stream is
+  dropped. The P4b hub sends one to a gather target whose gather ended early (`max_results`,
+  the deadline, the sender disconnected); a plain unary request is not cancelled by the hub
+  today, but the library honours a `Cancel` for it all the same. Nothing more is sent for the
+  request and the permits go back. A handler
+  whose work must finish once started (a critical section that is not safe to abandon half-way,
+  for example a write followed by a publish outside one transaction) should `tokio::spawn` that
+  section and await the join handle: the spawned task is not aborted with the handler.
+- **`Config.hub_stream_credit_timeout`** (`KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS`, default 10
+  minutes, at least 1 ms) is new: a streaming handler that waits for credit longer than that
+  ends its stream with `ReplyEnd{error = TIMEOUT "no credit within <d>"}` and releases its
+  permits; `Dispatcher::stream_credit_timeout` sets it when the dispatcher is wired by hand.
+  Code that builds `Config` as a struct literal needs the field (`Config::new` sets the default).
+- **Lost parts are an error.** A streaming query checks `seq` (1, 2, 3, ... in arrival order)
+  and a clean `ReplyEnd.parts` against the parts that arrived: a mismatch ends the stream with
+  `MessagingError::InvalidMessage("stream <type> lost N part(s)")` (at a gap the handler is
+  cancelled). Before, a part the hub dropped went unnoticed and the stream ended clean.
+- **`Sender::stream_owned`** and **`KrakenMessaging::sender()`** are new: `stream` still returns
+  a stream that borrows the sender; `stream_owned` (on the `Arc<Sender>` that `app.sender()` or
+  the builder's `sender()` gives) returns a `'static` stream for an HTTP streaming body or a
+  spawned task. See [Streaming queries](#streaming-queries).
 
 ## Build and test
 
