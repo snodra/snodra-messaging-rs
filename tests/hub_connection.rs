@@ -73,14 +73,17 @@ async fn registers_shared_query_types_apart_and_knows_whether_the_hub_scatters()
         commands: vec!["t.Cmd".into()],
         queries: vec!["t.Q".into()],
         shared_queries: vec!["t.S2".into(), "t.S1".into()],
+        // Exclusive streaming queries are query types to the hub (P4b): announced with `t.Q`.
+        streaming_queries: vec!["t.A".into()],
     });
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);
     let r = &hub.registers().await[0];
     assert_eq!(r.command_types, vec!["t.Cmd"]);
-    assert_eq!(r.query_types, vec!["t.Q"]);
+    assert_eq!(r.query_types, vec!["t.A", "t.Q"]);
     assert_eq!(r.shared_query_types, vec!["t.S1", "t.S2"]);
     assert!(conn.handshake().unwrap().scatter_gather());
+    assert!(conn.handshake().unwrap().streaming());
     conn.shutdown().await;
 
     // A P3 hub does not share the capability; a legacy hub has no ack at all.
@@ -91,6 +94,17 @@ async fn registers_shared_query_types_apart_and_knows_whether_the_hub_scatters()
     assert!(!conn.handshake().unwrap().scatter_gather());
     conn.shutdown().await;
     assert!(!Handshake::Legacy.scatter_gather());
+
+    // A P4a hub shares scatter-gather but not streaming.
+    hub.set_scatter_gather(true);
+    hub.set_streaming(false);
+    let (conn, _rx) = connection(settings(hub.address(), 1_000, 50, 500));
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    let h = conn.handshake().unwrap();
+    assert!(h.scatter_gather() && !h.streaming(), "{h:?}");
+    conn.shutdown().await;
+    assert!(!Handshake::Legacy.streaming());
     hub.stop();
 }
 
@@ -237,7 +251,12 @@ async fn register_declares_protocol_v2_and_client_version() {
     assert_eq!(r.protocol_version, 2);
     assert_eq!(
         r.capabilities,
-        ["flow-control", "instance-status", "scatter-gather"]
+        [
+            "flow-control",
+            "instance-status",
+            "scatter-gather",
+            "streaming"
+        ]
     );
     assert_eq!(r.client_version, CLIENT_VERSION);
     assert!(r.client_version.starts_with("kraken-messaging-rs/"));
@@ -265,6 +284,7 @@ async fn ack_completes_the_handshake_and_its_interval_replaces_the_fallback() {
             "flow-control".into(),
             "instance-status".into(),
             "scatter-gather".into(),
+            "streaming".into(),
         ],
         ..ack
     };
@@ -323,6 +343,47 @@ async fn send_returns_the_stream_it_wrote_to() {
     assert!(conn.await_registered(Duration::from_secs(5)).await);
     let stream = conn.send(heartbeat()).await.unwrap();
     assert_eq!(Some(stream), conn.current_stream());
+    conn.shutdown().await;
+    hub.stop();
+}
+
+/// Streaming (P4b) writes `Flow` and `Cancel` for a request to the very stream it was written to:
+/// `send_on` refuses any other stream (the request is gone with it), and the hub's `Flow` and
+/// `Cancel` reach the owner as inbound messages.
+#[tokio::test]
+async fn send_on_writes_only_to_the_named_stream_and_flow_and_cancel_come_inbound() {
+    let hub = FakeHub::start().await;
+    let (conn, mut rx) = connection(settings(hub.address(), 1_000, 50, 500));
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    let stream = conn.current_stream().unwrap();
+    conn.send_on(stream, heartbeat()).await.unwrap();
+    let e = conn.send_on(stream + 1_000, heartbeat()).await.unwrap_err();
+    assert!(matches!(e, MessagingError::HubUnavailable(_)), "{e:?}");
+    hub.send_to_clients(ServerMessage {
+        message: Some(server_message::Message::Flow(proto::Flow {
+            request_id: "s#1".into(),
+            credits: 3,
+        })),
+    })
+    .await;
+    hub.send_to_clients(ServerMessage {
+        message: Some(server_message::Message::Cancel(proto::Cancel {
+            request_id: "s#1".into(),
+            reason: "max results".into(),
+        })),
+    })
+    .await;
+    let flow = timeout(Duration::from_secs(2), rx.recv()).await.unwrap();
+    assert!(
+        matches!(flow, Some(Inbound::Flow(ref f)) if f.request_id == "s#1" && f.credits == 3),
+        "{flow:?}"
+    );
+    let cancel = timeout(Duration::from_secs(2), rx.recv()).await.unwrap();
+    assert!(
+        matches!(cancel, Some(Inbound::Cancel(ref c)) if c.request_id == "s#1" && c.reason == "max results"),
+        "{cancel:?}"
+    );
     conn.shutdown().await;
     hub.stop();
 }

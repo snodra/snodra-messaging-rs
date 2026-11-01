@@ -13,7 +13,7 @@ mod targets;
 pub use connection::{
     CAPABILITIES, CLIENT_VERSION, FLOW_CONTROL, Handshake, HubConnection, HubSettings,
     INSTANCE_STATUS, Inbound, PERMIT_BATCH, PERMIT_FLUSH_AFTER, PROTOCOL_VERSION, RegisteredTypes,
-    ReplyTo, SCATTER_GATHER, StreamId,
+    ReplyTo, SCATTER_GATHER, STREAMING, StreamId,
 };
 pub use dispatcher::Dispatcher;
 pub use pool::{DRAIN_LIMIT, HubPool, Resolver};

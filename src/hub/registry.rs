@@ -151,6 +151,7 @@ impl HandlerRegistry {
             commands: self.command_types(),
             queries: self.exclusive_query_types(),
             shared_queries: self.shared_query_types(),
+            ..super::RegisteredTypes::default()
         }
     }
 

@@ -40,6 +40,10 @@ pub enum MessagingError {
     /// the `RegisterAck` (or the hub answered `UNSUPPORTED`). Nothing was sent; not retried.
     #[error("{0}")]
     UnsupportedByHub(String),
+    /// Hub code CANCELLED (ADR 0017, P4b): the hub ended a streaming query (it outlived
+    /// `KRAKEN_HUB_MAX_STREAM_DURATION`). Not retried.
+    #[error("{0}")]
+    Cancelled(String),
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("storage error: {0}")]
@@ -61,14 +65,13 @@ impl MessagingError {
             ErrorCode::ResourceExhausted => Self::HandlerBusy(type_name.to_string()),
             // A request mode the hub does not implement or share (ADR 0017).
             ErrorCode::Unsupported => Self::UnsupportedByHub(format!("'{type_name}': {message}")),
-            // CANCELLED belongs to streaming (P4b): read it like an unknown code.
-            ErrorCode::HandlerError | ErrorCode::Cancelled | ErrorCode::Unspecified => {
-                Self::RemoteHandler {
-                    type_name: type_name.to_string(),
-                    message: message.to_string(),
-                    details: details.to_vec(),
-                }
-            }
+            // The hub ended a streaming query (P4b).
+            ErrorCode::Cancelled => Self::Cancelled(format!("'{type_name}': {message}")),
+            ErrorCode::HandlerError | ErrorCode::Unspecified => Self::RemoteHandler {
+                type_name: type_name.to_string(),
+                message: message.to_string(),
+                details: details.to_vec(),
+            },
         }
     }
 
@@ -137,6 +140,23 @@ mod tests {
             crate::proto::RequestKind::Query,
             &e
         ));
+    }
+
+    #[test]
+    fn cancelled_is_its_own_error_and_never_retried() {
+        let e = MessagingError::from_hub(
+            "t.X",
+            ErrorCode::Cancelled as i32,
+            "max stream duration (10m) exceeded",
+            b"",
+        );
+        assert!(matches!(e, MessagingError::Cancelled(_)), "{e:?}");
+        assert!(e.to_string().contains("max stream duration"), "{e}");
+        assert!(!crate::retry::is_retryable(
+            crate::proto::RequestKind::Query,
+            &e
+        ));
+        assert_eq!(e.to_reply_code(), ErrorCode::HandlerError);
     }
 
     #[test]

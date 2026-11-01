@@ -225,7 +225,7 @@ impl HubPool {
         self.set_registered_types(RegisteredTypes {
             commands: command_types,
             queries: query_types,
-            shared_queries: vec![],
+            ..RegisteredTypes::default()
         });
     }
 
@@ -391,6 +391,26 @@ impl HubPool {
         }
         Err(last
             .unwrap_or_else(|| MessagingError::HubUnavailable("not connected to the hub".into())))
+    }
+
+    /// Writes `msg` to the hub stream `stream`, if it is still the current stream of its
+    /// connection ([`HubConnection::send_on`]); `HubUnavailable` otherwise (nothing written).
+    pub async fn send_on(
+        &self,
+        stream: StreamId,
+        msg: ClientMessage,
+    ) -> Result<(), MessagingError> {
+        let Some(conn) = self
+            .members()
+            .into_iter()
+            .map(|m| m.conn.clone())
+            .find(|c| c.current_stream() == Some(stream))
+        else {
+            return Err(MessagingError::HubUnavailable(format!(
+                "hub stream {stream} is gone"
+            )));
+        };
+        conn.send_on(stream, msg).await
     }
 
     /// Background tasks held (status and resolve loops, drains); tests.

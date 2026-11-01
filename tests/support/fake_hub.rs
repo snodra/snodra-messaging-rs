@@ -136,6 +136,7 @@ pub struct State {
     evictions: AtomicUsize,
     events: StdMutex<Vec<(Event, std::time::Instant)>>,
     scatter_gather: AtomicBool,
+    streaming: AtomicBool,
     /// stream number → its registration.
     routes: StdMutex<HashMap<usize, Route>>,
     /// gather id → the gather; target id → gather id.
@@ -437,6 +438,7 @@ impl Hub for Service {
                                 let wants_flow = r.capabilities.iter().any(|c| c == "flow-control");
                                 let wants_status = r.capabilities.iter().any(|c| c == "instance-status");
                                 let wants_scatter = r.capabilities.iter().any(|c| c == "scatter-gather");
+                                let wants_streaming = r.capabilities.iter().any(|c| c == "streaming");
                                 state.log(Event::Register { stream: stream_no, types: r.command_types.len() + r.query_types.len() + r.shared_query_types.len() });
                                 let scatter = wants_scatter && v2 && state.scatter_gather.load(Ordering::SeqCst) && state.ack.lock().unwrap().is_some();
                                 state.routes.lock().unwrap().insert(stream_no, Route {
@@ -473,6 +475,9 @@ impl Hub for Service {
                                     }
                                     if wants_scatter && state.scatter_gather.load(Ordering::SeqCst) {
                                         ack.capabilities.push("scatter-gather".to_string());
+                                    }
+                                    if wants_streaming && state.streaming.load(Ordering::SeqCst) {
+                                        ack.capabilities.push("streaming".to_string());
                                     }
                                     ack
                                 });
@@ -589,6 +594,7 @@ impl FakeHub {
             evictions: AtomicUsize::new(0),
             events: StdMutex::new(vec![]),
             scatter_gather: AtomicBool::new(true),
+            streaming: AtomicBool::new(true),
             routes: StdMutex::new(HashMap::new()),
             gathers: StdMutex::new(HashMap::new()),
             target_of: StdMutex::new(HashMap::new()),
@@ -675,6 +681,11 @@ impl FakeHub {
     /// Whether the ack shares "scatter-gather" with clients that declare it (`false`: a P3 hub).
     pub fn set_scatter_gather(&self, on: bool) {
         self.state.scatter_gather.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether the ack shares "streaming" with clients that declare it (`false`: a P4a hub).
+    pub fn set_streaming(&self, on: bool) {
+        self.state.streaming.store(on, Ordering::SeqCst);
     }
 
     /// Scatter-gathers still open.

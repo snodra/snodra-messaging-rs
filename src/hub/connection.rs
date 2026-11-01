@@ -62,8 +62,12 @@ pub const INSTANCE_STATUS: &str = "instance-status";
 /// The scatter-gather capability (ADR 0017): `Request.mode = SCATTER_GATHER`, answered with
 /// `ReplyPart`s and a `ReplyEnd`; sent only to a hub whose ack lists it.
 pub const SCATTER_GATHER: &str = "scatter-gather";
+/// The streaming capability (ADR 0017, P4b): `Request.mode = STREAMING` with credits, answered
+/// with `ReplyPart`s and a `ReplyEnd`; `Flow` and `Cancel` both ways. Declared by senders and by
+/// handlers alike: the hub streams only to an instance that negotiated it.
+pub const STREAMING: &str = "streaming";
 /// Optional protocol features this client declares (`Register.capabilities`).
-pub const CAPABILITIES: &[&str] = &[FLOW_CONTROL, INSTANCE_STATUS, SCATTER_GATHER];
+pub const CAPABILITIES: &[&str] = &[FLOW_CONTROL, INSTANCE_STATUS, SCATTER_GATHER, STREAMING];
 /// A `Permits` message is sent as soon as this many grants are pending, or as soon as the hub holds
 /// no more than `min(PERMIT_BATCH, initial_permits / 2)` permits for the stream (the low-water mark)...
 pub const PERMIT_BATCH: u32 = 16;
@@ -170,6 +174,12 @@ impl Handshake {
     /// `Register.shared_query_types` (an older hub ignores that field).
     pub fn scatter_gather(&self) -> bool {
         self.shares(SCATTER_GATHER)
+    }
+
+    /// True when the hub shares `streaming`: it routes streaming queries, relays their parts
+    /// under the sender's credits and sends `Flow` and `Cancel`.
+    pub fn streaming(&self) -> bool {
+        self.shares(STREAMING)
     }
 
     pub(crate) fn shares(&self, capability: &str) -> bool {
@@ -421,11 +431,20 @@ impl ReplyTo {
 /// `queries` are exclusive (one owning service), `shared_queries` may be owned by many services
 /// (ADR 0017). Every registrant of a type must agree on exclusive vs shared: the hub rejects the
 /// later `Register` with `ALREADY_EXISTS` otherwise.
+///
+/// A streaming query (P4b) is a query type to the hub: the mode is the sender's choice and the
+/// hub streams only to instances that negotiated `streaming`. `streaming_queries` are the
+/// exclusive ones, announced in `Register.query_types` next to `queries`; a shared streaming
+/// query is listed in `shared_queries` like any shared query.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RegisteredTypes {
     pub commands: Vec<String>,
+    /// Exclusive unary queries.
     pub queries: Vec<String>,
+    /// Shared queries, unary or streaming.
     pub shared_queries: Vec<String>,
+    /// Exclusive streaming queries.
+    pub streaming_queries: Vec<String>,
 }
 
 impl RegisteredTypes {
@@ -433,7 +452,17 @@ impl RegisteredTypes {
         self.commands.sort();
         self.queries.sort();
         self.shared_queries.sort();
+        self.streaming_queries.sort();
         self
+    }
+
+    /// `Register.query_types`: the exclusive queries, unary and streaming, sorted.
+    fn exclusive_query_types(&self) -> Vec<String> {
+        let mut all = self.queries.clone();
+        all.extend(self.streaming_queries.iter().cloned());
+        all.sort();
+        all.dedup();
+        all
     }
 }
 
@@ -446,10 +475,18 @@ pub enum Inbound {
     },
     Reply(proto::Reply),
     Error(proto::Error),
-    /// One answer of a scatter-gather this client sent (ADR 0017).
+    /// One answer of a scatter-gather, or one part of a streaming query, this client sent
+    /// (ADR 0017).
     Part(proto::ReplyPart),
-    /// The end of a scatter-gather this client sent.
+    /// The end of a scatter-gather or of a streaming query this client sent.
     End(proto::ReplyEnd),
+    /// Credits for a streaming query this instance handles (P4b): `request_id` is the
+    /// handler-side id (`<id>#1`).
+    Flow(proto::Flow),
+    /// The hub cancels a request this instance handles (P4b): a streaming query (the sender
+    /// left or stopped reading, the hub's limits), or a unary / scatter-gather target whose
+    /// gather ended early. Nothing is to be sent for it any more.
+    Cancel(proto::Cancel),
     /// That stream was lost. `unsent`: the ids of requests still in its outbound buffer when it
     /// was lost (never taken by the transport, so never written): they may go to another hub with
     /// the same id. Every other request written to it and still pending has an unknown outcome.
@@ -472,6 +509,16 @@ impl std::fmt::Debug for Inbound {
             Inbound::Error(e) => write!(f, "Error(request_id={}, code={})", e.request_id, e.code),
             Inbound::Part(p) => write!(f, "Part(request_id={}, seq={})", p.request_id, p.seq),
             Inbound::End(e) => write!(f, "End(request_id={}, parts={})", e.request_id, e.parts),
+            Inbound::Flow(x) => write!(
+                f,
+                "Flow(request_id={}, credits={})",
+                x.request_id, x.credits
+            ),
+            Inbound::Cancel(c) => write!(
+                f,
+                "Cancel(request_id={}, reason={})",
+                c.request_id, c.reason
+            ),
             Inbound::Disconnected { stream, unsent } => {
                 write!(f, "Disconnected(stream={stream}, unsent={})", unsent.len())
             }
@@ -575,7 +622,7 @@ impl HubConnection {
         self.set_registered_types(RegisteredTypes {
             commands: command_types,
             queries: query_types,
-            shared_queries: vec![],
+            ..RegisteredTypes::default()
         });
     }
 
@@ -698,6 +745,31 @@ impl HubConnection {
             .await
             .map_err(|_| MessagingError::HubUnavailable("hub stream closed".into()))?;
         Ok((stream, extra))
+    }
+
+    /// Writes `msg` to the handshaken stream `stream` only: `HubUnavailable` when that stream is
+    /// not the current one (it was lost, and so was whatever `msg` refers to) or the write
+    /// fails. For a `Flow` or `Cancel` of a request written to `stream`: a newer stream is
+    /// another session, which knows nothing of the request.
+    pub async fn send_on(
+        &self,
+        stream: StreamId,
+        msg: ClientMessage,
+    ) -> Result<(), MessagingError> {
+        let tx = {
+            let live = self.live.lock().unwrap();
+            match live.as_ref() {
+                Some(live) if live.stream == stream => live.tx.clone(),
+                _ => {
+                    return Err(MessagingError::HubUnavailable(format!(
+                        "hub stream {stream} is gone"
+                    )));
+                }
+            }
+        };
+        tx.send(msg)
+            .await
+            .map_err(|_| MessagingError::HubUnavailable("hub stream closed".into()))
     }
 
     /// Tops the current stream up to `share` permits in all (the initial offer plus earlier
@@ -958,11 +1030,8 @@ impl HubConnection {
                         server_message::Message::Error(e) => self.forward(Inbound::Error(e)).await?,
                         server_message::Message::Part(p) => self.forward(Inbound::Part(p)).await?,
                         server_message::Message::End(e) => self.forward(Inbound::End(e)).await?,
-                        // Flow and Cancel belong to streaming and subscriptions (P4b, P4c), which
-                        // this client does not declare.
-                        server_message::Message::Flow(_) | server_message::Message::Cancel(_) => {
-                            tracing::debug!(service = %self.service_name, "multi-part message ignored");
-                        }
+                        server_message::Message::Flow(x) => self.forward(Inbound::Flow(x)).await?,
+                        server_message::Message::Cancel(c) => self.forward(Inbound::Cancel(c)).await?,
                     },
                 },
             }
@@ -993,8 +1062,8 @@ impl HubConnection {
         let register = Register {
             service_name: self.service_name.clone(),
             instance_id: self.instance_id.clone(),
-            command_types: types.commands,
-            query_types: types.queries,
+            command_types: types.commands.clone(),
+            query_types: types.exclusive_query_types(),
             protocol_version: PROTOCOL_VERSION,
             capabilities: CAPABILITIES.iter().map(|c| c.to_string()).collect(),
             credentials: None,
@@ -1002,7 +1071,7 @@ impl HubConnection {
             initial_permits,
             load_factor: self.settings.load_factor,
             tags: self.settings.tags.clone(),
-            shared_query_types: types.shared_queries,
+            shared_query_types: types.shared_queries.clone(),
         };
         ClientMessage {
             message: Some(client_message::Message::Register(register)),
@@ -1232,7 +1301,12 @@ mod tests {
         assert_eq!(PROTOCOL_VERSION, 2);
         assert_eq!(
             CAPABILITIES,
-            ["flow-control", "instance-status", "scatter-gather"]
+            [
+                "flow-control",
+                "instance-status",
+                "scatter-gather",
+                "streaming"
+            ]
         );
         assert!(CLIENT_VERSION.starts_with("kraken-messaging-rs/"));
         assert_eq!(

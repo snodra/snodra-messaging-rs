@@ -583,7 +583,8 @@ impl Sender {
                     e.waiter.finish(outcome);
                 }
             }
-            Inbound::Request { .. } => {} // the dispatcher's business
+            // The dispatcher's business.
+            Inbound::Request { .. } | Inbound::Flow(_) | Inbound::Cancel(_) => {}
         }
     }
 
