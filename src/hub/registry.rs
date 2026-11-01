@@ -130,21 +130,26 @@ impl HandlerRegistry {
         sorted(self.commands.keys())
     }
 
-    /// The exclusive query types.
+    /// Every query type served here, exclusive and shared (as kraken-messaging's `queryTypes()`).
     pub fn query_types(&self) -> Vec<String> {
+        sorted(self.queries.keys())
+    }
+
+    /// The exclusive query types (`Register.query_types`).
+    pub fn exclusive_query_types(&self) -> Vec<String> {
         sorted(self.queries.keys().filter(|t| !self.shared.contains(*t)))
     }
 
-    /// The shared query types.
+    /// The shared query types (`Register.shared_query_types`).
     pub fn shared_query_types(&self) -> Vec<String> {
         sorted(self.shared.iter())
     }
 
-    /// Everything the `Register` announces.
+    /// Everything the `Register` announces: the exclusive and the shared query types apart.
     pub fn registered_types(&self) -> super::RegisteredTypes {
         super::RegisteredTypes {
             commands: self.command_types(),
-            queries: self.query_types(),
+            queries: self.exclusive_query_types(),
             shared_queries: self.shared_query_types(),
         }
     }

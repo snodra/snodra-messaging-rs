@@ -353,7 +353,7 @@ impl KrakenMessagingBuilder {
             )?;
             tasks.push(consumer.start(cancel.clone()));
         }
-        tracing::info!(service = %config.service_name, instance = %hubs.instance_id(), hubs = ?hubs.targets(), commands = ?registry.command_types(), queries = ?registry.query_types(), shared_queries = ?registry.shared_query_types(), events = ?registry.event_types(), "kraken messaging started");
+        tracing::info!(service = %config.service_name, instance = %hubs.instance_id(), hubs = ?hubs.targets(), commands = ?registry.command_types(), queries = ?registry.exclusive_query_types(), shared_queries = ?registry.shared_query_types(), events = ?registry.event_types(), "kraken messaging started");
         Ok(KrakenMessaging {
             hubs,
             sender,

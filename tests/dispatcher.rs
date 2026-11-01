@@ -398,6 +398,8 @@ fn registry_lists_types_sorted() {
         ]
     );
     assert_eq!(r.query_types(), vec!["t.Count", "t.Maybe"]);
+    assert_eq!(r.exclusive_query_types(), vec!["t.Count", "t.Maybe"]);
+    assert!(r.shared_query_types().is_empty());
     assert!(r.event_types().is_empty());
 }
 
@@ -424,7 +426,10 @@ async fn shared_query_is_listed_apart_and_dispatched_like_any_query() {
         })
     });
     r.requires::<Search>(Guard::authenticated());
-    assert_eq!(r.query_types(), vec!["t.Count"]);
+    // `query_types` is every query served here (as in kraken-messaging); the `Register` lists
+    // the exclusive and the shared ones apart.
+    assert_eq!(r.query_types(), vec!["t.Count", "t.Search"]);
+    assert_eq!(r.exclusive_query_types(), vec!["t.Count"]);
     assert_eq!(r.shared_query_types(), vec!["t.Search"]);
     let types = r.registered_types();
     assert_eq!(types.queries, vec!["t.Count"]);
