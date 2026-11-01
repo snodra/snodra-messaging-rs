@@ -329,8 +329,8 @@ struct ScatterCall {
     max_results: u32,
 }
 
-/// One scatter-gather written to a hub: its parts as they arrive, then the end. Dropping it
-/// forgets the request (later parts are ignored).
+/// One scatter-gather written (or being written) to a hub: its parts as they arrive, then the
+/// end. Dropping it forgets the request, from before the write on (later parts are ignored).
 struct Gathering<'a> {
     sender: &'a Sender,
     call: Arc<ScatterCall>,
@@ -807,19 +807,25 @@ impl Sender {
         call: &Arc<ScatterCall>,
         chosen: Option<Duration>,
     ) -> Result<Gathering<'_>, MessagingError> {
-        let id = uuid::Uuid::new_v4().to_string();
-        let (events, guard) = self.write_gather(&id, call, chosen).await?;
-        Ok(Gathering {
+        // The gathering exists before the write: its drop forgets the pending entry (recorded by
+        // the build, before the write) when the caller drops the future while the write still
+        // waits for room in the stream's outbound buffer, as the unary path's guard does.
+        let (_, events) = mpsc::unbounded_channel();
+        let mut gathering = Gathering {
             sender: self,
             call: Arc::clone(call),
             chosen,
-            id,
+            id: uuid::Uuid::new_v4().to_string(),
             events,
-            deadline: tokio::time::Instant::now() + guard,
+            deadline: tokio::time::Instant::now(),
             moves: 0,
             end: None,
             done: false,
-        })
+        };
+        let (events, guard) = self.write_gather(&gathering.id, call, chosen).await?;
+        gathering.events = events;
+        gathering.deadline = tokio::time::Instant::now() + guard;
+        Ok(gathering)
     }
 
     /// Writes scatter-gather `id` to a hub whose ack lists `scatter-gather`, its pending entry

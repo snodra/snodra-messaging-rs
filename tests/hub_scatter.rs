@@ -1,8 +1,9 @@
 //! Scatter-gather queries and shared query types (ADR 0017) against in-process fake hubs: shared
 //! registration, one part per target in arrival order and the end, failed and timed-out targets,
 //! `max_results`, the request fields, the `UnsupportedByHub` gate, errors before any target,
-//! parts and ends of unknown requests, a lost stream, the retry policy over the whole gather, and
-//! the multi-hub pool (one gather to one capable hub).
+//! parts and ends of unknown requests, a lost stream, a gather dropped while its write is
+//! blocked, the retry policy over the whole gather, and the multi-hub pool (one gather to one
+//! capable hub).
 mod support;
 
 use std::sync::Arc;
@@ -185,6 +186,15 @@ fn who<R>(parts: &[ScatterPart<R>]) -> Vec<(String, String)> {
 
 fn pair(s: &str, i: &str) -> (String, String) {
     (s.to_string(), i.to_string())
+}
+
+/// Polls `check` every 20 ms for at most 5 s.
+async fn eventually(what: &str, mut check: impl AsyncFnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !check().await {
+        assert!(Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Scatter-gather requests the hub received.
@@ -734,5 +744,51 @@ async fn a_pool_gather_whose_hub_breaks_fails_and_the_next_one_succeeds_on_the_o
         .unwrap();
     assert_eq!(r.parts.len(), 1);
     t.shutdown().await;
+    c.shutdown().await;
+}
+
+/// A gather whose future is dropped while its write still waits for room in the stream's
+/// outbound buffer leaves no pending entry behind (the unary path has the same guard): a leaked
+/// entry would keep `in_flight` up and hold a draining connection open until its stream ends.
+#[tokio::test]
+async fn a_gather_dropped_while_its_write_is_blocked_leaves_nothing_pending() {
+    let hub = FakeHub::start().await;
+    let a = hub.address();
+    let c = caller(&a).await;
+    // The hub stops reading: a few 256 KiB gathers fill the HTTP/2 windows, 256 more fill the
+    // stream's outbound buffer, and the rest wait in the write itself.
+    hub.set_stall_reads(true);
+    let big = Find {
+        term: "x".repeat(256 * 1024),
+    };
+    let calls: Vec<_> = (0..324)
+        .map(|i| {
+            let sender = Arc::clone(&c.sender);
+            let query = if i < 24 { big.clone() } else { find() };
+            tokio::spawn(async move {
+                sender
+                    .scatter_gather(&query, ScatterOptions::default())
+                    .await
+            })
+        })
+        .collect();
+    // (One the hub read before it stalled may have finished with NO_HANDLER already.)
+    eventually("every gather recorded its pending entry", async || {
+        let finished = calls.iter().filter(|c| c.is_finished()).count();
+        c.sender.in_flight() + finished == calls.len()
+    })
+    .await;
+    for call in &calls {
+        call.abort();
+    }
+    for call in calls {
+        let _ = call.await;
+    }
+    assert_eq!(
+        c.sender.in_flight(),
+        0,
+        "a dropped gather leaves nothing pending"
+    );
+    hub.drop_streams();
     c.shutdown().await;
 }
