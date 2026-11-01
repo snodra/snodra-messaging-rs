@@ -15,7 +15,7 @@ use kraken_messaging::hub::{
 use kraken_messaging::proto::{self, ServerMessage, reply, server_message};
 use kraken_messaging::{Command, MessagingError, Query, RetryPolicy, message_type};
 use serde::{Deserialize, Serialize};
-use support::fake_hub::FakeHub;
+use support::fake_hub::{Event, FakeHub};
 use tokio::sync::mpsc;
 
 #[derive(Serialize, Deserialize)]
@@ -703,6 +703,105 @@ async fn a_dns_target_follows_the_resolution_and_drains_a_vanished_hub() {
     })
     .await;
     assert_eq!(c.pool.connections().len(), 1);
+    c.shutdown().await;
+}
+
+/// A vanished address is first deregistered with an empty `Register` (the hub stops routing to the
+/// instance there and hands its queue to other instances), so no new request arrives while its
+/// handlers finish; only then is the stream closed.
+#[tokio::test]
+async fn a_vanished_dns_address_is_deregistered_before_it_is_closed() {
+    let (a, b) = (answering("hub-a").await, answering("hub-b").await);
+    let resolved: Resolved = Arc::new(Mutex::new(vec![a.addr, b.addr]));
+    let c = client_with(
+        HubSettings {
+            dns_refresh: Duration::from_millis(50),
+            ..settings("dns:///hubs.test:7000".into())
+        },
+        |pool| {
+            let resolved = Arc::clone(&resolved);
+            pool.set_resolver(Arc::new(move |_, _| {
+                let addrs = resolved.lock().unwrap().clone();
+                Box::pin(async move { Ok(addrs) })
+            }));
+        },
+    )
+    .await;
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    a.send_to_clients(push_request("in-a")).await;
+    eventually("a handler runs", async || c.held.lock().unwrap().len() == 1).await;
+    *resolved.lock().unwrap() = vec![b.addr];
+    eventually("an empty Register on hub-a", async || {
+        a.events().contains(&Event::Register {
+            stream: 1,
+            types: 0,
+        })
+    })
+    .await;
+    assert_eq!(
+        a.connected_clients().await,
+        1,
+        "open while the handler runs"
+    );
+    let reply_to = c.held.lock().unwrap().pop().unwrap();
+    reply_to.grant().await;
+    eventually("hub-a closed once idle", async || {
+        a.events().contains(&Event::Closed { stream: 1 })
+    })
+    .await;
+    let events = a.events();
+    let empty = events
+        .iter()
+        .position(|e| {
+            *e == Event::Register {
+                stream: 1,
+                types: 0,
+            }
+        })
+        .unwrap();
+    let closed = events
+        .iter()
+        .position(|e| *e == Event::Closed { stream: 1 })
+        .unwrap();
+    assert!(empty < closed, "{events:?}");
+    assert_eq!(a.streams(), 1, "no reconnect to a vanished address");
+    c.shutdown().await;
+}
+
+/// An address that comes and goes leaves no finished drain task behind.
+#[tokio::test]
+async fn finished_drains_do_not_pile_up() {
+    let (a, b) = (answering("hub-a").await, answering("hub-b").await);
+    let resolved: Resolved = Arc::new(Mutex::new(vec![a.addr]));
+    let c = client_with(
+        HubSettings {
+            dns_refresh: Duration::from_millis(20),
+            ..settings("dns:///hubs.test:7000".into())
+        },
+        |pool| {
+            let resolved = Arc::clone(&resolved);
+            pool.set_resolver(Arc::new(move |_, _| {
+                let addrs = resolved.lock().unwrap().clone();
+                Box::pin(async move { Ok(addrs) })
+            }));
+        },
+    )
+    .await;
+    for round in 0..6 {
+        *resolved.lock().unwrap() = vec![a.addr, b.addr];
+        all_registered(&c, &["hub-a", "hub-b"]).await;
+        *resolved.lock().unwrap() = vec![a.addr];
+        eventually(&format!("round {round}: hub-b closed"), async || {
+            c.pool.connections().len() == 1
+        })
+        .await;
+    }
+    // The status loop, the resolve loop and at most the last drain.
+    assert!(
+        c.pool.background_tasks() <= 3,
+        "{}",
+        c.pool.background_tasks()
+    );
     c.shutdown().await;
 }
 

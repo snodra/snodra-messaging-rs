@@ -28,8 +28,9 @@
 //!   flight) goes to every hub whose ack lists `instance-status`, and never to another.
 //! - **DNS.** A `dns:///name:port` target is resolved at start and every `dns_refresh` into
 //!   `ip:port` targets of one family (IPv4 when any, else IPv6, [`resolved_targets`]): a new
-//!   address gets a connection; a vanished one leaves the routing at once and is closed once idle
-//!   (no request of ours written to it unanswered, no handler of its requests running), at most
+//!   address gets a connection; a vanished one leaves the routing at once, gets an empty
+//!   `Register` (the hub stops routing to the instance there) and is closed once idle (no request
+//!   of ours written to it unanswered, no handler of its requests running), at most
 //!   [`DRAIN_LIMIT`] later. A failed or empty resolution keeps the current hubs.
 
 use std::collections::HashMap;
@@ -355,6 +356,12 @@ impl HubPool {
             .unwrap_or_else(|| MessagingError::HubUnavailable("not connected to the hub".into())))
     }
 
+    /// Background tasks held (status and resolve loops, drains); tests.
+    #[doc(hidden)]
+    pub fn background_tasks(&self) -> usize {
+        self.tasks.lock().unwrap().len()
+    }
+
     /// Lets the pool see whether requests written to a stream are unanswered (draining).
     pub(crate) fn add_pending_probe(&self, probe: PendingProbe) {
         self.probes.lock().unwrap().push(probe);
@@ -593,6 +600,15 @@ impl HubPool {
                 Some(m) => {
                     tracing::info!(service = %self.service_name, address, "hub address is back in DNS; kept");
                     m.set_role(Role::Active);
+                    // Announce the types again (the drain had withdrawn them).
+                    let (commands, queries) = self.types.lock().unwrap().clone();
+                    m.conn.set_types(commands, queries);
+                    let conn = Arc::clone(&m.conn);
+                    tokio::spawn(async move {
+                        if let Err(e) = conn.reregister().await {
+                            tracing::debug!(address = %conn.address(), "types not announced again now: {e}");
+                        }
+                    });
                 }
                 None => {
                     tracing::info!(service = %self.service_name, address, "new hub address in DNS; connecting");
@@ -609,13 +625,24 @@ impl HubPool {
         self.top_up();
     }
 
+    /// Takes a vanished address out of the routing and closes it once idle: an empty `Register`
+    /// first (the hub stops routing to this instance there and hands its queue to other
+    /// instances; a reconnect registers no types either), then the stream is closed when no
+    /// request of ours written to it is unanswered and no handler of its requests runs, at most
+    /// [`DRAIN_LIMIT`] later.
     fn drain(self: &Arc<Self>, member: Arc<Member>) {
         let was = member.role();
         member.set_role(Role::Draining);
+        if was != Role::Duplicate {
+            member.conn.set_types(vec![], vec![]);
+        }
         let me = Arc::clone(self);
         let task = tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + DRAIN_LIMIT;
             if was != Role::Duplicate {
+                if let Err(e) = member.conn.reregister().await {
+                    tracing::debug!(address = %member.address(), "no stream to deregister on: {e}");
+                }
                 while !me.idle(&member.conn) && tokio::time::Instant::now() < deadline {
                     tokio::select! {
                         _ = me.cancel.cancelled() => return,
@@ -637,10 +664,13 @@ impl HubPool {
                 .lock()
                 .unwrap()
                 .retain(|_, owner| owner != member.address());
+            member.conn.flushed(Duration::from_secs(1)).await;
             member.conn.shutdown().await;
             tracing::info!(service = %me.service_name, address = %member.address(), "hub connection closed (address left DNS)");
         });
-        self.tasks.lock().unwrap().push(task);
+        let mut tasks = self.tasks.lock().unwrap();
+        tasks.retain(|t| !t.is_finished());
+        tasks.push(task);
     }
 
     /// No handler of its requests running and none of our requests written to it unanswered.

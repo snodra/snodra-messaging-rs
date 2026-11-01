@@ -271,6 +271,11 @@ impl Grants {
 
     /// Raises the permits this stream offered to `share` when it offered fewer (a flow-controlled
     /// stream only); returns the top-up to write. Never lowers them.
+    /// The permits this stream offered so far (its `Register` plus top-ups).
+    fn initial(&self) -> u32 {
+        self.state.lock().unwrap().initial
+    }
+
     fn raise(&self, share: u32) -> u32 {
         let mut s = self.state.lock().unwrap();
         if s.mode != GrantMode::On || share <= s.initial {
@@ -456,6 +461,7 @@ pub struct HubConnection {
     /// Requests that arrived on this connection's streams and are not finished yet.
     in_flight: Arc<AtomicUsize>,
     hooks: OnceLock<Hooks>,
+    reregistering: tokio::sync::Mutex<()>,
     cancel: CancellationToken,
     task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -494,6 +500,7 @@ impl HubConnection {
             failed_once: AtomicBool::new(false),
             in_flight: Arc::new(AtomicUsize::new(0)),
             hooks: OnceLock::new(),
+            reregistering: tokio::sync::Mutex::new(()),
             cancel: CancellationToken::new(),
             task: Mutex::new(None),
         })
@@ -642,6 +649,43 @@ impl HubConnection {
         }
     }
 
+    /// Writes the `Register` again, with the types set now ([`set_types`](Self::set_types)), to
+    /// the current handshaken stream. With no types the hub stops routing to this instance there
+    /// and hands its queue to other instances, while replies to requests it already forwarded
+    /// still go through. `HubUnavailable` when there is no handshaken stream.
+    pub(crate) async fn reregister(&self) -> Result<(), MessagingError> {
+        // One at a time: the message built last (with the types set last) is written last.
+        let _order = self.reregistering.lock().await;
+        let (tx, initial) = {
+            let live = self.live.lock().unwrap();
+            let live = live
+                .as_ref()
+                .ok_or_else(|| MessagingError::HubUnavailable("not connected to the hub".into()))?;
+            (live.tx.clone(), live.grants.initial())
+        };
+        tx.send(self.register(initial))
+            .await
+            .map_err(|_| MessagingError::HubUnavailable("hub stream closed".into()))
+    }
+
+    /// Waits (at most `timeout`) until everything queued for the current stream has been taken by
+    /// the transport, so closing it does not drop a last reply or `Register`.
+    pub(crate) async fn flushed(&self, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let pending = self
+                .live
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|l| l.tx.capacity() < l.tx.max_capacity());
+            if !pending || tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Makes writes to the current stream fail as if it had just dropped and the connection had
     /// not noticed yet (tests of the failover of requests that were never written).
     #[doc(hidden)]
@@ -745,29 +789,13 @@ impl HubConnection {
 
         // The Register is the first message of every stream; the ack or the echo of the heartbeat
         // after it completes the handshake.
-        let (commands, queries) = self.types.lock().unwrap().clone();
         let initial_permits = match self.hooks.get() {
             Some(h) => (h.initial_permits)(),
             None => self.settings.max_concurrent_handlers.min(u32::MAX as usize) as u32,
         };
-        let register = Register {
-            service_name: self.service_name.clone(),
-            instance_id: self.instance_id.clone(),
-            command_types: commands,
-            query_types: queries,
-            protocol_version: PROTOCOL_VERSION,
-            capabilities: CAPABILITIES.iter().map(|c| c.to_string()).collect(),
-            credentials: None,
-            client_version: CLIENT_VERSION.to_string(),
-            initial_permits,
-            load_factor: self.settings.load_factor,
-            tags: self.settings.tags.clone(),
-        };
-        tx.send(ClientMessage {
-            message: Some(client_message::Message::Register(register)),
-        })
-        .await
-        .map_err(|_| Status::unavailable("stream closed before Register"))?;
+        tx.send(self.register(initial_permits))
+            .await
+            .map_err(|_| Status::unavailable("stream closed before Register"))?;
         tx.send(heartbeat())
             .await
             .map_err(|_| Status::unavailable("stream closed before first heartbeat"))?;
@@ -851,6 +879,27 @@ impl HubConnection {
                     },
                 },
             }
+        }
+    }
+
+    /// The `Register` of this instance with the types set now.
+    fn register(&self, initial_permits: u32) -> ClientMessage {
+        let (commands, queries) = self.types.lock().unwrap().clone();
+        let register = Register {
+            service_name: self.service_name.clone(),
+            instance_id: self.instance_id.clone(),
+            command_types: commands,
+            query_types: queries,
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: CAPABILITIES.iter().map(|c| c.to_string()).collect(),
+            credentials: None,
+            client_version: CLIENT_VERSION.to_string(),
+            initial_permits,
+            load_factor: self.settings.load_factor,
+            tags: self.settings.tags.clone(),
+        };
+        ClientMessage {
+            message: Some(client_message::Message::Register(register)),
         }
     }
 

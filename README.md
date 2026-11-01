@@ -206,8 +206,10 @@ every instance registers on every hub, and the client picks a hub per request.
   every address the name resolves to, as `ip:port`, of one family only: the IPv4 addresses when
   there is any, else the IPv6 ones (a dual-stack name lists each hub twice, and two streams of one
   instance on one hub replace each other). It is resolved at start and every 30 s: a new address gets a
-  connection, a vanished one leaves the routing at once and is closed once idle (no request of
-  ours written to it unanswered, no handler of its requests running; at most 65 s later). A
+  connection, a vanished one leaves the routing at once and gets an empty `Register` (that hub
+  stops routing to this instance and hands its queue to other instances; replies to requests it
+  already forwarded still go through), and is closed once idle (no request of ours written to it
+  unanswered, no handler of its requests running; at most 65 s later). A
   failed or empty resolution keeps the current hubs. `dns:///` must be the only target and needs a
   port; its host may not contain `/`; `dns://server/...` is not supported. An address that names no hub fails `Config::validate`.
 - **Connections.** One stream per hub, each with its own handshake, heartbeat, reconnect backoff
