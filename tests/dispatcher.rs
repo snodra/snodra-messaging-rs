@@ -400,3 +400,72 @@ fn registry_lists_types_sorted() {
     assert_eq!(r.query_types(), vec!["t.Count", "t.Maybe"]);
     assert!(r.event_types().is_empty());
 }
+
+#[derive(Serialize, Deserialize)]
+struct Search {
+    term: String,
+}
+message_type!(Search, "t.Search");
+impl Query for Search {
+    type Reply = Total;
+}
+
+#[tokio::test]
+async fn shared_query_is_listed_apart_and_dispatched_like_any_query() {
+    let mut r = HandlerRegistry::new();
+    r.query::<Count, _, _>(|q, _| async move {
+        Ok(Total {
+            n: q.name.len() as u64,
+        })
+    });
+    r.shared_query::<Search, _, _>(|q, _| async move {
+        Ok(Total {
+            n: q.term.len() as u64 * 10,
+        })
+    });
+    r.requires::<Search>(Guard::authenticated());
+    assert_eq!(r.query_types(), vec!["t.Count"]);
+    assert_eq!(r.shared_query_types(), vec!["t.Search"]);
+    let types = r.registered_types();
+    assert_eq!(types.queries, vec!["t.Count"]);
+    assert_eq!(types.shared_queries, vec!["t.Search"]);
+    assert!(types.commands.is_empty());
+
+    // A per-target request `<id>#<n>` of a scatter-gather is an ordinary unary request.
+    let mut r2 = HandlerRegistry::new();
+    r2.shared_query::<Search, _, _>(|q, _| async move {
+        Ok(Total {
+            n: q.term.len() as u64 * 10,
+        })
+    });
+    let d = Dispatcher::new(Arc::new(r2), Arc::new(IdentityResolver::new(None)), 4);
+    let mut req = request(RequestKind::Query, "t.Search", r#"{"term":"abc"}"#, &[]);
+    req.id = "g-1#2".into();
+    let reply = d.handle(req).await;
+    assert_eq!(reply.request_id, "g-1#2");
+    assert_eq!(payload(&reply)["n"], 30);
+}
+
+#[test]
+#[should_panic(expected = "t.Search registered both as an exclusive and as a shared query")]
+fn exclusive_then_shared_registration_panics() {
+    let mut r = HandlerRegistry::new();
+    r.query::<Search, _, _>(|_, _| async move { Ok(Total { n: 0 }) });
+    r.shared_query::<Search, _, _>(|_, _| async move { Ok(Total { n: 0 }) });
+}
+
+#[test]
+#[should_panic(expected = "t.Search registered both as an exclusive and as a shared query")]
+fn shared_then_exclusive_registration_panics() {
+    let mut r = HandlerRegistry::new();
+    r.shared_query::<Search, _, _>(|_, _| async move { Ok(Total { n: 0 }) });
+    r.query::<Search, _, _>(|_, _| async move { Ok(Total { n: 0 }) });
+}
+
+#[test]
+#[should_panic(expected = "duplicate handler")]
+fn shared_query_registered_twice_panics() {
+    let mut r = HandlerRegistry::new();
+    r.shared_query::<Search, _, _>(|_, _| async move { Ok(Total { n: 0 }) });
+    r.shared_query::<Search, _, _>(|_, _| async move { Ok(Total { n: 0 }) });
+}

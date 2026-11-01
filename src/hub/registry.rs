@@ -1,6 +1,6 @@
 //! Typed handler registration, erased to byte-level closures the dispatcher and consumer call.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -40,6 +40,8 @@ pub struct EventContext {
 pub struct HandlerRegistry {
     commands: HashMap<&'static str, RequestHandler>,
     queries: HashMap<&'static str, RequestHandler>,
+    /// The query types registered as shared (their handlers are in `queries`).
+    shared: HashSet<&'static str>,
     events: HashMap<&'static str, Vec<EventHandler>>,
     guards: HashMap<&'static str, Guard>,
 }
@@ -55,20 +57,45 @@ impl HandlerRegistry {
         F: Fn(C, MessageContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<C::Reply, MessagingError>> + Send + 'static,
     {
-        self.assert_unowned(C::TYPE);
+        self.assert_unowned(C::TYPE, None);
         self.commands
             .insert(C::TYPE, erase_request::<C, C::Reply, F, Fut>(handler));
     }
 
+    /// An exclusive query: this service is its only owner (`Register.query_types`).
     pub fn query<Q, F, Fut>(&mut self, handler: F)
     where
         Q: Query,
         F: Fn(Q, MessageContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Q::Reply, MessagingError>> + Send + 'static,
     {
-        self.assert_unowned(Q::TYPE);
+        self.assert_unowned(Q::TYPE, Some(false));
         self.queries
             .insert(Q::TYPE, erase_request::<Q, Q::Reply, F, Fut>(handler));
+    }
+
+    /// A shared query (`Register.shared_query_types`, ADR 0017): several services may own it. A
+    /// point query goes to one instance of any owner; a scatter-gather to every instance of every
+    /// owner. Each instance of each owner serves it like any query (a scatter-gather target gets
+    /// an ordinary request with id `<id>#<n>`).
+    ///
+    /// Every registrant of the type, in every service, must register it shared: a hub rejects a
+    /// `Register` that disagrees with an earlier one (`ALREADY_EXISTS`, the connection keeps
+    /// retrying). Shared types need a hub that lists `scatter-gather` in its ack; an older hub
+    /// ignores the field, so the type is not registered there.
+    ///
+    /// # Panics
+    /// When the type already has a handler here, shared or exclusive.
+    pub fn shared_query<Q, F, Fut>(&mut self, handler: F)
+    where
+        Q: Query,
+        F: Fn(Q, MessageContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Q::Reply, MessagingError>> + Send + 'static,
+    {
+        self.assert_unowned(Q::TYPE, Some(true));
+        self.queries
+            .insert(Q::TYPE, erase_request::<Q, Q::Reply, F, Fut>(handler));
+        self.shared.insert(Q::TYPE);
     }
 
     /// Several handlers may react to the same event type.
@@ -103,8 +130,23 @@ impl HandlerRegistry {
         sorted(self.commands.keys())
     }
 
+    /// The exclusive query types.
     pub fn query_types(&self) -> Vec<String> {
-        sorted(self.queries.keys())
+        sorted(self.queries.keys().filter(|t| !self.shared.contains(*t)))
+    }
+
+    /// The shared query types.
+    pub fn shared_query_types(&self) -> Vec<String> {
+        sorted(self.shared.iter())
+    }
+
+    /// Everything the `Register` announces.
+    pub fn registered_types(&self) -> super::RegisteredTypes {
+        super::RegisteredTypes {
+            commands: self.command_types(),
+            queries: self.query_types(),
+            shared_queries: self.shared_query_types(),
+        }
     }
 
     pub fn event_types(&self) -> Vec<String> {
@@ -131,7 +173,15 @@ impl HandlerRegistry {
         self.guards.get(type_name)
     }
 
-    fn assert_unowned(&self, type_name: &str) {
+    /// `shared`: the flavour of the query being registered (`None` for a command).
+    fn assert_unowned(&self, type_name: &str, shared: Option<bool>) {
+        if let Some(shared) = shared {
+            assert!(
+                !self.queries.contains_key(type_name) || self.shared.contains(type_name) == shared,
+                "{type_name} registered both as an exclusive and as a shared query; every \
+                 registrant must agree on one"
+            );
+        }
         assert!(
             !self.commands.contains_key(type_name) && !self.queries.contains_key(type_name),
             "duplicate handler for {type_name}"

@@ -10,21 +10,32 @@
 //! With several hubs ([`HubPool`]) a request goes to one of them (round-robin, or rendezvous by
 //! routing key); one that could not be written to that hub's stream is written to the next hub
 //! with the same id (it was never sent), so `HubUnavailable` means no hub took it.
+//!
+//! Scatter-gather (ADR 0017, [`Sender::scatter_gather`]): one `Request` with
+//! `mode = SCATTER_GATHER` to one hub whose ack lists `scatter-gather` (unkeyed round-robin over
+//! those), answered by `ReplyPart`s in arrival order and one `ReplyEnd`. Its pending entry collects
+//! the parts until the end; the local guard covers the whole gather. If its stream breaks before
+//! the end, the gather fails with `HubConnectionLost` (parts already received are not kept).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::oneshot;
+use futures::Stream;
+use serde::de::DeserializeOwned;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::codec;
 use crate::context::{MessageContext, hub_headers};
 use crate::error::MessagingError;
-use crate::proto::{self, ClientMessage, RequestKind, client_message, reply};
+use crate::proto::{
+    self, ClientMessage, ErrorCode, RequestKind, RequestMode, client_message, reply,
+};
 use crate::retry::{self, RetryPolicy};
 use crate::types::{Command, Query};
 
-use super::connection::{Handshake, HubConnection, Inbound, StreamId};
+use super::connection::{Handshake, HubConnection, Inbound, SCATTER_GATHER, StreamId};
 use super::pool::{HubPool, weak_probe};
 
 /// The timeout sent to a hub older than protocol v2 when the caller chose none (today's default).
@@ -136,6 +147,97 @@ impl Default for SenderSettings {
     }
 }
 
+/// Options of one scatter-gather ([`Sender::scatter_gather`]).
+#[derive(Clone, Debug, Default)]
+pub struct ScatterOptions {
+    /// The deadline of the whole gather, sent as `timeout_ms` (the rules of
+    /// [`SendOptions::timeout`]: without one, `Config.hub_request_timeout`, else the hub's per-type
+    /// override or default). Targets that have not answered by then count as `timed_out`.
+    pub timeout: Option<Duration>,
+    /// End the gather after this many successful parts; 0 waits for every target.
+    pub max_results: u32,
+    /// `Request.priority` of every target's request. Without one, `Config.hub_priorities` for the
+    /// type, else 0.
+    pub priority: Option<i32>,
+}
+
+/// One target's answer to a scatter-gather.
+#[derive(Debug)]
+pub struct ScatterPart<R> {
+    /// The service and instance that answered.
+    pub service: String,
+    pub instance: String,
+    /// The decoded reply, or the target's failure (its handler's error, or a hub-side failure of
+    /// that target such as `HANDLER_DISCONNECTED` or `RESOURCE_EXHAUSTED`).
+    pub outcome: Result<R, RemoteError>,
+}
+
+/// Everything a scatter-gather got by its end.
+#[derive(Debug)]
+pub struct ScatterResult<R> {
+    /// One per answer, in arrival order (failed ones included).
+    pub parts: Vec<ScatterPart<R>>,
+    /// Parts whose outcome is an error.
+    pub failed: u32,
+    /// Targets that had not answered by the deadline (no part for them).
+    pub timed_out: u32,
+}
+
+/// The failure of one scatter-gather target, as the hub relayed it (or a reply this client could
+/// not decode, with code `UNSPECIFIED`).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{message} ({code:?})")]
+pub struct RemoteError {
+    pub code: ErrorCode,
+    pub message: String,
+    pub details: Vec<u8>,
+}
+
+impl RemoteError {
+    /// The error a unary query of `type_name` would have failed with.
+    pub fn into_error(self, type_name: &str) -> MessagingError {
+        MessagingError::from_hub(type_name, self.code as i32, &self.message, &self.details)
+    }
+}
+
+/// A `ReplyPart` as the caller sees it: the payload decoded with the unary reply codec.
+fn decode_part<R: DeserializeOwned + 'static>(part: proto::ReplyPart) -> ScatterPart<R> {
+    let outcome = match part.error {
+        Some(e) => Err(RemoteError {
+            code: ErrorCode::try_from(e.code).unwrap_or(ErrorCode::Unspecified),
+            message: e.message,
+            details: e.details,
+        }),
+        None => codec::decode_reply::<R>(&part.payload).map_err(|e| RemoteError {
+            code: ErrorCode::Unspecified,
+            message: format!(
+                "cannot decode the answer of {}/{}: {e}",
+                part.responder_service, part.responder_instance
+            ),
+            details: vec![],
+        }),
+    };
+    ScatterPart {
+        service: part.responder_service,
+        instance: part.responder_instance,
+        outcome,
+    }
+}
+
+/// The result of a gather from its parts (in arrival order) and its end.
+fn assemble<R: DeserializeOwned + 'static>(
+    parts: Vec<proto::ReplyPart>,
+    end: Option<&proto::ReplyEnd>,
+) -> ScatterResult<R> {
+    let parts: Vec<ScatterPart<R>> = parts.into_iter().map(decode_part).collect();
+    let failed = parts.iter().filter(|p| p.outcome.is_err()).count() as u32;
+    ScatterResult {
+        parts,
+        failed,
+        timed_out: end.map_or(0, |e| e.timed_out),
+    }
+}
+
 /// The time all attempts of one call share: the caller's chosen timeout; else, against a v2 hub,
 /// its bound for the type (the per-type override, else its default); else (legacy hub, or not
 /// connected yet) [`LEGACY_REQUEST_TIMEOUT`].
@@ -177,7 +279,34 @@ enum Outcome {
     NotWritten,
 }
 
-type Pending = oneshot::Sender<Outcome>;
+/// Who waits for a pending request.
+enum Waiter {
+    /// A unary request: its one outcome.
+    Unary(oneshot::Sender<Outcome>),
+    /// A scatter-gather: its parts, then its end (or how it failed).
+    Scatter(mpsc::UnboundedSender<GatherEvent>),
+}
+
+impl Waiter {
+    /// Ends the wait with `outcome`.
+    fn finish(self, outcome: Outcome) {
+        match self {
+            Waiter::Unary(tx) => {
+                let _ = tx.send(outcome);
+            }
+            Waiter::Scatter(tx) => {
+                let _ = tx.send(GatherEvent::Ended(outcome));
+            }
+        }
+    }
+}
+
+enum GatherEvent {
+    Part(proto::ReplyPart),
+    End(proto::ReplyEnd),
+    /// Failed as a whole (an `Error`, the stream lost), or not written ([`Outcome::NotWritten`]).
+    Ended(Outcome),
+}
 
 /// How often one attempt moves to another hub because its stream was lost before the request was
 /// written; past that it fails with `HubUnavailable` (nothing was written).
@@ -189,6 +318,102 @@ const MAX_UNWRITTEN_MOVES: usize = 8;
 struct ForgetOnDrop<'a> {
     pending: &'a Mutex<HashMap<String, Entry>>,
     id: &'a str,
+}
+
+/// What stays the same across the hubs and attempts of one scatter-gather.
+struct ScatterCall {
+    type_name: &'static str,
+    payload: Vec<u8>,
+    headers: HashMap<String, String>,
+    priority: i32,
+    max_results: u32,
+}
+
+/// One scatter-gather written to a hub: its parts as they arrive, then the end. Dropping it
+/// forgets the request (later parts are ignored).
+struct Gathering<'a> {
+    sender: &'a Sender,
+    call: Arc<ScatterCall>,
+    chosen: Option<Duration>,
+    id: String,
+    events: mpsc::UnboundedReceiver<GatherEvent>,
+    /// The local guard: the hub's bound for the gather plus [`LOCAL_GUARD_MARGIN`].
+    deadline: tokio::time::Instant,
+    moves: usize,
+    end: Option<proto::ReplyEnd>,
+    done: bool,
+}
+
+impl Drop for Gathering<'_> {
+    fn drop(&mut self) {
+        self.sender.take(&self.id);
+    }
+}
+
+impl Gathering<'_> {
+    /// The next part; `None` once the end arrived. An error ends the gather.
+    async fn next(&mut self) -> Option<Result<proto::ReplyPart, MessagingError>> {
+        if self.done {
+            return None;
+        }
+        loop {
+            let event = match tokio::time::timeout_at(self.deadline, self.events.recv()).await {
+                Ok(Some(event)) => event,
+                Ok(None) => GatherEvent::Ended(Outcome::Done(Err(MessagingError::HubUnavailable(
+                    "sender closed".into(),
+                )))),
+                // The hub ends a gather at its deadline itself; the guard covers a hub that never does.
+                Err(_) => GatherEvent::Ended(Outcome::Done(Err(MessagingError::Timeout(
+                    self.call.type_name.to_string(),
+                )))),
+            };
+            match event {
+                GatherEvent::Part(part) => return Some(Ok(part)),
+                GatherEvent::End(end) => {
+                    self.done = true;
+                    self.end = Some(end);
+                    return None;
+                }
+                GatherEvent::Ended(Outcome::NotWritten) => {
+                    self.moves += 1;
+                    if self.moves > MAX_UNWRITTEN_MOVES {
+                        return self.fail(MessagingError::HubUnavailable(format!(
+                            "'{}' not written: {} hub streams lost before it was",
+                            self.call.type_name, self.moves
+                        )));
+                    }
+                    tracing::debug!(r#type = self.call.type_name, request = %self.id, "stream lost before the scatter-gather was written; trying the next hub");
+                    match self
+                        .sender
+                        .write_gather(&self.id, &self.call, self.chosen)
+                        .await
+                    {
+                        Ok((events, guard)) => {
+                            self.events = events;
+                            self.deadline = tokio::time::Instant::now() + guard;
+                        }
+                        Err(e) => return self.fail(e),
+                    }
+                }
+                GatherEvent::Ended(Outcome::Done(Err(e))) => return self.fail(e),
+                GatherEvent::Ended(Outcome::Done(Ok(_))) => {
+                    unreachable!("a scatter-gather never ends with a reply")
+                }
+            }
+        }
+    }
+
+    fn fail(&mut self, e: MessagingError) -> Option<Result<proto::ReplyPart, MessagingError>> {
+        self.done = true;
+        Some(Err(e))
+    }
+}
+
+/// Where a [`Sender::scatter_gather_stream`] is.
+enum StreamState<'a> {
+    Start(Result<Arc<ScatterCall>, MessagingError>),
+    Open(Gathering<'a>),
+    Done,
 }
 
 impl Drop for ForgetOnDrop<'_> {
@@ -203,7 +428,7 @@ struct Entry {
     type_name: String,
     /// The stream the request was written to.
     stream: StreamId,
-    tx: Pending,
+    waiter: Waiter,
 }
 
 /// The `CommandBus`/`QueryBus` of the Rust side. Replies arrive through [`Sender::on_inbound`].
@@ -287,7 +512,12 @@ impl Sender {
     pub fn on_inbound(&self, msg: Inbound) {
         match msg {
             Inbound::Reply(r) => {
-                if let Some(Entry { type_name, tx, .. }) = self.take(&r.request_id) {
+                // A scatter-gather is answered by parts and an end, never by a reply.
+                let unary = self.take_if(&r.request_id, |w| matches!(w, Waiter::Unary(_)));
+                if let Some(Entry {
+                    type_name, waiter, ..
+                }) = unary
+                {
                     let result = match r.result {
                         Some(reply::Result::Payload(p)) => Ok(p),
                         Some(reply::Result::Error(e)) => Err(MessagingError::from_hub(
@@ -295,14 +525,38 @@ impl Sender {
                         )),
                         None => Ok(b"{}".to_vec()),
                     };
-                    let _ = tx.send(Outcome::Done(result));
+                    waiter.finish(Outcome::Done(result));
                 }
             }
             Inbound::Error(e) => {
-                if let Some(Entry { type_name, tx, .. }) = self.take(&e.request_id) {
-                    let _ = tx.send(Outcome::Done(Err(MessagingError::from_hub(
+                if let Some(Entry {
+                    type_name, waiter, ..
+                }) = self.take(&e.request_id)
+                {
+                    waiter.finish(Outcome::Done(Err(MessagingError::from_hub(
                         &type_name, e.code, &e.message, &e.details,
                     ))));
+                }
+            }
+            // Parts and ends of an unknown request (or of a unary one) are ignored.
+            Inbound::Part(p) => {
+                let pending = self.pending.lock().unwrap();
+                if let Some(Entry {
+                    waiter: Waiter::Scatter(tx),
+                    ..
+                }) = pending.get(&p.request_id)
+                {
+                    let _ = tx.send(GatherEvent::Part(p));
+                }
+            }
+            Inbound::End(end) => {
+                let gather = self.take_if(&end.request_id, |w| matches!(w, Waiter::Scatter(_)));
+                if let Some(Entry {
+                    waiter: Waiter::Scatter(tx),
+                    ..
+                }) = gather
+                {
+                    let _ = tx.send(GatherEvent::End(end));
                 }
             }
             Inbound::Disconnected { stream, unsent } => {
@@ -326,7 +580,7 @@ impl Sender {
                             e.type_name
                         ))))
                     };
-                    let _ = e.tx.send(outcome);
+                    e.waiter.finish(outcome);
                 }
             }
             Inbound::Request { .. } => {} // the dispatcher's business
@@ -346,16 +600,8 @@ impl Sender {
         opts: SendOptions,
     ) -> Result<Vec<u8>, MessagingError> {
         let policy = opts.retry.or_else(|| self.retry.clone());
-        if policy.as_ref().is_some_and(|p| p.max_attempts == 0) {
-            return Err(MessagingError::InvalidMessage(format!(
-                "retry policy for '{type_name}' has max_attempts 0; it must be at least 1 (1 = no retry)"
-            )));
-        }
         let headers = self.headers(opts.authorization.clone());
-        let priority = opts
-            .priority
-            .or_else(|| self.priorities.get(type_name).copied())
-            .unwrap_or(0);
+        let priority = self.priority(type_name, opts.priority);
         let chosen = chosen_timeout(opts.timeout, self.default_timeout);
         let routing_key = opts.routing_key.unwrap_or_default();
         let call = Attempt {
@@ -365,14 +611,48 @@ impl Sender {
             headers: &headers,
             priority,
         };
+        self.retrying(kind, type_name, policy, chosen, &routing_key, |timeout| {
+            self.attempt(&call, &payload, timeout)
+        })
+        .await
+    }
+
+    /// `priority` for this call, else `Config.hub_priorities` for the type, else 0.
+    fn priority(&self, type_name: &str, priority: Option<i32>) -> i32 {
+        priority
+            .or_else(|| self.priorities.get(type_name).copied())
+            .unwrap_or(0)
+    }
+
+    /// Runs `attempt` under `policy` (see [`request`](Self::request)): without a policy (or with
+    /// one attempt) once with the `chosen` timeout; otherwise each attempt gets what is left of the
+    /// budget.
+    async fn retrying<T, F, Fut>(
+        &self,
+        kind: RequestKind,
+        type_name: &str,
+        policy: Option<RetryPolicy>,
+        chosen: Option<Duration>,
+        routing_key: &str,
+        mut attempt: F,
+    ) -> Result<T, MessagingError>
+    where
+        F: FnMut(Option<Duration>) -> Fut,
+        Fut: Future<Output = Result<T, MessagingError>>,
+    {
+        if policy.as_ref().is_some_and(|p| p.max_attempts == 0) {
+            return Err(MessagingError::InvalidMessage(format!(
+                "retry policy for '{type_name}' has max_attempts 0; it must be at least 1 (1 = no retry)"
+            )));
+        }
         let policy = match policy {
             Some(p) if p.max_attempts > 1 => p,
-            _ => return self.attempt(&call, &payload, chosen).await,
+            _ => return attempt(chosen).await,
         };
         let attempts = policy.max_attempts;
 
         let budget = retry_budget(
-            self.hubs.handshake_for(&routing_key).as_ref(),
+            self.hubs.handshake_for(routing_key).as_ref(),
             type_name,
             chosen,
         );
@@ -380,33 +660,216 @@ impl Sender {
         let min_remaining = policy.initial_backoff.max(RETRY_MIN_REMAINING);
         // The first attempt is never gated and gets the whole budget.
         let mut remaining = budget.saturating_sub(started.elapsed());
-        let mut attempt = 1;
+        let mut n = 1;
         loop {
             let timeout = remaining.max(MIN_TIMEOUT);
-            let result = self.attempt(&call, &payload, Some(timeout)).await;
-            let error = match result {
-                Ok(bytes) => return Ok(bytes),
+            let error = match attempt(Some(timeout)).await {
+                Ok(value) => return Ok(value),
                 Err(e) => e,
             };
-            if attempt >= attempts || !retry::is_retryable(kind, &error) {
+            if n >= attempts || !retry::is_retryable(kind, &error) {
                 return Err(error);
             }
-            let wait = policy.jittered_backoff(attempt);
+            let wait = policy.jittered_backoff(n);
             // What the next attempt would have, from the moment its wait is over.
             remaining = match budget.checked_sub(started.elapsed() + wait) {
                 Some(left) if left >= min_remaining => left,
                 _ => {
                     tracing::debug!(
                         r#type = type_name,
-                        attempt,
+                        attempt = n,
                         "no room left in the budget for a retry: {error}"
                     );
                     return Err(error);
                 }
             };
-            tracing::debug!(r#type = type_name, attempt, retry_in = ?wait, "retrying: {error}");
+            tracing::debug!(r#type = type_name, attempt = n, retry_in = ?wait, "retrying: {error}");
             tokio::time::sleep(wait).await;
-            attempt += 1;
+            n += 1;
+        }
+    }
+
+    /// Asks every live instance of every owner of `Q` (ADR 0017) and collects their answers until
+    /// the hub's `ReplyEnd`: one [`ScatterPart`] per answer in arrival order, with the counts of
+    /// failed parts and of targets that timed out. Partial answers are answers: a gather where
+    /// some targets failed or timed out still succeeds.
+    ///
+    /// Sent to one hub whose `RegisterAck` lists `scatter-gather` (unkeyed round-robin over
+    /// those). Fails at once, without sending anything, with
+    /// [`MessagingError::UnsupportedByHub`] when no hub lists it (a P3 or older hub, or a legacy
+    /// hub). Before any target: no live target is `NoHandler`, a command type `InvalidMessage`, a
+    /// hub `UNSUPPORTED` answer `UnsupportedByHub`. A hub stream lost before the end fails the
+    /// call with `HubConnectionLost` (the parts received are dropped), the local guard (the hub's
+    /// bound plus [`LOCAL_GUARD_MARGIN`]) with `Timeout`.
+    ///
+    /// `Config.hub_retry` applies to the whole gather, for the same errors as a unary query: a
+    /// retry sends a new gather with a fresh id and starts collecting from scratch.
+    pub async fn scatter_gather<Q: Query>(
+        &self,
+        query: &Q,
+        options: ScatterOptions,
+    ) -> Result<ScatterResult<Q::Reply>, MessagingError> {
+        let call = Arc::new(self.scatter_call(Q::TYPE, codec::encode(query)?, &options));
+        let chosen = chosen_timeout(options.timeout, self.default_timeout);
+        let call = &call;
+        self.retrying(
+            RequestKind::Query,
+            Q::TYPE,
+            self.retry.clone(),
+            chosen,
+            "",
+            |timeout| async move {
+                let mut gathering = self.open_gather(call, timeout).await?;
+                let mut parts = Vec::new();
+                while let Some(part) = gathering.next().await {
+                    parts.push(part?);
+                }
+                Ok(assemble::<Q::Reply>(parts, gathering.end.as_ref()))
+            },
+        )
+        .await
+    }
+
+    /// [`scatter_gather`](Self::scatter_gather) as a stream: each part as it arrives, completing
+    /// on the hub's `ReplyEnd`. An error is the last item. `Config.hub_retry` applies until the
+    /// first part arrives (a retry then starts a new gather); once a part was yielded, a failure
+    /// ends the stream with that error. Dropping the stream abandons the gather (later parts are
+    /// ignored).
+    pub fn scatter_gather_stream<'a, Q: Query>(
+        &'a self,
+        query: &Q,
+        options: ScatterOptions,
+    ) -> impl Stream<Item = Result<ScatterPart<Q::Reply>, MessagingError>> + Send + use<'a, Q> {
+        let call = codec::encode(query)
+            .map(|payload| Arc::new(self.scatter_call(Q::TYPE, payload, &options)));
+        let chosen = chosen_timeout(options.timeout, self.default_timeout);
+        futures::stream::unfold(StreamState::Start(call), move |state| async move {
+            match state {
+                StreamState::Start(Err(e)) => Some((Err(e), StreamState::Done)),
+                StreamState::Start(Ok(call)) => {
+                    // Retried (whole new gathers) until the first part, the end or a final error.
+                    let opened = self
+                        .retrying(
+                            RequestKind::Query,
+                            Q::TYPE,
+                            self.retry.clone(),
+                            chosen,
+                            "",
+                            |timeout| {
+                                let call = Arc::clone(&call);
+                                async move {
+                                    let mut gathering = self.open_gather(&call, timeout).await?;
+                                    match gathering.next().await {
+                                        Some(Ok(part)) => Ok(Some((gathering, part))),
+                                        Some(Err(e)) => Err(e),
+                                        None => Ok(None),
+                                    }
+                                }
+                            },
+                        )
+                        .await;
+                    match opened {
+                        Ok(Some((gathering, part))) => {
+                            Some((Ok(decode_part(part)), StreamState::Open(gathering)))
+                        }
+                        Ok(None) => None,
+                        Err(e) => Some((Err(e), StreamState::Done)),
+                    }
+                }
+                StreamState::Open(mut gathering) => match gathering.next().await {
+                    Some(Ok(part)) => Some((Ok(decode_part(part)), StreamState::Open(gathering))),
+                    Some(Err(e)) => Some((Err(e), StreamState::Done)),
+                    None => None,
+                },
+                StreamState::Done => None,
+            }
+        })
+    }
+
+    fn scatter_call(
+        &self,
+        type_name: &'static str,
+        payload: Vec<u8>,
+        options: &ScatterOptions,
+    ) -> ScatterCall {
+        ScatterCall {
+            type_name,
+            payload,
+            headers: self.headers(None),
+            priority: self.priority(type_name, options.priority),
+            max_results: options.max_results,
+        }
+    }
+
+    /// Writes a new scatter-gather of `call` (fresh id) to a hub that shares the capability.
+    async fn open_gather(
+        &self,
+        call: &Arc<ScatterCall>,
+        chosen: Option<Duration>,
+    ) -> Result<Gathering<'_>, MessagingError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let (events, guard) = self.write_gather(&id, call, chosen).await?;
+        Ok(Gathering {
+            sender: self,
+            call: Arc::clone(call),
+            chosen,
+            id,
+            events,
+            deadline: tokio::time::Instant::now() + guard,
+            moves: 0,
+            end: None,
+            done: false,
+        })
+    }
+
+    /// Writes scatter-gather `id` to a hub whose ack lists `scatter-gather`, its pending entry
+    /// recorded while the stream is current. Returns its events and the local guard.
+    async fn write_gather(
+        &self,
+        id: &str,
+        call: &ScatterCall,
+        chosen: Option<Duration>,
+    ) -> Result<(mpsc::UnboundedReceiver<GatherEvent>, Duration), MessagingError> {
+        let mut events = None;
+        let sent = self
+            .hubs
+            .send_where("", Some(SCATTER_GATHER), |stream, handshake| {
+                let (timeout_ms, guard) = request_timing(handshake, call.type_name, chosen);
+                let (tx, rx) = mpsc::unbounded_channel();
+                events = Some(rx);
+                self.pending.lock().unwrap().insert(
+                    id.to_string(),
+                    Entry {
+                        type_name: call.type_name.to_string(),
+                        stream,
+                        waiter: Waiter::Scatter(tx),
+                    },
+                );
+                let request = proto::Request {
+                    id: id.to_string(),
+                    kind: RequestKind::Query as i32,
+                    r#type: call.type_name.to_string(),
+                    payload: call.payload.clone(),
+                    headers: call.headers.clone(),
+                    timeout_ms,
+                    priority: call.priority,
+                    mode: RequestMode::ScatterGather as i32,
+                    max_results: call.max_results,
+                    ..proto::Request::default()
+                };
+                let msg = ClientMessage {
+                    message: Some(client_message::Message::Request(request)),
+                };
+                (msg, guard)
+            })
+            .await;
+        match (sent, events) {
+            (Ok((_, guard)), Some(events)) => Ok((events, guard)),
+            (Err(e), _) => {
+                self.take(id);
+                Err(e)
+            }
+            (Ok(_), None) => unreachable!("a written request was built"),
         }
     }
 
@@ -475,7 +938,7 @@ impl Sender {
                         Entry {
                             type_name: type_name.to_string(),
                             stream,
-                            tx,
+                            waiter: Waiter::Unary(tx),
                         },
                     );
                     let request = proto::Request {
@@ -535,13 +998,11 @@ impl Sender {
             .map(|(_, e)| e)
             .collect();
         for e in lost {
-            let _ =
-                e.tx.send(Outcome::Done(Err(MessagingError::HubConnectionLost(
-                    format!(
-                        "{reason} before the reply to '{}'; the outcome is unknown",
-                        e.type_name
-                    ),
-                ))));
+            let error = MessagingError::HubConnectionLost(format!(
+                "{reason} before the reply to '{}'; the outcome is unknown",
+                e.type_name
+            ));
+            e.waiter.finish(Outcome::Done(Err(error)));
         }
     }
 
@@ -552,6 +1013,16 @@ impl Sender {
 
     fn take(&self, request_id: &str) -> Option<Entry> {
         self.pending.lock().unwrap().remove(request_id)
+    }
+
+    /// Takes the entry of `request_id` if its waiter is the right kind.
+    fn take_if(&self, request_id: &str, kind: impl Fn(&Waiter) -> bool) -> Option<Entry> {
+        let mut pending = self.pending.lock().unwrap();
+        if pending.get(request_id).is_some_and(|e| kind(&e.waiter)) {
+            pending.remove(request_id)
+        } else {
+            None
+        }
     }
 }
 
@@ -653,6 +1124,173 @@ mod tests {
             S(5),
             "zero is unset"
         );
+    }
+
+    fn part(service: &str, payload: &[u8], error: Option<ErrorCode>) -> proto::ReplyPart {
+        proto::ReplyPart {
+            request_id: "g".into(),
+            payload: payload.to_vec(),
+            error: error.map(|code| proto::Error {
+                request_id: "g".into(),
+                code: code as i32,
+                message: "boom".into(),
+                details: vec![],
+            }),
+            responder_service: service.into(),
+            responder_instance: format!("{service}-1"),
+            seq: 0,
+        }
+    }
+
+    #[test]
+    fn a_gather_assembles_its_parts_in_arrival_order_and_counts_the_failures() {
+        let parts = vec![
+            part("b", br#"{"n":2}"#, None),
+            part("a", b"", Some(ErrorCode::HandlerDisconnected)),
+            part("c", b"not json", None),
+            part("d", br#"{"n":4}"#, None),
+        ];
+        let end = proto::ReplyEnd {
+            request_id: "g".into(),
+            parts: 4,
+            failed: 1,
+            timed_out: 2,
+            ..Default::default()
+        };
+        let r: ScatterResult<serde_json::Value> = assemble(parts, Some(&end));
+        let who: Vec<_> = r.parts.iter().map(|p| p.service.as_str()).collect();
+        assert_eq!(who, ["b", "a", "c", "d"]);
+        assert_eq!(r.parts[0].instance, "b-1");
+        assert_eq!(r.parts[0].outcome.as_ref().unwrap()["n"], 2);
+        let e = r.parts[1].outcome.as_ref().unwrap_err();
+        assert_eq!(
+            (e.code, e.message.as_str()),
+            (ErrorCode::HandlerDisconnected, "boom")
+        );
+        assert!(matches!(
+            e.clone().into_error("t.X"),
+            MessagingError::HandlerDisconnected(t) if t == "t.X"
+        ));
+        let undecodable = r.parts[2].outcome.as_ref().unwrap_err();
+        assert_eq!(undecodable.code, ErrorCode::Unspecified);
+        assert!(undecodable.message.contains("c/c-1"), "{undecodable}");
+        // The handler's failure plus the reply this client could not decode.
+        assert_eq!((r.failed, r.timed_out), (2, 2));
+        // A unit reply accepts the empty object, like a unary reply.
+        let unit: ScatterResult<()> = assemble(vec![part("a", b"{}", None)], None);
+        assert!(unit.parts[0].outcome.is_ok());
+    }
+
+    fn idle_sender() -> Arc<Sender> {
+        let (tx, _rx) = mpsc::channel(1);
+        let conn = HubConnection::new(
+            super::super::HubSettings::default(),
+            "svc".into(),
+            "i".into(),
+            tx,
+        );
+        Sender::with_settings(conn, SenderSettings::default())
+    }
+
+    fn pending(sender: &Sender, id: &str, waiter: Waiter) {
+        sender.pending.lock().unwrap().insert(
+            id.into(),
+            Entry {
+                type_name: "t.X".into(),
+                stream: 7,
+                waiter,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn parts_and_ends_reach_their_gather_only_and_the_end_completes_it() {
+        let sender = idle_sender();
+        let (tx, mut gather) = mpsc::unbounded_channel();
+        pending(&sender, "g", Waiter::Scatter(tx));
+        let (unary_tx, mut unary) = oneshot::channel();
+        pending(&sender, "u", Waiter::Unary(unary_tx));
+
+        for id in ["nobody", "u"] {
+            sender.on_inbound(Inbound::Part(proto::ReplyPart {
+                request_id: id.into(),
+                ..Default::default()
+            }));
+            sender.on_inbound(Inbound::End(proto::ReplyEnd {
+                request_id: id.into(),
+                ..Default::default()
+            }));
+        }
+        assert!(
+            unary.try_recv().is_err(),
+            "a unary request ignores parts and ends"
+        );
+        assert!(gather.try_recv().is_err());
+        // A reply never answers a gather.
+        sender.on_inbound(Inbound::Reply(proto::Reply {
+            request_id: "g".into(),
+            result: None,
+        }));
+        assert!(gather.try_recv().is_err());
+        assert_eq!(sender.in_flight(), 2);
+
+        sender.on_inbound(Inbound::Part(proto::ReplyPart {
+            request_id: "g".into(),
+            seq: 0,
+            ..Default::default()
+        }));
+        sender.on_inbound(Inbound::End(proto::ReplyEnd {
+            request_id: "g".into(),
+            parts: 1,
+            ..Default::default()
+        }));
+        assert!(matches!(gather.try_recv(), Ok(GatherEvent::Part(p)) if p.seq == 0));
+        assert!(matches!(gather.try_recv(), Ok(GatherEvent::End(e)) if e.parts == 1));
+        assert_eq!(sender.in_flight(), 1, "the end takes the gather's entry");
+        // Parts after the end are ignored.
+        sender.on_inbound(Inbound::Part(proto::ReplyPart {
+            request_id: "g".into(),
+            ..Default::default()
+        }));
+        assert!(gather.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_lost_stream_or_an_error_ends_a_gather() {
+        let sender = idle_sender();
+        let (tx, mut lost) = mpsc::unbounded_channel();
+        pending(&sender, "g1", Waiter::Scatter(tx));
+        let (tx, mut unwritten) = mpsc::unbounded_channel();
+        pending(&sender, "g2", Waiter::Scatter(tx));
+        let (tx, mut rejected) = mpsc::unbounded_channel();
+        pending(&sender, "g3", Waiter::Scatter(tx));
+        sender.on_inbound(Inbound::Error(proto::Error {
+            request_id: "g3".into(),
+            code: ErrorCode::NoHandler as i32,
+            message: "no handler".into(),
+            details: vec![],
+        }));
+        sender.on_inbound(Inbound::Disconnected {
+            stream: 7,
+            unsent: vec!["g2".into()],
+        });
+        assert!(matches!(
+            lost.try_recv(),
+            Ok(GatherEvent::Ended(Outcome::Done(Err(
+                MessagingError::HubConnectionLost(_)
+            ))))
+        ));
+        assert!(matches!(
+            unwritten.try_recv(),
+            Ok(GatherEvent::Ended(Outcome::NotWritten))
+        ));
+        assert!(matches!(
+            rejected.try_recv(),
+            Ok(GatherEvent::Ended(Outcome::Done(Err(
+                MessagingError::NoHandler(_)
+            ))))
+        ));
+        assert_eq!(sender.in_flight(), 0);
     }
 
     #[test]

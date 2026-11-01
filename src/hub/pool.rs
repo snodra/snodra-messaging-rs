@@ -49,7 +49,9 @@ use tokio_util::sync::CancellationToken;
 use crate::error::MessagingError;
 use crate::proto::{ClientMessage, InstanceStatus, client_message};
 
-use super::connection::{Handshake, Hooks, HubConnection, HubSettings, Inbound, StreamId};
+use super::connection::{
+    Handshake, Hooks, HubConnection, HubSettings, Inbound, RegisteredTypes, StreamId,
+};
 use super::targets::{HubTargets, permit_share, rank_keyed, rank_round_robin, resolved_targets};
 
 /// The longest a vanished DNS address stays open to finish its requests.
@@ -109,7 +111,7 @@ pub struct HubPool {
     service_name: String,
     instance_id: String,
     inbound: mpsc::Sender<Inbound>,
-    types: Mutex<(Vec<String>, Vec<String>)>,
+    types: Mutex<RegisteredTypes>,
     members: Mutex<Vec<Arc<Member>>>,
     /// hub id → the address of the connection that reaches it.
     owners: Mutex<HashMap<String, String>>,
@@ -188,7 +190,7 @@ impl HubPool {
             service_name,
             instance_id,
             inbound,
-            types: Mutex::new((vec![], vec![])),
+            types: Mutex::new(RegisteredTypes::default()),
             members: Mutex::new(vec![]),
             owners: Mutex::new(HashMap::new()),
             turn: AtomicUsize::new(0),
@@ -217,11 +219,21 @@ impl HubPool {
         &self.targets
     }
 
-    /// The types announced in every `Register` on every hub; set before [`start`](Self::start).
+    /// The command and exclusive query types announced in every `Register` on every hub, no
+    /// shared query types; set before [`start`](Self::start).
     pub fn set_types(&self, command_types: Vec<String>, query_types: Vec<String>) {
-        *self.types.lock().unwrap() = (command_types.clone(), query_types.clone());
+        self.set_registered_types(RegisteredTypes {
+            commands: command_types,
+            queries: query_types,
+            shared_queries: vec![],
+        });
+    }
+
+    /// The types announced in every `Register` on every hub; set before [`start`](Self::start).
+    pub fn set_registered_types(&self, types: RegisteredTypes) {
+        *self.types.lock().unwrap() = types.clone();
         for m in self.members() {
-            m.conn.set_types(command_types.clone(), query_types.clone());
+            m.conn.set_registered_types(types.clone());
         }
     }
 
@@ -338,10 +350,31 @@ impl HubPool {
     pub(crate) async fn send_with<T>(
         &self,
         routing_key: &str,
+        build: impl FnMut(StreamId, &Handshake) -> (ClientMessage, T),
+    ) -> Result<(StreamId, T), MessagingError> {
+        self.send_where(routing_key, None, build).await
+    }
+
+    /// [`send_with`](Self::send_with) over the live hubs whose ack lists `capability` only
+    /// (`None`: every live hub). `UnsupportedByHub` when hubs are live but none lists it (nothing
+    /// was written); `HubUnavailable` when none is live.
+    pub(crate) async fn send_where<T>(
+        &self,
+        routing_key: &str,
+        capability: Option<&str>,
         mut build: impl FnMut(StreamId, &Handshake) -> (ClientMessage, T),
     ) -> Result<(StreamId, T), MessagingError> {
         let mut last = None;
-        for conn in self.ranked(routing_key) {
+        let ranked = self.ranked(routing_key, capability);
+        if ranked.is_empty()
+            && let Some(capability) = capability
+            && !self.live().is_empty()
+        {
+            return Err(MessagingError::UnsupportedByHub(format!(
+                "no hub this instance is registered on lists the \"{capability}\" capability; it needs a newer kraken-hub"
+            )));
+        }
+        for conn in ranked {
             match conn
                 .send_with(|stream, handshake| build(stream, handshake))
                 .await
@@ -399,9 +432,16 @@ impl HubPool {
             .collect()
     }
 
-    /// The live hubs in the order a request with `routing_key` tries them.
-    fn ranked(&self, routing_key: &str) -> Vec<Arc<HubConnection>> {
-        let live = self.live();
+    /// The live hubs (those whose ack lists `capability`, when given) in the order a request with
+    /// `routing_key` tries them.
+    fn ranked(&self, routing_key: &str, capability: Option<&str>) -> Vec<Arc<HubConnection>> {
+        let mut live = self.live();
+        if let Some(capability) = capability {
+            live.retain(|l| l.handshake.shares(capability));
+        }
+        if live.is_empty() {
+            return vec![];
+        }
         let order = if routing_key.is_empty() {
             rank_round_robin(live.len(), self.turn.fetch_add(1, Ordering::Relaxed))
         } else {
@@ -425,8 +465,7 @@ impl HubPool {
             self.instance_id.clone(),
             self.inbound.clone(),
         );
-        let (commands, queries) = self.types.lock().unwrap().clone();
-        conn.set_types(commands, queries);
+        conn.set_registered_types(self.types.lock().unwrap().clone());
         let weak = Arc::downgrade(self);
         let max = self.settings.max_concurrent_handlers;
         conn.set_hooks(Hooks {
@@ -602,8 +641,8 @@ impl HubPool {
                     tracing::info!(service = %self.service_name, address, "hub address is back in DNS; kept");
                     m.set_role(Role::Active);
                     // Announce the types again (the drain had withdrawn them).
-                    let (commands, queries) = self.types.lock().unwrap().clone();
-                    m.conn.set_types(commands, queries);
+                    m.conn
+                        .set_registered_types(self.types.lock().unwrap().clone());
                     let conn = Arc::clone(&m.conn);
                     tokio::spawn(async move {
                         if let Err(e) = conn.reregister().await {
@@ -635,7 +674,7 @@ impl HubPool {
         let was = member.role();
         member.set_role(Role::Draining);
         if was != Role::Duplicate {
-            member.conn.set_types(vec![], vec![]);
+            member.conn.set_registered_types(RegisteredTypes::default());
         }
         let me = Arc::clone(self);
         let task = tokio::spawn(async move {

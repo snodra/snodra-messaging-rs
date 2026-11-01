@@ -19,6 +19,11 @@
 //!   shares `instance-status` and gets `InstanceStatus` reports; `kraken-hub:p2`
 //!   (`KRAKEN_HUB_P2_IMAGE`) and the v1 baseline do not share it and get none, and work as before.
 //!
+//! - P4a (ADR 0017): the new hub shares `scatter-gather`. Against `kraken-hub:p3`
+//!   (`KRAKEN_HUB_P3_IMAGE`) and the v1 baseline a scatter-gather fails with `UnsupportedByHub`
+//!   (nothing is sent), a unary query still works, and a shared query type is not registered
+//!   there (the field is ignored: a point query to it is `NoHandler`).
+//!
 //! A missing image fails the test with the command that builds it. No Kafka or MongoDB: the
 //! participants are a `HubConnection` and a `Sender` each; a pass-through (`PermitTap`) records the
 //! `Permits` and `InstanceStatus` messages a participant writes.
@@ -31,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use kraken_messaging::hub::{
     CLIENT_VERSION, Handshake, HubConnection, HubPool, HubSettings, Inbound, PERMIT_FLUSH_AFTER,
-    SendOptions, Sender, SenderSettings,
+    RegisteredTypes, ScatterOptions, SendOptions, Sender, SenderSettings,
 };
 use kraken_messaging::proto::{self, ClientMessage, client_message, reply};
 use kraken_messaging::{Command, MessagingError, Query, RetryPolicy, message_type};
@@ -75,6 +80,7 @@ impl Command for Hang {
 fn handler_delay(type_name: &str) -> Duration {
     match type_name {
         "compat.Fast" => Duration::from_millis(2_000), // under the 5 s default
+        "compat.Lookup" | "compat.Shared" => Duration::ZERO,
         "compat.Slow" => Duration::from_millis(3_000), // over its 1.5 s override
         _ => Duration::from_secs(30),                  // compat.Hang: never in time
     }
@@ -93,6 +99,19 @@ impl Peer {
 
 /// A participant: registers `commands`, answers each after [`handler_delay`] on its arrival stream.
 async fn peer(address: &str, service: &str, commands: &[&str]) -> Peer {
+    peer_with(
+        address,
+        service,
+        RegisteredTypes {
+            commands: commands.iter().map(|c| c.to_string()).collect(),
+            ..RegisteredTypes::default()
+        },
+    )
+    .await
+}
+
+/// A participant registering `types`, answering like [`peer`].
+async fn peer_with(address: &str, service: &str, types: RegisteredTypes) -> Peer {
     let (tx, mut rx) = mpsc::channel::<Inbound>(64);
     let settings = HubSettings {
         address: address.to_string(),
@@ -106,7 +125,7 @@ async fn peer(address: &str, service: &str, commands: &[&str]) -> Peer {
         uuid::Uuid::new_v4().to_string(),
         tx,
     );
-    conn.set_types(commands.iter().map(|c| c.to_string()).collect(), vec![]);
+    conn.set_registered_types(types);
     let sender = Sender::new(Arc::clone(&conn), None, false);
     let forward = Arc::clone(&sender);
     tokio::spawn(async move {
@@ -198,7 +217,7 @@ async fn new_hub_acks_with_its_configured_values_and_applies_type_overrides() {
     assert_eq!(ack.protocol_version, 2);
     assert_eq!(
         ack.capabilities,
-        ["flow-control", "instance-status"],
+        ["flow-control", "instance-status", "scatter-gather"],
         "the hub shares what we declared"
     );
     assert_eq!(ack.heartbeat_interval_ms, 3_000);
@@ -1206,4 +1225,77 @@ async fn p2_hub_single_target_works_and_gets_no_instance_status() {
 async fn baseline_hub_single_target_pool_runs_in_legacy_mode_without_instance_status() {
     require_docker!();
     single_target_pool(HubImage::Baseline).await;
+}
+
+#[derive(Serialize, Deserialize)]
+struct Lookup {}
+message_type!(Lookup, "compat.Lookup");
+impl Query for Lookup {
+    type Reply = ();
+}
+
+#[derive(Serialize, Deserialize)]
+struct SharedLookup {}
+message_type!(SharedLookup, "compat.Shared");
+impl Query for SharedLookup {
+    type Reply = ();
+}
+
+/// A hub before P4a: no `scatter-gather` in its ack (none at all for the baseline), so a
+/// scatter-gather fails with `UnsupportedByHub` before anything is sent, while a unary query to an
+/// exclusive owner works as before. The hub ignores `shared_query_types`: the registration is
+/// accepted, the shared type is simply not there.
+async fn scatter_gather_unsupported(image: HubImage) {
+    let hub = hub_with(HubOptions::new(image)).await;
+    let owner = peer_with(
+        &hub.address,
+        "compat-owner",
+        RegisteredTypes {
+            queries: vec!["compat.Lookup".into()],
+            shared_queries: vec!["compat.Shared".into()],
+            ..RegisteredTypes::default()
+        },
+    )
+    .await;
+    let a = peer(&hub.address, "compat-a", &[]).await;
+    let handshake = a.conn.handshake().unwrap();
+    assert!(!handshake.scatter_gather(), "{handshake:?}");
+
+    let e = a
+        .sender
+        .scatter_gather(&Lookup {}, ScatterOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, MessagingError::UnsupportedByHub(_)),
+        "{image:?}: {e:?}"
+    );
+    assert_eq!(a.sender.in_flight(), 0);
+    a.sender
+        .send_query(&Lookup {}, SendOptions::default())
+        .await
+        .expect("unary query on an older hub");
+    let e = a
+        .sender
+        .send_query(&SharedLookup {}, SendOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, MessagingError::NoHandler(_)),
+        "{image:?}: {e:?}"
+    );
+    a.shutdown().await;
+    owner.shutdown().await;
+}
+
+#[tokio::test]
+async fn p3_hub_scatter_gather_is_unsupported_by_hub_and_unary_still_works() {
+    require_docker!();
+    scatter_gather_unsupported(HubImage::P3).await;
+}
+
+#[tokio::test]
+async fn baseline_hub_scatter_gather_is_unsupported_by_hub_and_unary_still_works() {
+    require_docker!();
+    scatter_gather_unsupported(HubImage::Baseline).await;
 }

@@ -59,8 +59,11 @@ pub const FLOW_CONTROL: &str = "flow-control";
 /// The multi-hub status capability (ADR 0016): `InstanceStatus` reports go only to a hub whose ack
 /// lists it.
 pub const INSTANCE_STATUS: &str = "instance-status";
+/// The scatter-gather capability (ADR 0017): `Request.mode = SCATTER_GATHER`, answered with
+/// `ReplyPart`s and a `ReplyEnd`; sent only to a hub whose ack lists it.
+pub const SCATTER_GATHER: &str = "scatter-gather";
 /// Optional protocol features this client declares (`Register.capabilities`).
-pub const CAPABILITIES: &[&str] = &[FLOW_CONTROL, INSTANCE_STATUS];
+pub const CAPABILITIES: &[&str] = &[FLOW_CONTROL, INSTANCE_STATUS, SCATTER_GATHER];
 /// A `Permits` message is sent as soon as this many grants are pending, or as soon as the hub holds
 /// no more than `min(PERMIT_BATCH, initial_permits / 2)` permits for the stream (the low-water mark)...
 pub const PERMIT_BATCH: u32 = 16;
@@ -163,7 +166,13 @@ impl Handshake {
         self.shares(INSTANCE_STATUS)
     }
 
-    fn shares(&self, capability: &str) -> bool {
+    /// True when the hub shares `scatter-gather`: it fans a scatter-gather query out and knows
+    /// `Register.shared_query_types` (an older hub ignores that field).
+    pub fn scatter_gather(&self) -> bool {
+        self.shares(SCATTER_GATHER)
+    }
+
+    pub(crate) fn shares(&self, capability: &str) -> bool {
         self.ack()
             .is_some_and(|a| a.capabilities.iter().any(|c| c == capability))
     }
@@ -407,6 +416,27 @@ impl ReplyTo {
     }
 }
 
+/// The types an instance announces in every `Register`.
+///
+/// `queries` are exclusive (one owning service), `shared_queries` may be owned by many services
+/// (ADR 0017). Every registrant of a type must agree on exclusive vs shared: the hub rejects the
+/// later `Register` with `ALREADY_EXISTS` otherwise.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RegisteredTypes {
+    pub commands: Vec<String>,
+    pub queries: Vec<String>,
+    pub shared_queries: Vec<String>,
+}
+
+impl RegisteredTypes {
+    fn sorted(mut self) -> Self {
+        self.commands.sort();
+        self.queries.sort();
+        self.shared_queries.sort();
+        self
+    }
+}
+
 /// What the hub sends us, handed to the owner (dispatcher and sender) in order.
 pub enum Inbound {
     /// A request for one of our handlers; the reply goes to `reply_to`, the stream it arrived on.
@@ -416,6 +446,10 @@ pub enum Inbound {
     },
     Reply(proto::Reply),
     Error(proto::Error),
+    /// One answer of a scatter-gather this client sent (ADR 0017).
+    Part(proto::ReplyPart),
+    /// The end of a scatter-gather this client sent.
+    End(proto::ReplyEnd),
     /// That stream was lost. `unsent`: the ids of requests still in its outbound buffer when it
     /// was lost (never taken by the transport, so never written): they may go to another hub with
     /// the same id. Every other request written to it and still pending has an unknown outcome.
@@ -436,6 +470,8 @@ impl std::fmt::Debug for Inbound {
             ),
             Inbound::Reply(r) => write!(f, "Reply(request_id={})", r.request_id),
             Inbound::Error(e) => write!(f, "Error(request_id={}, code={})", e.request_id, e.code),
+            Inbound::Part(p) => write!(f, "Part(request_id={}, seq={})", p.request_id, p.seq),
+            Inbound::End(e) => write!(f, "End(request_id={}, parts={})", e.request_id, e.parts),
             Inbound::Disconnected { stream, unsent } => {
                 write!(f, "Disconnected(stream={stream}, unsent={})", unsent.len())
             }
@@ -456,7 +492,7 @@ pub struct HubConnection {
     service_name: String,
     instance_id: String,
     inbound: mpsc::Sender<Inbound>,
-    types: Mutex<(Vec<String>, Vec<String>)>,
+    types: Mutex<RegisteredTypes>,
     live: Mutex<Option<Live>>,
     connected: AtomicBool,
     handshake: watch::Sender<Option<Handshake>>,
@@ -517,7 +553,7 @@ impl HubConnection {
             service_name,
             instance_id,
             inbound,
-            types: Mutex::new((vec![], vec![])),
+            types: Mutex::new(RegisteredTypes::default()),
             live: Mutex::new(None),
             connected: AtomicBool::new(false),
             handshake,
@@ -532,13 +568,20 @@ impl HubConnection {
         })
     }
 
-    /// The types announced in every `Register`; set before [`start`](Self::start).
+    /// The command and exclusive query types announced in every `Register`, no shared query
+    /// types; set before [`start`](Self::start). See
+    /// [`set_registered_types`](Self::set_registered_types).
     pub fn set_types(&self, command_types: Vec<String>, query_types: Vec<String>) {
-        let mut c = command_types;
-        let mut q = query_types;
-        c.sort();
-        q.sort();
-        *self.types.lock().unwrap() = (c, q);
+        self.set_registered_types(RegisteredTypes {
+            commands: command_types,
+            queries: query_types,
+            shared_queries: vec![],
+        });
+    }
+
+    /// The types announced in every `Register`; set before [`start`](Self::start).
+    pub fn set_registered_types(&self, types: RegisteredTypes) {
+        *self.types.lock().unwrap() = types.sorted();
     }
 
     pub fn instance_id(&self) -> &str {
@@ -911,12 +954,11 @@ impl HubConnection {
                         }
                         server_message::Message::Reply(r) => self.forward(Inbound::Reply(r)).await?,
                         server_message::Message::Error(e) => self.forward(Inbound::Error(e)).await?,
-                        // Multi-part messages (ADR 0017) answer request modes this client never
-                        // sends yet (it declares no scatter-gather, streaming or subscription).
-                        server_message::Message::Part(_)
-                        | server_message::Message::End(_)
-                        | server_message::Message::Flow(_)
-                        | server_message::Message::Cancel(_) => {
+                        server_message::Message::Part(p) => self.forward(Inbound::Part(p)).await?,
+                        server_message::Message::End(e) => self.forward(Inbound::End(e)).await?,
+                        // Flow and Cancel belong to streaming and subscriptions (P4b, P4c), which
+                        // this client does not declare.
+                        server_message::Message::Flow(_) | server_message::Message::Cancel(_) => {
                             tracing::debug!(service = %self.service_name, "multi-part message ignored");
                         }
                     },
@@ -945,12 +987,12 @@ impl HubConnection {
 
     /// The `Register` of this instance with the types set now.
     fn register(&self, initial_permits: u32) -> ClientMessage {
-        let (commands, queries) = self.types.lock().unwrap().clone();
+        let types = self.types.lock().unwrap().clone();
         let register = Register {
             service_name: self.service_name.clone(),
             instance_id: self.instance_id.clone(),
-            command_types: commands,
-            query_types: queries,
+            command_types: types.commands,
+            query_types: types.queries,
             protocol_version: PROTOCOL_VERSION,
             capabilities: CAPABILITIES.iter().map(|c| c.to_string()).collect(),
             credentials: None,
@@ -958,7 +1000,7 @@ impl HubConnection {
             initial_permits,
             load_factor: self.settings.load_factor,
             tags: self.settings.tags.clone(),
-            shared_query_types: Vec::new(),
+            shared_query_types: types.shared_queries,
         };
         ClientMessage {
             message: Some(client_message::Message::Register(register)),
@@ -1186,7 +1228,10 @@ mod tests {
     #[test]
     fn client_identity_constants() {
         assert_eq!(PROTOCOL_VERSION, 2);
-        assert_eq!(CAPABILITIES, ["flow-control", "instance-status"]);
+        assert_eq!(
+            CAPABILITIES,
+            ["flow-control", "instance-status", "scatter-gather"]
+        );
         assert!(CLIENT_VERSION.starts_with("kraken-messaging-rs/"));
         assert_eq!(
             HubSettings::default().backoff_max,

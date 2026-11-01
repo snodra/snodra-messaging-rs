@@ -6,7 +6,7 @@ use std::time::Duration;
 use kraken_messaging::MessagingError;
 use kraken_messaging::hub::{
     CAPABILITIES, CLIENT_VERSION, Handshake, HubConnection, HubSettings, Inbound,
-    PERMIT_FLUSH_AFTER, PROTOCOL_VERSION,
+    PERMIT_FLUSH_AFTER, PROTOCOL_VERSION, RegisteredTypes,
 };
 use kraken_messaging::proto::{
     self, ClientMessage, Heartbeat, Reply, ServerMessage, client_message, reply, server_message,
@@ -62,6 +62,35 @@ async fn registers_with_declared_types() {
     assert_eq!(registers[0].query_types, vec!["t.Q"]);
     assert!(conn.is_connected());
     conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn registers_shared_query_types_apart_and_knows_whether_the_hub_scatters() {
+    let hub = FakeHub::start().await;
+    let (conn, _rx) = connection(settings(hub.address(), 1_000, 50, 500));
+    conn.set_registered_types(RegisteredTypes {
+        commands: vec!["t.Cmd".into()],
+        queries: vec!["t.Q".into()],
+        shared_queries: vec!["t.S2".into(), "t.S1".into()],
+    });
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    let r = &hub.registers().await[0];
+    assert_eq!(r.command_types, vec!["t.Cmd"]);
+    assert_eq!(r.query_types, vec!["t.Q"]);
+    assert_eq!(r.shared_query_types, vec!["t.S1", "t.S2"]);
+    assert!(conn.handshake().unwrap().scatter_gather());
+    conn.shutdown().await;
+
+    // A P3 hub does not share the capability; a legacy hub has no ack at all.
+    hub.set_scatter_gather(false);
+    let (conn, _rx) = connection(settings(hub.address(), 1_000, 50, 500));
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    assert!(!conn.handshake().unwrap().scatter_gather());
+    conn.shutdown().await;
+    assert!(!Handshake::Legacy.scatter_gather());
     hub.stop();
 }
 
@@ -206,7 +235,10 @@ async fn register_declares_protocol_v2_and_client_version() {
     let r = &hub.registers().await[0];
     assert_eq!(r.protocol_version, PROTOCOL_VERSION);
     assert_eq!(r.protocol_version, 2);
-    assert_eq!(r.capabilities, ["flow-control", "instance-status"]);
+    assert_eq!(
+        r.capabilities,
+        ["flow-control", "instance-status", "scatter-gather"]
+    );
     assert_eq!(r.client_version, CLIENT_VERSION);
     assert!(r.client_version.starts_with("kraken-messaging-rs/"));
     assert!(r.credentials.is_none());
@@ -229,7 +261,11 @@ async fn ack_completes_the_handshake_and_its_interval_replaces_the_fallback() {
     assert!(conn.await_registered(Duration::from_secs(5)).await);
     let shared = proto::RegisterAck {
         // we declared them, the hub shares them
-        capabilities: vec!["flow-control".into(), "instance-status".into()],
+        capabilities: vec![
+            "flow-control".into(),
+            "instance-status".into(),
+            "scatter-gather".into(),
+        ],
         ..ack
     };
     assert_eq!(conn.handshake(), Some(Handshake::V2(shared)));

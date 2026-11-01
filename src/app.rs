@@ -6,6 +6,7 @@
 //! let app = builder
 //!     .command::<Shout, _, _>(move |cmd, ctx| { let events = events.clone(); async move { ... } })
 //!     .query::<Reverse, _, _>(|q, ctx| async move { ... })
+//!     .shared_query::<Search, _, _>(|q, ctx| async move { ... }) // many services may own it
 //!     .event::<GreetingDelivered, _, _>(|e, ctx| async move { ... })
 //!     .start()
 //!     .await?;
@@ -222,6 +223,23 @@ impl KrakenMessagingBuilder {
         self
     }
 
+    /// A shared query handler (ADR 0017): several services may own `Q`; a point query goes to one
+    /// instance of any owner, a scatter-gather ([`Sender::scatter_gather`]) to all of them. Every
+    /// service registering `Q` must register it shared, or the hub rejects the later registration
+    /// with `ALREADY_EXISTS`. See [`HandlerRegistry::shared_query`].
+    ///
+    /// # Panics
+    /// When `Q` already has a handler here (shared or exclusive).
+    pub fn shared_query<Q, F, Fut>(mut self, handler: F) -> Self
+    where
+        Q: Query,
+        F: Fn(Q, MessageContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Q::Reply, MessagingError>> + Send + 'static,
+    {
+        self.registry.shared_query::<Q, F, Fut>(handler);
+        self
+    }
+
     pub fn event<E, F, Fut>(mut self, handler: F) -> Self
     where
         E: Event,
@@ -286,7 +304,7 @@ impl KrakenMessagingBuilder {
         let handlers = TaskTracker::new();
         let mut tasks = Vec::new();
 
-        hubs.set_types(registry.command_types(), registry.query_types());
+        hubs.set_registered_types(registry.registered_types());
         hubs.start();
         let loop_sender = Arc::clone(&sender);
         let loop_cancel = cancel.clone();
@@ -335,7 +353,7 @@ impl KrakenMessagingBuilder {
             )?;
             tasks.push(consumer.start(cancel.clone()));
         }
-        tracing::info!(service = %config.service_name, instance = %hubs.instance_id(), hubs = ?hubs.targets(), commands = ?registry.command_types(), queries = ?registry.query_types(), events = ?registry.event_types(), "kraken messaging started");
+        tracing::info!(service = %config.service_name, instance = %hubs.instance_id(), hubs = ?hubs.targets(), commands = ?registry.command_types(), queries = ?registry.query_types(), shared_queries = ?registry.shared_query_types(), events = ?registry.event_types(), "kraken messaging started");
         Ok(KrakenMessaging {
             hubs,
             sender,

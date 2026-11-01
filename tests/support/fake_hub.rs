@@ -17,6 +17,16 @@
 //! adds `count`, never past the stream's cap. The cap starts at `initial_permits` and a
 //! `Permits.grant` above it raises it first (never lowers it). `set_permit_cap(false)` drops the
 //! cap; `set_permit_grants(false)` emulates a hub that predates `Permits.grant`.
+//!
+//! Scatter-gather like kraken-hub (ADR 0017): the ack lists "scatter-gather" when the client
+//! declared it, unless `set_scatter_gather(false)` (a P3 hub). A `Request` with
+//! `mode = SCATTER_GATHER` goes to every stream whose `Register` lists the type in `query_types` or
+//! `shared_query_types` (ordered by service, then instance id) as a unary request `<id>#<n>`; each
+//! answer goes back to the sender as a `ReplyPart` in arrival order, then one `ReplyEnd` once every
+//! target answered, after `max_results` successful parts, or at the deadline (`timeout_ms`, else
+//! 5 s) with the unanswered targets as `timed_out`. A target whose stream ends is a failed part
+//! (`HANDLER_DISCONNECTED`). No target: `NO_HANDLER`; a command: `INVALID_REQUEST`; a session
+//! without the capability: `UNSUPPORTED`. Unary requests still go to the responder only.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -50,6 +60,42 @@ pub fn default_ack() -> proto::RegisterAck {
         context: "default".into(),
         type_timeouts_ms: Default::default(),
     }
+}
+
+/// A stream's registration, for scatter-gather targeting.
+struct Route {
+    service: String,
+    instance: String,
+    commands: Vec<String>,
+    /// Exclusive and shared query types.
+    queries: Vec<String>,
+    /// The session declared "scatter-gather" and the hub shares it.
+    scatter: bool,
+    tx: Outbound,
+}
+
+/// A scatter-gather in progress.
+struct Gather {
+    sender: Outbound,
+    /// target id → (stream number, service, instance).
+    outstanding: HashMap<String, (usize, String, String)>,
+    parts: u32,
+    ok: u32,
+    failed: u32,
+    max_results: u32,
+}
+
+fn server(m: server_message::Message) -> ServerMessage {
+    ServerMessage { message: Some(m) }
+}
+
+fn hub_error(id: &str, code: proto::ErrorCode, message: &str) -> ServerMessage {
+    server(server_message::Message::Error(proto::Error {
+        request_id: id.to_string(),
+        code: code as i32,
+        message: message.to_string(),
+        details: vec![],
+    }))
 }
 
 pub struct State {
@@ -86,6 +132,12 @@ pub struct State {
     sessions: StdMutex<HashMap<String, (usize, CancellationToken)>>,
     evictions: AtomicUsize,
     events: StdMutex<Vec<(Event, std::time::Instant)>>,
+    scatter_gather: AtomicBool,
+    /// stream number → its registration.
+    routes: StdMutex<HashMap<usize, Route>>,
+    /// gather id → the gather; target id → gather id.
+    gathers: StdMutex<HashMap<String, Gather>>,
+    target_of: StdMutex<HashMap<String, String>>,
 }
 
 /// What happened on the fake hub, in order.
@@ -105,6 +157,218 @@ impl State {
             .lock()
             .unwrap()
             .push((event, std::time::Instant::now()));
+    }
+
+    /// A scatter-gather `Request` from stream `stream_no`: rejected, or fanned out.
+    async fn scatter(self: &Arc<Self>, stream_no: usize, req: proto::Request, tx: &Outbound) {
+        use proto::ErrorCode;
+        let reject = |code, message: &str| hub_error(&req.id, code, message);
+        let declared = self
+            .routes
+            .lock()
+            .unwrap()
+            .get(&stream_no)
+            .is_some_and(|r| r.scatter);
+        if !declared || !self.scatter_gather.load(Ordering::SeqCst) {
+            let _ = tx
+                .send(Ok(reject(
+                    ErrorCode::Unsupported,
+                    "scatter-gather not supported",
+                )))
+                .await;
+            return;
+        }
+        let (is_command, mut targets) = {
+            let routes = self.routes.lock().unwrap();
+            let is_command = req.kind == proto::RequestKind::Command as i32
+                || routes.values().any(|r| r.commands.contains(&req.r#type));
+            let targets: Vec<(usize, String, String, Outbound)> = routes
+                .iter()
+                .filter(|(_, r)| r.queries.contains(&req.r#type))
+                .map(|(n, r)| (*n, r.service.clone(), r.instance.clone(), r.tx.clone()))
+                .collect();
+            (is_command, targets)
+        };
+        if is_command {
+            let _ = tx
+                .send(Ok(reject(
+                    ErrorCode::InvalidRequest,
+                    "invalid request: a command",
+                )))
+                .await;
+            return;
+        }
+        if targets.is_empty() {
+            let _ = tx
+                .send(Ok(reject(ErrorCode::NoHandler, "no handler")))
+                .await;
+            return;
+        }
+        targets.sort_by(|a, b| (&a.1, &a.2).cmp(&(&b.1, &b.2)));
+        let ids: Vec<String> = (0..targets.len())
+            .map(|n| format!("{}#{n}", req.id))
+            .collect();
+        {
+            let mut gathers = self.gathers.lock().unwrap();
+            let mut target_of = self.target_of.lock().unwrap();
+            gathers.insert(
+                req.id.clone(),
+                Gather {
+                    sender: tx.clone(),
+                    outstanding: ids
+                        .iter()
+                        .zip(&targets)
+                        .map(|(id, (n, s, i, _))| (id.clone(), (*n, s.clone(), i.clone())))
+                        .collect(),
+                    parts: 0,
+                    ok: 0,
+                    failed: 0,
+                    max_results: req.max_results,
+                },
+            );
+            for id in &ids {
+                target_of.insert(id.clone(), req.id.clone());
+            }
+        }
+        let timeout = if req.timeout_ms > 0 {
+            req.timeout_ms
+        } else {
+            5_000
+        };
+        let me = Arc::clone(self);
+        let gather = req.id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(timeout.into())).await;
+            let end = me.close(&gather, true);
+            if let Some((tx, end)) = end {
+                let _ = tx.send(Ok(end)).await;
+            }
+        });
+        for (id, (_, _, _, target)) in ids.into_iter().zip(targets) {
+            let forwarded = proto::Request {
+                id,
+                mode: proto::RequestMode::Unary as i32,
+                max_results: 0,
+                ..req.clone()
+            };
+            let _ = target
+                .send(Ok(server(server_message::Message::Request(forwarded))))
+                .await;
+        }
+    }
+
+    /// The answer of scatter-gather target `id`, if it is one: its part, and the end when done.
+    async fn answer(&self, id: &str, result: Result<Vec<u8>, proto::Error>) {
+        let out = {
+            let Some(parent) = self.target_of.lock().unwrap().remove(id) else {
+                return;
+            };
+            let mut gathers = self.gathers.lock().unwrap();
+            let Some(g) = gathers.get_mut(&parent) else {
+                return;
+            };
+            let Some((_, service, instance)) = g.outstanding.remove(id) else {
+                return;
+            };
+            let seq = u64::from(g.parts);
+            g.parts += 1;
+            let (payload, error) = match result {
+                Ok(p) => {
+                    g.ok += 1;
+                    (p, None)
+                }
+                Err(mut e) => {
+                    g.failed += 1;
+                    e.request_id = parent.clone();
+                    (vec![], Some(e))
+                }
+            };
+            let part = server(server_message::Message::Part(proto::ReplyPart {
+                request_id: parent.clone(),
+                payload,
+                error,
+                responder_service: service,
+                responder_instance: instance,
+                seq,
+            }));
+            let done = g.outstanding.is_empty() || (g.max_results > 0 && g.ok >= g.max_results);
+            let sender = g.sender.clone();
+            drop(gathers);
+            let end = if done {
+                self.close(&parent, false).map(|(_, e)| e)
+            } else {
+                None
+            };
+            (sender, part, end)
+        };
+        let (sender, part, end) = out;
+        let _ = sender.send(Ok(part)).await;
+        if let Some(end) = end {
+            let _ = sender.send(Ok(end)).await;
+        }
+    }
+
+    /// Ends gather `id` (if still open): its `ReplyEnd`, the unanswered targets timed out when
+    /// `deadline`.
+    fn close(&self, id: &str, deadline: bool) -> Option<(Outbound, ServerMessage)> {
+        let g = self.gathers.lock().unwrap().remove(id)?;
+        let mut target_of = self.target_of.lock().unwrap();
+        for t in g.outstanding.keys() {
+            target_of.remove(t);
+        }
+        let end = server(server_message::Message::End(proto::ReplyEnd {
+            request_id: id.to_string(),
+            error: None,
+            parts: g.parts,
+            failed: g.failed,
+            timed_out: if deadline {
+                g.outstanding.len() as u32
+            } else {
+                0
+            },
+        }));
+        Some((g.sender, end))
+    }
+
+    /// Stream `stream_no` (written through `tx`) ended: its gathers end silently, it is no longer
+    /// a target and its unanswered targets fail as parts (unless every stream was `dropped`).
+    async fn stream_closed(&self, stream_no: usize, tx: &Outbound, dropped: bool) {
+        self.routes.lock().unwrap().remove(&stream_no);
+        let gone: Vec<String> = self
+            .gathers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, g)| g.sender.same_channel(tx))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in gone {
+            self.close(&id, false);
+        }
+        if dropped {
+            return;
+        }
+        let lost: Vec<String> = self
+            .gathers
+            .lock()
+            .unwrap()
+            .values()
+            .flat_map(|g| {
+                g.outstanding
+                    .iter()
+                    .filter(|(_, (n, _, _))| *n == stream_no)
+                    .map(|(id, _)| id.clone())
+            })
+            .collect();
+        for id in lost {
+            let error = proto::Error {
+                request_id: id.clone(),
+                code: proto::ErrorCode::HandlerDisconnected as i32,
+                message: "handler disconnected".into(),
+                details: vec![],
+            };
+            self.answer(&id, Err(error)).await;
+        }
     }
 }
 
@@ -140,10 +404,13 @@ impl Hub for Service {
         let cancel = CancellationToken::new();
         tokio::spawn(async move {
             let mut instance: Option<String> = None;
+            // Dropped with every other stream (a hub restart): nothing more is delivered.
+            let mut dropped = false;
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     _ = drop_rx.recv() => {
+                        dropped = true;
                         let _ = tx.send(Err(Status::unavailable("dropped by test"))).await;
                         break;
                     }
@@ -155,7 +422,17 @@ impl Hub for Service {
                                 let v2 = r.protocol_version >= 2;
                                 let wants_flow = r.capabilities.iter().any(|c| c == "flow-control");
                                 let wants_status = r.capabilities.iter().any(|c| c == "instance-status");
-                                state.log(Event::Register { stream: stream_no, types: r.command_types.len() + r.query_types.len() });
+                                let wants_scatter = r.capabilities.iter().any(|c| c == "scatter-gather");
+                                state.log(Event::Register { stream: stream_no, types: r.command_types.len() + r.query_types.len() + r.shared_query_types.len() });
+                                let scatter = wants_scatter && v2 && state.scatter_gather.load(Ordering::SeqCst) && state.ack.lock().unwrap().is_some();
+                                state.routes.lock().unwrap().insert(stream_no, Route {
+                                    service: r.service_name.clone(),
+                                    instance: r.instance_id.clone(),
+                                    commands: r.command_types.clone(),
+                                    queries: r.query_types.iter().chain(&r.shared_query_types).cloned().collect(),
+                                    scatter,
+                                    tx: tx.clone(),
+                                });
                                 instance = Some(r.instance_id.clone());
                                 let replaced = state.sessions.lock().unwrap().insert(r.instance_id.clone(), (stream_no, cancel.clone()));
                                 if let Some((old, token)) = replaced
@@ -180,6 +457,9 @@ impl Hub for Service {
                                     if wants_status && state.instance_status.load(Ordering::SeqCst) {
                                         ack.capabilities.push("instance-status".to_string());
                                     }
+                                    if wants_scatter && state.scatter_gather.load(Ordering::SeqCst) {
+                                        ack.capabilities.push("scatter-gather".to_string());
+                                    }
                                     ack
                                 });
                                 if let (true, Some(ack)) = (v2, ack) {
@@ -194,7 +474,15 @@ impl Hub for Service {
                                     if tx.send(Ok(echo)).await.is_err() { break; }
                                 }
                             }
-                            client_message::Message::Reply(r) => state.replies.lock().await.push((stream_no, r)),
+                            client_message::Message::Reply(r) => {
+                                state.replies.lock().await.push((stream_no, r.clone()));
+                                let result = match r.result {
+                                    Some(proto::reply::Result::Error(e)) => Err(e),
+                                    Some(proto::reply::Result::Payload(p)) => Ok(p),
+                                    None => Ok(b"{}".to_vec()),
+                                };
+                                state.answer(&r.request_id, result).await;
+                            }
                             client_message::Message::Permits(p) => {
                                 state.permits.lock().unwrap().push((stream_no, p.count, std::time::Instant::now()));
                                 state.grants.lock().unwrap().push((stream_no, p.grant));
@@ -209,6 +497,10 @@ impl Hub for Service {
                                 }
                             }
                             client_message::Message::Status(st) => state.statuses.lock().unwrap().push((stream_no, st)),
+                            client_message::Message::Request(req) if req.mode == proto::RequestMode::ScatterGather as i32 => {
+                                state.requests.lock().await.push(req.clone());
+                                state.scatter(stream_no, req, &tx).await;
+                            }
                             client_message::Message::Request(req) => {
                                 state.requests.lock().await.push(req.clone());
                                 let response = state.responder.lock().await.as_ref().and_then(|f| f(req));
@@ -230,6 +522,7 @@ impl Hub for Service {
                     sessions.remove(&id);
                 }
             }
+            state.stream_closed(stream_no, &tx, dropped).await;
             state.log(Event::Closed { stream: stream_no });
             let mut clients = state.clients.lock().await;
             clients.retain(|(_, c)| !c.same_channel(&tx));
@@ -281,6 +574,10 @@ impl FakeHub {
             sessions: StdMutex::new(HashMap::new()),
             evictions: AtomicUsize::new(0),
             events: StdMutex::new(vec![]),
+            scatter_gather: AtomicBool::new(true),
+            routes: StdMutex::new(HashMap::new()),
+            gathers: StdMutex::new(HashMap::new()),
+            target_of: StdMutex::new(HashMap::new()),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -359,6 +656,16 @@ impl FakeHub {
     /// before P3).
     pub fn set_instance_status(&self, on: bool) {
         self.state.instance_status.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether the ack shares "scatter-gather" with clients that declare it (`false`: a P3 hub).
+    pub fn set_scatter_gather(&self, on: bool) {
+        self.state.scatter_gather.store(on, Ordering::SeqCst);
+    }
+
+    /// Scatter-gathers still open.
+    pub fn open_gathers(&self) -> usize {
+        self.state.gathers.lock().unwrap().len()
     }
 
     /// InstanceStatus messages received: (1-based stream number, report).
