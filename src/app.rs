@@ -25,7 +25,7 @@ use crate::config::Config;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
 use crate::hub::{
-    Dispatcher, EventContext, HandlerRegistry, HubConnection, HubSettings, Inbound, Sender,
+    Dispatcher, EventContext, HandlerRegistry, HubPool, HubSettings, Inbound, Sender,
     SenderSettings,
 };
 use crate::identity::{Guard, IdentityResolver, JwksVerifier};
@@ -60,13 +60,13 @@ pub struct KrakenMessagingBuilder {
     client: mongodb::Client,
     db: mongodb::Database,
     events: EventBus,
-    conn: Arc<HubConnection>,
+    hubs: Arc<HubPool>,
     inbound: mpsc::Receiver<Inbound>,
     sender: Arc<Sender>,
 }
 
 pub struct KrakenMessaging {
-    conn: Arc<HubConnection>,
+    hubs: Arc<HubPool>,
     sender: Arc<Sender>,
     events: EventBus,
     client: mongodb::Client,
@@ -95,15 +95,17 @@ impl KrakenMessaging {
             max_concurrent_handlers: config.max_concurrent_handlers,
             load_factor: config.hub_load_factor,
             tags: config.hub_tags.clone(),
+            status_interval: config.hub_status_interval,
+            dns_refresh: crate::hub::DNS_REFRESH,
         };
-        let conn = HubConnection::new(
+        let hubs = HubPool::new(
             settings,
             config.service_name.clone(),
             uuid::Uuid::new_v4().to_string(),
             tx,
-        );
-        let sender = Sender::with_settings(
-            Arc::clone(&conn),
+        )?;
+        let sender = Sender::with_pool(
+            Arc::clone(&hubs),
             SenderSettings {
                 default_timeout: config.hub_request_timeout,
                 forward_jwt: config.forward_jwt,
@@ -117,7 +119,7 @@ impl KrakenMessaging {
             client,
             db,
             events,
-            conn,
+            hubs,
             inbound,
             sender,
         })
@@ -139,7 +141,12 @@ impl KrakenMessaging {
     }
 
     pub fn instance_id(&self) -> &str {
-        self.conn.instance_id()
+        self.hubs.instance_id()
+    }
+
+    /// The ids of the hubs this instance is registered on now (a legacy hub by its address).
+    pub fn hub_ids(&self) -> Vec<String> {
+        self.hubs.hub_ids()
     }
 
     /// The crate's Mongo client; sessions for `events().publish_in` must come from this client.
@@ -152,12 +159,12 @@ impl KrakenMessaging {
         self.db.clone()
     }
 
-    /// True once the hub confirmed this instance's registration.
+    /// True once a hub (with several: at least one) confirmed this instance's registration.
     pub async fn await_hub(&self, timeout: Duration) -> bool {
-        self.conn.await_registered(timeout).await
+        self.hubs.await_registered(timeout).await
     }
 
-    /// Drains in-flight handlers (bounded), closes the hub stream (the hub drops this instance at once),
+    /// Drains in-flight handlers (bounded), closes every hub stream (each hub drops this instance at once),
     /// stops the outbox publisher and the consumer. Pending outgoing requests fail with `HubConnectionLost`.
     pub async fn shutdown(self) {
         self.handlers.close();
@@ -170,7 +177,7 @@ impl KrakenMessaging {
         // Close the stream before stopping the inbound loop, then fail whatever is still pending:
         // those requests were written, so the outcome is unknown (the Disconnected of the closed
         // stream may still sit in the inbound queue when the loop stops).
-        self.conn.shutdown().await;
+        self.hubs.shutdown().await;
         self.sender.fail_all_lost("hub stream closed by shutdown");
         self.cancel.cancel();
         for t in self.tasks {
@@ -250,7 +257,7 @@ impl KrakenMessagingBuilder {
             client,
             db,
             events,
-            conn,
+            hubs,
             mut inbound,
             sender,
         } = self;
@@ -269,8 +276,8 @@ impl KrakenMessagingBuilder {
         let handlers = TaskTracker::new();
         let mut tasks = Vec::new();
 
-        conn.set_types(registry.command_types(), registry.query_types());
-        conn.start();
+        hubs.set_types(registry.command_types(), registry.query_types());
+        hubs.start();
         let loop_sender = Arc::clone(&sender);
         let loop_cancel = cancel.clone();
         let loop_handlers = handlers.clone();
@@ -318,9 +325,9 @@ impl KrakenMessagingBuilder {
             )?;
             tasks.push(consumer.start(cancel.clone()));
         }
-        tracing::info!(service = %config.service_name, instance = %conn.instance_id(), commands = ?registry.command_types(), queries = ?registry.query_types(), events = ?registry.event_types(), "kraken messaging started");
+        tracing::info!(service = %config.service_name, instance = %hubs.instance_id(), hubs = ?hubs.targets(), commands = ?registry.command_types(), queries = ?registry.query_types(), events = ?registry.event_types(), "kraken messaging started");
         Ok(KrakenMessaging {
-            conn,
+            hubs,
             sender,
             events,
             client,

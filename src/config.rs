@@ -5,14 +5,20 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::error::MessagingError;
+use crate::hub::HubTargets;
 use crate::retry::RetryPolicy;
 
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Hub `Register.service_name`, Kafka consumer group and event `source`.
     pub service_name: String,
-    /// `static://host:port` (prefix optional).
+    /// The hubs to connect to (ADR 0016): `host:port` (`static://` prefix optional), a
+    /// comma-separated list of them, or one `dns:///name:port` whose addresses are re-resolved
+    /// every 30 s. One address is the single-hub setup.
     pub hub_address: String,
+    /// How often an `InstanceStatus` goes to every hub that shares the `instance-status`
+    /// capability (default 5 s, at least 1 ms).
+    pub hub_status_interval: Duration,
     /// Request timeout sent as `timeout_ms` when a call sets none (`SendOptions.timeout` wins).
     /// `None` (default): a protocol v2 hub decides (its per-type override or its default, 5 s);
     /// a legacy hub gets 5 s as before.
@@ -70,6 +76,7 @@ impl Config {
         Config {
             service_name: service_name.to_string(),
             hub_address: hub_address.to_string(),
+            hub_status_interval: Duration::from_secs(5),
             hub_request_timeout: None,
             heartbeat_interval: Duration::from_secs(10),
             reconnect_backoff_min: Duration::from_millis(500),
@@ -99,7 +106,7 @@ impl Config {
     /// `KRAKEN_SERVICE_NAME` and `KRAKEN_MONGODB_URI` are required; `KRAKEN_HUB_ADDRESS` defaults to
     /// `static://kraken-hub:7000`, `KRAKEN_KAFKA_BOOTSTRAP` to `kafka:19092`. Optional:
     /// `KRAKEN_KAFKA_TOPIC`, `KRAKEN_JWKS_URL`, `KRAKEN_ISSUER`, `KRAKEN_HUB_REQUEST_TIMEOUT_MS`,
-    /// `KRAKEN_HEARTBEAT_INTERVAL_MS`, `KRAKEN_RECONNECT_BACKOFF_MIN_MS`, `KRAKEN_RECONNECT_BACKOFF_MAX_MS`,
+    /// `KRAKEN_HUB_STATUS_INTERVAL_MS`, `KRAKEN_HEARTBEAT_INTERVAL_MS`, `KRAKEN_RECONNECT_BACKOFF_MIN_MS`, `KRAKEN_RECONNECT_BACKOFF_MAX_MS`,
     /// `KRAKEN_MAX_CONCURRENT_HANDLERS`, `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS`,
     /// `KRAKEN_OUTBOX_ENABLED`, `KRAKEN_OUTBOX_POLL_INTERVAL_MS`, `KRAKEN_OUTBOX_BATCH_SIZE`,
     /// `KRAKEN_OUTBOX_MAX_ATTEMPTS`, `KRAKEN_FORWARD_JWT`, `KRAKEN_HUB_LOAD_FACTOR`,
@@ -136,6 +143,9 @@ impl Config {
             // 0 means "not chosen", like leaving it unset (the hub decides).
             c.hub_request_timeout =
                 Some(millis("KRAKEN_HUB_REQUEST_TIMEOUT_MS", &v)?).filter(|d| !d.is_zero());
+        }
+        if let Some(v) = optional("KRAKEN_HUB_STATUS_INTERVAL_MS") {
+            c.hub_status_interval = millis("KRAKEN_HUB_STATUS_INTERVAL_MS", &v)?;
         }
         if let Some(v) = optional("KRAKEN_HEARTBEAT_INTERVAL_MS") {
             c.heartbeat_interval = millis("KRAKEN_HEARTBEAT_INTERVAL_MS", &v)?;
@@ -218,13 +228,20 @@ impl Config {
         Ok(c)
     }
 
-    /// Rejects what cannot work: an empty service name, `jwks_url` without `issuer`,
+    /// Rejects what cannot work: an empty service name, a `hub_address` that names no hub (or a
+    /// malformed `dns:///` target), a zero `hub_status_interval`, `jwks_url` without `issuer`,
     /// `max_concurrent_handlers` 0, an invalid `hub_retry` policy. Called by `from_env` and by
     /// `KrakenMessaging::builder`.
     pub fn validate(&self) -> Result<(), MessagingError> {
         if self.service_name.trim().is_empty() {
             return Err(MessagingError::InvalidMessage(
                 "service_name must not be empty".into(),
+            ));
+        }
+        HubTargets::parse(&self.hub_address)?;
+        if self.hub_status_interval.is_zero() {
+            return Err(MessagingError::InvalidMessage(
+                "hub_status_interval (KRAKEN_HUB_STATUS_INTERVAL_MS) must be at least 1 ms".into(),
             ));
         }
         if self.jwks_url.is_some() && self.issuer.is_none() {
@@ -499,6 +516,41 @@ mod tests {
         }
         // 0 is sent as is; the hub reads it as 100.
         assert_eq!(from(&[("KRAKEN_HUB_LOAD_FACTOR", "0")]).hub_load_factor, 0);
+    }
+
+    #[test]
+    fn hub_address_takes_a_list_or_a_dns_name_and_a_status_interval() {
+        let c = from(&[]);
+        assert_eq!(c.hub_address, "static://kraken-hub:7000");
+        assert_eq!(c.hub_status_interval, Duration::from_secs(5));
+        let c = from(&[
+            ("KRAKEN_HUB_ADDRESS", "static://hub:7000,hub-2:7000"),
+            ("KRAKEN_HUB_STATUS_INTERVAL_MS", "2500"),
+        ]);
+        assert_eq!(c.hub_address, "static://hub:7000,hub-2:7000");
+        assert_eq!(c.hub_status_interval, Duration::from_millis(2500));
+        assert_eq!(
+            from(&[("KRAKEN_HUB_ADDRESS", "dns:///kraken-hub:7000")]).hub_address,
+            "dns:///kraken-hub:7000"
+        );
+        for (name, value) in [
+            ("KRAKEN_HUB_ADDRESS", "dns:///kraken-hub"),
+            ("KRAKEN_HUB_ADDRESS", "hub:7000,dns:///kraken-hub:7000"),
+            ("KRAKEN_HUB_ADDRESS", ","),
+            ("KRAKEN_HUB_STATUS_INTERVAL_MS", "0"),
+            ("KRAKEN_HUB_STATUS_INTERVAL_MS", "soon"),
+        ] {
+            let result = try_from(&[(name, value)]);
+            assert!(
+                matches!(result, Err(MessagingError::InvalidMessage(_))),
+                "{name}={value}: {result:?}"
+            );
+        }
+        let in_code = Config {
+            hub_address: " , ".into(),
+            ..code_config()
+        };
+        assert!(in_code.validate().is_err(), "an empty hub list accepted");
     }
 
     #[test]

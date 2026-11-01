@@ -35,8 +35,8 @@
 //! one-way partition is noticed by the transport too, not only by the missing heartbeat echoes.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, watch};
@@ -57,8 +57,11 @@ use crate::retry::{jittered, random_unit};
 pub const PROTOCOL_VERSION: u32 = 2;
 /// The flow-control capability: permits, per-instance queues at the hub, RESOURCE_EXHAUSTED.
 pub const FLOW_CONTROL: &str = "flow-control";
+/// The multi-hub status capability (ADR 0016): `InstanceStatus` reports go only to a hub whose ack
+/// lists it.
+pub const INSTANCE_STATUS: &str = "instance-status";
 /// Optional protocol features this client declares (`Register.capabilities`).
-pub const CAPABILITIES: &[&str] = &[FLOW_CONTROL];
+pub const CAPABILITIES: &[&str] = &[FLOW_CONTROL, INSTANCE_STATUS];
 /// A `Permits` message is sent as soon as this many grants are pending, or as soon as the hub holds
 /// no more than `min(PERMIT_BATCH, initial_permits / 2)` permits for the stream (the low-water mark)...
 pub const PERMIT_BATCH: u32 = 16;
@@ -72,12 +75,16 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// How long a PING may stay unanswered before the channel is dropped.
 pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Identifies one stream (one connect attempt) of a [`HubConnection`]; strictly increasing.
+/// Identifies one stream (one connect attempt); strictly increasing and unique in the process, so
+/// streams of different hubs never share an id.
 pub type StreamId = u64;
+
+static NEXT_STREAM: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
 pub struct HubSettings {
-    /// `host:port`, optionally prefixed with `static://` or `http://`.
+    /// `host:port`, optionally prefixed with `static://` or `http://`. For a [`super::HubPool`]:
+    /// the whole `hub_address` (a list or `dns:///name:port`, see [`super::HubTargets`]).
     pub address: String,
     /// Heartbeat period used until, and unless, the hub announces one in its `RegisterAck`
     /// (old hubs do not; they evict after 30 s, so this must stay well below that).
@@ -93,6 +100,11 @@ pub struct HubSettings {
     pub load_factor: u32,
     /// `Register.tags`.
     pub tags: HashMap<String, String>,
+    /// [`super::HubPool`] only: how often `InstanceStatus` goes to every hub sharing
+    /// `instance-status`.
+    pub status_interval: Duration,
+    /// [`super::HubPool`] only: how often a `dns:///` address is resolved again.
+    pub dns_refresh: Duration,
 }
 
 impl Default for HubSettings {
@@ -106,6 +118,8 @@ impl Default for HubSettings {
             max_concurrent_handlers: 256,
             load_factor: 100,
             tags: HashMap::new(),
+            status_interval: Duration::from_secs(5),
+            dns_refresh: super::targets::DNS_REFRESH,
         }
     }
 }
@@ -133,8 +147,17 @@ impl Handshake {
 
     /// True when the hub shares `flow-control`: it forwards only with permits.
     pub fn flow_control(&self) -> bool {
+        self.shares(FLOW_CONTROL)
+    }
+
+    /// True when the hub shares `instance-status`: it keeps our `InstanceStatus` reports.
+    pub fn instance_status(&self) -> bool {
+        self.shares(INSTANCE_STATUS)
+    }
+
+    fn shares(&self, capability: &str) -> bool {
         self.ack()
-            .is_some_and(|a| a.capabilities.iter().any(|c| c == FLOW_CONTROL))
+            .is_some_and(|a| a.capabilities.iter().any(|c| c == capability))
     }
 }
 
@@ -208,11 +231,23 @@ impl GrantState {
 pub(crate) struct Grants {
     tx: mpsc::WeakSender<ClientMessage>,
     state: Mutex<GrantState>,
+    /// Requests that arrived and are not finished yet (the connection's and the pool's count).
+    in_flight: Vec<Arc<AtomicUsize>>,
 }
 
 impl Grants {
+    #[cfg(test)]
     fn new(tx: mpsc::WeakSender<ClientMessage>, initial: u32) -> Arc<Grants> {
+        Self::counting(tx, initial, vec![])
+    }
+
+    fn counting(
+        tx: mpsc::WeakSender<ClientMessage>,
+        initial: u32,
+        in_flight: Vec<Arc<AtomicUsize>>,
+    ) -> Arc<Grants> {
         Arc::new(Grants {
+            in_flight,
             tx,
             state: Mutex::new(GrantState {
                 mode: GrantMode::Undecided,
@@ -228,6 +263,16 @@ impl Grants {
     /// A request arrived on this stream (the hub spent one of our permits on it).
     fn received(&self) {
         self.state.lock().unwrap().received += 1;
+        for c in &self.in_flight {
+            c.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The request is finished: one less in flight (never below zero).
+    fn finished(&self) {
+        for c in &self.in_flight {
+            let _ = c.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        }
     }
 
     /// The hub decided (handshake): with flow control, grants held so far follow the flush rule;
@@ -251,6 +296,7 @@ impl Grants {
     }
 
     async fn grant(self: &Arc<Self>) {
+        self.finished();
         let next = {
             let mut s = self.state.lock().unwrap();
             match s.mode {
@@ -383,9 +429,26 @@ pub struct HubConnection {
     connected: AtomicBool,
     handshake: watch::Sender<Option<Handshake>>,
     last_rejection: Mutex<Option<String>>,
-    next_stream: AtomicU64,
+    /// A stream of this connection failed or ended at least once.
+    failed_once: AtomicBool,
+    /// Requests that arrived on this connection's streams and are not finished yet.
+    in_flight: Arc<AtomicUsize>,
+    hooks: OnceLock<Hooks>,
     cancel: CancellationToken,
     task: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// How a [`super::HubPool`] takes part in a member connection's handshake.
+pub(crate) struct Hooks {
+    /// `Register.initial_permits` for the stream being opened.
+    pub initial_permits: Box<dyn Fn() -> u32 + Send + Sync>,
+    /// Called with the handshake before the stream goes live; `false` closes the connection for
+    /// good (another connection already reaches that hub).
+    pub accept: Box<dyn Fn(&Handshake) -> bool + Send + Sync>,
+    /// A stream went live or was lost.
+    pub changed: Box<dyn Fn() + Send + Sync>,
+    /// Also counts requests that arrived and are not finished (all connections of the pool).
+    pub in_flight: Arc<AtomicUsize>,
 }
 
 impl HubConnection {
@@ -406,7 +469,9 @@ impl HubConnection {
             connected: AtomicBool::new(false),
             handshake,
             last_rejection: Mutex::new(None),
-            next_stream: AtomicU64::new(1),
+            failed_once: AtomicBool::new(false),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            hooks: OnceLock::new(),
             cancel: CancellationToken::new(),
             task: Mutex::new(None),
         })
@@ -423,6 +488,42 @@ impl HubConnection {
 
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    /// The target this connection dials (`HubSettings.address`).
+    pub fn address(&self) -> &str {
+        &self.settings.address
+    }
+
+    /// The id of the hub behind the current handshaken stream: `RegisterAck.hub_id`, or the
+    /// address for a legacy hub (it has no id). `None` while there is no handshaken stream.
+    pub fn hub_id(&self) -> Option<String> {
+        self.handshake().map(|h| match h {
+            Handshake::V2(ack) => ack.hub_id,
+            Handshake::Legacy => self.settings.address.clone(),
+        })
+    }
+
+    /// Requests that arrived on this connection and whose handler has not finished
+    /// ([`ReplyTo::grant`] not called yet).
+    pub fn inbound_in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// True once a stream of this connection failed or ended (the first connect attempt is over
+    /// without a lasting stream).
+    pub(crate) fn failed_once(&self) -> bool {
+        self.failed_once.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_hooks(&self, hooks: Hooks) {
+        let _ = self.hooks.set(hooks);
+    }
+
+    fn changed(&self) {
+        if let Some(h) = self.hooks.get() {
+            (h.changed)();
+        }
     }
 
     /// Spawns the connect loop. Returns immediately; use [`await_registered`](Self::await_registered).
@@ -501,6 +602,16 @@ impl HubConnection {
         Ok((stream, extra))
     }
 
+    /// Makes writes to the current stream fail as if it had just dropped and the connection had
+    /// not noticed yet (tests of the failover of requests that were never written).
+    #[doc(hidden)]
+    pub fn sever_writes(&self) {
+        if let Some(live) = self.live.lock().unwrap().as_mut() {
+            let (closed, _) = mpsc::channel(1);
+            live.tx = closed;
+        }
+    }
+
     /// Stops the loop and closes the stream (the hub then drops this instance immediately).
     pub async fn shutdown(&self) {
         self.cancel.cancel();
@@ -517,14 +628,18 @@ impl HubConnection {
         let mut backoff = self.settings.backoff_min;
         let mut failures: u32 = 0;
         while !self.cancel.is_cancelled() {
-            let stream = self.next_stream.fetch_add(1, Ordering::SeqCst);
+            let stream = NEXT_STREAM.fetch_add(1, Ordering::SeqCst);
             let outcome = self.run_stream(stream).await;
             self.connected.store(false, Ordering::SeqCst);
+            self.failed_once.store(true, Ordering::SeqCst);
             // Clear the live stream before announcing the loss: a request is tagged with a stream
             // only while that stream is live, so it is always failed by this Disconnected.
             *self.live.lock().unwrap() = None;
             let reached_handshake = self.handshake.send_replace(None).is_some();
             let _ = self.inbound.send(Inbound::Disconnected { stream }).await;
+            if reached_handshake {
+                self.changed();
+            }
             if self.cancel.is_cancelled() {
                 break;
             }
@@ -543,14 +658,14 @@ impl HubConnection {
             let wait = if matches!(status.code(), Code::AlreadyExists | Code::InvalidArgument) {
                 *self.last_rejection.lock().unwrap() = Some(status.message().to_string());
                 let wait = jittered(max, max, random_unit());
-                tracing::error!(service = %self.service_name, instance = %self.instance_id, reason = status.message(), retry_in = ?wait, "hub rejected the registration");
+                tracing::error!(service = %self.service_name, instance = %self.instance_id, address = %self.settings.address, reason = status.message(), retry_in = ?wait, "hub rejected the registration");
                 wait
             } else {
                 let wait = jittered(backoff, max, random_unit());
                 if failures == 1 {
-                    tracing::warn!(service = %self.service_name, instance = %self.instance_id, reason = %describe(&status), retry_in = ?wait, "hub stream closed; reconnecting");
+                    tracing::warn!(service = %self.service_name, instance = %self.instance_id, address = %self.settings.address, reason = %describe(&status), retry_in = ?wait, "hub stream closed; reconnecting");
                 } else {
-                    tracing::debug!(service = %self.service_name, instance = %self.instance_id, reason = %describe(&status), retry_in = ?wait, "hub stream closed; reconnecting");
+                    tracing::debug!(service = %self.service_name, instance = %self.instance_id, address = %self.settings.address, reason = %describe(&status), retry_in = ?wait, "hub stream closed; reconnecting");
                 }
                 backoff = (backoff * 2).min(max);
                 wait
@@ -590,7 +705,10 @@ impl HubConnection {
         // The Register is the first message of every stream; the ack or the echo of the heartbeat
         // after it completes the handshake.
         let (commands, queries) = self.types.lock().unwrap().clone();
-        let initial_permits = self.settings.max_concurrent_handlers.min(u32::MAX as usize) as u32;
+        let initial_permits = match self.hooks.get() {
+            Some(h) => (h.initial_permits)(),
+            None => self.settings.max_concurrent_handlers.min(u32::MAX as usize) as u32,
+        };
         let register = Register {
             service_name: self.service_name.clone(),
             instance_id: self.instance_id.clone(),
@@ -613,7 +731,9 @@ impl HubConnection {
             .await
             .map_err(|_| Status::unavailable("stream closed before first heartbeat"))?;
         self.connected.store(true, Ordering::SeqCst);
-        let grants = Grants::new(tx.downgrade(), initial_permits);
+        let mut counters = vec![Arc::clone(&self.in_flight)];
+        counters.extend(self.hooks.get().map(|h| Arc::clone(&h.in_flight)));
+        let grants = Grants::counting(tx.downgrade(), initial_permits, counters);
         let reply_to = ReplyTo {
             stream: stream_id,
             tx: tx.downgrade(),
@@ -649,9 +769,12 @@ impl HubConnection {
                                     ticker = self::ticker(interval);
                                 }
                                 let h = Handshake::V2(ack);
+                                if !self.accept(&h) {
+                                    return Ok(());
+                                }
                                 grants.decide(h.flow_control()).await;
                                 let ack = h.ack().expect("v2");
-                                tracing::info!(service = %self.service_name, instance = %self.instance_id, hub = %ack.hub_id, protocol = ack.protocol_version, heartbeat = ?interval, flow_control = h.flow_control(), "registered with the hub");
+                                tracing::info!(service = %self.service_name, instance = %self.instance_id, hub = %ack.hub_id, address = %self.settings.address, protocol = ack.protocol_version, heartbeat = ?interval, flow_control = h.flow_control(), "registered with the hub");
                                 self.go_live(stream_id, &tx, &h);
                                 handshake = Some(h);
                             }
@@ -668,8 +791,11 @@ impl HubConnection {
                         server_message::Message::Heartbeat(_) => {
                             last_echo = tokio::time::Instant::now();
                             if handshake.is_none() {
-                                tracing::info!(service = %self.service_name, instance = %self.instance_id, heartbeat = ?interval, "registered with the hub (legacy hub without protocol v2)");
+                                tracing::info!(service = %self.service_name, instance = %self.instance_id, address = %self.settings.address, heartbeat = ?interval, "registered with the hub (legacy hub without protocol v2)");
                                 let h = Handshake::Legacy;
+                                if !self.accept(&h) {
+                                    return Ok(());
+                                }
                                 grants.decide(false).await;
                                 self.go_live(stream_id, &tx, &h);
                                 handshake = Some(h);
@@ -693,7 +819,22 @@ impl HubConnection {
             tx: tx.clone(),
             handshake: handshake.clone(),
         });
-        self.handshake.send_replace(Some(handshake.clone()));
+        let first = self
+            .handshake
+            .send_replace(Some(handshake.clone()))
+            .is_none();
+        if first {
+            self.changed();
+        }
+    }
+
+    /// Asks the pool (if any) whether this stream may go live; a refusal stops the connection.
+    fn accept(&self, handshake: &Handshake) -> bool {
+        let accepted = self.hooks.get().is_none_or(|h| (h.accept)(handshake));
+        if !accepted {
+            self.cancel.cancel();
+        }
+        accepted
     }
 
     async fn forward(&self, msg: Inbound) -> Result<(), Status> {
@@ -886,7 +1027,7 @@ mod tests {
     #[test]
     fn client_identity_constants() {
         assert_eq!(PROTOCOL_VERSION, 2);
-        assert_eq!(CAPABILITIES, ["flow-control"]);
+        assert_eq!(CAPABILITIES, ["flow-control", "instance-status"]);
         assert!(CLIENT_VERSION.starts_with("kraken-messaging-rs/"));
         assert_eq!(
             HubSettings::default().backoff_max,

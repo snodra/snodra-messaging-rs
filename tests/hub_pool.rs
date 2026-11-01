@@ -1,0 +1,526 @@
+//! Multi-hub (ADR 0016) against in-process fake hubs: one connection per hub with the identical
+//! registration, permits split, routing (round-robin, rendezvous by key), failover of requests
+//! never written, `HubConnectionLost` for written ones, dedupe by hub id, `InstanceStatus` only to
+//! hubs that share the capability, and `dns:///` re-resolution.
+mod support;
+
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use kraken_messaging::hub::{
+    Handshake, HubPool, HubSettings, Inbound, ReplyTo, SendOptions, Sender, SenderSettings,
+    rendezvous_score,
+};
+use kraken_messaging::proto::{self, ServerMessage, reply, server_message};
+use kraken_messaging::{Command, MessagingError, Query, RetryPolicy, message_type};
+use serde::{Deserialize, Serialize};
+use support::fake_hub::FakeHub;
+use tokio::sync::mpsc;
+
+#[derive(Serialize, Deserialize)]
+struct Ping {}
+message_type!(Ping, "t.Ping");
+impl Command for Ping {
+    type Reply = ();
+}
+
+#[derive(Serialize, Deserialize)]
+struct Look {}
+message_type!(Look, "t.Look");
+impl Query for Look {
+    type Reply = ();
+}
+
+fn ok_reply(req: &proto::Request) -> ServerMessage {
+    ServerMessage {
+        message: Some(server_message::Message::Reply(proto::Reply {
+            request_id: req.id.clone(),
+            result: Some(reply::Result::Payload(b"{}".to_vec())),
+        })),
+    }
+}
+
+async fn answering(id: &str) -> FakeHub {
+    let hub = FakeHub::start_with_id(id).await;
+    hub.set_responder(|req| Some(ok_reply(&req))).await;
+    hub
+}
+
+struct Client {
+    pool: Arc<HubPool>,
+    sender: Arc<Sender>,
+    /// Requests pushed by the hubs, held until the test finishes them.
+    held: Arc<Mutex<Vec<ReplyTo>>>,
+}
+
+impl Client {
+    async fn shutdown(self) {
+        self.pool.shutdown().await;
+    }
+}
+
+fn settings(address: String) -> HubSettings {
+    HubSettings {
+        address,
+        heartbeat_interval: Duration::from_secs(1),
+        backoff_min: Duration::from_millis(50),
+        backoff_max: Duration::from_millis(200),
+        max_concurrent_handlers: 10,
+        status_interval: Duration::from_millis(100),
+        ..HubSettings::default()
+    }
+}
+
+/// A started pool with a sender; requests pushed by a hub are held, not answered.
+async fn client(settings: HubSettings) -> Client {
+    client_with(settings, |_| {}).await
+}
+
+async fn client_with(settings: HubSettings, before_start: impl FnOnce(&HubPool)) -> Client {
+    let (tx, mut rx) = mpsc::channel::<Inbound>(64);
+    let pool = HubPool::new(settings, "svc".into(), uuid::Uuid::new_v4().to_string(), tx)
+        .expect("valid hub address");
+    pool.set_types(vec!["t.Handled".into()], vec![]);
+    before_start(&pool);
+    let sender = Sender::with_pool(Arc::clone(&pool), SenderSettings::default());
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let (forward, keep) = (Arc::clone(&sender), Arc::clone(&held));
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                Inbound::Request { reply_to, .. } => keep.lock().unwrap().push(reply_to),
+                other => forward.on_inbound(other),
+            }
+        }
+    });
+    pool.start();
+    Client { pool, sender, held }
+}
+
+fn addresses(hubs: &[&FakeHub]) -> String {
+    hubs.iter()
+        .map(|h| h.address())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Waits (bounded) until `check` holds.
+async fn eventually(what: &str, mut check: impl AsyncFnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !check().await {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn all_registered(c: &Client, ids: &[&str]) {
+    eventually(&format!("registered on {ids:?}"), async || {
+        c.pool.hub_ids() == ids
+    })
+    .await;
+}
+
+fn push_request(id: &str) -> ServerMessage {
+    ServerMessage {
+        message: Some(server_message::Message::Request(proto::Request {
+            id: id.into(),
+            kind: proto::RequestKind::Command as i32,
+            r#type: "t.Handled".into(),
+            payload: b"{}".to_vec(),
+            ..Default::default()
+        })),
+    }
+}
+
+#[tokio::test]
+async fn registers_identically_on_every_hub_and_splits_the_permits() {
+    let (a, b) = (answering("hub-a").await, answering("hub-b").await);
+    let c = client(settings(addresses(&[&a, &b]))).await;
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    let (ra, rb) = (a.registers().await, b.registers().await);
+    assert_eq!((ra.len(), rb.len()), (1, 1));
+    assert_eq!(ra[0], rb[0], "the identical Register on every hub");
+    assert_eq!(ra[0].command_types, ["t.Handled"]);
+    assert_eq!(ra[0].initial_permits, 5, "ceil(10 / 2)");
+    assert!(c.pool.await_registered(Duration::from_millis(10)).await);
+    c.shutdown().await;
+}
+
+/// N counts the hubs live (or on their first attempt) when the Register is written: a stream
+/// re-opened while the other hub is down offers all the permits; nothing is revoked.
+#[tokio::test]
+async fn a_stream_opened_while_the_other_hub_is_down_offers_all_permits() {
+    let (a, b) = (answering("hub-a").await, answering("hub-b").await);
+    let c = client(settings(addresses(&[&a, &b]))).await;
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    b.set_down(true);
+    all_registered(&c, &["hub-a"]).await;
+    a.drop_streams();
+    eventually("hub-a re-registered", async || {
+        a.registers().await.len() == 2
+    })
+    .await;
+    let permits: Vec<u32> = a
+        .registers()
+        .await
+        .iter()
+        .map(|r| r.initial_permits)
+        .collect();
+    assert_eq!(permits, [5, 10]);
+    b.set_down(false);
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    let permits: Vec<u32> = b
+        .registers()
+        .await
+        .iter()
+        .map(|r| r.initial_permits)
+        .collect();
+    assert_eq!(permits, [5, 5], "back with two live hubs: half each");
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn unkeyed_requests_round_robin_over_live_hubs_and_skip_a_dead_one() {
+    let (a, b) = (answering("hub-a").await, answering("hub-b").await);
+    let c = client(settings(addresses(&[&a, &b]))).await;
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    for _ in 0..10 {
+        c.sender
+            .send_command(&Ping {}, SendOptions::default())
+            .await
+            .unwrap();
+    }
+    assert_eq!((a.requests().await.len(), b.requests().await.len()), (5, 5));
+
+    b.set_down(true);
+    all_registered(&c, &["hub-a"]).await;
+    for _ in 0..6 {
+        c.sender
+            .send_command(&Ping {}, SendOptions::default())
+            .await
+            .expect("hub-a takes everything while hub-b reconnects");
+    }
+    assert_eq!(
+        (a.requests().await.len(), b.requests().await.len()),
+        (11, 5)
+    );
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn keyed_requests_go_to_the_rendezvous_hub_and_move_only_when_it_leaves() {
+    let (a, b) = (answering("hub-a").await, answering("hub-b").await);
+    let c = client(settings(addresses(&[&a, &b]))).await;
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    let keys: Vec<String> = (0..40).map(|i| format!("order-{i}")).collect();
+    let owner = |key: &str| {
+        if rendezvous_score("hub-a", key) > rendezvous_score("hub-b", key) {
+            "hub-a"
+        } else {
+            "hub-b"
+        }
+    };
+    for round in 0..2 {
+        for key in &keys {
+            let opts = SendOptions {
+                routing_key: Some(key.clone()),
+                ..Default::default()
+            };
+            c.sender.send_command(&Ping {}, opts).await.unwrap();
+        }
+        let at = |reqs: Vec<proto::Request>| -> Vec<String> {
+            reqs.into_iter().map(|r| r.routing_key).collect()
+        };
+        let (on_a, on_b) = (at(a.requests().await), at(b.requests().await));
+        for key in &keys {
+            let want = owner(key);
+            let n_a = on_a.iter().filter(|k| *k == key).count();
+            let n_b = on_b.iter().filter(|k| *k == key).count();
+            let want_counts = if want == "hub-a" {
+                (round + 1, 0)
+            } else {
+                (0, round + 1)
+            };
+            assert_eq!(
+                (n_a, n_b),
+                want_counts,
+                "{key} (owner {want}), round {round}"
+            );
+        }
+    }
+    let on_b_before = b.requests().await.len();
+    a.set_down(true);
+    all_registered(&c, &["hub-b"]).await;
+    for key in &keys {
+        let opts = SendOptions {
+            routing_key: Some(key.clone()),
+            ..Default::default()
+        };
+        c.sender.send_command(&Ping {}, opts).await.unwrap();
+    }
+    assert_eq!(
+        b.requests().await.len(),
+        on_b_before + keys.len(),
+        "hub-a's keys moved to hub-b"
+    );
+    c.shutdown().await;
+}
+
+/// The chosen hub's stream dropped and the write fails: the request was never sent, so it goes to
+/// the next hub with the same id, without any retry policy.
+#[tokio::test]
+async fn a_request_not_written_when_its_hub_drops_is_sent_to_another_hub() {
+    let (a, b) = (answering("hub-a").await, answering("hub-b").await);
+    let c = client(settings(addresses(&[&a, &b]))).await;
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    let conns = c.pool.connections();
+    conns[0].sever_writes(); // hub-a: dropped, not noticed yet
+    conns[1].sever_writes(); // ... and hub-b too for one of the tries below
+    let err = c
+        .sender
+        .send_command(&Ping {}, SendOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, MessagingError::HubUnavailable(_)),
+        "no hub took it: {err:?}"
+    );
+    assert_eq!(c.sender.in_flight(), 0, "nothing left pending");
+    // Let both reconnect, then break hub-a only: unkeyed and keyed requests all go to hub-b.
+    a.drop_streams();
+    b.drop_streams();
+    eventually("both re-registered", async || {
+        a.registers().await.len() == 2 && b.registers().await.len() == 2
+    })
+    .await;
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    c.pool.connections()[0].sever_writes();
+    let key_on_a = (0..)
+        .map(|i| format!("k{i}"))
+        .find(|k| rendezvous_score("hub-a", k) > rendezvous_score("hub-b", k))
+        .unwrap();
+    for i in 0..4 {
+        let opts = SendOptions {
+            routing_key: (i % 2 == 0).then(|| key_on_a.clone()),
+            retry: Some(RetryPolicy::NONE),
+            ..Default::default()
+        };
+        c.sender
+            .send_command(&Ping {}, opts)
+            .await
+            .expect("failed over to hub-b transparently");
+    }
+    assert!(a.requests().await.is_empty(), "nothing reached hub-a");
+    assert_eq!(b.requests().await.len(), 4);
+    assert_eq!(c.sender.in_flight(), 0);
+    c.shutdown().await;
+}
+
+/// A request written to a hub whose stream then drops has an unknown outcome: the command fails
+/// with `HubConnectionLost` and is not sent elsewhere; a query under a retry policy is retried on
+/// the other hub.
+#[tokio::test]
+async fn a_request_written_before_its_hub_drops_is_connection_lost() {
+    let a = FakeHub::start_with_id("hub-a").await; // swallows requests
+    let b = answering("hub-b").await;
+    let c = client(settings(addresses(&[&a, &b]))).await;
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    let key_on_a = (0..)
+        .map(|i| format!("k{i}"))
+        .find(|k| rendezvous_score("hub-a", k) > rendezvous_score("hub-b", k))
+        .unwrap();
+    let opts = SendOptions {
+        routing_key: Some(key_on_a.clone()),
+        timeout: Some(Duration::from_secs(10)),
+        ..Default::default()
+    };
+    let command = tokio::spawn({
+        let (sender, opts) = (Arc::clone(&c.sender), opts.clone());
+        async move { sender.send_command(&Ping {}, opts).await }
+    });
+    let query = tokio::spawn({
+        let sender = Arc::clone(&c.sender);
+        let opts = SendOptions {
+            retry: Some(RetryPolicy::default()),
+            ..opts
+        };
+        async move { sender.send_query(&Look {}, opts).await }
+    });
+    eventually("both written to hub-a", async || {
+        a.requests().await.len() == 2
+    })
+    .await;
+    a.set_down(true);
+    let lost = tokio::time::timeout(Duration::from_secs(5), command)
+        .await
+        .expect("the command is failed at once, not left to its timeout")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(lost, MessagingError::HubConnectionLost(_)),
+        "{lost:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(5), query)
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("the query's retry policy sends it again, to hub-b");
+    let on_b: Vec<String> = b.requests().await.into_iter().map(|r| r.r#type).collect();
+    assert_eq!(on_b, ["t.Look"], "the command was not sent again");
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_addresses_of_one_hub_keep_one_connection() {
+    // Two hubs answering the same id stand for two addresses of one hub.
+    let (a, b) = (answering("hub-x").await, answering("hub-x").await);
+    let c = client(settings(addresses(&[&a, &b]))).await;
+    all_registered(&c, &["hub-x"]).await;
+    eventually("the second connection closed", async || {
+        a.connected_clients().await + b.connected_clients().await == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await; // several backoffs
+    assert_eq!(
+        a.streams() + b.streams(),
+        2,
+        "the duplicate never reconnects"
+    );
+    assert_eq!(c.pool.hub_ids(), ["hub-x"]);
+    for _ in 0..4 {
+        c.sender
+            .send_command(&Ping {}, SendOptions::default())
+            .await
+            .unwrap();
+    }
+    let (na, nb) = (a.requests().await.len(), b.requests().await.len());
+    assert!(na == 4 && nb == 0 || na == 0 && nb == 4, "{na} / {nb}");
+    c.shutdown().await;
+}
+
+/// `InstanceStatus` goes every interval to the hubs that share `instance-status` and to no other;
+/// it lists the acknowledged hubs (not a legacy one, which has no id) and the handlers running.
+#[tokio::test]
+async fn instance_status_goes_only_to_hubs_sharing_the_capability() {
+    let (a, b, old) = (
+        answering("hub-a").await,
+        answering("hub-b").await,
+        answering("hub-v1").await,
+    );
+    b.set_instance_status(false); // a P2 hub
+    old.set_ack(None); // a v1 hub
+    let c = client(settings(addresses(&[&a, &b, &old]))).await;
+    all_registered(&c, &["hub-a", "hub-b", &old.address()]).await;
+    assert!(c.pool.connections()[2].handshake() == Some(Handshake::Legacy));
+    a.send_to_clients(push_request("in-1")).await;
+    eventually("a handler runs", async || c.held.lock().unwrap().len() == 1).await;
+    eventually("hub-a got reports", async || a.statuses().len() >= 2).await;
+    let (_, last) = a.statuses().last().cloned().unwrap();
+    assert_eq!(last.connected_hub_ids, ["hub-a", "hub-b"]);
+    assert_eq!(last.handlers_in_flight, 1);
+    let reply_to = c.held.lock().unwrap().pop().unwrap();
+    reply_to.grant().await;
+    let seen = a.statuses().len();
+    eventually("a report with no handler running", async || {
+        a.statuses()[seen..]
+            .iter()
+            .any(|(_, s)| s.handlers_in_flight == 0)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        b.statuses().is_empty(),
+        "no report to a hub without the capability"
+    );
+    assert!(old.statuses().is_empty(), "no report to a legacy hub");
+    c.shutdown().await;
+}
+
+type Resolved = Arc<Mutex<Vec<SocketAddr>>>;
+
+/// `dns:///`: new addresses get a connection; a vanished one leaves the routing at once and is
+/// closed once its handlers are done.
+#[tokio::test]
+async fn a_dns_target_follows_the_resolution_and_drains_a_vanished_hub() {
+    let (a, b) = (answering("hub-a").await, answering("hub-b").await);
+    let resolved: Resolved = Arc::new(Mutex::new(vec![a.addr]));
+    let c = client_with(
+        HubSettings {
+            dns_refresh: Duration::from_millis(100),
+            ..settings("dns:///hubs.test:7000".into())
+        },
+        |pool| {
+            let resolved = Arc::clone(&resolved);
+            pool.set_resolver(Arc::new(move |host, port| {
+                assert_eq!((host.as_str(), port), ("hubs.test", 7000));
+                let addrs = resolved.lock().unwrap().clone();
+                Box::pin(async move { Ok(addrs) })
+            }));
+        },
+    )
+    .await;
+    all_registered(&c, &["hub-a"]).await;
+    resolved.lock().unwrap().push(b.addr);
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+
+    // hub-a's request is still being handled when hub-a leaves DNS.
+    a.send_to_clients(push_request("in-a")).await;
+    eventually("a handler runs", async || c.held.lock().unwrap().len() == 1).await;
+    *resolved.lock().unwrap() = vec![b.addr];
+    all_registered(&c, &["hub-b"]).await;
+    for _ in 0..3 {
+        c.sender
+            .send_command(&Ping {}, SendOptions::default())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        b.requests().await.len(),
+        3,
+        "a draining hub gets no new request"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        a.connected_clients().await,
+        1,
+        "kept open while its handler runs"
+    );
+    let reply_to = c.held.lock().unwrap().pop().unwrap();
+    reply_to.grant().await;
+    eventually("hub-a closed once idle", async || {
+        a.connected_clients().await == 0
+    })
+    .await;
+    assert_eq!(c.pool.connections().len(), 1);
+    c.shutdown().await;
+}
+
+/// A failed or empty resolution keeps the hubs there are.
+#[tokio::test]
+async fn a_failed_resolution_keeps_the_current_hubs() {
+    let a = answering("hub-a").await;
+    let answer: Arc<Mutex<Option<Vec<SocketAddr>>>> = Arc::new(Mutex::new(Some(vec![a.addr])));
+    let c = client_with(
+        HubSettings {
+            dns_refresh: Duration::from_millis(50),
+            ..settings("dns:///hubs.test:7000".into())
+        },
+        |pool| {
+            let answer = Arc::clone(&answer);
+            pool.set_resolver(Arc::new(move |_, _| {
+                let r = answer.lock().unwrap().clone();
+                Box::pin(async move { r.ok_or_else(|| std::io::Error::other("no such host")) })
+            }));
+        },
+    )
+    .await;
+    all_registered(&c, &["hub-a"]).await;
+    *answer.lock().unwrap() = None;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    *answer.lock().unwrap() = Some(vec![]);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(c.pool.hub_ids(), ["hub-a"]);
+    assert_eq!(a.connected_clients().await, 1);
+    c.shutdown().await;
+}

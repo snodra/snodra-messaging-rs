@@ -1,7 +1,8 @@
 //! In-process stand-in for kraken-hub: records registrations, answers a v2 `Register` with a
 //! `RegisterAck` (new-hub behaviour, the default) or not at all (old-hub behaviour, `set_ack(None)`).
 //! The ack lists "flow-control" when the client declared it, unless `set_flow_control(false)`
-//! (the P0 hub). Permits messages are recorded per stream. It
+//! (the P0 hub), and "instance-status" likewise unless `set_instance_status(false)` (hubs before
+//! P3). Permits and InstanceStatus messages are recorded per stream. It
 //! echoes heartbeats, can drop streams, reject a registration, push requests to clients and answer
 //! their requests.
 
@@ -54,6 +55,10 @@ pub struct State {
     flow_control: AtomicBool,
     /// Permits messages: (stream number, count, when).
     permits: StdMutex<Vec<(usize, u32, std::time::Instant)>>,
+    instance_status: AtomicBool,
+    /// InstanceStatus messages: (stream number, report).
+    statuses: StdMutex<Vec<(usize, proto::InstanceStatus)>>,
+    down: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -69,6 +74,9 @@ impl Hub for Service {
         request: Request<Streaming<ClientMessage>>,
     ) -> Result<Response<Self::ConnectStream>, Status> {
         let state = self.0.clone();
+        if state.down.load(Ordering::SeqCst) {
+            return Err(Status::unavailable("hub down (test)"));
+        }
         if state.reject_next.swap(false, Ordering::SeqCst) {
             return Err(Status::already_exists(
                 "type t.Cmd is owned by other-service",
@@ -95,11 +103,15 @@ impl Hub for Service {
                             client_message::Message::Register(r) => {
                                 let v2 = r.protocol_version >= 2;
                                 let wants_flow = r.capabilities.iter().any(|c| c == "flow-control");
+                                let wants_status = r.capabilities.iter().any(|c| c == "instance-status");
                                 state.registers.lock().await.push(r);
                                 // Like the real hub: the ack is written before the echo of the next heartbeat.
                                 let ack = state.ack.lock().unwrap().clone().map(|mut ack| {
                                     if wants_flow && state.flow_control.load(Ordering::SeqCst) {
                                         ack.capabilities.push("flow-control".to_string());
+                                    }
+                                    if wants_status && state.instance_status.load(Ordering::SeqCst) {
+                                        ack.capabilities.push("instance-status".to_string());
                                     }
                                     ack
                                 });
@@ -117,8 +129,7 @@ impl Hub for Service {
                             }
                             client_message::Message::Reply(r) => state.replies.lock().await.push((stream_no, r)),
                             client_message::Message::Permits(p) => state.permits.lock().unwrap().push((stream_no, p.count, std::time::Instant::now())),
-                            // Multi-hub status reports (ADR 0016): the client does not send them yet.
-                            client_message::Message::Status(_) => {}
+                            client_message::Message::Status(st) => state.statuses.lock().unwrap().push((stream_no, st)),
                             client_message::Message::Request(req) => {
                                 state.requests.lock().await.push(req.clone());
                                 let response = state.responder.lock().await.as_ref().and_then(|f| f(req));
@@ -167,6 +178,9 @@ impl FakeHub {
             streams: AtomicUsize::new(0),
             flow_control: AtomicBool::new(true),
             permits: StdMutex::new(vec![]),
+            instance_status: AtomicBool::new(true),
+            statuses: StdMutex::new(vec![]),
+            down: AtomicBool::new(false),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -229,6 +243,35 @@ impl FakeHub {
     /// Whether the ack shares "flow-control" with clients that declare it (`false`: the P0 hub).
     pub fn set_flow_control(&self, on: bool) {
         self.state.flow_control.store(on, Ordering::SeqCst);
+    }
+
+    /// A hub whose ack carries `hub_id` (the default ack otherwise).
+    pub async fn start_with_id(hub_id: &str) -> FakeHub {
+        let hub = FakeHub::start().await;
+        hub.set_ack(Some(proto::RegisterAck {
+            hub_id: hub_id.to_string(),
+            ..default_ack()
+        }));
+        hub
+    }
+
+    /// Whether the ack shares "instance-status" with clients that declare it (`false`: a hub
+    /// before P3).
+    pub fn set_instance_status(&self, on: bool) {
+        self.state.instance_status.store(on, Ordering::SeqCst);
+    }
+
+    /// InstanceStatus messages received: (1-based stream number, report).
+    pub fn statuses(&self) -> Vec<(usize, proto::InstanceStatus)> {
+        self.state.statuses.lock().unwrap().clone()
+    }
+
+    /// A down hub refuses every new stream (UNAVAILABLE) and drops the open ones.
+    pub fn set_down(&self, down: bool) {
+        self.state.down.store(down, Ordering::SeqCst);
+        if down {
+            self.drop_streams();
+        }
     }
 
     /// Permits messages received: (1-based stream number, count).

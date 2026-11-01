@@ -206,7 +206,7 @@ async fn register_declares_protocol_v2_and_client_version() {
     let r = &hub.registers().await[0];
     assert_eq!(r.protocol_version, PROTOCOL_VERSION);
     assert_eq!(r.protocol_version, 2);
-    assert_eq!(r.capabilities, ["flow-control"]);
+    assert_eq!(r.capabilities, ["flow-control", "instance-status"]);
     assert_eq!(r.client_version, CLIENT_VERSION);
     assert!(r.client_version.starts_with("kraken-messaging-rs/"));
     assert!(r.credentials.is_none());
@@ -228,7 +228,8 @@ async fn ack_completes_the_handshake_and_its_interval_replaces_the_fallback() {
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);
     let shared = proto::RegisterAck {
-        capabilities: vec!["flow-control".into()], // we declared it, the hub shares it
+        // we declared them, the hub shares them
+        capabilities: vec!["flow-control".into(), "instance-status".into()],
         ..ack
     };
     assert_eq!(conn.handshake(), Some(Handshake::V2(shared)));

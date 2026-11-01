@@ -4,6 +4,10 @@
 //! `HubUnavailable` (the hub never saw it, a retry is always safe); one that was accepted by a
 //! stream's outbound queue and whose stream then broke fails with `HubConnectionLost` (outcome
 //! unknown, the handler may have run).
+//!
+//! With several hubs ([`HubPool`]) a request goes to one of them (round-robin, or rendezvous by
+//! routing key); one that could not be written to that hub's stream is written to the next hub
+//! with the same id (it was never sent), so `HubUnavailable` means no hub took it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -19,6 +23,7 @@ use crate::retry::{self, RetryPolicy};
 use crate::types::{Command, Query};
 
 use super::connection::{Handshake, HubConnection, Inbound, StreamId};
+use super::pool::{HubPool, weak_probe};
 
 /// The timeout sent to a hub older than protocol v2 when the caller chose none (today's default).
 pub const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -189,7 +194,7 @@ struct Entry {
 
 /// The `CommandBus`/`QueryBus` of the Rust side. Replies arrive through [`Sender::on_inbound`].
 pub struct Sender {
-    conn: Arc<HubConnection>,
+    hubs: Arc<HubPool>,
     pending: Mutex<HashMap<String, Entry>>,
     default_timeout: Option<Duration>,
     forward_jwt: bool,
@@ -213,15 +218,32 @@ impl Sender {
         )
     }
 
+    /// A sender over one connection the caller owns.
     pub fn with_settings(conn: Arc<HubConnection>, settings: SenderSettings) -> Arc<Sender> {
-        Arc::new(Sender {
-            conn,
+        Self::with_pool(HubPool::of(conn), settings)
+    }
+
+    /// A sender over every hub of `hubs`.
+    pub fn with_pool(hubs: Arc<HubPool>, settings: SenderSettings) -> Arc<Sender> {
+        let sender = Arc::new(Sender {
+            hubs: Arc::clone(&hubs),
             pending: Mutex::new(HashMap::new()),
             default_timeout: settings.default_timeout,
             forward_jwt: settings.forward_jwt,
             priorities: settings.priorities,
             retry: settings.retry,
-        })
+        });
+        hubs.add_pending_probe(weak_probe(Arc::downgrade(&sender), Sender::pending_on));
+        sender
+    }
+
+    /// True while a request written to `stream` is unanswered.
+    fn pending_on(&self, stream: StreamId) -> bool {
+        self.pending
+            .lock()
+            .unwrap()
+            .values()
+            .any(|e| e.stream == stream)
     }
 
     pub async fn send_command<C: Command>(
@@ -324,11 +346,15 @@ impl Sender {
         };
         let policy = match policy {
             Some(p) if p.max_attempts > 1 => p,
-            _ => return self.attempt(&call, payload, chosen).await,
+            _ => return self.attempt(&call, &payload, chosen).await,
         };
         let attempts = policy.max_attempts;
 
-        let budget = retry_budget(self.conn.handshake().as_ref(), type_name, chosen);
+        let budget = retry_budget(
+            self.hubs.handshake_for(&routing_key).as_ref(),
+            type_name,
+            chosen,
+        );
         let started = tokio::time::Instant::now();
         let min_remaining = policy.initial_backoff.max(RETRY_MIN_REMAINING);
         // The first attempt is never gated and gets the whole budget.
@@ -336,7 +362,7 @@ impl Sender {
         let mut attempt = 1;
         loop {
             let timeout = remaining.max(MIN_TIMEOUT);
-            let result = self.attempt(&call, payload.clone(), Some(timeout)).await;
+            let result = self.attempt(&call, &payload, Some(timeout)).await;
             let error = match result {
                 Ok(bytes) => return Ok(bytes),
                 Err(e) => e,
@@ -395,26 +421,31 @@ impl Sender {
     }
 
     /// One `Request` with a fresh id: written, then awaited until the reply, the hub's error or
-    /// the local guard.
+    /// the local guard. A hub whose stream does not take the write is skipped for the next one
+    /// (same id: nothing was written).
     async fn attempt(
         &self,
         call: &Attempt<'_>,
-        payload: Vec<u8>,
+        payload: &[u8],
         chosen: Option<Duration>,
     ) -> Result<Vec<u8>, MessagingError> {
         let id = uuid::Uuid::new_v4().to_string();
         let type_name = call.type_name;
-        let (tx, rx) = oneshot::channel();
         let _forget = ForgetOnDrop {
             pending: &self.pending,
             id: &id,
         };
         // The entry is recorded while the stream is still current, tagged with it, so that stream's
-        // Disconnected always finds it; a failed write removes it again (never written).
+        // Disconnected always finds it. A failed write leaves it to the next hub's build, which
+        // replaces it (new stream, new channel: a late Disconnected of the failed stream finds
+        // nothing of it); when no hub takes the write it is removed (never written).
+        let mut answer = None;
         let sent = self
-            .conn
-            .send_with(|stream, handshake| {
+            .hubs
+            .send_with(call.routing_key, |stream, handshake| {
                 let (timeout_ms, guard) = request_timing(handshake, type_name, chosen);
+                let (tx, rx) = oneshot::channel();
+                answer = Some(rx);
                 self.pending.lock().unwrap().insert(
                     id.clone(),
                     Entry {
@@ -428,7 +459,7 @@ impl Sender {
                     kind: call.kind as i32,
                     r#type: type_name.to_string(),
                     routing_key: call.routing_key.to_string(),
-                    payload,
+                    payload: payload.to_vec(),
                     headers: call.headers.clone(),
                     timeout_ms,
                     priority: call.priority,
@@ -439,12 +470,13 @@ impl Sender {
                 (msg, guard)
             })
             .await;
-        let guard = match sent {
-            Ok((_, guard)) => guard,
-            Err(e) => {
+        let (guard, rx) = match (sent, answer) {
+            (Ok((_, guard)), Some(rx)) => (guard, rx),
+            (Err(e), _) => {
                 self.take(&id);
                 return Err(e);
             }
+            (Ok(_), None) => unreachable!("a written request was built"),
         };
         // The hub emits TIMEOUT itself; the guard covers a hub that never answers at all.
         match tokio::time::timeout(guard, rx).await {
