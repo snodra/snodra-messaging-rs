@@ -1105,7 +1105,7 @@ impl Sender {
     /// `ReplyEnd`; a `ReplyEnd{error}` (the idle timeout, the handler's error or its leaving, the
     /// hub's limits: `Timeout`, `RemoteHandler`, `HandlerDisconnected`, `Cancelled`, ...), a lost
     /// hub stream (`HubConnectionLost`), a part that does not decode (`Serialization`; the
-    /// handler is cancelled) or a lost part (`InvalidMessage` "stream <type> lost N part(s)":
+    /// handler is cancelled) or a lost part (`InvalidMessage` `stream <type> lost N part(s)`:
     /// `seq` must run 1, 2, 3, ... in arrival order, and a clean `ReplyEnd` must count the parts
     /// that arrived; the handler is cancelled at a gap) is its last item. It refills credit as it is consumed: half the
     /// window ([`StreamOptions::initial_credit`]) every time half of it was pulled, so a handler

@@ -84,7 +84,7 @@ impl Dispatcher {
     }
 
     /// The longest a streaming handler waits for credit before its stream ends with `TIMEOUT`
-    /// "no credit within <d>" and its permits go back (`Config.hub_stream_credit_timeout`;
+    /// `no credit within <d>` and its permits go back (`Config.hub_stream_credit_timeout`;
     /// default [`crate::config::DEFAULT_STREAM_CREDIT_TIMEOUT`]). A hub that forgot the stream
     /// (a lost `Flow` or `Cancel`) would otherwise leave the handler task waiting for ever.
     pub fn stream_credit_timeout(mut self, timeout: Duration) -> Dispatcher {

@@ -53,7 +53,7 @@ pub struct Config {
     /// and its multiplier a finite number >= 1 ([`Config::validate`]).
     pub hub_retry: Option<RetryPolicy>,
     /// How long a streaming query handler waits for credit before ending its stream with
-    /// `TIMEOUT` "no credit within <d>" and releasing its permits (a hub that forgot the stream
+    /// `TIMEOUT` `no credit within <d>` and releasing its permits (a hub that forgot the stream
     /// would otherwise leave the handler task waiting for ever). Default 10 minutes, the hub's
     /// default `KRAKEN_HUB_MAX_STREAM_DURATION`; at least 1 ms ([`Config::validate`]).
     pub hub_stream_credit_timeout: Duration,
