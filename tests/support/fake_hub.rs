@@ -46,7 +46,8 @@
 //! `max_results` parts the stream ends and the handler gets `Cancel{"max results"}`; a sender
 //! `Flow` adds credit and is relayed as `Flow{<id>#1}`; a sender `Cancel` cancels the handler and
 //! ends the stream silently; no part within `timeout_ms` (else 5 s, from the forward, reset per
-//! part) ends it with `TIMEOUT` and `Cancel{"idle timeout"}`; the handler leaving ends it with
+//! part; the clock does not run while the credit is 0 and starts over at the `Flow` that raises
+//! it) ends it with `TIMEOUT` and `Cancel{"idle timeout"}`; the handler leaving ends it with
 //! `HANDLER_DISCONNECTED`, the sender leaving cancels the handler (`"sender disconnected"`).
 //! Client-sent parts, ends, flows and cancels are recorded per stream.
 
@@ -111,7 +112,8 @@ struct StreamState {
     parts: u32,
     max_results: u32,
     idle: Duration,
-    deadline: Instant,
+    /// When the idle timeout fires; `None` while the credit is 0 (the clock is paused).
+    deadline: Option<Instant>,
 }
 
 /// Why a gather closes.
@@ -544,7 +546,7 @@ impl State {
                 parts: 0,
                 max_results: req.max_results,
                 idle,
-                deadline: Instant::now() + idle,
+                deadline: Some(Instant::now() + idle),
             },
         );
         self.stream_target_of
@@ -562,6 +564,11 @@ impl State {
                 if !me.stream_timeouts.load(Ordering::SeqCst) {
                     return;
                 }
+                // Paused (credit 0): look again shortly, the Flow that resumes it re-arms it.
+                let Some(deadline) = deadline else {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                };
                 if Instant::now() >= deadline {
                     let end = me.end_stream(
                         &id,
@@ -657,7 +664,7 @@ impl State {
             } else {
                 st.credit -= 1;
                 st.parts += 1;
-                st.deadline = Instant::now() + st.idle;
+                st.deadline = (st.credit > 0).then(|| Instant::now() + st.idle);
                 let part = server(server_message::Message::Part(proto::ReplyPart {
                     request_id: parent.clone(),
                     payload: p.payload,
@@ -719,6 +726,9 @@ impl State {
         else {
             return vec![];
         };
+        if st.credit == 0 {
+            st.deadline = Some(Instant::now() + st.idle);
+        }
         st.credit = st.credit.saturating_add(f.credits);
         vec![(
             st.target.clone(),

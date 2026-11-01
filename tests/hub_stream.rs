@@ -1053,6 +1053,44 @@ async fn the_idle_timeout_ends_the_stream_with_timeout() {
     c.shutdown().await;
 }
 
+/// The hub's idle clock does not run while the stream's credit is 0 (the handler cannot send,
+/// the sender owes credit) and starts over at the `Flow` that raises it: a consumer slower than
+/// the idle timeout is not timed out while the window sits in its buffer.
+#[tokio::test]
+async fn a_consumer_slower_than_the_idle_timeout_is_not_timed_out_while_it_owes_credit() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let h = handler(&hub.address(), "svc-h", "h1", &probe, 2).await;
+    let c = caller(&hub.address()).await;
+    let options = StreamOptions {
+        timeout: Some(Duration::from_millis(300)),
+        initial_credit: 4,
+        ..StreamOptions::default()
+    };
+    // The window (4 parts) is sent at once; the handler then holds item 4 at zero credit.
+    let mut stream = c.sender.stream(&export(6, 0, None), options).await.unwrap();
+    assert_eq!(stream.next().await.unwrap().unwrap().i, 0);
+    eventually("the window sent", async || hub.parts().len() == 4).await;
+    // Longer than the idle timeout before the pull that refills (half the window: 2 credits).
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(stream.next().await.unwrap().unwrap().i, 1);
+    eventually("the refill", async || hub.flows().len() == 1).await;
+    // And again while the handler's last items and its end sit in the buffer.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let (rows, error) = collect(&mut stream).await;
+    assert!(error.is_none(), "no TIMEOUT for a slow consumer: {error:?}");
+    assert_eq!(rows, [2, 3, 4, 5]);
+    assert!(hub.cancels().is_empty(), "{:?}", hub.cancels());
+    assert_eq!(c.sender.in_flight(), 0);
+    eventually("the handler ended", async || {
+        probe.dropped.load(Ordering::SeqCst) == 1 && h.dispatcher.available_permits() == 2
+    })
+    .await;
+    drop(stream);
+    h.shutdown().await;
+    c.shutdown().await;
+}
+
 /// The hub bounds a queue wait by `timeout_ms` and restarts the idle clock at the forward, so
 /// the first part may take up to twice the timeout: the local guard allows 2 x the hub's bound
 /// plus 1 s for it, then the bound plus 1 s reset by every part. (A hub that never ends an idle
