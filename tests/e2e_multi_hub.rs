@@ -1,6 +1,7 @@
 //! End to end with two real P3 hubs (`kraken-hub:p3-hub`, ADR 0016): every instance registers on
 //! both, reports its connected hubs to both, spreads unkeyed requests over both, survives one hub
-//! stopping mid-traffic and is back on it within the backoff cap once it restarts.
+//! stopping mid-traffic and is back on it within the backoff cap once it restarts, and moves a
+//! stopped hub's permits to the other one (`Permits.grant`) without revoking them on its return.
 mod support;
 
 use std::sync::Arc;
@@ -313,6 +314,69 @@ async fn a_hub_stopped_mid_traffic_fails_over_and_is_rejoined_after_its_restart(
         "the restarted hub is used again"
     );
     Arc::into_inner(a).unwrap().shutdown().await;
+    b.shutdown().await;
+}
+
+/// `permitsAvailable` of `service`'s instance on `hub`; `None` while it is not listed.
+async fn permits_available(hub: &HubContainer, service: &str) -> Option<u64> {
+    instance(hub, service)
+        .await
+        .and_then(|v| v["permitsAvailable"].as_u64())
+}
+
+/// Polls (every 25 ms, at most `limit`) until `service` shows `want` permits on `hub`.
+async fn permits_reach(hub: &HubContainer, service: &str, want: u64, limit: Duration) -> Duration {
+    let started = Instant::now();
+    loop {
+        let now = permits_available(hub, service).await;
+        if now == Some(want) {
+            return started.elapsed();
+        }
+        assert!(
+            started.elapsed() < limit,
+            "{} shows {now:?} permits, not {want}",
+            hub.http
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// max 8 over two hubs: 4 permits on each. Hub 2 stops: hub 1 is topped up with
+/// `Permits{count = 4, grant = 8}` and shows 8 within about 2 s. Hub 2 returns: it gets 4 afresh
+/// and hub 1 keeps its 8 (nothing is revoked).
+#[tokio::test]
+async fn a_stopped_hubs_permits_move_to_the_other_and_are_not_revoked_on_its_return() {
+    require_docker!();
+    let ((h1, h2), db) = tokio::join!(two_hubs(), mongo());
+    let hubs = format!("{},{}", h1.address, h2.address);
+    let b = worker(config("e2e-b", &hubs, &db.uri_for("b"))).await;
+    registered_on(&b, &IDS, Duration::from_secs(15)).await;
+    for hub in [&h1, &h2] {
+        permits_reach(hub, "e2e-b", 4, Duration::from_secs(10)).await;
+    }
+
+    let stopping = Instant::now();
+    h2.container.stop().await.unwrap();
+    let stopped = stopping.elapsed();
+    let topped_up = permits_reach(&h1, "e2e-b", 8, Duration::from_secs(10)).await;
+    eprintln!(
+        "hub 1 shows 8 permits {topped_up:?} after hub 2 stopped (the stop took {stopped:?})"
+    );
+    assert!(
+        topped_up <= Duration::from_millis(2_500),
+        "topped up only after {topped_up:?}"
+    );
+
+    h2.container.start().await.unwrap();
+    wait_until_reachable(&h2.address).await;
+    registered_on(&b, &IDS, Duration::from_secs(15)).await;
+    permits_reach(&h2, "e2e-b", 4, Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        permits_available(&h1, "e2e-b").await,
+        Some(8),
+        "nothing revoked"
+    );
     b.shutdown().await;
 }
 

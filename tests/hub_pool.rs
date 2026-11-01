@@ -201,8 +201,10 @@ async fn await_registered_waits_for_any_hub_and_await_all_registered_for_every_h
 
 /// While a hub is out, the survivors may run its share too (shared with kraken-messaging): when
 /// the live hubs go from N_old to N_new < N_old, every live hub gets a `Permits` top-up up to
-/// `ceil(max / N_new)` (here 8 / 1 − 8 / 2 = 4). A returning hub offers `ceil(max / N)` afresh;
-/// nothing is revoked, and a hub that already holds the larger share gets no second top-up.
+/// `ceil(max / N_new)` (here 8 / 1 − 8 / 2 = 4) with `grant = ceil(max / N_new)`, which raises the
+/// hub's permit cap (the fake hub caps like kraken-hub) so the hub keeps the top-up. A returning hub
+/// offers `ceil(max / N)` afresh; nothing is revoked, and a hub that already holds the larger share
+/// gets no second top-up.
 #[tokio::test]
 async fn surviving_hubs_get_the_share_of_a_hub_that_left() {
     let (a, b) = (answering("hub-a").await, answering("hub-b").await);
@@ -229,6 +231,12 @@ async fn surviving_hubs_get_the_share_of_a_hub_that_left() {
         "ceil(8 / 1) - ceil(8 / 2) on hub-a's stream"
     );
     assert!(at.duration_since(stopped) < Duration::from_secs(1));
+    assert_eq!(
+        a.grants(),
+        [(1, 8)],
+        "the top-up raises the cap to ceil(8 / 1)"
+    );
+    assert_eq!(a.permits_held(1), Some(8), "hub-a holds the whole share");
 
     b.set_down(false);
     all_registered(&c, &["hub-a", "hub-b"]).await;
@@ -242,6 +250,7 @@ async fn surviving_hubs_get_the_share_of_a_hub_that_left() {
     all_registered(&c, &["hub-a"]).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(a.permits(), [(1, 4)], "one top-up, nothing else");
+    assert_eq!(a.permits_held(1), Some(8), "nothing revoked");
     assert_eq!(
         initial(a.registers().await),
         [4],
@@ -273,10 +282,8 @@ async fn a_hub_down_at_start_leaves_its_share_to_the_others() {
     all_registered(&c, &["hub-a"]).await;
     let offered = a.registers().await[0].initial_permits;
     assert_eq!(offered, 5, "split with the hub still on its first attempt");
-    eventually("hub-a holds all 10", async || {
-        offered + a.permits().iter().map(|(_, n)| n).sum::<u32>() == 10
-    })
-    .await;
+    eventually("hub-a holds all 10", async || a.permits_held(1) == Some(10)).await;
+    assert_eq!(a.grants(), [(1, 10)]);
     c.shutdown().await;
 }
 

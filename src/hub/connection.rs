@@ -268,13 +268,13 @@ impl Grants {
         })
     }
 
-    /// Raises the permits this stream offered to `share` when it offered fewer (a flow-controlled
-    /// stream only); returns the top-up to write. Never lowers them.
     /// The permits this stream offered so far (its `Register` plus top-ups).
     fn initial(&self) -> u32 {
         self.state.lock().unwrap().initial
     }
 
+    /// Raises the permits this stream offered to `share` when it offered fewer (a flow-controlled
+    /// stream only); returns the top-up to write. Never lowers them.
     fn raise(&self, share: u32) -> u32 {
         let mut s = self.state.lock().unwrap();
         if s.mode != GrantMode::On || share <= s.initial {
@@ -341,7 +341,7 @@ impl Grants {
 
     async fn run(self: &Arc<Self>, next: Flush) {
         match next {
-            Flush::Now(count) => self.send(count).await,
+            Flush::Now(count) => self.send(count, 0).await,
             Flush::Arm => {
                 let me = Arc::clone(self);
                 tokio::spawn(async move { me.flush_later().await });
@@ -358,16 +358,17 @@ impl Grants {
             s.take()
         };
         if count > 0 {
-            self.send(count).await;
+            self.send(count, 0).await;
         }
     }
 
+    /// Writes `Permits{count, grant}` (`grant` 0: plain grants; see [`HubConnection::top_up`]).
     /// Best effort: a stream that is gone takes its permits with it (the hub resets them).
-    async fn send(&self, count: u32) {
+    async fn send(&self, count: u32, grant: u32) {
         if let Some(tx) = self.tx.upgrade() {
             let _ = tx
                 .send(ClientMessage {
-                    message: Some(client_message::Message::Permits(Permits { count })),
+                    message: Some(client_message::Message::Permits(Permits { count, grant })),
                 })
                 .await;
         }
@@ -657,6 +658,9 @@ impl HubConnection {
     /// Tops the current stream up to `share` permits in all (the initial offer plus earlier
     /// top-ups) with one `Permits` message, when its hub shares flow control and the stream
     /// offered fewer; never lowers them ([`super::HubPool`]: a hub left, the others take its share).
+    /// The message is `Permits{count = share - offered, grant = share}`: the grant raises the
+    /// hub's permit cap on the session (`initial_permits` until then) so the hub keeps the top-up;
+    /// a hub that predates `Permits.grant` ignores it and clamps the top-up away.
     pub(crate) async fn top_up(&self, share: u32) {
         let Some((stream, grants)) = self
             .live
@@ -670,7 +674,7 @@ impl HubConnection {
         let count = grants.raise(share);
         if count > 0 {
             tracing::debug!(service = %self.service_name, address = %self.settings.address, stream, count, share, "permits topped up");
-            grants.send(count).await;
+            grants.send(count, share).await;
         }
     }
 

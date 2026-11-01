@@ -10,6 +10,13 @@
 //! stream's session: the older stream is ended (its forwarded requests can no longer be answered)
 //! unless `set_replace_sessions(false)`. A stream that ends while it holds the session removes the
 //! instance. Registrations and stream ends are logged in order ([`FakeHub::events`]).
+//!
+//! Permit accounting like kraken-hub (it never holds requests back, it only counts): a stream whose
+//! ack shares "flow-control" and whose first `Register` offers `initial_permits > 0` holds that
+//! many permits ([`FakeHub::permits_held`]); each request pushed to it spends one, each `Permits`
+//! adds `count`, never past the stream's cap. The cap starts at `initial_permits` and a
+//! `Permits.grant` above it raises it first (never lowers it). `set_permit_cap(false)` drops the
+//! cap; `set_permit_grants(false)` emulates a hub that predates `Permits.grant`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -55,13 +62,20 @@ pub struct State {
     reject_invalid_next: AtomicBool,
     echo_heartbeats: AtomicBool,
     drop_tx: broadcast::Sender<()>,
-    clients: Mutex<Vec<Outbound>>,
+    /// Open streams: (stream number, outbound).
+    clients: Mutex<Vec<(usize, Outbound)>>,
     responder: Mutex<Option<Responder>>,
     ack: StdMutex<Option<proto::RegisterAck>>,
     streams: AtomicUsize,
     flow_control: AtomicBool,
     /// Permits messages: (stream number, count, when).
     permits: StdMutex<Vec<(usize, u32, std::time::Instant)>>,
+    /// Permits messages' grants: (stream number, grant).
+    grants: StdMutex<Vec<(usize, u32)>>,
+    /// Flow-controlled streams: stream number → (permits held, cap).
+    held: StdMutex<HashMap<usize, (u32, u32)>>,
+    permit_cap: AtomicBool,
+    permit_grants: AtomicBool,
     instance_status: AtomicBool,
     /// InstanceStatus messages: (stream number, report).
     statuses: StdMutex<Vec<(usize, proto::InstanceStatus)>>,
@@ -121,7 +135,7 @@ impl Hub for Service {
         let mut inbound = request.into_inner();
         let stream_no = state.streams.fetch_add(1, Ordering::SeqCst) + 1;
         let (tx, rx) = mpsc::channel::<Result<ServerMessage, Status>>(64);
-        state.clients.lock().await.push(tx.clone());
+        state.clients.lock().await.push((stream_no, tx.clone()));
         let mut drop_rx = state.drop_tx.subscribe();
         let cancel = CancellationToken::new();
         tokio::spawn(async move {
@@ -152,6 +166,11 @@ impl Hub for Service {
                                     state.log(Event::Evicted { stream: old });
                                     token.cancel();
                                 }
+                                let flow = wants_flow && state.flow_control.load(Ordering::SeqCst) && state.ack.lock().unwrap().is_some() && v2;
+                                if flow && r.initial_permits > 0 {
+                                    // Like the real hub: the first Register of a stream fixes its permits.
+                                    state.held.lock().unwrap().entry(stream_no).or_insert((r.initial_permits, r.initial_permits));
+                                }
                                 state.registers.lock().await.push(r);
                                 // Like the real hub: the ack is written before the echo of the next heartbeat.
                                 let ack = state.ack.lock().unwrap().clone().map(|mut ack| {
@@ -176,7 +195,19 @@ impl Hub for Service {
                                 }
                             }
                             client_message::Message::Reply(r) => state.replies.lock().await.push((stream_no, r)),
-                            client_message::Message::Permits(p) => state.permits.lock().unwrap().push((stream_no, p.count, std::time::Instant::now())),
+                            client_message::Message::Permits(p) => {
+                                state.permits.lock().unwrap().push((stream_no, p.count, std::time::Instant::now()));
+                                state.grants.lock().unwrap().push((stream_no, p.grant));
+                                if let Some((held, cap)) = state.held.lock().unwrap().get_mut(&stream_no) {
+                                    if state.permit_grants.load(Ordering::SeqCst) {
+                                        *cap = (*cap).max(p.grant);
+                                    }
+                                    *held = held.saturating_add(p.count);
+                                    if state.permit_cap.load(Ordering::SeqCst) {
+                                        *held = (*held).min(*cap);
+                                    }
+                                }
+                            }
                             client_message::Message::Status(st) => state.statuses.lock().unwrap().push((stream_no, st)),
                             client_message::Message::Request(req) => {
                                 state.requests.lock().await.push(req.clone());
@@ -196,7 +227,7 @@ impl Hub for Service {
             }
             state.log(Event::Closed { stream: stream_no });
             let mut clients = state.clients.lock().await;
-            clients.retain(|c| !c.same_channel(&tx));
+            clients.retain(|(_, c)| !c.same_channel(&tx));
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
@@ -233,6 +264,10 @@ impl FakeHub {
             streams: AtomicUsize::new(0),
             flow_control: AtomicBool::new(true),
             permits: StdMutex::new(vec![]),
+            grants: StdMutex::new(vec![]),
+            held: StdMutex::new(HashMap::new()),
+            permit_cap: AtomicBool::new(true),
+            permit_grants: AtomicBool::new(true),
             instance_status: AtomicBool::new(true),
             statuses: StdMutex::new(vec![]),
             down: AtomicBool::new(false),
@@ -345,6 +380,32 @@ impl FakeHub {
             .collect()
     }
 
+    /// The `Permits.grant` of each Permits message received: (1-based stream number, grant).
+    pub fn grants(&self) -> Vec<(usize, u32)> {
+        self.state.grants.lock().unwrap().clone()
+    }
+
+    /// Permits the hub holds for stream `stream` (1-based); `None` unless that stream is
+    /// flow-controlled with `initial_permits > 0`.
+    pub fn permits_held(&self, stream: usize) -> Option<u32> {
+        self.state
+            .held
+            .lock()
+            .unwrap()
+            .get(&stream)
+            .map(|(held, _)| *held)
+    }
+
+    /// Whether permits stop at the stream's cap (default `true`, as kraken-hub).
+    pub fn set_permit_cap(&self, on: bool) {
+        self.state.permit_cap.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether `Permits.grant` raises the cap (default `true`; `false`: a hub that predates it).
+    pub fn set_permit_grants(&self, on: bool) {
+        self.state.permit_grants.store(on, Ordering::SeqCst);
+    }
+
     /// Permits messages with the instant each arrived.
     pub fn permits_timed(&self) -> Vec<(usize, u32, std::time::Instant)> {
         self.state.permits.lock().unwrap().clone()
@@ -372,9 +433,16 @@ impl FakeHub {
     }
 
     /// Pushes a server message (typically a Request) to every connected client.
+    /// A Request spends one permit of each flow-controlled stream it is pushed to.
     pub async fn send_to_clients(&self, msg: ServerMessage) {
-        for c in self.state.clients.lock().await.iter() {
-            let _ = c.send(Ok(msg.clone())).await;
+        let request = matches!(msg.message, Some(server_message::Message::Request(_)));
+        for (stream, c) in self.state.clients.lock().await.iter() {
+            if c.send(Ok(msg.clone())).await.is_ok()
+                && request
+                && let Some((held, _)) = self.state.held.lock().unwrap().get_mut(stream)
+            {
+                *held = held.saturating_sub(1);
+            }
         }
     }
 

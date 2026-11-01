@@ -20,8 +20,9 @@
 //!   ([`permit_share`]), N being the hubs live when its `Register` is written, itself included;
 //!   until a hub's first connect attempt is over it counts as live, so hubs that come up together
 //!   split from the start. When N shrinks (a hub is lost, closed as a duplicate or leaves DNS),
-//!   every live stream is topped up to `ceil(max / N)` with one `Permits` message, so the
-//!   survivors can run the share of the hub that left; a stream that already offered that many
+//!   every live stream is topped up to `ceil(max / N)` with one `Permits` message whose `grant`
+//!   (`ceil(max / N)`) raises the hub's permit cap on the session, so the survivors can run the
+//!   share of the hub that left; a stream that already offered that many
 //!   gets nothing. Permits are never revoked when N grows. The local concurrency guard stays the
 //!   total.
 //! - **Status.** Every `status_interval` an `InstanceStatus` (acknowledged hub ids, handlers in

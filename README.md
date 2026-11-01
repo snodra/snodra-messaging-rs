@@ -247,7 +247,9 @@ every instance registers on every hub, and the client picks a hub per request.
   as live, so hubs that start together split from the start). When N shrinks from N_old to N_new
   (a hub is lost, its first attempt fails, it is closed as a duplicate or leaves DNS), every live
   stream gets one `Permits` top-up so that it holds `ceil(max / N_new)` in all: with 8 permits and
-  two hubs each offers 4, and when one stops the survivor gets `Permits(4)`. A stream that already
+  two hubs each offers 4, and when one stops the survivor gets `Permits{count: 4, grant: 8}`; the
+  grant raises the hub's permit cap on the session (otherwise its `initial_permits`) so the hub
+  keeps the top-up (a hub that predates `Permits.grant` ignores it and clamps). A stream that already
   offered that many (it was topped up before, or opened while another hub was down) gets nothing,
   so flapping hubs never inflate the permits. A joining or returning hub offers `ceil(max / N)`
   afresh. Permits are never revoked when N grows; the local concurrency limit stays
