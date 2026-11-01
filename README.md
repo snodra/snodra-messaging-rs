@@ -26,6 +26,7 @@ indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
 | Register with the hub, handle commands and queries, reconnect with backoff | `hub::HubConnection`, `hub::Dispatcher` |
 | Connect to every hub of a list or a DNS name, route and fail over between them | `hub::HubPool` |
 | Send commands and queries, typed replies, timeouts, error mapping | `hub::Sender` (`app.commands()`, `app.queries()`) |
+| Shared query types and scatter-gather queries | `shared_query`, `Sender::scatter_gather` (see [Scatter-gather](#scatter-gather)) |
 | Publish events through the Mongo outbox, relay to Kafka | `kafka::EventBus`, `kafka::OutboxPublisher` |
 | Consume events idempotently (marker + handler in one transaction) | `kafka::EventConsumer` |
 | Identity from the forwarded JWT: JWKS verification or unverified parsing; handler guards | `identity::{IdentityResolver, JwksVerifier, Guard}` |
@@ -37,6 +38,7 @@ indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
 - [Configuration (`Config::from_env`)](#configuration-configfromenv)
 - [Semantics worth knowing](#semantics-worth-knowing)
 - [Multiple hubs](#multiple-hubs)
+- [Scatter-gather](#scatter-gather)
 - [Build and test](#build-and-test)
 - [Example](#example)
 - [CI/CD pipeline](#cicd-pipeline)
@@ -262,6 +264,76 @@ every instance registers on every hub, and the client picks a hub per request.
   (`connectedHubIds`, `statusAgeMs`) and its dashboard flags instances missing a hub.
 - **Logs** of each connection carry its `address` (and the `hub` id once acknowledged). The crate
   has no metrics of its own.
+
+## Scatter-gather
+
+Shared query types and scatter-gather queries ([ADR 0017](../kraken/docs/adr/0017-query-modes-and-shared-query-types.md)),
+the counterpart of kraken-messaging's `scatterGather` and `@QueryHandler(shared = true)`.
+
+```rust
+use kraken_messaging::hub::{ScatterOptions, ScatterPart, ScatterResult};
+
+// Handler side: several services may own Search. A per-target request has the id `<id>#<n>`
+// and is served like any query.
+let app = KrakenMessaging::builder(config).await?
+    .shared_query::<Search, _, _>(|q, ctx| async move { Ok(Hits { .. }) })
+    .start().await?;
+
+// Sender side: every live instance of every owner answers.
+let result: ScatterResult<Hits> = app.queries().scatter_gather(&Search { term }, ScatterOptions {
+    timeout: Some(Duration::from_secs(2)), // the whole gather; else Config.hub_request_timeout, else the hub's
+    max_results: 0,                        // end after this many successful parts (0: all targets)
+    priority: None,                        // else KRAKEN_HUB_PRIORITIES for the type, else 0
+}).await?;
+for ScatterPart { service, instance, outcome } in result.parts { /* arrival order */ }
+let (failed, timed_out) = (result.failed, result.timed_out);
+
+// Or part by part, completing on the hub's ReplyEnd:
+let mut parts = app.queries().scatter_gather_stream(&Search { term }, ScatterOptions::default());
+while let Some(part) = parts.next().await { let part = part?; /* ... */ }
+```
+
+| API | Signature |
+|---|---|
+| Register a shared query | `KrakenMessagingBuilder::shared_query::<Q, F, Fut>(handler) -> Self` (also `HandlerRegistry::shared_query`) |
+| Gather | `Sender::scatter_gather<Q: Query>(&self, &Q, ScatterOptions) -> Result<ScatterResult<Q::Reply>, MessagingError>` |
+| Stream | `Sender::scatter_gather_stream<Q: Query>(&self, &Q, ScatterOptions) -> impl Stream<Item = Result<ScatterPart<Q::Reply>, MessagingError>>` |
+| Options | `ScatterOptions { timeout: Option<Duration>, max_results: u32, priority: Option<i32> }` (`Default`) |
+| Result | `ScatterResult<R> { parts: Vec<ScatterPart<R>>, failed: u32, timed_out: u32 }` |
+| Part | `ScatterPart<R> { service: String, instance: String, outcome: Result<R, RemoteError> }` |
+| Part failure | `RemoteError { code: ErrorCode, message: String, details: Vec<u8> }`, `into_error(type)` gives the unary error |
+
+- **Shared registration.** `shared_query` puts the type in `Register.shared_query_types` instead
+  of `query_types`. Registering one type both as `query` and `shared_query` panics at startup.
+  Exclusive vs shared must be consistent across **every** registrant of the type, in every
+  service: the hub answers `ALREADY_EXISTS` at register time to the one that disagrees (the
+  connection keeps retrying at the backoff cap, `last_rejection` says why). Switching a type
+  between the two needs every registrant gone and the owner grace expired. Commands are never
+  shared.
+- **Point queries still work.** `send_query` on a shared type goes to one live instance of any
+  owner (one round-robin pool over all owners at the hub).
+- **Capability.** The client declares `scatter-gather`; a gather goes only to a hub whose
+  `RegisterAck` lists it (`Handshake::scatter_gather`). With none (a P3 or older hub, a legacy
+  hub) it fails at once with `MessagingError::UnsupportedByHub`, nothing sent. An older hub also
+  ignores `shared_query_types`: the type is simply not registered there (a point query to it is
+  `NoHandler`).
+- **Answers.** One part per target answer, in arrival order; a failed target is a part whose
+  `outcome` is a `RemoteError` (the handler's error, or `HANDLER_DISCONNECTED`,
+  `RESOURCE_EXHAUSTED` from the hub); a reply that does not decode is a failed part with code
+  `UNSPECIFIED`. `failed` counts the failed parts, `timed_out` the targets without an answer at
+  the deadline. Partial answers are answers: the call succeeds; check `failed + timed_out` for
+  "all or error". Payloads use the unary reply codec (`()` accepts `{}`).
+- **Errors before any target** are the unary ones: no live target `NoHandler`, a command type
+  `InvalidMessage`, a hub `UNSUPPORTED` answer `UnsupportedByHub`.
+- **Transport.** One gather goes to one hub (unkeyed round-robin over the capable ones). If its
+  stream breaks before the end, the gather fails with `HubConnectionLost` (the parts received are
+  dropped, none is retried on its own); one never written moves to the next hub like a unary
+  request. The local guard (the hub's bound plus 1 s) covers the whole gather (`Timeout`).
+  Parts and ends of unknown requests are ignored, and dropping the stream abandons the gather.
+- **Retry.** `Config.hub_retry` applies to the whole gather for the same errors as a unary query
+  (`HubUnavailable`, `NoHandler`, `HandlerBusy`, `HandlerDisconnected`, `Timeout`,
+  `HubConnectionLost`): a retry is a new gather with a fresh id, collected from scratch, within the
+  same budget. The stream retries only until its first part; after that an error ends it.
 
 ## Build and test
 
