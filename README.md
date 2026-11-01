@@ -391,9 +391,13 @@ while let Some(row) = rows.next().await { let row = row?; /* in the handler's or
   `UnsupportedByHub` too (the hub names the services). Unary queries and gathers are untouched.
 - **One handler, one instance.** The hub picks one capable instance as for a point query (on a
   shared type, one pool over every owner). The handler gets `Request{id = <id>#1, mode =
-  STREAMING, initial_credit}` and only a streaming handler serves it: a unary query to a
-  streaming type, or a stream to a unary type, is `NoHandler` on that instance (a type has one
-  handler, whatever its kind; the sender's retry may find another instance).
+  STREAMING, initial_credit}` and only a streaming handler serves it. A type has one handler,
+  whatever its kind, and the mode must match it: a stream to a type whose handler is unary ends
+  with `INVALID_REQUEST` ("`<type>` is not a streaming query handler (it answers mode UNARY)"),
+  a unary query to a streaming type is answered `INVALID_REQUEST` ("`<type>` is a streaming
+  query: send it with Sender::stream (mode STREAMING)"): the caller used the wrong mode, which no
+  retry fixes (`InvalidMessage`, never retried), unlike `NoHandler` for a type the instance does
+  not serve at all.
 - **Credits.** The handler's stream is pulled only while there is credit (`initial_credit` plus
   every `Flow`), one `ReplyPart` per item (`seq` from 1), then `ReplyEnd`; the end of its stream
   is found by a poll, which needs one credit beyond the last item. The sender refills

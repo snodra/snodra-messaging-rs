@@ -111,7 +111,8 @@ impl HandlerRegistry {
     /// that error (`ReplyEnd{error}`, the stream dropped); a hub `Cancel` drops it silently. The
     /// handler permit is held for the whole stream. The type is announced in
     /// `Register.query_types`; only a streaming request (`Sender::stream`) reaches the handler, a
-    /// unary query to the type is `NO_HANDLER` here.
+    /// unary query to the type is answered `INVALID_REQUEST` here (the wrong mode is the
+    /// caller's mistake, not retryable).
     ///
     /// # Panics
     /// When the type already has a handler here.

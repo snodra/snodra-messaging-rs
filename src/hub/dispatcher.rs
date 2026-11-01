@@ -209,10 +209,19 @@ impl Dispatcher {
     async fn run(&self, req: proto::Request) -> Result<Vec<u8>, MessagingError> {
         let identity = self.identity(&req).await?;
         let handler = match kind(&req)? {
-            RequestKind::Command => self.registry.command_handler(&req.r#type),
-            _ => self.registry.query_handler(&req.r#type),
+            RequestKind::Command => self.registry.command_handler(&req.r#type).cloned(),
+            _ => match self.registry.query_handler(&req.r#type) {
+                Some(handler) => Some(handler.clone()),
+                // The caller used the wrong mode: not retryable, unlike NO_HANDLER.
+                None if self.registry.stream_handler(&req.r#type).is_some() => {
+                    return Err(MessagingError::InvalidMessage(format!(
+                        "{} is a streaming query: send it with Sender::stream (mode STREAMING)",
+                        req.r#type
+                    )));
+                }
+                None => None,
+            },
         }
-        .cloned()
         .ok_or_else(|| MessagingError::NoHandler(req.r#type.clone()))?;
         let type_name = req.r#type.clone();
         let (ctx, _permit, payload) = self.admit(req, identity).await?;
@@ -378,10 +387,19 @@ impl Dispatcher {
     ) -> Result<(OwnedSemaphorePermit, MessageContext, ItemStream), MessagingError> {
         let identity = self.identity(&req).await?;
         let handler = match kind(&req)? {
-            RequestKind::Query => self.registry.stream_handler(&req.r#type),
+            RequestKind::Query => match self.registry.stream_handler(&req.r#type) {
+                Some(handler) => Some(handler.clone()),
+                // The caller used the wrong mode: not retryable, unlike NO_HANDLER.
+                None if self.registry.query_handler(&req.r#type).is_some() => {
+                    return Err(MessagingError::InvalidMessage(format!(
+                        "{} is not a streaming query handler (it answers mode UNARY)",
+                        req.r#type
+                    )));
+                }
+                None => None,
+            },
             _ => None,
         }
-        .cloned()
         .ok_or_else(|| MessagingError::NoHandler(req.r#type.clone()))?;
         let type_name = req.r#type.clone();
         let (ctx, permit, payload) = self.admit(req, identity).await?;

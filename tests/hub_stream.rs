@@ -540,24 +540,48 @@ async fn a_hub_cancel_aborts_a_unary_handler() {
 }
 
 #[tokio::test]
-async fn a_request_whose_mode_does_not_match_the_handler_is_no_handler() {
+async fn a_request_whose_mode_does_not_match_the_handler_is_invalid_request() {
     let hub = FakeHub::start().await;
     let probe = Arc::new(Probe::default());
     let h = handler(&hub.address(), "svc-h", "h1", &probe, 2).await;
+    // The caller used the wrong mode: not retryable, unlike NO_HANDLER (a unary query to a type
+    // this instance does not serve at all stays NO_HANDLER).
     hub.send_to_clients(forwarded("s#1", "t.Lookup", b"{}", 8))
         .await;
     eventually("the end", async || !hub.ends().is_empty()).await;
     let (_, end) = &hub.ends()[0];
-    assert_eq!(end_code(end), Some(ErrorCode::NoHandler));
+    assert_eq!(end_code(end), Some(ErrorCode::InvalidRequest));
+    assert_eq!(
+        end.error.as_ref().unwrap().message,
+        "t.Lookup is not a streaming query handler (it answers mode UNARY)"
+    );
     let payload = serde_json::to_vec(&export(1, 0, None)).unwrap();
     hub.send_to_clients(forwarded("u", "t.Export", &payload, 0))
         .await;
-    eventually("the reply", async || !hub.replies().await.is_empty()).await;
-    let reply = &hub.replies().await[0];
-    assert!(
-        matches!(&reply.result, Some(proto::reply::Result::Error(e)) if e.code == ErrorCode::NoHandler as i32),
-        "{reply:?}"
+    hub.send_to_clients(forwarded("n", "t.Nobody", b"{}", 0))
+        .await;
+    eventually("the replies", async || hub.replies().await.len() == 2).await;
+    let replies = hub.replies().await;
+    let reply_of = |id: &str| {
+        replies
+            .iter()
+            .find(|r| r.request_id == id)
+            .map(|r| match &r.result {
+                Some(proto::reply::Result::Error(e)) => {
+                    (ErrorCode::try_from(e.code).unwrap(), e.message.clone())
+                }
+                other => panic!("expected an error reply, got {other:?}"),
+            })
+            .unwrap()
+    };
+    assert_eq!(
+        reply_of("u"),
+        (
+            ErrorCode::InvalidRequest,
+            "t.Export is a streaming query: send it with Sender::stream (mode STREAMING)".into()
+        )
     );
+    assert_eq!(reply_of("n").0, ErrorCode::NoHandler);
     assert_eq!(probe.started.load(Ordering::SeqCst), 0);
     eventually("permits released", async || {
         h.dispatcher.available_permits() == 2 && hub.permits_held(1) == Some(2)
