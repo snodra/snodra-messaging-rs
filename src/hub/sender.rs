@@ -511,6 +511,8 @@ struct Streaming<'a> {
     done: bool,
     /// Parts consumed since the last refill.
     consumed: u32,
+    /// Parts received so far: the next one must carry `seq = received + 1`.
+    received: u64,
 }
 
 impl Drop for Streaming<'_> {
@@ -551,10 +553,33 @@ impl Streaming<'_> {
                 }
             };
             match event {
+                // The hub drops a part it cannot buffer in time (and nobody else notices):
+                // `seq` is 1, 2, 3, ... in arrival order, so a gap is that many lost parts.
+                // The handler still streams: cancelled, like an undecodable part.
                 GatherEvent::Part(part) => {
+                    let expected = self.received + 1;
+                    if part.seq != expected {
+                        let (reason, e) = if part.seq > expected {
+                            ("lost parts", self.lost(part.seq - expected))
+                        } else {
+                            (
+                                "part out of order",
+                                MessagingError::InvalidMessage(format!(
+                                    "stream {} part {} out of order (expected {expected})",
+                                    self.call.type_name, part.seq
+                                )),
+                            )
+                        };
+                        tracing::debug!(request = %self.id, seq = part.seq, expected, "{e}");
+                        self.cancel(reason).await;
+                        return Some(Err(e));
+                    }
+                    self.received = expected;
                     self.first = false;
                     return Some(Ok(part));
                 }
+                // `ReplyEnd.parts` is the hub's count of what it sent: a clean end with more
+                // than arrived lost its last parts (an error end is that error, whatever the count).
                 GatherEvent::End(end) => {
                     self.done = true;
                     return match end.error {
@@ -564,6 +589,11 @@ impl Streaming<'_> {
                             &e.message,
                             &e.details,
                         ))),
+                        None if u64::from(end.parts) > self.received => {
+                            let e = self.lost(u64::from(end.parts) - self.received);
+                            tracing::debug!(request = %self.id, parts = end.parts, received = self.received, "{e}");
+                            Some(Err(e))
+                        }
                         None => None,
                     };
                 }
@@ -650,6 +680,11 @@ impl Streaming<'_> {
     fn fail(&mut self, e: MessagingError) -> Option<Result<proto::ReplyPart, MessagingError>> {
         self.done = true;
         Some(Err(e))
+    }
+
+    /// The error of `n` parts the hub sent (or counted) that never arrived.
+    fn lost(&self, n: u64) -> MessagingError {
+        MessagingError::InvalidMessage(format!("stream {} lost {n} part(s)", self.call.type_name))
     }
 }
 
@@ -1041,8 +1076,10 @@ impl Sender {
     /// The returned stream yields the items in the handler's order and ends on the hub's
     /// `ReplyEnd`; a `ReplyEnd{error}` (the idle timeout, the handler's error or its leaving, the
     /// hub's limits: `Timeout`, `RemoteHandler`, `HandlerDisconnected`, `Cancelled`, ...), a lost
-    /// hub stream (`HubConnectionLost`) or a part that does not decode (`Serialization`; the
-    /// handler is cancelled) is its last item. It refills credit as it is consumed: half the
+    /// hub stream (`HubConnectionLost`), a part that does not decode (`Serialization`; the
+    /// handler is cancelled) or a lost part (`InvalidMessage` "stream <type> lost N part(s)":
+    /// `seq` must run 1, 2, 3, ... in arrival order, and a clean `ReplyEnd` must count the parts
+    /// that arrived; the handler is cancelled at a gap) is its last item. It refills credit as it is consumed: half the
     /// window ([`StreamOptions::initial_credit`]) every time half of it was pulled, so a handler
     /// never runs more than a window (plus the one item it may hold) ahead of the consumer.
     /// Dropping it before the end cancels
@@ -1131,6 +1168,7 @@ impl Sender {
             written: false,
             done: false,
             consumed: 0,
+            received: 0,
         };
         let (events, guard, stream) = self.write_stream(&streaming.id, call, chosen).await?;
         streaming.events = events;

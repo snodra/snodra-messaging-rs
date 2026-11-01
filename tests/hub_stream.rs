@@ -1188,6 +1188,94 @@ async fn an_undecodable_part_fails_the_stream_and_cancels_the_handler() {
     c.shutdown().await;
 }
 
+/// The hub may drop a part it could not buffer (its outbound buffer stayed full for 5 s): the
+/// sender checks `seq` (1, 2, 3, ... in arrival order) and ends the stream with
+/// `InvalidMessage` at the first gap, cancelling the handler, which still streams.
+#[tokio::test]
+async fn a_gap_in_seq_fails_the_stream_as_lost_parts_and_cancels_the_handler() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let h = handler(&hub.address(), "svc-h", "h1", &probe, 2).await;
+    let c = caller(&hub.address()).await;
+    let mut stream = c
+        .sender
+        .stream(&export(3, 5_000, None), StreamOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(stream.next().await.unwrap().unwrap().i, 0);
+    let id = streams(&hub).await[0].id.clone();
+    // Seq 2 never arrives: seq 4 right after seq 1 is two parts lost.
+    hub.send_to_clients(ServerMessage {
+        message: Some(server_message::Message::Part(proto::ReplyPart {
+            request_id: id.clone(),
+            payload: row(3),
+            seq: 4,
+            ..Default::default()
+        })),
+    })
+    .await;
+    let e = stream.next().await.unwrap().unwrap_err();
+    assert!(
+        matches!(&e, MessagingError::InvalidMessage(m) if m == "stream t.Export lost 2 part(s)"),
+        "{e:?}"
+    );
+    assert!(stream.next().await.is_none());
+    eventually("the cancel", async || !hub.cancels().is_empty()).await;
+    let (_, cancel) = &hub.cancels()[0];
+    assert_eq!(
+        (cancel.request_id.as_str(), cancel.reason.as_str()),
+        (id.as_str(), "lost parts")
+    );
+    eventually("the handler cancelled", async || {
+        probe.dropped.load(Ordering::SeqCst) == 1 && h.dispatcher.available_permits() == 2
+    })
+    .await;
+    assert_eq!(c.sender.in_flight(), 0);
+    drop(stream);
+    h.shutdown().await;
+    c.shutdown().await;
+}
+
+/// `ReplyEnd.parts` is the hub's count of the parts it sent: fewer received means the last
+/// ones were lost after the sender's last check, so the end is `InvalidMessage`, not a clean end.
+#[tokio::test]
+async fn an_end_counting_more_parts_than_arrived_fails_the_stream_as_lost_parts() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let h = handler(&hub.address(), "svc-h", "h1", &probe, 2).await;
+    let c = caller(&hub.address()).await;
+    let mut stream = c
+        .sender
+        .stream(&export(3, 5_000, None), StreamOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(stream.next().await.unwrap().unwrap().i, 0);
+    let id = streams(&hub).await[0].id.clone();
+    hub.send_to_clients(ServerMessage {
+        message: Some(server_message::Message::End(proto::ReplyEnd {
+            request_id: id.clone(),
+            error: None,
+            parts: 3,
+            ..Default::default()
+        })),
+    })
+    .await;
+    let e = stream.next().await.unwrap().unwrap_err();
+    assert!(
+        matches!(&e, MessagingError::InvalidMessage(m) if m == "stream t.Export lost 2 part(s)"),
+        "{e:?}"
+    );
+    assert!(stream.next().await.is_none());
+    assert_eq!(c.sender.in_flight(), 0);
+    assert!(
+        hub.cancels().is_empty(),
+        "the stream had ended at the hub: nothing to cancel"
+    );
+    drop(stream);
+    h.shutdown().await;
+    c.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_hub_without_the_capability_is_unsupported_and_gets_nothing() {
     for legacy in [false, true] {

@@ -415,7 +415,11 @@ while let Some(row) = rows.next().await { let row = row?; /* in the handler's or
   part), `RemoteHandler` (the handler's `Err` item, or a part beyond the credit: `InvalidMessage`),
   `HandlerDisconnected` (the handler left), `Cancelled` (`KRAKEN_HUB_MAX_STREAM_DURATION`). A hub
   stream lost after the first item is `HubConnectionLost`, a part that does not decode
-  `Serialization` (the handler is cancelled). After `max_results` items the hub ends the stream
+  `Serialization` (the handler is cancelled). The sender checks for lost parts (the hub drops a
+  part it could not buffer within 5 s): `seq` must run 1, 2, 3, ... in arrival order and a clean
+  `ReplyEnd.parts` must equal the parts that arrived; otherwise the last item is
+  `InvalidMessage` "stream `<type>` lost N part(s)" (at a gap the handler is cancelled, reason
+  `lost parts`; a part out of order is `InvalidMessage` too). After `max_results` items the hub ends the stream
   and cancels the handler. The local guard (for a hub that never answers; it cancels the stream,
   best effort) allows 2 x the hub's bound plus 1 s for the first part (the hub bounds a queue
   wait by the timeout and then restarts the idle clock at the forward) and the bound plus 1 s,
