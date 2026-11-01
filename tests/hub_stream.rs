@@ -983,6 +983,10 @@ async fn the_idle_timeout_ends_the_stream_with_timeout() {
 /// the first part may take up to twice the timeout: the local guard allows 2 x the hub's bound
 /// plus 1 s for it, then the bound plus 1 s reset by every part. (A hub that never ends an idle
 /// stream shows which guard fired; the guard cancels the stream at the hub.)
+///
+/// With a 1 s timeout the guards are 3 s and 2 s apart by a second, so each window below is
+/// about a second wide (a timer never fires early; under load it fires late): the two halves
+/// run at once so the test still takes about 3 s.
 #[tokio::test]
 async fn the_local_guard_allows_twice_the_hub_bound_for_the_first_part_then_the_bound() {
     let hub = FakeHub::start().await;
@@ -991,10 +995,9 @@ async fn the_local_guard_allows_twice_the_hub_bound_for_the_first_part_then_the_
     let h = handler(&hub.address(), "svc-h", "h1", &probe, 2).await;
     let c = caller(&hub.address()).await;
     let options = StreamOptions {
-        timeout: Some(Duration::from_millis(300)),
+        timeout: Some(Duration::from_secs(1)),
         ..StreamOptions::default()
     };
-    // No first part ever: the open fails at 2 x 300 ms + 1 s.
     let hang = Arc::new(Probe::default());
     let slow = node_with(
         &hub.address(),
@@ -1018,46 +1021,53 @@ async fn the_local_guard_allows_twice_the_hub_bound_for_the_first_part_then_the_
         SenderSettings::default(),
     )
     .await;
-    let started = Instant::now();
-    let e = c
-        .sender
-        .stream(&SharedExport {}, options.clone())
-        .await
-        .err()
-        .expect("the local guard");
-    let took = started.elapsed();
-    assert!(matches!(e, MessagingError::Timeout(_)), "{e:?}");
-    assert!(
-        took >= Duration::from_millis(1_550) && took < Duration::from_millis(2_500),
-        "the first-part guard is 2 x bound + 1 s, took {took:?}"
-    );
-    eventually("the slow handler cancelled by the guard", async || {
-        hang.dropped.load(Ordering::SeqCst) == 1
-    })
-    .await;
-    assert_eq!(c.sender.in_flight(), 0);
+    // No first part ever: the open fails at 2 x 1 s + 1 s.
+    let first_part = async {
+        let started = Instant::now();
+        let e = c
+            .sender
+            .stream(&SharedExport {}, options.clone())
+            .await
+            .err()
+            .expect("the local guard");
+        (e, started.elapsed())
+    };
     // A first part at once, then nothing: the idle guard is the bound + 1 s.
-    let mut stream = c
-        .sender
-        .stream(&export(3, 30_000, None), options)
-        .await
-        .unwrap();
-    assert_eq!(stream.next().await.unwrap().unwrap().i, 0);
-    let started = Instant::now();
-    let e = stream.next().await.unwrap().unwrap_err();
-    let took = started.elapsed();
-    assert!(matches!(e, MessagingError::Timeout(_)), "{e:?}");
+    let idle = async {
+        let mut stream = c
+            .sender
+            .stream(&export(3, 30_000, None), options.clone())
+            .await
+            .unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap().i, 0);
+        let started = Instant::now();
+        let e = stream.next().await.unwrap().unwrap_err();
+        let took = started.elapsed();
+        assert!(stream.next().await.is_none());
+        (e, took)
+    };
+    let ((first_error, first_took), (idle_error, idle_took)) = tokio::join!(first_part, idle);
     assert!(
-        took >= Duration::from_millis(1_250) && took < Duration::from_millis(1_550),
-        "the idle guard is bound + 1 s, took {took:?}"
+        matches!(first_error, MessagingError::Timeout(_)),
+        "{first_error:?}"
     );
-    assert!(stream.next().await.is_none());
-    eventually("the handler cancelled by the guard", async || {
-        probe.dropped.load(Ordering::SeqCst) == 1
+    assert!(
+        first_took >= Duration::from_millis(2_950) && first_took < Duration::from_millis(4_500),
+        "the first-part guard is 2 x bound + 1 s, took {first_took:?}"
+    );
+    assert!(
+        matches!(idle_error, MessagingError::Timeout(_)),
+        "{idle_error:?}"
+    );
+    assert!(
+        idle_took >= Duration::from_millis(1_950) && idle_took < Duration::from_millis(2_950),
+        "the idle guard is bound + 1 s, took {idle_took:?}"
+    );
+    eventually("both handlers cancelled by the guards", async || {
+        hang.dropped.load(Ordering::SeqCst) == 1 && probe.dropped.load(Ordering::SeqCst) == 1
     })
     .await;
     assert_eq!(c.sender.in_flight(), 0);
-    drop(stream);
     h.shutdown().await;
     slow.shutdown().await;
     c.shutdown().await;
