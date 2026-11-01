@@ -6,8 +6,10 @@
 //! identical `Register`, and all feeding one inbound channel (replies go on the arrival stream).
 //!
 //! - **Dedupe.** Two targets whose acks carry the same `hub_id` are one hub: the connection
-//!   acknowledged first keeps it, the other is closed for good (logged once). A legacy hub (no ack)
-//!   is identified by its target.
+//!   acknowledged first keeps it, the other is closed for good (logged once). A hub has no say in
+//!   this: its second `Register` already replaced the first stream's session, so that stream is
+//!   ended by the hub and reconnects, once. A hub without an id (legacy, or an empty
+//!   `RegisterAck.hub_id`) is identified by its target as `host:port` (prefix stripped).
 //! - **Routing.** An unkeyed request goes round-robin over the hubs whose stream is handshaken
 //!   (reconnecting ones are skipped); a keyed one to the live hub with the highest
 //!   [`rendezvous_score`](super::rendezvous_score) for `(hub_id, routing key)`. A request that
@@ -21,7 +23,8 @@
 //!   stays the total.
 //! - **Status.** Every `status_interval` an `InstanceStatus` (acknowledged hub ids, handlers in
 //!   flight) goes to every hub whose ack lists `instance-status`, and never to another.
-//! - **DNS.** A `dns:///name:port` target is resolved at start and every `dns_refresh`: a new
+//! - **DNS.** A `dns:///name:port` target is resolved at start and every `dns_refresh` into
+//!   `ip:port` targets of one family (IPv4 when any, else IPv6, [`resolved_targets`]): a new
 //!   address gets a connection; a vanished one leaves the routing at once and is closed once idle
 //!   (no request of ours written to it unanswered, no handler of its requests running), at most
 //!   [`DRAIN_LIMIT`] later. A failed or empty resolution keeps the current hubs.
@@ -42,7 +45,7 @@ use crate::error::MessagingError;
 use crate::proto::{ClientMessage, InstanceStatus, client_message};
 
 use super::connection::{Handshake, Hooks, HubConnection, HubSettings, Inbound, StreamId};
-use super::targets::{HubTargets, permit_share, rank_keyed, rank_round_robin};
+use super::targets::{HubTargets, permit_share, rank_keyed, rank_round_robin, resolved_targets};
 
 /// The longest a vanished DNS address stays open to finish its requests.
 pub const DRAIN_LIMIT: Duration = Duration::from_secs(65);
@@ -259,8 +262,8 @@ impl HubPool {
         }
     }
 
-    /// The ids of the hubs live now (handshaken streams), in target order; a legacy hub by its
-    /// address.
+    /// The ids of the hubs live now (handshaken streams), in target order; a hub without an id
+    /// (legacy, or an empty `RegisterAck.hub_id`) by its target as `host:port`.
     pub fn hub_ids(&self) -> Vec<String> {
         self.live().into_iter().map(|l| l.hub_id).collect()
     }
@@ -346,10 +349,7 @@ impl HubPool {
             .filter(|m| m.role() == Role::Active)
             .filter_map(|m| {
                 let handshake = m.conn.handshake()?;
-                let hub_id = match &handshake {
-                    Handshake::V2(ack) => ack.hub_id.clone(),
-                    Handshake::Legacy => m.address().to_string(),
-                };
+                let hub_id = handshake.hub_id(m.address());
                 Some(Live {
                     conn: Arc::clone(&m.conn),
                     hub_id,
@@ -436,10 +436,7 @@ impl HubPool {
     /// The connection at `address` completed its handshake: it keeps its hub unless another
     /// active connection reached the same hub id first.
     fn accept(&self, address: &str, handshake: &Handshake) -> bool {
-        let hub_id = match handshake {
-            Handshake::V2(ack) => ack.hub_id.clone(),
-            Handshake::Legacy => address.to_string(),
-        };
+        let hub_id = handshake.hub_id(address);
         let mut owners = self.owners.lock().unwrap();
         // This connection may reach another hub than before (a restarted hub gets a new id).
         owners.retain(|_, owner| owner != address);
@@ -511,11 +508,7 @@ impl HubPool {
                 r = resolver(host.clone(), port) => r,
             };
             match resolved {
-                Ok(addrs) if !addrs.is_empty() => {
-                    let addresses: Vec<String> =
-                        addrs.iter().map(|a| format!("static://{a}")).collect();
-                    self.apply_resolution(&addresses);
-                }
+                Ok(addrs) if !addrs.is_empty() => self.apply_resolution(&resolved_targets(&addrs)),
                 Ok(_) => {
                     tracing::warn!(service = %self.service_name, host, "dns:/// name resolved to no address; keeping the current hubs")
                 }

@@ -5,7 +5,13 @@
 //! P3). Permits and InstanceStatus messages are recorded per stream. It
 //! echoes heartbeats, can drop streams, reject a registration, push requests to clients and answer
 //! their requests.
+//!
+//! Like kraken-hub, a `Register` for an instance id that another open stream holds replaces that
+//! stream's session: the older stream is ended (its forwarded requests can no longer be answered)
+//! unless `set_replace_sessions(false)`. A stream that ends while it holds the session removes the
+//! instance. Registrations and stream ends are logged in order ([`FakeHub::events`]).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -18,6 +24,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 
 type Responder = Box<dyn Fn(proto::Request) -> Option<ServerMessage> + Send + Sync>;
@@ -59,6 +66,31 @@ pub struct State {
     /// InstanceStatus messages: (stream number, report).
     statuses: StdMutex<Vec<(usize, proto::InstanceStatus)>>,
     down: AtomicBool,
+    replace_sessions: AtomicBool,
+    /// instance id → (stream number, that stream's cancel token).
+    sessions: StdMutex<HashMap<String, (usize, CancellationToken)>>,
+    evictions: AtomicUsize,
+    events: StdMutex<Vec<(Event, std::time::Instant)>>,
+}
+
+/// What happened on the fake hub, in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// A `Register` on stream `stream` announcing `types` command and query types.
+    Register { stream: usize, types: usize },
+    /// Stream `stream` ended (either side).
+    Closed { stream: usize },
+    /// Stream `stream` lost its session to a newer stream of the same instance id.
+    Evicted { stream: usize },
+}
+
+impl State {
+    fn log(&self, event: Event) {
+        self.events
+            .lock()
+            .unwrap()
+            .push((event, std::time::Instant::now()));
+    }
 }
 
 #[derive(Clone)]
@@ -90,9 +122,12 @@ impl Hub for Service {
         let (tx, rx) = mpsc::channel::<Result<ServerMessage, Status>>(64);
         state.clients.lock().await.push(tx.clone());
         let mut drop_rx = state.drop_tx.subscribe();
+        let cancel = CancellationToken::new();
         tokio::spawn(async move {
+            let mut instance: Option<String> = None;
             loop {
                 tokio::select! {
+                    _ = cancel.cancelled() => break,
                     _ = drop_rx.recv() => {
                         let _ = tx.send(Err(Status::unavailable("dropped by test"))).await;
                         break;
@@ -104,6 +139,17 @@ impl Hub for Service {
                                 let v2 = r.protocol_version >= 2;
                                 let wants_flow = r.capabilities.iter().any(|c| c == "flow-control");
                                 let wants_status = r.capabilities.iter().any(|c| c == "instance-status");
+                                state.log(Event::Register { stream: stream_no, types: r.command_types.len() + r.query_types.len() });
+                                instance = Some(r.instance_id.clone());
+                                let replaced = state.sessions.lock().unwrap().insert(r.instance_id.clone(), (stream_no, cancel.clone()));
+                                if let Some((old, token)) = replaced
+                                    && old != stream_no
+                                    && state.replace_sessions.load(Ordering::SeqCst)
+                                {
+                                    state.evictions.fetch_add(1, Ordering::SeqCst);
+                                    state.log(Event::Evicted { stream: old });
+                                    token.cancel();
+                                }
                                 state.registers.lock().await.push(r);
                                 // Like the real hub: the ack is written before the echo of the next heartbeat.
                                 let ack = state.ack.lock().unwrap().clone().map(|mut ack| {
@@ -140,6 +186,13 @@ impl Hub for Service {
                     }
                 }
             }
+            if let Some(id) = instance {
+                let mut sessions = state.sessions.lock().unwrap();
+                if sessions.get(&id).is_some_and(|(s, _)| *s == stream_no) {
+                    sessions.remove(&id);
+                }
+            }
+            state.log(Event::Closed { stream: stream_no });
             let mut clients = state.clients.lock().await;
             clients.retain(|c| !c.same_channel(&tx));
         });
@@ -181,6 +234,10 @@ impl FakeHub {
             instance_status: AtomicBool::new(true),
             statuses: StdMutex::new(vec![]),
             down: AtomicBool::new(false),
+            replace_sessions: AtomicBool::new(true),
+            sessions: StdMutex::new(HashMap::new()),
+            evictions: AtomicUsize::new(0),
+            events: StdMutex::new(vec![]),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -328,6 +385,35 @@ impl FakeHub {
         f: impl Fn(proto::Request) -> Option<ServerMessage> + Send + Sync + 'static,
     ) {
         *self.state.responder.lock().await = Some(Box::new(f));
+    }
+
+    /// Whether a `Register` for an instance id held by another open stream ends that stream (the
+    /// default, as kraken-hub does) or both streams stay (`false`).
+    pub fn set_replace_sessions(&self, on: bool) {
+        self.state.replace_sessions.store(on, Ordering::SeqCst);
+    }
+
+    /// Sessions replaced by a newer stream of the same instance id so far.
+    pub fn evictions(&self) -> usize {
+        self.state.evictions.load(Ordering::SeqCst)
+    }
+
+    /// True while an open stream holds `instance_id`'s session (the hub routes to it).
+    pub fn holds(&self, instance_id: &str) -> bool {
+        self.state
+            .sessions
+            .lock()
+            .unwrap()
+            .contains_key(instance_id)
+    }
+
+    /// Registrations, evictions and stream ends in the order they happened.
+    pub fn events(&self) -> Vec<Event> {
+        self.events_timed().into_iter().map(|(e, _)| e).collect()
+    }
+
+    pub fn events_timed(&self) -> Vec<(Event, std::time::Instant)> {
+        self.state.events.lock().unwrap().clone()
     }
 
     pub fn stop(mut self) {

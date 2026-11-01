@@ -138,6 +138,15 @@ impl Handshake {
         matches!(self, Handshake::Legacy)
     }
 
+    /// The id of the hub reached at `address`: `RegisterAck.hub_id`, or, for a hub that names
+    /// none (legacy, or an empty id), the target as `host:port` ([`super::targets::target_id`]).
+    pub fn hub_id(&self, address: &str) -> String {
+        match self.ack() {
+            Some(ack) if !ack.hub_id.is_empty() => ack.hub_id.clone(),
+            _ => super::targets::target_id(address),
+        }
+    }
+
     pub fn ack(&self) -> Option<&RegisterAck> {
         match self {
             Handshake::V2(ack) => Some(ack),
@@ -495,13 +504,11 @@ impl HubConnection {
         &self.settings.address
     }
 
-    /// The id of the hub behind the current handshaken stream: `RegisterAck.hub_id`, or the
-    /// address for a legacy hub (it has no id). `None` while there is no handshaken stream.
+    /// The id of the hub behind the current handshaken stream ([`Handshake::hub_id`]): its
+    /// `RegisterAck.hub_id`, else its target as `host:port`. `None` while there is no handshaken
+    /// stream.
     pub fn hub_id(&self) -> Option<String> {
-        self.handshake().map(|h| match h {
-            Handshake::V2(ack) => ack.hub_id,
-            Handshake::Legacy => self.settings.address.clone(),
-        })
+        self.handshake().map(|h| h.hub_id(&self.settings.address))
     }
 
     /// Requests that arrived on this connection and whose handler has not finished

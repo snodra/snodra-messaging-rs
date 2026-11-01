@@ -399,6 +399,112 @@ async fn two_addresses_of_one_hub_keep_one_connection() {
     c.shutdown().await;
 }
 
+/// The real hub replaces the session of an instance id when a second stream registers it, ending
+/// the first. Two targets of one hub (`127.0.0.1:port` and `localhost:port`) therefore evict each
+/// other once at start; the second connection is closed for good when its ack shows the same hub
+/// id, the first comes back, and from then on the hub holds the instance without further evictions.
+#[tokio::test]
+async fn two_targets_of_one_replacing_hub_settle_without_ping_pong() {
+    let hub = answering("hub-x").await;
+    let port = hub.addr.port();
+    let c = client(settings(format!(
+        "static://127.0.0.1:{port},localhost:{port}"
+    )))
+    .await;
+    let instance = c.pool.instance_id().to_string();
+    all_registered(&c, &["hub-x"]).await;
+    eventually("one stream left, holding the session", async || {
+        hub.connected_clients().await == 1 && hub.holds(&instance) && c.pool.hub_ids() == ["hub-x"]
+    })
+    .await;
+    assert!(
+        hub.evictions() >= 1,
+        "the fake hub replaces sessions like kraken-hub"
+    );
+    let (evictions, streams) = (hub.evictions(), hub.streams());
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(50)).await; // 1 s: several backoffs (50-200 ms)
+        assert!(
+            hub.holds(&instance),
+            "the instance left the hub: {:?}",
+            hub.events()
+        );
+    }
+    assert_eq!(
+        (hub.evictions(), hub.streams()),
+        (evictions, streams),
+        "no ping-pong: {:?}",
+        hub.events()
+    );
+    for _ in 0..4 {
+        c.sender
+            .send_command(&Ping {}, SendOptions::default())
+            .await
+            .unwrap();
+    }
+    c.shutdown().await;
+}
+
+/// A hub without an id (a legacy hub, or an empty `RegisterAck.hub_id`) is known by its target
+/// as `host:port` (shared with kraken-messaging): two such hubs are two hubs, not duplicates.
+#[tokio::test]
+async fn a_hub_without_an_id_is_known_by_its_bare_target() {
+    let (a, b, old) = (
+        answering("").await,
+        answering("").await,
+        answering("x").await,
+    );
+    old.set_ack(None);
+    let c = client(settings(format!(
+        "{},http://{},{}",
+        a.address(),
+        b.addr,
+        old.address()
+    )))
+    .await;
+    let ids = [a.addr.to_string(), b.addr.to_string(), old.addr.to_string()];
+    eventually("three hubs", async || c.pool.hub_ids() == ids).await;
+    let by_conn: Vec<Option<String>> = c.pool.connections().iter().map(|c| c.hub_id()).collect();
+    assert_eq!(by_conn, ids.map(Some));
+    c.shutdown().await;
+}
+
+/// A dual-stack `dns:///` name resolves to IPv6 and IPv4 addresses of the same hubs: only the
+/// IPv4 ones are used, as bare `ip:port`, so no hub is registered on twice.
+#[tokio::test]
+async fn a_dual_stack_dns_name_reaches_each_hub_once_over_ipv4() {
+    let hub = answering("hub-a").await;
+    let port = hub.addr.port();
+    let c = client_with(
+        HubSettings {
+            dns_refresh: Duration::from_millis(100),
+            ..settings("dns:///hubs.test:7000".into())
+        },
+        |pool| {
+            pool.set_resolver(Arc::new(move |_, _| {
+                let addrs: Vec<SocketAddr> = vec![
+                    format!("[::1]:{port}").parse().unwrap(),
+                    format!("127.0.0.1:{port}").parse().unwrap(),
+                ];
+                Box::pin(async move { Ok(addrs) })
+            }));
+        },
+    )
+    .await;
+    all_registered(&c, &["hub-a"]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await; // a few re-resolutions
+    let addresses: Vec<String> = c
+        .pool
+        .connections()
+        .iter()
+        .map(|c| c.address().to_string())
+        .collect();
+    assert_eq!(addresses, [format!("127.0.0.1:{port}")]);
+    assert_eq!(hub.evictions(), 0);
+    assert_eq!(hub.registers().await.len(), 1);
+    c.shutdown().await;
+}
+
 /// `InstanceStatus` goes every interval to the hubs that share `instance-status` and to no other;
 /// it lists the acknowledged hubs (not a legacy one, which has no id) and the handlers running.
 #[tokio::test]
@@ -411,7 +517,7 @@ async fn instance_status_goes_only_to_hubs_sharing_the_capability() {
     b.set_instance_status(false); // a P2 hub
     old.set_ack(None); // a v1 hub
     let c = client(settings(addresses(&[&a, &b, &old]))).await;
-    all_registered(&c, &["hub-a", "hub-b", &old.address()]).await;
+    all_registered(&c, &["hub-a", "hub-b", &old.addr.to_string()]).await;
     assert!(c.pool.connections()[2].handshake() == Some(Handshake::Legacy));
     a.send_to_clients(push_request("in-1")).await;
     eventually("a handler runs", async || c.held.lock().unwrap().len() == 1).await;

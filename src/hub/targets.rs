@@ -10,6 +10,7 @@
 //!   keys of a hub that leaves move.
 //! - **Permits** are split: a hub gets [`permit_share`] of `max_concurrent_handlers`.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::error::MessagingError;
@@ -78,6 +79,37 @@ impl HubTargets {
         }
         Ok(HubTargets::Static(targets))
     }
+}
+
+/// The id of a hub that names none (a legacy hub, or an empty `RegisterAck.hub_id`): its target
+/// as `host:port`, the `static://` or `http(s)://` prefix stripped (shared with kraken-messaging).
+pub fn target_id(address: &str) -> String {
+    let address = address.strip_prefix("static://").unwrap_or(address);
+    ["http://", "https://"]
+        .iter()
+        .find_map(|p| address.strip_prefix(p))
+        .unwrap_or(address)
+        .to_string()
+}
+
+/// The targets of one `dns:///` resolution (shared with kraken-messaging): the IPv4 addresses
+/// when there is any, else the IPv6 ones, each as `ip:port` (`[ip]:port` for IPv6, no zone), no
+/// prefix, repeats dropped, order kept. A dual-stack name lists every hub under both families;
+/// connecting to both would register twice on one hub, and the second `Register` takes the session
+/// of the first.
+pub fn resolved_targets(addrs: &[SocketAddr]) -> Vec<String> {
+    let v4 = addrs.iter().any(SocketAddr::is_ipv4);
+    let mut out: Vec<String> = Vec::new();
+    for a in addrs.iter().filter(|a| a.is_ipv4() == v4) {
+        let target = match a {
+            SocketAddr::V4(a) => format!("{}:{}", a.ip(), a.port()),
+            SocketAddr::V6(a) => format!("[{}]:{}", a.ip(), a.port()),
+        };
+        if !out.contains(&target) {
+            out.push(target);
+        }
+    }
+    out
 }
 
 /// The rendezvous score of `(hub_id, key)`: 64-bit FNV-1a (offset basis `0xcbf29ce484222325`,
@@ -184,6 +216,47 @@ mod tests {
                 port: 7100
             }
         );
+    }
+
+    /// Shared with kraken-messaging (Kotlin): the id of a hub without one (a legacy hub, or an
+    /// empty `RegisterAck.hub_id`) is its target as `host:port`, prefix stripped.
+    #[test]
+    fn a_target_id_is_the_bare_host_and_port() {
+        for (address, id) in [
+            ("static://hub:7000", "hub:7000"),
+            ("hub:7000", "hub:7000"),
+            ("http://hub:7000", "hub:7000"),
+            ("https://hub:7000", "hub:7000"),
+            ("10.0.0.1:7000", "10.0.0.1:7000"),
+            ("[::1]:7000", "[::1]:7000"),
+        ] {
+            assert_eq!(target_id(address), id, "{address}");
+        }
+    }
+
+    /// Shared with kraken-messaging (Kotlin): a `dns:///` name yields one target per address of
+    /// one family (IPv4 when there is any, else IPv6), `ip:port` without prefix, repeats dropped,
+    /// order kept. A dual-stack name would otherwise reach each hub twice.
+    #[test]
+    fn a_resolution_keeps_one_address_family_preferring_ipv4() {
+        let addrs = |list: &[&str]| -> Vec<std::net::SocketAddr> {
+            list.iter().map(|a| a.parse().unwrap()).collect()
+        };
+        assert_eq!(
+            resolved_targets(&addrs(&[
+                "[::1]:7000",
+                "127.0.0.1:7000",
+                "[fe80::2]:7000",
+                "10.0.0.2:7000",
+                "127.0.0.1:7000"
+            ])),
+            ["127.0.0.1:7000", "10.0.0.2:7000"]
+        );
+        assert_eq!(
+            resolved_targets(&addrs(&["[::1]:7000", "[2001:db8::5]:7000", "[::1]:7000"])),
+            ["[::1]:7000", "[2001:db8::5]:7000"]
+        );
+        assert!(resolved_targets(&[]).is_empty());
     }
 
     #[test]

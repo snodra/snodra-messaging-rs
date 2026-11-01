@@ -303,3 +303,53 @@ async fn a_hub_stopped_mid_traffic_fails_over_and_is_rejoined_after_its_restart(
     Arc::into_inner(a).unwrap().shutdown().await;
     b.shutdown().await;
 }
+
+/// One hub reached through two targets (`127.0.0.1:port` and `localhost:port`): the hub replaces
+/// an instance's session when a second stream registers the same instance id, so the pool must
+/// settle on one stream and keep it. Once settled, the hub lists the instance on every poll for
+/// 10 s with the same `connectedSinceMs` (no re-registration), and requests keep succeeding.
+#[tokio::test]
+async fn one_hub_reached_through_two_targets_keeps_the_instance_registered() {
+    require_docker!();
+    let (h, db) = tokio::join!(
+        hub_with(
+            HubOptions::new(HubImage::P3)
+                .port(free_port())
+                .env("KRAKEN_HUB_ID", "e2e-solo"),
+        ),
+        mongo()
+    );
+    let port = h.address.rsplit_once(':').unwrap().1;
+    let twice = format!("127.0.0.1:{port},localhost:{port}");
+    let b = worker(config("e2e-b", &twice, &db.uri_for("b"))).await;
+    let a = caller(config("e2e-a", &h.address, &db.uri_for("a"))).await;
+    registered_on(&b, &["e2e-solo"], Duration::from_secs(15)).await;
+    registered_on(&a, &["e2e-solo"], Duration::from_secs(15)).await;
+    // Both targets have registered by now; at most one eviction happened at start.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let since = |view: &serde_json::Value| view["connectedSinceMs"].as_i64().unwrap();
+    let first = instance(&h, "e2e-b").await.expect("listed once settled");
+    let started = Instant::now();
+    let mut polls = 0;
+    while started.elapsed() < Duration::from_secs(10) {
+        let view = instance(&h, "e2e-b")
+            .await
+            .unwrap_or_else(|| panic!("instance absent after {:?}", started.elapsed()));
+        assert_eq!(
+            since(&view),
+            since(&first),
+            "re-registered after {:?}: {view}",
+            started.elapsed()
+        );
+        a.commands()
+            .send_command(&Work {}, SendOptions::default())
+            .await
+            .expect("round trip while the instance stays registered");
+        polls += 1;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    eprintln!("{polls} polls over 10 s, the instance listed every time");
+    assert_eq!(b.hub_ids(), ["e2e-solo"]);
+    a.shutdown().await;
+    b.shutdown().await;
+}

@@ -22,4 +22,6 @@ pub use sender::{
     LEGACY_REQUEST_TIMEOUT, LOCAL_GUARD_MARGIN, RETRY_MIN_REMAINING, SendOptions, Sender,
     SenderSettings, request_timing, retry_budget,
 };
-pub use targets::{DNS_REFRESH, HubTargets, permit_share, rendezvous_score};
+pub use targets::{
+    DNS_REFRESH, HubTargets, permit_share, rendezvous_score, resolved_targets, target_id,
+};

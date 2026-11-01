@@ -200,7 +200,9 @@ every instance registers on every hub, and the client picks a hub per request.
 
 - **Targets.** `KRAKEN_HUB_ADDRESS=static://hub:7000,hub-2:7000` lists the hubs (blanks and
   repeats of the same target are ignored). `KRAKEN_HUB_ADDRESS=dns:///kraken-hub:7000` connects to
-  every address the name resolves to; it is resolved at start and every 30 s: a new address gets a
+  every address the name resolves to, as `ip:port`, of one family only: the IPv4 addresses when
+  there is any, else the IPv6 ones (a dual-stack name lists each hub twice, and two streams of one
+  instance on one hub replace each other). It is resolved at start and every 30 s: a new address gets a
   connection, a vanished one leaves the routing at once and is closed once idle (no request of
   ours written to it unanswered, no handler of its requests running; at most 65 s later). A
   failed or empty resolution keeps the current hubs. `dns:///` must be the only target and needs a
@@ -209,7 +211,10 @@ every instance registers on every hub, and the client picks a hub per request.
   and legacy detection, all with the identical `Register`. Two targets whose acks carry the same
   `hub_id` are one hub: the connection acknowledged first keeps it and the other is closed for
   good (logged once). The hub replaces a session when the same instance registers again, so the
-  kept connection reconnects once. A legacy (v1) hub has no id; its target stands for it.
+  kept connection reconnects once, and the hub drops the instance until it is back (well under a
+  second with the default backoff). A hub without an id (legacy v1, or an empty `hub_id` in the
+  ack) is known by its target as `host:port`, the `static://` or `http(s)://` prefix stripped
+  (`hub::target_id`, the same rule as kraken-messaging); a resolved address is `ip:port`.
 - **Routing.** An unkeyed request goes round-robin over the hubs whose stream is acknowledged
   (reconnecting hubs are skipped). A request with a `routing_key` goes to the live hub with the
   highest rendezvous score, so a key keeps its hub while the hubs are stable and only the keys of a

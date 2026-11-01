@@ -1161,7 +1161,8 @@ async fn single_target_pool(image: HubImage) {
     assert_eq!(handshake.instance_status(), shares_status, "{handshake:?}");
     let expected_id = match &handshake {
         Handshake::V2(ack) => ack.hub_id.clone(),
-        Handshake::Legacy => tap.address.clone(),
+        // A legacy hub is known by its target as host:port (shared with kraken-messaging).
+        Handshake::Legacy => tap.address.trim_start_matches("static://").to_string(),
     };
     assert_eq!(pool.hub_ids(), [expected_id]);
     sender
