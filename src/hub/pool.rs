@@ -19,8 +19,11 @@
 //! - **Permits.** A stream offers `ceil(max_concurrent_handlers / N)` permits
 //!   ([`permit_share`]), N being the hubs live when its `Register` is written, itself included;
 //!   until a hub's first connect attempt is over it counts as live, so hubs that come up together
-//!   split from the start. Permits are never revoked when N changes. The local concurrency guard
-//!   stays the total.
+//!   split from the start. When N shrinks (a hub is lost, closed as a duplicate or leaves DNS),
+//!   every live stream is topped up to `ceil(max / N)` with one `Permits` message, so the
+//!   survivors can run the share of the hub that left; a stream that already offered that many
+//!   gets nothing. Permits are never revoked when N grows. The local concurrency guard stays the
+//!   total.
 //! - **Status.** Every `status_interval` an `InstanceStatus` (acknowledged hub ids, handlers in
 //!   flight) goes to every hub whose ack lists `instance-status`, and never to another.
 //! - **DNS.** A `dns:///name:port` target is resolved at start and every `dns_refresh` into
@@ -433,6 +436,7 @@ impl HubPool {
             changed: Box::new(move || {
                 if let Some(pool) = weak.upgrade() {
                     pool.changes.send_modify(|n| *n += 1);
+                    pool.top_up();
                 }
             }),
             in_flight: Arc::clone(&self.in_flight),
@@ -451,15 +455,38 @@ impl HubPool {
     /// `ceil(max / N)`, N = the hubs live now or still on their first connect attempt, the one at
     /// `address` included.
     fn initial_permits(&self, address: &str) -> u32 {
-        let hubs = self
-            .members()
+        permit_share(
+            self.settings.max_concurrent_handlers,
+            self.hubs(Some(address)),
+        )
+    }
+
+    /// N of the split: the active connections whose stream is live or that are still on their
+    /// first connect attempt, plus the one at `including`.
+    fn hubs(&self, including: Option<&str>) -> usize {
+        self.members()
             .iter()
             .filter(|m| m.role() == Role::Active)
             .filter(|m| {
-                m.address() == address || m.conn.handshake().is_some() || !m.conn.failed_once()
+                Some(m.address()) == including
+                    || m.conn.handshake().is_some()
+                    || !m.conn.failed_once()
             })
-            .count();
-        permit_share(self.settings.max_concurrent_handlers, hubs)
+            .count()
+    }
+
+    /// Fewer hubs now than when some live stream offered its permits: that stream is topped up to
+    /// `ceil(max / N)` (shared with kraken-messaging). More hubs: nothing (permits are never
+    /// revoked; the local concurrency guard stays the total).
+    fn top_up(&self) {
+        let share = permit_share(self.settings.max_concurrent_handlers, self.hubs(None));
+        let live: Vec<_> = self.live().into_iter().map(|l| l.conn).collect();
+        if live.is_empty() {
+            return;
+        }
+        tokio::spawn(async move {
+            futures::future::join_all(live.iter().map(|c| c.top_up(share))).await;
+        });
     }
 
     /// The connection at `address` completed its handshake: it keeps its hub unless another
@@ -579,6 +606,7 @@ impl HubPool {
                 self.drain(Arc::clone(m));
             }
         }
+        self.top_up();
     }
 
     fn drain(self: &Arc<Self>, member: Arc<Member>) {

@@ -269,6 +269,18 @@ impl Grants {
         })
     }
 
+    /// Raises the permits this stream offered to `share` when it offered fewer (a flow-controlled
+    /// stream only); returns the top-up to write. Never lowers them.
+    fn raise(&self, share: u32) -> u32 {
+        let mut s = self.state.lock().unwrap();
+        if s.mode != GrantMode::On || share <= s.initial {
+            return 0;
+        }
+        let count = share - s.initial;
+        s.initial = share;
+        count
+    }
+
     /// A request arrived on this stream (the hub spent one of our permits on it).
     fn received(&self) {
         self.state.lock().unwrap().received += 1;
@@ -426,6 +438,7 @@ struct Live {
     stream: StreamId,
     tx: mpsc::Sender<ClientMessage>,
     handshake: Handshake,
+    grants: Arc<Grants>,
 }
 
 pub struct HubConnection {
@@ -454,7 +467,7 @@ pub(crate) struct Hooks {
     /// Called with the handshake before the stream goes live; `false` closes the connection for
     /// good (another connection already reaches that hub).
     pub accept: Box<dyn Fn(&Handshake) -> bool + Send + Sync>,
-    /// A stream went live or was lost.
+    /// A stream went live or was lost, or the first connect attempt failed.
     pub changed: Box<dyn Fn() + Send + Sync>,
     /// Also counts requests that arrived and are not finished (all connections of the pool).
     pub in_flight: Arc<AtomicUsize>,
@@ -609,6 +622,26 @@ impl HubConnection {
         Ok((stream, extra))
     }
 
+    /// Tops the current stream up to `share` permits in all (the initial offer plus earlier
+    /// top-ups) with one `Permits` message, when its hub shares flow control and the stream
+    /// offered fewer; never lowers them ([`super::HubPool`]: a hub left, the others take its share).
+    pub(crate) async fn top_up(&self, share: u32) {
+        let Some((stream, grants)) = self
+            .live
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|l| (l.stream, Arc::clone(&l.grants)))
+        else {
+            return;
+        };
+        let count = grants.raise(share);
+        if count > 0 {
+            tracing::debug!(service = %self.service_name, address = %self.settings.address, stream, count, share, "permits topped up");
+            grants.send(count).await;
+        }
+    }
+
     /// Makes writes to the current stream fail as if it had just dropped and the connection had
     /// not noticed yet (tests of the failover of requests that were never written).
     #[doc(hidden)]
@@ -638,13 +671,14 @@ impl HubConnection {
             let stream = NEXT_STREAM.fetch_add(1, Ordering::SeqCst);
             let outcome = self.run_stream(stream).await;
             self.connected.store(false, Ordering::SeqCst);
-            self.failed_once.store(true, Ordering::SeqCst);
+            // The first attempt is over: the pool no longer counts this hub in its split.
+            let first_failure = !self.failed_once.swap(true, Ordering::SeqCst);
             // Clear the live stream before announcing the loss: a request is tagged with a stream
             // only while that stream is live, so it is always failed by this Disconnected.
             *self.live.lock().unwrap() = None;
             let reached_handshake = self.handshake.send_replace(None).is_some();
             let _ = self.inbound.send(Inbound::Disconnected { stream }).await;
-            if reached_handshake {
+            if reached_handshake || first_failure {
                 self.changed();
             }
             if self.cancel.is_cancelled() {
@@ -782,13 +816,13 @@ impl HubConnection {
                                 grants.decide(h.flow_control()).await;
                                 let ack = h.ack().expect("v2");
                                 tracing::info!(service = %self.service_name, instance = %self.instance_id, hub = %ack.hub_id, address = %self.settings.address, protocol = ack.protocol_version, heartbeat = ?interval, flow_control = h.flow_control(), "registered with the hub");
-                                self.go_live(stream_id, &tx, &h);
+                                self.go_live(stream_id, &tx, &h, &grants);
                                 handshake = Some(h);
                             }
                             // Every later Register is acked too; the values do not change.
                             Some(Handshake::V2(_)) => {
                                 let h = Handshake::V2(ack);
-                                self.go_live(stream_id, &tx, &h);
+                                self.go_live(stream_id, &tx, &h, &grants);
                                 handshake = Some(h);
                             }
                             Some(Handshake::Legacy) => {
@@ -804,7 +838,7 @@ impl HubConnection {
                                     return Ok(());
                                 }
                                 grants.decide(false).await;
-                                self.go_live(stream_id, &tx, &h);
+                                self.go_live(stream_id, &tx, &h, &grants);
                                 handshake = Some(h);
                             }
                         }
@@ -820,11 +854,18 @@ impl HubConnection {
         }
     }
 
-    fn go_live(&self, stream: StreamId, tx: &mpsc::Sender<ClientMessage>, handshake: &Handshake) {
+    fn go_live(
+        &self,
+        stream: StreamId,
+        tx: &mpsc::Sender<ClientMessage>,
+        handshake: &Handshake,
+        grants: &Arc<Grants>,
+    ) {
         *self.live.lock().unwrap() = Some(Live {
             stream,
             tx: tx.clone(),
             handshake: handshake.clone(),
+            grants: Arc::clone(grants),
         });
         let first = self
             .handshake

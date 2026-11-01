@@ -199,6 +199,87 @@ async fn await_registered_waits_for_any_hub_and_await_all_registered_for_every_h
     c.shutdown().await;
 }
 
+/// While a hub is out, the survivors may run its share too (shared with kraken-messaging): when
+/// the live hubs go from N_old to N_new < N_old, every live hub gets a `Permits` top-up up to
+/// `ceil(max / N_new)` (here 8 / 1 − 8 / 2 = 4). A returning hub offers `ceil(max / N)` afresh;
+/// nothing is revoked, and a hub that already holds the larger share gets no second top-up.
+#[tokio::test]
+async fn surviving_hubs_get_the_share_of_a_hub_that_left() {
+    let (a, b) = (answering("hub-a").await, answering("hub-b").await);
+    let c = client(HubSettings {
+        max_concurrent_handlers: 8,
+        ..settings(addresses(&[&a, &b]))
+    })
+    .await;
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    let initial = |regs: Vec<proto::Register>| -> Vec<u32> {
+        regs.iter().map(|r| r.initial_permits).collect()
+    };
+    assert_eq!(initial(a.registers().await), [4]);
+    assert_eq!(initial(b.registers().await), [4]);
+    assert!(a.permits().is_empty());
+
+    let stopped = std::time::Instant::now();
+    b.set_down(true);
+    eventually("hub-a topped up", async || !a.permits().is_empty()).await;
+    let (stream, count, at) = a.permits_timed()[0];
+    assert_eq!(
+        (stream, count),
+        (1, 4),
+        "ceil(8 / 1) - ceil(8 / 2) on hub-a's stream"
+    );
+    assert!(at.duration_since(stopped) < Duration::from_secs(1));
+
+    b.set_down(false);
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    assert_eq!(
+        initial(b.registers().await).last(),
+        Some(&4),
+        "back: ceil(8 / 2)"
+    );
+    // hub-b leaves again: hub-a already holds 8, the share of one hub; nothing more.
+    b.set_down(true);
+    all_registered(&c, &["hub-a"]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(a.permits(), [(1, 4)], "one top-up, nothing else");
+    assert_eq!(
+        initial(a.registers().await),
+        [4],
+        "hub-a's stream was never reopened"
+    );
+    c.shutdown().await;
+}
+
+/// A hub down at start counts while its first attempt runs (the split is made before anyone
+/// knows); once that attempt fails, the live hubs are topped up to the share of the hubs left.
+#[tokio::test]
+async fn a_hub_down_at_start_leaves_its_share_to_the_others() {
+    let a = answering("hub-a").await;
+    // A peer that accepts TCP and never answers: the first attempt fails after the handshake
+    // timeout, long after hub-a's Register split the permits.
+    let mute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mute_addr = mute.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((conn, _)) = mute.accept().await {
+            held.push(conn);
+        }
+    });
+    let c = client(HubSettings {
+        handshake_timeout: Duration::from_millis(300),
+        ..settings(format!("{},{mute_addr}", a.address()))
+    })
+    .await;
+    all_registered(&c, &["hub-a"]).await;
+    let offered = a.registers().await[0].initial_permits;
+    assert_eq!(offered, 5, "split with the hub still on its first attempt");
+    eventually("hub-a holds all 10", async || {
+        offered + a.permits().iter().map(|(_, n)| n).sum::<u32>() == 10
+    })
+    .await;
+    c.shutdown().await;
+}
+
 #[tokio::test]
 async fn unkeyed_requests_round_robin_over_live_hubs_and_skip_a_dead_one() {
     let (a, b) = (answering("hub-a").await, answering("hub-b").await);

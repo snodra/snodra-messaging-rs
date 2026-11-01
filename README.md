@@ -240,9 +240,15 @@ every instance registers on every hub, and the client picks a hub per request.
   (queries are retried, commands are not). Replies go on the stream the request arrived on.
 - **Permits.** A stream offers `ceil(max_concurrent_handlers / N)` permits, N being the hubs live
   when its `Register` is written, itself included (a hub still on its first connect attempt counts
-  as live, so hubs that start together split from the start). Permits are never revoked when N
-  changes; a stream opened while another hub is down offers the larger share. The local
-  concurrency limit stays `max_concurrent_handlers` over all hubs.
+  as live, so hubs that start together split from the start). When N shrinks from N_old to N_new
+  (a hub is lost, its first attempt fails, it is closed as a duplicate or leaves DNS), every live
+  stream gets one `Permits` top-up so that it holds `ceil(max / N_new)` in all: with 8 permits and
+  two hubs each offers 4, and when one stops the survivor gets `Permits(4)`. A stream that already
+  offered that many (it was topped up before, or opened while another hub was down) gets nothing,
+  so flapping hubs never inflate the permits. A joining or returning hub offers `ceil(max / N)`
+  afresh. Permits are never revoked when N grows; the local concurrency limit stays
+  `max_concurrent_handlers` over all hubs, so a hub may briefly hold more permits than this
+  instance runs at once, and the extra requests wait locally (same rule as kraken-messaging).
 - **Status.** Every `KRAKEN_HUB_STATUS_INTERVAL_MS` the instance sends `InstanceStatus` to every
   hub whose ack lists `instance-status`: `connected_hub_ids` (the acknowledged hubs; a legacy hub
   has no id and is left out) and `handlers_in_flight` (handlers running over all hubs). A hub
