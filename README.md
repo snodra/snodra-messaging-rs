@@ -454,7 +454,9 @@ tokio::spawn(async move { rows.try_for_each(|row| async { Ok(()) }).await });
   (`HubUnavailable`, `NoHandler`, `HandlerBusy`, `HandlerDisconnected`, `Timeout`,
   `HubConnectionLost`): a retry is a new stream with a fresh id; a hub stream lost while the
   request still sat in its outbound buffer moves to the next capable hub with the same id, as a
-  unary request. Nothing is retried after the first item.
+  unary request. Every attempt sends the chosen idle timeout as is (it is an idle timeout, not a
+  deadline: unlike a unary retry, an attempt does not send what is left of the budget); the
+  budget only bounds how many attempts there are. Nothing is retried after the first item.
 - **Compat.** Against a P3 / P4a hub `stream` fails with `UnsupportedByHub` (`tests/hub_compat.rs`);
   the P4b hub serves it (`tests/e2e_stream.rs`, image `kraken-hub:p4b-hub`, `KRAKEN_HUB_P4B_IMAGE`).
 
