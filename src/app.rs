@@ -32,28 +32,6 @@ use crate::hub::{
 };
 use crate::identity::{Guard, IdentityResolver, JwksVerifier};
 use crate::kafka::{EventBus, EventConsumer, OutboxPublisher, ensure_indexes};
-use crate::proto::{ClientMessage, client_message};
-
-/// Replies go back on the stream the request arrived on, never on whatever stream is current: a
-/// reply on another stream (after a reconnect, or to another hub later) would be ignored by the hub.
-async fn reply_on_arrival_stream(
-    dispatcher: Arc<Dispatcher>,
-    request: crate::proto::Request,
-    reply_to: crate::hub::ReplyTo,
-) {
-    let reply = dispatcher.handle(request).await;
-    let request_id = reply.request_id.clone();
-    if let Err(e) = reply_to
-        .send(ClientMessage {
-            message: Some(client_message::Message::Reply(reply)),
-        })
-        .await
-    {
-        tracing::warn!(request = %request_id, stream = reply_to.stream(), "reply dropped: {e}");
-    }
-    // The request is finished either way: one permit back to the hub it came from.
-    reply_to.grant().await;
-}
 use crate::types::{Command, Event, MessageType, Query, StreamingQuery};
 
 pub struct KrakenMessagingBuilder {
@@ -351,13 +329,13 @@ impl KrakenMessagingBuilder {
                     msg = inbound.recv() => match msg { Some(m) => m, None => break },
                 };
                 match msg {
+                    // Served on the stream it arrived on; registered before the spawn so that a
+                    // Flow or Cancel right behind it finds it.
                     Inbound::Request { request, reply_to } => {
-                        loop_handlers.spawn(reply_on_arrival_stream(
-                            Arc::clone(&dispatcher),
-                            request,
-                            reply_to,
-                        ));
+                        loop_handlers.spawn(dispatcher.serve(request, reply_to));
                     }
+                    Inbound::Flow(f) => dispatcher.flow(&f.request_id, f.credits),
+                    Inbound::Cancel(c) => dispatcher.cancel(&c.request_id, &c.reason),
                     other => loop_sender.on_inbound(other),
                 }
             }

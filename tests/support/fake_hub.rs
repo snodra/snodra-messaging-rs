@@ -29,7 +29,26 @@
 //! target answered, after `max_results` successful parts, or at the deadline (`timeout_ms`, else
 //! 5 s) with the unanswered targets as `timed_out`. A target whose stream ends is a failed part
 //! (`HANDLER_DISCONNECTED`). No target: `NO_HANDLER`; a command: `INVALID_REQUEST`; a session
-//! without the capability: `UNSUPPORTED`. Unary requests still go to the responder only.
+//! without the capability: `UNSUPPORTED`. Unary requests still go to the responder only. A gather
+//! that ends early (`max_results`, the deadline, the sender gone) sends `Cancel{<id>#<n>, reason}`
+//! to each still-outstanding target whose session negotiated "streaming".
+//!
+//! Streaming like kraken-hub (ADR 0017, P4b): the ack lists "streaming" when the client declared
+//! it, unless `set_streaming(false)` (a P4a hub). A `Request` with `mode = STREAMING` on a session
+//! without it is `UNSUPPORTED` (unary on a session that never saw `scatter-gather` either: a P3
+//! hub does not know `mode`). Otherwise: a command `INVALID_REQUEST`, no owner `NO_HANDLER`, no
+//! owner instance that negotiated "streaming" `UNSUPPORTED`, a duplicate id `INVALID_REQUEST`;
+//! else one capable instance (round-robin over them, by service then instance id) gets
+//! `Request{<id>#1, mode = STREAMING, initial_credit (0 reads as 64), max_results 0}`. Its
+//! `ReplyPart`s are relayed under the credit (`request_id` rewritten, responder set, `seq` kept;
+//! one beyond the credit ends the stream with `INVALID_REQUEST "part without credit"` and cancels
+//! the handler; one carrying `error` ends it with that error), its `ReplyEnd` is relayed; after
+//! `max_results` parts the stream ends and the handler gets `Cancel{"max results"}`; a sender
+//! `Flow` adds credit and is relayed as `Flow{<id>#1}`; a sender `Cancel` cancels the handler and
+//! ends the stream silently; no part within `timeout_ms` (else 5 s, from the forward, reset per
+//! part) ends it with `TIMEOUT` and `Cancel{"idle timeout"}`; the handler leaving ends it with
+//! `HANDLER_DISCONNECTED`, the sender leaving cancels the handler (`"sender disconnected"`).
+//! Client-sent parts, ends, flows and cancels are recorded per stream.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -37,6 +56,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use kraken_messaging::proto::hub_server::{Hub, HubServer};
 use kraken_messaging::proto::{self, ClientMessage, ServerMessage, client_message, server_message};
@@ -74,7 +94,35 @@ struct Route {
     queries: Vec<String>,
     /// The session declared "scatter-gather" and the hub shares it.
     scatter: bool,
+    /// The session declared "streaming" and the hub shares it.
+    streaming: bool,
     tx: Outbound,
+}
+
+/// A streaming query in progress (P4b).
+struct StreamState {
+    sender: Outbound,
+    sender_no: usize,
+    target_no: usize,
+    service: String,
+    instance: String,
+    target: Outbound,
+    credit: u32,
+    parts: u32,
+    max_results: u32,
+    idle: Duration,
+    deadline: Instant,
+}
+
+/// Why a gather closes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Closed {
+    /// Every target answered.
+    Complete,
+    MaxResults,
+    Deadline,
+    /// The sender's stream ended: no end to send, the targets are cancelled.
+    SenderGone,
 }
 
 /// A scatter-gather in progress.
@@ -93,12 +141,30 @@ fn server(m: server_message::Message) -> ServerMessage {
 }
 
 fn hub_error(id: &str, code: proto::ErrorCode, message: &str) -> ServerMessage {
-    server(server_message::Message::Error(proto::Error {
+    server(server_message::Message::Error(error(id, code, message)))
+}
+
+fn error(id: &str, code: proto::ErrorCode, message: &str) -> proto::Error {
+    proto::Error {
         request_id: id.to_string(),
         code: code as i32,
         message: message.to_string(),
         details: vec![],
+    }
+}
+
+fn cancel_msg(id: &str, reason: &str) -> ServerMessage {
+    server(server_message::Message::Cancel(proto::Cancel {
+        request_id: id.to_string(),
+        reason: reason.to_string(),
     }))
+}
+
+/// Writes each message to its stream, in order.
+async fn deliver(msgs: Vec<(Outbound, ServerMessage)>) {
+    for (tx, m) in msgs {
+        let _ = tx.send(Ok(m)).await;
+    }
 }
 
 pub struct State {
@@ -142,6 +208,16 @@ pub struct State {
     /// gather id → the gather; target id → gather id.
     gathers: StdMutex<HashMap<String, Gather>>,
     target_of: StdMutex<HashMap<String, String>>,
+    /// stream id → the stream; `<id>#1` → stream id.
+    open_streams: StdMutex<HashMap<String, StreamState>>,
+    stream_target_of: StdMutex<HashMap<String, String>>,
+    /// Round-robin over the capable instances of a streaming query.
+    rotation: AtomicUsize,
+    /// Client-sent multi-part messages: (stream number, message).
+    parts: StdMutex<Vec<(usize, proto::ReplyPart)>>,
+    ends: StdMutex<Vec<(usize, proto::ReplyEnd)>>,
+    flows: StdMutex<Vec<(usize, proto::Flow)>>,
+    cancels: StdMutex<Vec<(usize, proto::Cancel)>>,
 }
 
 /// What happened on the fake hub, in order.
@@ -252,11 +328,8 @@ impl State {
         let me = Arc::clone(self);
         let gather = req.id.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(timeout.into())).await;
-            let end = me.close(&gather, true);
-            if let Some((tx, end)) = end {
-                let _ = tx.send(Ok(end)).await;
-            }
+            tokio::time::sleep(Duration::from_millis(timeout.into())).await;
+            deliver(me.close(&gather, Closed::Deadline)).await;
         });
         for (id, (_, _, _, target)) in ids.into_iter().zip(targets) {
             let forwarded = proto::Request {
@@ -306,47 +379,371 @@ impl State {
                 responder_instance: instance,
                 seq,
             }));
-            let done = g.outstanding.is_empty() || (g.max_results > 0 && g.ok >= g.max_results);
-            let sender = g.sender.clone();
-            drop(gathers);
-            let end = if done {
-                self.close(&parent, false).map(|(_, e)| e)
+            let done = if g.outstanding.is_empty() {
+                Some(Closed::Complete)
+            } else if g.max_results > 0 && g.ok >= g.max_results {
+                Some(Closed::MaxResults)
             } else {
                 None
             };
-            (sender, part, end)
+            let sender = g.sender.clone();
+            drop(gathers);
+            let mut out = vec![(sender, part)];
+            if let Some(how) = done {
+                out.extend(self.close(&parent, how));
+            }
+            out
         };
-        let (sender, part, end) = out;
-        let _ = sender.send(Ok(part)).await;
-        if let Some(end) = end {
-            let _ = sender.send(Ok(end)).await;
-        }
+        deliver(out).await;
     }
 
-    /// Ends gather `id` (if still open): its `ReplyEnd`, the unanswered targets timed out when
-    /// `deadline`.
-    fn close(&self, id: &str, deadline: bool) -> Option<(Outbound, ServerMessage)> {
-        let g = self.gathers.lock().unwrap().remove(id)?;
-        let mut target_of = self.target_of.lock().unwrap();
-        for t in g.outstanding.keys() {
-            target_of.remove(t);
+    /// Ends gather `id` (if still open): its `ReplyEnd` (unless the sender is gone), the
+    /// unanswered targets timed out at the deadline, and a `Cancel` to each still-outstanding
+    /// target whose session negotiated "streaming" when the gather ends early.
+    fn close(&self, id: &str, how: Closed) -> Vec<(Outbound, ServerMessage)> {
+        let Some(g) = self.gathers.lock().unwrap().remove(id) else {
+            return vec![];
+        };
+        let mut out = vec![];
+        {
+            let mut target_of = self.target_of.lock().unwrap();
+            for t in g.outstanding.keys() {
+                target_of.remove(t);
+            }
         }
-        let end = server(server_message::Message::End(proto::ReplyEnd {
-            request_id: id.to_string(),
-            error: None,
-            parts: g.parts,
-            failed: g.failed,
-            timed_out: if deadline {
-                g.outstanding.len() as u32
+        if how != Closed::SenderGone {
+            out.push((
+                g.sender,
+                server(server_message::Message::End(proto::ReplyEnd {
+                    request_id: id.to_string(),
+                    error: None,
+                    parts: g.parts,
+                    failed: g.failed,
+                    timed_out: if how == Closed::Deadline {
+                        g.outstanding.len() as u32
+                    } else {
+                        0
+                    },
+                })),
+            ));
+        }
+        let reason = match how {
+            Closed::Complete => return out,
+            Closed::MaxResults => "max results",
+            Closed::Deadline => "deadline",
+            Closed::SenderGone => "sender disconnected",
+        };
+        let routes = self.routes.lock().unwrap();
+        let mut targets: Vec<(&String, &(usize, String, String))> = g.outstanding.iter().collect();
+        targets.sort();
+        for (target_id, (n, _, _)) in targets {
+            if let Some(r) = routes.get(n).filter(|r| r.streaming) {
+                out.push((r.tx.clone(), cancel_msg(target_id, reason)));
+            }
+        }
+        out
+    }
+
+    /// A streaming `Request` from stream `stream_no`: rejected, or forwarded to one capable
+    /// instance. `false` when the session knows no query modes at all (served as unary).
+    async fn open_stream(
+        self: &Arc<Self>,
+        stream_no: usize,
+        req: &proto::Request,
+        tx: &Outbound,
+    ) -> bool {
+        use proto::ErrorCode;
+        let reject = |code, message: &str| hub_error(&req.id, code, message);
+        let (knows_modes, listed) = self
+            .routes
+            .lock()
+            .unwrap()
+            .get(&stream_no)
+            .map(|r| (r.scatter || r.streaming, r.streaming))
+            .unwrap_or((false, false));
+        if !knows_modes {
+            return false;
+        }
+        if !listed || !self.streaming.load(Ordering::SeqCst) {
+            let _ = tx
+                .send(Ok(reject(
+                    ErrorCode::Unsupported,
+                    "streaming not negotiated",
+                )))
+                .await;
+            return true;
+        }
+        let (is_command, owners, mut capable) = {
+            let routes = self.routes.lock().unwrap();
+            let is_command = req.kind == proto::RequestKind::Command as i32
+                || routes.values().any(|r| r.commands.contains(&req.r#type));
+            let owners: Vec<String> = routes
+                .values()
+                .filter(|r| r.queries.contains(&req.r#type))
+                .map(|r| r.service.clone())
+                .collect();
+            let capable: Vec<(usize, String, String, Outbound)> = routes
+                .iter()
+                .filter(|(_, r)| r.queries.contains(&req.r#type) && r.streaming)
+                .map(|(n, r)| (*n, r.service.clone(), r.instance.clone(), r.tx.clone()))
+                .collect();
+            (is_command, owners, capable)
+        };
+        let rejection = if is_command {
+            Some(reject(
+                ErrorCode::InvalidRequest,
+                "invalid request: a command",
+            ))
+        } else if owners.is_empty() {
+            Some(reject(ErrorCode::NoHandler, "no handler"))
+        } else if capable.is_empty() {
+            Some(reject(
+                ErrorCode::Unsupported,
+                &format!("no instance of {owners:?} negotiated streaming"),
+            ))
+        } else if self.open_streams.lock().unwrap().contains_key(&req.id)
+            || self.gathers.lock().unwrap().contains_key(&req.id)
+        {
+            Some(reject(ErrorCode::InvalidRequest, "duplicate id"))
+        } else {
+            None
+        };
+        if let Some(rejection) = rejection {
+            let _ = tx.send(Ok(rejection)).await;
+            return true;
+        }
+        capable.sort_by(|a, b| (&a.1, &a.2).cmp(&(&b.1, &b.2)));
+        let pick = self.rotation.fetch_add(1, Ordering::SeqCst) % capable.len();
+        let (target_no, service, instance, target) = capable.swap_remove(pick);
+        let credit = if req.initial_credit == 0 {
+            64
+        } else {
+            req.initial_credit
+        };
+        let idle = Duration::from_millis(
+            if req.timeout_ms > 0 {
+                req.timeout_ms
             } else {
-                0
+                5_000
+            }
+            .into(),
+        );
+        let target_id = format!("{}#1", req.id);
+        self.open_streams.lock().unwrap().insert(
+            req.id.clone(),
+            StreamState {
+                sender: tx.clone(),
+                sender_no: stream_no,
+                target_no,
+                service,
+                instance,
+                target: target.clone(),
+                credit,
+                parts: 0,
+                max_results: req.max_results,
+                idle,
+                deadline: Instant::now() + idle,
             },
-        }));
-        Some((g.sender, end))
+        );
+        self.stream_target_of
+            .lock()
+            .unwrap()
+            .insert(target_id.clone(), req.id.clone());
+        let me = Arc::clone(self);
+        let id = req.id.clone();
+        tokio::spawn(async move {
+            loop {
+                let Some(deadline) = me.open_streams.lock().unwrap().get(&id).map(|s| s.deadline)
+                else {
+                    return;
+                };
+                if Instant::now() >= deadline {
+                    let end = me.end_stream(
+                        &id,
+                        Some(Some(error(&id, proto::ErrorCode::Timeout, "idle timeout"))),
+                        Some("idle timeout"),
+                    );
+                    deliver(end).await;
+                    return;
+                }
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            }
+        });
+        let forwarded = proto::Request {
+            id: target_id,
+            mode: proto::RequestMode::Streaming as i32,
+            initial_credit: credit,
+            max_results: 0,
+            ..req.clone()
+        };
+        let _ = target
+            .send(Ok(server(server_message::Message::Request(forwarded))))
+            .await;
+        true
     }
 
-    /// Stream `stream_no` (written through `tx`) ended: its gathers end silently, it is no longer
-    /// a target and its unanswered targets fail as parts (unless every stream was `dropped`).
+    /// Ends stream `id` (if still open): `end` is `Some(error)` for a `ReplyEnd` to the sender
+    /// (`None`: nothing more to the sender), `cancel` the reason of a `Cancel` to the handler.
+    fn end_stream(
+        &self,
+        id: &str,
+        end: Option<Option<proto::Error>>,
+        cancel: Option<&str>,
+    ) -> Vec<(Outbound, ServerMessage)> {
+        let Some(st) = self.open_streams.lock().unwrap().remove(id) else {
+            return vec![];
+        };
+        let target_id = format!("{id}#1");
+        self.stream_target_of.lock().unwrap().remove(&target_id);
+        let mut out = vec![];
+        if let Some(error) = end {
+            let error = error.map(|mut e| {
+                e.request_id = id.to_string();
+                e
+            });
+            out.push((
+                st.sender.clone(),
+                server(server_message::Message::End(proto::ReplyEnd {
+                    request_id: id.to_string(),
+                    error,
+                    parts: st.parts,
+                    failed: 0,
+                    timed_out: 0,
+                })),
+            ));
+        }
+        if let Some(reason) = cancel {
+            out.push((st.target.clone(), cancel_msg(&target_id, reason)));
+        }
+        out
+    }
+
+    /// A handler's `ReplyPart` for `<id>#1` from stream `stream_no`: relayed under the credit.
+    fn on_part(&self, stream_no: usize, p: proto::ReplyPart) -> Vec<(Outbound, ServerMessage)> {
+        self.parts.lock().unwrap().push((stream_no, p.clone()));
+        let Some(parent) = self
+            .stream_target_of
+            .lock()
+            .unwrap()
+            .get(&p.request_id)
+            .cloned()
+        else {
+            return vec![];
+        };
+        let relayed = {
+            let mut streams = self.open_streams.lock().unwrap();
+            let Some(st) = streams
+                .get_mut(&parent)
+                .filter(|s| s.target_no == stream_no)
+            else {
+                return vec![];
+            };
+            if let Some(e) = p.error {
+                Err((Some(Some(e)), None))
+            } else if st.credit == 0 {
+                Err((
+                    Some(Some(error(
+                        &parent,
+                        proto::ErrorCode::InvalidRequest,
+                        "part without credit",
+                    ))),
+                    Some("part without credit"),
+                ))
+            } else {
+                st.credit -= 1;
+                st.parts += 1;
+                st.deadline = Instant::now() + st.idle;
+                let part = server(server_message::Message::Part(proto::ReplyPart {
+                    request_id: parent.clone(),
+                    payload: p.payload,
+                    error: None,
+                    responder_service: st.service.clone(),
+                    responder_instance: st.instance.clone(),
+                    seq: p.seq,
+                }));
+                let maxed = st.max_results > 0 && st.parts >= st.max_results;
+                Ok((st.sender.clone(), part, maxed))
+            }
+        };
+        match relayed {
+            Ok((sender, part, maxed)) => {
+                let mut out = vec![(sender, part)];
+                if maxed {
+                    out.extend(self.end_stream(&parent, Some(None), Some("max results")));
+                }
+                out
+            }
+            Err((end, cancel)) => self.end_stream(&parent, end, cancel),
+        }
+    }
+
+    /// A handler's `ReplyEnd` for `<id>#1` from stream `stream_no`: relayed.
+    fn on_end(&self, stream_no: usize, e: proto::ReplyEnd) -> Vec<(Outbound, ServerMessage)> {
+        self.ends.lock().unwrap().push((stream_no, e.clone()));
+        let Some(parent) = self
+            .stream_target_of
+            .lock()
+            .unwrap()
+            .get(&e.request_id)
+            .cloned()
+        else {
+            return vec![];
+        };
+        if !self
+            .open_streams
+            .lock()
+            .unwrap()
+            .get(&parent)
+            .is_some_and(|s| s.target_no == stream_no)
+        {
+            return vec![];
+        }
+        self.end_stream(&parent, Some(e.error), None)
+    }
+
+    /// A sender's `Flow` from stream `stream_no`: more credit, relayed to the handler.
+    fn on_flow(&self, stream_no: usize, f: proto::Flow) -> Vec<(Outbound, ServerMessage)> {
+        self.flows.lock().unwrap().push((stream_no, f.clone()));
+        if f.credits == 0 {
+            return vec![];
+        }
+        let mut streams = self.open_streams.lock().unwrap();
+        let Some(st) = streams
+            .get_mut(&f.request_id)
+            .filter(|s| s.sender_no == stream_no)
+        else {
+            return vec![];
+        };
+        st.credit = st.credit.saturating_add(f.credits);
+        vec![(
+            st.target.clone(),
+            server(server_message::Message::Flow(proto::Flow {
+                request_id: format!("{}#1", f.request_id),
+                credits: f.credits,
+            })),
+        )]
+    }
+
+    /// A sender's `Cancel` from stream `stream_no`: the handler is cancelled, nothing more to
+    /// the sender.
+    fn on_cancel(&self, stream_no: usize, c: proto::Cancel) -> Vec<(Outbound, ServerMessage)> {
+        self.cancels.lock().unwrap().push((stream_no, c.clone()));
+        if !self
+            .open_streams
+            .lock()
+            .unwrap()
+            .get(&c.request_id)
+            .is_some_and(|s| s.sender_no == stream_no)
+        {
+            return vec![];
+        }
+        self.end_stream(&c.request_id, None, Some(&c.reason))
+    }
+
+    /// Stream `stream_no` (written through `tx`) ended: its gathers end silently (their targets
+    /// cancelled), it is no longer a target and its unanswered targets fail as parts (unless
+    /// every stream was `dropped`); the streams it sent are cancelled at their handlers, the
+    /// streams it handled end with `HANDLER_DISCONNECTED`.
     async fn stream_closed(&self, stream_no: usize, tx: &Outbound, dropped: bool) {
         self.routes.lock().unwrap().remove(&stream_no);
         let gone: Vec<String> = self
@@ -358,7 +755,45 @@ impl State {
             .map(|(id, _)| id.clone())
             .collect();
         for id in gone {
-            self.close(&id, false);
+            let msgs = self.close(&id, Closed::SenderGone);
+            if !dropped {
+                deliver(msgs).await;
+            }
+        }
+        let (sent, handled): (Vec<String>, Vec<String>) = {
+            let streams = self.open_streams.lock().unwrap();
+            (
+                streams
+                    .iter()
+                    .filter(|(_, s)| s.sender_no == stream_no)
+                    .map(|(id, _)| id.clone())
+                    .collect(),
+                streams
+                    .iter()
+                    .filter(|(_, s)| s.target_no == stream_no)
+                    .map(|(id, _)| id.clone())
+                    .collect(),
+            )
+        };
+        for id in sent {
+            let msgs = self.end_stream(&id, None, Some("sender disconnected"));
+            if !dropped {
+                deliver(msgs).await;
+            }
+        }
+        for id in handled {
+            let msgs = self.end_stream(
+                &id,
+                Some(Some(error(
+                    &id,
+                    proto::ErrorCode::HandlerDisconnected,
+                    "handler disconnected",
+                ))),
+                None,
+            );
+            if !dropped {
+                deliver(msgs).await;
+            }
         }
         if dropped {
             return;
@@ -441,12 +876,14 @@ impl Hub for Service {
                                 let wants_streaming = r.capabilities.iter().any(|c| c == "streaming");
                                 state.log(Event::Register { stream: stream_no, types: r.command_types.len() + r.query_types.len() + r.shared_query_types.len() });
                                 let scatter = wants_scatter && v2 && state.scatter_gather.load(Ordering::SeqCst) && state.ack.lock().unwrap().is_some();
+                                let streaming = wants_streaming && v2 && state.streaming.load(Ordering::SeqCst) && state.ack.lock().unwrap().is_some();
                                 state.routes.lock().unwrap().insert(stream_no, Route {
                                     service: r.service_name.clone(),
                                     instance: r.instance_id.clone(),
                                     commands: r.command_types.clone(),
                                     queries: r.query_types.iter().chain(&r.shared_query_types).cloned().collect(),
                                     scatter,
+                                    streaming,
                                     tx: tx.clone(),
                                 });
                                 instance = Some(r.instance_id.clone());
@@ -520,16 +957,18 @@ impl Hub for Service {
                                 state.requests.lock().await.push(req.clone());
                                 let scattered = req.mode == proto::RequestMode::ScatterGather as i32
                                     && state.scatter(stream_no, &req, &tx).await;
-                                if !scattered {
+                                let streamed = req.mode == proto::RequestMode::Streaming as i32
+                                    && state.open_stream(stream_no, &req, &tx).await;
+                                if !scattered && !streamed {
                                     let response = state.responder.lock().await.as_ref().and_then(|f| f(req));
                                     if let Some(resp) = response && tx.send(Ok(resp)).await.is_err() { break; }
                                 }
                             }
-                            // Multi-part messages (ADR 0017): this client sends none yet.
-                            client_message::Message::Part(_)
-                            | client_message::Message::End(_)
-                            | client_message::Message::Flow(_)
-                            | client_message::Message::Cancel(_) => {}
+                            // Multi-part messages of streaming queries (ADR 0017, P4b).
+                            client_message::Message::Part(p) => deliver(state.on_part(stream_no, p)).await,
+                            client_message::Message::End(e) => deliver(state.on_end(stream_no, e)).await,
+                            client_message::Message::Flow(f) => deliver(state.on_flow(stream_no, f)).await,
+                            client_message::Message::Cancel(c) => deliver(state.on_cancel(stream_no, c)).await,
                         },
                         Some(Ok(ClientMessage { message: None })) => {}
                     }
@@ -598,6 +1037,13 @@ impl FakeHub {
             routes: StdMutex::new(HashMap::new()),
             gathers: StdMutex::new(HashMap::new()),
             target_of: StdMutex::new(HashMap::new()),
+            open_streams: StdMutex::new(HashMap::new()),
+            stream_target_of: StdMutex::new(HashMap::new()),
+            rotation: AtomicUsize::new(0),
+            parts: StdMutex::new(vec![]),
+            ends: StdMutex::new(vec![]),
+            flows: StdMutex::new(vec![]),
+            cancels: StdMutex::new(vec![]),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -691,6 +1137,31 @@ impl FakeHub {
     /// Scatter-gathers still open.
     pub fn open_gathers(&self) -> usize {
         self.state.gathers.lock().unwrap().len()
+    }
+
+    /// Streaming queries still open.
+    pub fn open_streams(&self) -> usize {
+        self.state.open_streams.lock().unwrap().len()
+    }
+
+    /// `ReplyPart`s clients sent (handlers of streaming queries): (1-based stream number, part).
+    pub fn parts(&self) -> Vec<(usize, proto::ReplyPart)> {
+        self.state.parts.lock().unwrap().clone()
+    }
+
+    /// `ReplyEnd`s clients sent: (1-based stream number, end).
+    pub fn ends(&self) -> Vec<(usize, proto::ReplyEnd)> {
+        self.state.ends.lock().unwrap().clone()
+    }
+
+    /// `Flow`s clients sent (senders of streaming queries): (1-based stream number, flow).
+    pub fn flows(&self) -> Vec<(usize, proto::Flow)> {
+        self.state.flows.lock().unwrap().clone()
+    }
+
+    /// `Cancel`s clients sent: (1-based stream number, cancel).
+    pub fn cancels(&self) -> Vec<(usize, proto::Cancel)> {
+        self.state.cancels.lock().unwrap().clone()
     }
 
     /// InstanceStatus messages received: (1-based stream number, report).
