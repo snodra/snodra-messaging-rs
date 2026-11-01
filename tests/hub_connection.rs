@@ -75,6 +75,7 @@ async fn registers_shared_query_types_apart_and_knows_whether_the_hub_scatters()
         shared_queries: vec!["t.S2".into(), "t.S1".into()],
         // Exclusive streaming queries are query types to the hub (P4b): announced with `t.Q`.
         streaming_queries: vec!["t.A".into()],
+        subscription_queries: vec![],
     });
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);
@@ -255,7 +256,8 @@ async fn register_declares_protocol_v2_and_client_version() {
             "flow-control",
             "instance-status",
             "scatter-gather",
-            "streaming"
+            "streaming",
+            "subscription"
         ]
     );
     assert_eq!(r.client_version, CLIENT_VERSION);
@@ -285,6 +287,7 @@ async fn ack_completes_the_handshake_and_its_interval_replaces_the_fallback() {
             "instance-status".into(),
             "scatter-gather".into(),
             "streaming".into(),
+            "subscription".into(),
         ],
         ..ack
     };

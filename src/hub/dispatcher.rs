@@ -1,6 +1,9 @@
 //! Incoming hub requests: identity, lookup, guard, decode, handler, reply. Streaming queries
 //! (ADR 0017, P4b): the handler's stream pulled under the sender's credits, one `ReplyPart` per
 //! item, then the `ReplyEnd`. The hub's `Flow` and `Cancel` reach the running request by id.
+//! Subscription queries (P4c): `mode = SUBSCRIPTION` registers a subscription (see
+//! [`super::subscriptions`]), the initial result (`<id>#0`, `mode = UNARY`) is served like any
+//! unary request.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -21,6 +24,7 @@ use crate::proto::{
 
 use super::connection::{ReplyTo, StreamId};
 use super::registry::{HandlerRegistry, Invocation, ItemStream};
+use super::subscriptions::{DEFAULT_MAX_SUBSCRIPTIONS, QueryUpdateEmitter, Subscriptions};
 
 /// How the hub reaches a running request: its cancel token and, for a stream, its credits.
 struct Control {
@@ -66,6 +70,21 @@ pub struct Dispatcher {
     running: Mutex<HashMap<String, Control>>,
     /// The longest a streaming handler waits for credit (`Config.hub_stream_credit_timeout`).
     stream_credit_timeout: Duration,
+    /// The subscriptions served here (P4c), shared with the [`QueryUpdateEmitter`]s.
+    subscriptions: Arc<Subscriptions>,
+}
+
+/// Why a subscription request was not registered.
+enum Rejected {
+    /// The instance already serves that many subscriptions.
+    Limit(usize),
+    Error(MessagingError),
+}
+
+impl From<MessagingError> for Rejected {
+    fn from(e: MessagingError) -> Self {
+        Rejected::Error(e)
+    }
 }
 
 impl Dispatcher {
@@ -80,7 +99,40 @@ impl Dispatcher {
             permits: Arc::new(Semaphore::new(max_concurrent_handlers.max(1))),
             running: Mutex::new(HashMap::new()),
             stream_credit_timeout: crate::config::DEFAULT_STREAM_CREDIT_TIMEOUT,
+            subscriptions: Arc::new(Subscriptions::new(DEFAULT_MAX_SUBSCRIPTIONS)),
         }
+    }
+
+    /// The most subscriptions this instance serves at once (`Config.hub_max_subscriptions`;
+    /// default [`DEFAULT_MAX_SUBSCRIPTIONS`], at least 1): a `Request{mode = SUBSCRIPTION}`
+    /// beyond it is answered `ReplyEnd{error = RESOURCE_EXHAUSTED "subscription limit (N)
+    /// reached"}`.
+    pub fn max_subscriptions(self, max: usize) -> Dispatcher {
+        self.subscriptions.set_max(max);
+        self
+    }
+
+    /// Serves the subscriptions `emitter` feeds (one created before this dispatcher, so
+    /// handlers could capture it) instead of its own; its limit is kept.
+    pub fn with_emitter(mut self, emitter: QueryUpdateEmitter) -> Dispatcher {
+        self.subscriptions = Arc::clone(emitter.inner());
+        self
+    }
+
+    /// An emitter for the subscriptions this dispatcher serves.
+    pub fn emitter(&self) -> QueryUpdateEmitter {
+        QueryUpdateEmitter::from_inner(Arc::clone(&self.subscriptions))
+    }
+
+    /// Subscriptions open on this instance now.
+    pub fn open_subscriptions(&self) -> usize {
+        self.subscriptions.len()
+    }
+
+    /// Completes every subscription cleanly with a `ReplyEnd` (shutdown), best effort: the
+    /// returned tasks finish once the ends are written (or their streams are gone).
+    pub fn end_subscriptions(&self) -> Vec<JoinHandle<()>> {
+        self.subscriptions.end_all()
     }
 
     /// The longest a streaming handler waits for credit before its stream ends with `TIMEOUT`
@@ -116,13 +168,21 @@ impl Dispatcher {
 
     /// The hub's `Cancel{request_id, reason}`: the running handler (unary, a scatter-gather
     /// target, or streaming) is aborted and nothing more is sent for the request; its permits go
-    /// back. Ignored for an unknown id (it already ended).
+    /// back. A subscription (`<id>#n`, P4c) is removed: nothing more is emitted to it. Ignored
+    /// for an unknown id (it already ended).
     pub fn cancel(&self, request_id: &str, reason: &str) {
         let control = self.running.lock().unwrap().remove(request_id);
         match control {
             Some(control) => {
                 tracing::debug!(request = request_id, reason, "request cancelled by the hub");
                 control.cancel.cancel();
+            }
+            None if self.subscriptions.cancel(request_id) => {
+                tracing::debug!(
+                    request = request_id,
+                    reason,
+                    "subscription cancelled by the hub"
+                );
             }
             None => tracing::debug!(
                 request = request_id,
@@ -134,8 +194,17 @@ impl Dispatcher {
 
     /// The hub stream `stream` was lost: the streaming queries that arrived on it are cancelled
     /// (the hub forgot them with the session; their handlers would otherwise wait for credit for
-    /// ever, holding their permits). Unary handlers run on, their reply dropped, as before.
+    /// ever, holding their permits) and the subscriptions that arrived on it are removed. Unary
+    /// handlers run on, their reply dropped, as before.
     pub fn stream_lost(&self, stream: StreamId) {
+        let subscriptions = self.subscriptions.stream_lost(stream);
+        if subscriptions > 0 {
+            tracing::debug!(
+                stream,
+                subscriptions,
+                "subscriptions removed: their hub stream was lost"
+            );
+        }
         let lost: Vec<(String, Control)> = {
             let mut running = self.running.lock().unwrap();
             let ids: Vec<String> = running
@@ -158,17 +227,25 @@ impl Dispatcher {
     /// by the hub). The request is registered before the returned future runs, so a `Flow` or
     /// `Cancel` for its id that follows it at once still finds it. A unary request gets its
     /// `Reply`; a streaming one (`mode = STREAMING`) its parts under the credits and its end.
-    /// One permit goes back to the hub at the end, whatever the end.
+    /// One permit goes back to the hub at the end, whatever the end. A subscription request
+    /// (`mode = SUBSCRIPTION`, P4c) registers a subscription instead: it is passive (no running
+    /// handler, no permit here or at the hub) and gets a `ReplyEnd{error}` only when refused.
     pub fn serve(
         self: &Arc<Self>,
         request: proto::Request,
         reply_to: ReplyTo,
     ) -> impl Future<Output = ()> + Send + 'static {
         let streaming = request.mode == RequestMode::Streaming as i32;
-        let (running, credits) = self.accept(&request.id, reply_to.stream(), streaming);
+        let subscription = request.mode == RequestMode::Subscription as i32;
+        let accepted =
+            (!subscription).then(|| self.accept(&request.id, reply_to.stream(), streaming));
         let me = Arc::clone(self);
         async move {
             let request_id = request.id.clone();
+            let Some((running, credits)) = accepted else {
+                me.subscribe(request, &reply_to).await;
+                return;
+            };
             if streaming {
                 me.stream(&running, request, credits, &reply_to).await;
             } else if let Some(reply) = me.unary(request, Some(&running.cancel)).await
@@ -265,7 +342,18 @@ impl Dispatcher {
                         req.r#type
                     )));
                 }
-                None => None,
+                // A subscription's initial result is the unary request `<id>#0` (P4c): the
+                // subscription handler answers it; any other unary request used the wrong mode.
+                None => match self.registry.subscription_handler(&req.r#type) {
+                    Some(handler) if req.id.ends_with("#0") => Some(handler.initial.clone()),
+                    Some(_) => {
+                        return Err(MessagingError::InvalidMessage(format!(
+                            "{} is a subscription query: send it with Sender::subscribe (mode SUBSCRIPTION)",
+                            req.r#type
+                        )));
+                    }
+                    None => None,
+                },
             },
         }
         .ok_or_else(|| MessagingError::NoHandler(req.r#type.clone()))?;
@@ -303,6 +391,22 @@ impl Dispatcher {
         req: proto::Request,
         identity: Option<Identity>,
     ) -> Result<(MessageContext, OwnedSemaphorePermit, Vec<u8>), MessagingError> {
+        let (ctx, payload) = self.context(req, identity)?;
+        let permit = self
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| MessagingError::HubUnavailable("dispatcher closed".into()))?;
+        Ok((ctx, permit, payload))
+    }
+
+    /// The request's context and its guard's verdict (before decoding), without a permit.
+    fn context(
+        &self,
+        req: proto::Request,
+        identity: Option<Identity>,
+    ) -> Result<(MessageContext, Vec<u8>), MessagingError> {
         let authorization = req.headers.get(hub_headers::AUTHORIZATION).cloned();
         let ctx = MessageContext {
             message_id: req.id.clone(),
@@ -319,13 +423,73 @@ impl Dispatcher {
         if let Some(guard) = self.registry.guard(&req.r#type) {
             guard.check(ctx.identity.as_ref(), &ctx)?;
         }
-        let permit = self
-            .permits
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| MessagingError::HubUnavailable("dispatcher closed".into()))?;
-        Ok((ctx, permit, req.payload))
+        Ok((ctx, req.payload))
+    }
+
+    /// A subscription request (`<id>#n`, `mode = SUBSCRIPTION`): registered with the
+    /// subscriptions the emitter feeds, or refused with a `ReplyEnd{error}`: `INVALID_REQUEST`
+    /// when the type's handler answers another mode (a unary or streaming handler: the sender
+    /// used the wrong call), `NO_HANDLER` for a type not served here, `RESOURCE_EXHAUSTED`
+    /// `subscription limit (N) reached` beyond `max_subscriptions`, the guard's code, or
+    /// `INVALID_REQUEST` for a query that does not decode.
+    async fn subscribe(&self, req: proto::Request, reply_to: &ReplyTo) {
+        let request_id = req.id.clone();
+        let error = match self.open_subscription(req, reply_to).await {
+            Ok(()) => return,
+            Err(Rejected::Limit(max)) => proto::Error {
+                request_id: request_id.clone(),
+                code: ErrorCode::ResourceExhausted as i32,
+                message: format!("subscription limit ({max}) reached"),
+                details: vec![],
+            },
+            Err(Rejected::Error(e)) => hub_error(&request_id, &e),
+        };
+        tracing::debug!(request = %request_id, code = error.code, "subscription refused: {}", error.message);
+        send_end(reply_to, &request_id, Some(error)).await;
+    }
+
+    async fn open_subscription(
+        &self,
+        req: proto::Request,
+        reply_to: &ReplyTo,
+    ) -> Result<(), Rejected> {
+        let identity = self.identity(&req).await?;
+        let handler = match kind(&req)? {
+            RequestKind::Query => match self.registry.subscription_handler(&req.r#type) {
+                Some(handler) => Some(handler.clone()),
+                // The caller used the wrong mode: not retryable, unlike NO_HANDLER.
+                None if self.registry.query_handler(&req.r#type).is_some() => {
+                    return Err(MessagingError::InvalidMessage(format!(
+                        "{} is not a subscription query handler (it answers mode UNARY)",
+                        req.r#type
+                    ))
+                    .into());
+                }
+                None if self.registry.stream_handler(&req.r#type).is_some() => {
+                    return Err(MessagingError::InvalidMessage(format!(
+                        "{} is not a subscription query handler (it answers mode STREAMING)",
+                        req.r#type
+                    ))
+                    .into());
+                }
+                None => None,
+            },
+            _ => None,
+        }
+        .ok_or_else(|| MessagingError::NoHandler(req.r#type.clone()))?;
+        let (ctx, payload) = self.context(req, identity)?;
+        let query = (handler.decode)(&payload).map_err(|e| invocation_error(&ctx.type_name, e))?;
+        self.subscriptions
+            .open(
+                &ctx.message_id,
+                &ctx.type_name,
+                query,
+                payload,
+                reply_to.clone(),
+            )
+            .map_err(Rejected::Limit)?;
+        tracing::debug!(request = %ctx.message_id, r#type = %ctx.type_name, stream = reply_to.stream(), "subscription registered");
+        Ok(())
     }
 
     /// A streaming request: its parts under the credits (`initial_credit` plus every `Flow`;

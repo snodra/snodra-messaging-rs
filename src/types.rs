@@ -29,6 +29,17 @@ pub trait StreamingQuery:
     type Item: Serialize + DeserializeOwned + Send + 'static;
 }
 
+/// A read request whose result is an initial value followed by the updates every owner instance
+/// pushes, until the subscriber cancels or the emitters complete (ADR 0017, P4c: `Request.mode =
+/// SUBSCRIPTION`). Routed through the hub to every instance whose library negotiated
+/// `subscription` and lists the type; one of them also answers the initial result.
+pub trait SubscriptionQuery:
+    MessageType + Serialize + DeserializeOwned + Send + Sync + 'static
+{
+    type Initial: Serialize + DeserializeOwned + Send + 'static;
+    type Update: Serialize + DeserializeOwned + Send + 'static;
+}
+
 /// A fact that happened; published to Kafka topic `kraken.events`.
 pub trait Event: MessageType + Serialize + DeserializeOwned + Send + Sync + 'static {}
 

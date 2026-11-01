@@ -1,5 +1,6 @@
 //! Typed handler registration, erased to byte-level closures the dispatcher and consumer call.
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -12,7 +13,7 @@ use crate::codec;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
 use crate::identity::Guard;
-use crate::types::{Command, Event, MessageType, Query, StreamingQuery};
+use crate::types::{Command, Event, MessageType, Query, StreamingQuery, SubscriptionQuery};
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// Why an erased request handler did not produce a payload: the dispatcher maps each case to its
@@ -32,6 +33,18 @@ pub(crate) type StreamHandler =
     Arc<dyn Fn(Vec<u8>, MessageContext) -> BoxFut<Result<ItemStream, Invocation>> + Send + Sync>;
 pub(crate) type EventHandler =
     Arc<dyn Fn(Vec<u8>, EventContext) -> BoxFut<Result<(), MessagingError>> + Send + Sync>;
+/// Decodes a subscription query's payload to the registered `Q`, erased for the emitter's
+/// filters to downcast.
+pub(crate) type QueryDecoder =
+    Arc<dyn Fn(&[u8]) -> Result<Box<dyn Any + Send + Sync>, Invocation> + Send + Sync>;
+
+/// A subscription query's handler (ADR 0017, P4c): the initial result, answered like a unary
+/// query, and the decoder of the query a `Request{mode = SUBSCRIPTION}` registers.
+#[derive(Clone)]
+pub(crate) struct SubscriptionHandler {
+    pub initial: RequestHandler,
+    pub decode: QueryDecoder,
+}
 
 /// What an event handler receives: the message metadata plus the Mongo session of the transaction
 /// the consumer opened, so the handler's own writes commit together with the dedupe marker.
@@ -47,7 +60,11 @@ pub struct HandlerRegistry {
     queries: HashMap<&'static str, RequestHandler>,
     /// Streaming queries (ADR 0017, P4b), served only for `mode = STREAMING`.
     streams: HashMap<&'static str, StreamHandler>,
-    /// The query types registered as shared (their handlers are in `queries` or `streams`).
+    /// Subscription queries (ADR 0017, P4c): the initial result for `<id>#0` (`mode = UNARY`),
+    /// the subscription for `mode = SUBSCRIPTION`.
+    subscriptions: HashMap<&'static str, SubscriptionHandler>,
+    /// The query types registered as shared (their handlers are in `queries`, `streams` or
+    /// `subscriptions`).
     shared: HashSet<&'static str>,
     events: HashMap<&'static str, Vec<EventHandler>>,
     guards: HashMap<&'static str, Guard>,
@@ -148,6 +165,48 @@ impl HandlerRegistry {
         self.shared.insert(Q::TYPE);
     }
 
+    /// An exclusive subscription query (ADR 0017, P4c): `handler` answers the initial result
+    /// (the hub asks one capable instance with `Request{id = <id>#0, mode = UNARY}`, served like
+    /// any unary query, permit included); every capable instance listing the type also gets
+    /// `Request{id = <id>#n, mode = SUBSCRIPTION}`, which registers a subscription here (the
+    /// decoded query, the request id, the arrival stream; no permit) that the
+    /// [`QueryUpdateEmitter`](super::QueryUpdateEmitter) feeds: one `ReplyPart` per `emit`, a
+    /// `ReplyEnd` on `complete` / `complete_exceptionally`. A hub `Cancel` (the subscriber
+    /// cancelled or left, the hub's limits) removes it. The type is announced in
+    /// `Register.query_types`; a unary query to it (an id without the `#0` suffix) is answered
+    /// `INVALID_REQUEST` (the wrong mode is the caller's mistake, not retryable).
+    ///
+    /// # Panics
+    /// When the type already has a handler here.
+    pub fn subscription_query<Q, F, Fut>(&mut self, handler: F)
+    where
+        Q: SubscriptionQuery,
+        F: Fn(Q, MessageContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Q::Initial, MessagingError>> + Send + 'static,
+    {
+        self.assert_unowned(Q::TYPE, Some(false));
+        self.subscriptions
+            .insert(Q::TYPE, erase_subscription::<Q, F, Fut>(handler));
+    }
+
+    /// A shared subscription query (`Register.shared_query_types`): several services may own
+    /// it; a subscription reaches every capable instance of every owner. See
+    /// [`subscription_query`](Self::subscription_query) and [`shared_query`](Self::shared_query).
+    ///
+    /// # Panics
+    /// When the type already has a handler here, shared or exclusive.
+    pub fn shared_subscription_query<Q, F, Fut>(&mut self, handler: F)
+    where
+        Q: SubscriptionQuery,
+        F: Fn(Q, MessageContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Q::Initial, MessagingError>> + Send + 'static,
+    {
+        self.assert_unowned(Q::TYPE, Some(true));
+        self.subscriptions
+            .insert(Q::TYPE, erase_subscription::<Q, F, Fut>(handler));
+        self.shared.insert(Q::TYPE);
+    }
+
     /// Several handlers may react to the same event type.
     pub fn event<E, F, Fut>(&mut self, handler: F)
     where
@@ -171,7 +230,8 @@ impl HandlerRegistry {
         assert!(
             self.commands.contains_key(M::TYPE)
                 || self.queries.contains_key(M::TYPE)
-                || self.streams.contains_key(M::TYPE),
+                || self.streams.contains_key(M::TYPE)
+                || self.subscriptions.contains_key(M::TYPE),
             "requires::<{}>: register the command or query handler first",
             M::TYPE
         );
@@ -182,10 +242,15 @@ impl HandlerRegistry {
         sorted(self.commands.keys())
     }
 
-    /// Every query type served here, unary and streaming, exclusive and shared (as
-    /// kraken-messaging's `queryTypes()`).
+    /// Every query type served here, unary, streaming and subscription, exclusive and shared
+    /// (as kraken-messaging's `queryTypes()`).
     pub fn query_types(&self) -> Vec<String> {
-        sorted(self.queries.keys().chain(self.streams.keys()))
+        sorted(
+            self.queries
+                .keys()
+                .chain(self.streams.keys())
+                .chain(self.subscriptions.keys()),
+        )
     }
 
     /// The exclusive unary query types (`RegisteredTypes.queries`).
@@ -198,19 +263,29 @@ impl HandlerRegistry {
         sorted(self.streams.keys())
     }
 
-    /// The shared query types, unary and streaming (`Register.shared_query_types`).
+    /// Every subscription query type served here, exclusive and shared.
+    pub fn subscription_query_types(&self) -> Vec<String> {
+        sorted(self.subscriptions.keys())
+    }
+
+    /// The shared query types, unary, streaming and subscription (`Register.shared_query_types`).
     pub fn shared_query_types(&self) -> Vec<String> {
         sorted(self.shared.iter())
     }
 
-    /// Everything the `Register` announces: the exclusive unary, the exclusive streaming and the
-    /// shared query types apart (see [`super::RegisteredTypes`]).
+    /// Everything the `Register` announces: the exclusive unary, the exclusive streaming, the
+    /// exclusive subscription and the shared query types apart (see [`super::RegisteredTypes`]).
     pub fn registered_types(&self) -> super::RegisteredTypes {
         super::RegisteredTypes {
             commands: self.command_types(),
             queries: self.exclusive_query_types(),
             shared_queries: self.shared_query_types(),
             streaming_queries: sorted(self.streams.keys().filter(|t| !self.shared.contains(*t))),
+            subscription_queries: sorted(
+                self.subscriptions
+                    .keys()
+                    .filter(|t| !self.shared.contains(*t)),
+            ),
         }
     }
 
@@ -234,6 +309,10 @@ impl HandlerRegistry {
         self.streams.get(type_name)
     }
 
+    pub(crate) fn subscription_handler(&self, type_name: &str) -> Option<&SubscriptionHandler> {
+        self.subscriptions.get(type_name)
+    }
+
     pub(crate) fn event_handlers(&self, type_name: &str) -> &[EventHandler] {
         self.events.get(type_name).map(Vec::as_slice).unwrap_or(&[])
     }
@@ -244,7 +323,9 @@ impl HandlerRegistry {
 
     /// `shared`: the flavour of the query being registered (`None` for a command).
     fn assert_unowned(&self, type_name: &str, shared: Option<bool>) {
-        let query = self.queries.contains_key(type_name) || self.streams.contains_key(type_name);
+        let query = self.queries.contains_key(type_name)
+            || self.streams.contains_key(type_name)
+            || self.subscriptions.contains_key(type_name);
         if let Some(shared) = shared {
             assert!(
                 !query || self.shared.contains(type_name) == shared,
@@ -311,4 +392,22 @@ where
             Ok(items)
         })
     })
+}
+
+/// Erases a subscription handler: the initial result as a unary handler, plus the decoder of
+/// the query a subscription registers (boxed for the emitter's typed filters).
+fn erase_subscription<Q, F, Fut>(handler: F) -> SubscriptionHandler
+where
+    Q: SubscriptionQuery,
+    F: Fn(Q, MessageContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Q::Initial, MessagingError>> + Send + 'static,
+{
+    SubscriptionHandler {
+        initial: erase_request::<Q, Q::Initial, F, Fut>(handler),
+        decode: Arc::new(|payload: &[u8]| {
+            let query: Q = codec::decode(payload)
+                .map_err(|e| Invocation::Decode(format!("cannot decode payload: {e}")))?;
+            Ok(Box::new(query) as Box<dyn Any + Send + Sync>)
+        }),
+    }
 }

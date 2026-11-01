@@ -66,8 +66,19 @@ pub const SCATTER_GATHER: &str = "scatter-gather";
 /// with `ReplyPart`s and a `ReplyEnd`; `Flow` and `Cancel` both ways. Declared by senders and by
 /// handlers alike: the hub streams only to an instance that negotiated it.
 pub const STREAMING: &str = "streaming";
+/// The subscription capability (ADR 0017, P4c): `Request.mode = SUBSCRIPTION`, answered with the
+/// initial result and every owner instance's updates as `ReplyPart`s and one `ReplyEnd`; `Flow`
+/// and `Cancel` both ways. Declared by senders and by handlers alike: the hub subscribes only
+/// instances that negotiated it.
+pub const SUBSCRIPTION: &str = "subscription";
 /// Optional protocol features this client declares (`Register.capabilities`).
-pub const CAPABILITIES: &[&str] = &[FLOW_CONTROL, INSTANCE_STATUS, SCATTER_GATHER, STREAMING];
+pub const CAPABILITIES: &[&str] = &[
+    FLOW_CONTROL,
+    INSTANCE_STATUS,
+    SCATTER_GATHER,
+    STREAMING,
+    SUBSCRIPTION,
+];
 /// A `Permits` message is sent as soon as this many grants are pending, or as soon as the hub holds
 /// no more than `min(PERMIT_BATCH, initial_permits / 2)` permits for the stream (the low-water mark)...
 pub const PERMIT_BATCH: u32 = 16;
@@ -180,6 +191,12 @@ impl Handshake {
     /// under the sender's credits and sends `Flow` and `Cancel`.
     pub fn streaming(&self) -> bool {
         self.shares(STREAMING)
+    }
+
+    /// True when the hub shares `subscription`: it routes subscription queries to every capable
+    /// owner instance, relays their updates under the sender's credit and sends `Cancel`.
+    pub fn subscription(&self) -> bool {
+        self.shares(SUBSCRIPTION)
     }
 
     pub(crate) fn shares(&self, capability: &str) -> bool {
@@ -435,16 +452,19 @@ impl ReplyTo {
 /// A streaming query (P4b) is a query type to the hub: the mode is the sender's choice and the
 /// hub streams only to instances that negotiated `streaming`. `streaming_queries` are the
 /// exclusive ones, announced in `Register.query_types` next to `queries`; a shared streaming
-/// query is listed in `shared_queries` like any shared query.
+/// query is listed in `shared_queries` like any shared query. A subscription query (P4c) is the
+/// same: `subscription_queries` are the exclusive ones, a shared one is in `shared_queries`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RegisteredTypes {
     pub commands: Vec<String>,
     /// Exclusive unary queries.
     pub queries: Vec<String>,
-    /// Shared queries, unary or streaming.
+    /// Shared queries, unary, streaming or subscription.
     pub shared_queries: Vec<String>,
     /// Exclusive streaming queries.
     pub streaming_queries: Vec<String>,
+    /// Exclusive subscription queries.
+    pub subscription_queries: Vec<String>,
 }
 
 impl RegisteredTypes {
@@ -453,13 +473,15 @@ impl RegisteredTypes {
         self.queries.sort();
         self.shared_queries.sort();
         self.streaming_queries.sort();
+        self.subscription_queries.sort();
         self
     }
 
-    /// `Register.query_types`: the exclusive queries, unary and streaming, sorted.
+    /// `Register.query_types`: the exclusive queries, unary, streaming and subscription, sorted.
     fn exclusive_query_types(&self) -> Vec<String> {
         let mut all = self.queries.clone();
         all.extend(self.streaming_queries.iter().cloned());
+        all.extend(self.subscription_queries.iter().cloned());
         all.sort();
         all.dedup();
         all
@@ -1305,7 +1327,8 @@ mod tests {
                 "flow-control",
                 "instance-status",
                 "scatter-gather",
-                "streaming"
+                "streaming",
+                "subscription"
             ]
         );
         assert!(CLIENT_VERSION.starts_with("kraken-messaging-rs/"));
