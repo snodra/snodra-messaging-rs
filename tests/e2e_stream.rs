@@ -258,7 +258,7 @@ async fn a_thousand_rows_stream_in_order_under_a_window_of_eight_and_a_drop_canc
     let pulled = probe.pulled.load(Ordering::SeqCst);
     assert!(
         (1_005..=1_016).contains(&pulled),
-        "the handler never ran more than a window ahead: {pulled}"
+        "the handler never ran more than a window (plus one held item) ahead: {pulled}"
     );
 
     // max_results ends a stream from the hub (the handler is cancelled); the idle timeout too.

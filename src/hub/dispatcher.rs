@@ -283,9 +283,9 @@ impl Dispatcher {
     }
 
     /// A streaming request: its parts under the credits (`initial_credit` plus every `Flow`;
-    /// the handler's stream is never pulled without credit), then its end. A hub `Cancel` aborts
-    /// the pump (the handler's stream is dropped, nothing more is sent). The handler permit is
-    /// held until the end, whatever the end.
+    /// the handler's stream is pulled at most one item ahead of the credit), then its end. A hub
+    /// `Cancel` aborts the pump (the handler's stream is dropped, nothing more is sent). The
+    /// handler permit is held until the end, whatever the end.
     async fn stream(
         self: &Arc<Self>,
         running: &Running,
@@ -338,6 +338,21 @@ impl Dispatcher {
         let pumping = async move {
             let mut seq: u64 = 0;
             loop {
+                // The stream is polled at most one item ahead of the credit: the item is held
+                // until credit arrives, so its end (or failure) is found without spare credit.
+                let payload = match items.next().await {
+                    None => {
+                        send_end(&reply_to, &request_id, None).await;
+                        return;
+                    }
+                    Some(Err(invocation)) => {
+                        let e = invocation_error(&type_name, invocation);
+                        tracing::debug!(request = %request_id, "stream failed: {e}");
+                        send_end(&reply_to, &request_id, Some(hub_error(&request_id, &e))).await;
+                        return;
+                    }
+                    Some(Ok(payload)) => payload,
+                };
                 while credit == 0 {
                     match credits.recv().await {
                         Some(more) => credit = credit.saturating_add(more),
@@ -347,33 +362,19 @@ impl Dispatcher {
                 while let Ok(more) = credits.try_recv() {
                     credit = credit.saturating_add(more);
                 }
-                match items.next().await {
-                    None => {
-                        send_end(&reply_to, &request_id, None).await;
-                        return;
-                    }
-                    Some(Ok(payload)) => {
-                        seq += 1;
-                        credit -= 1;
-                        let part = ClientMessage {
-                            message: Some(client_message::Message::Part(proto::ReplyPart {
-                                request_id: request_id.clone(),
-                                payload,
-                                seq,
-                                ..Default::default()
-                            })),
-                        };
-                        if let Err(e) = reply_to.send(part).await {
-                            tracing::warn!(request = %request_id, stream = reply_to.stream(), "part dropped, stream abandoned: {e}");
-                            return;
-                        }
-                    }
-                    Some(Err(invocation)) => {
-                        let e = invocation_error(&type_name, invocation);
-                        tracing::debug!(request = %request_id, "stream failed: {e}");
-                        send_end(&reply_to, &request_id, Some(hub_error(&request_id, &e))).await;
-                        return;
-                    }
+                seq += 1;
+                credit -= 1;
+                let part = ClientMessage {
+                    message: Some(client_message::Message::Part(proto::ReplyPart {
+                        request_id: request_id.clone(),
+                        payload,
+                        seq,
+                        ..Default::default()
+                    })),
+                };
+                if let Err(e) = reply_to.send(part).await {
+                    tracing::warn!(request = %request_id, stream = reply_to.stream(), "part dropped, stream abandoned: {e}");
+                    return;
                 }
             }
         };

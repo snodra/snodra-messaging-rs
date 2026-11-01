@@ -1018,7 +1018,8 @@ impl Sender {
     /// hub stream (`HubConnectionLost`) or a part that does not decode (`Serialization`; the
     /// handler is cancelled) is its last item. It refills credit as it is consumed: half the
     /// window ([`StreamOptions::initial_credit`]) every time half of it was pulled, so a handler
-    /// never runs more than a window ahead of the consumer. Dropping it before the end cancels
+    /// never runs more than a window (plus the one item it may hold) ahead of the consumer.
+    /// Dropping it before the end cancels
     /// the stream at the hub (the handler is told) and forgets the request.
     pub async fn stream<'a, Q: StreamingQuery>(
         &'a self,

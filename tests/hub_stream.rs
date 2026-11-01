@@ -428,26 +428,20 @@ async fn a_streaming_handler_sends_parts_under_credit_then_the_end() {
     assert!(parts.iter().all(|(_, p)| p.error.is_none()));
     assert_eq!(
         probe.polled.load(Ordering::SeqCst),
-        2,
-        "the handler's stream is not polled without credit"
+        3,
+        "the handler's stream is polled at most one item ahead of the credit"
     );
     assert_eq!(h.dispatcher.available_permits(), 1, "the permit is held");
     assert_eq!(hub.permits_held(1), Some(1), "the hub's permit too");
     assert!(hub.ends().is_empty());
 
+    // Exactly the credit the remaining items need: the end is found without spare credit.
     hub.send_to_clients(flow("s#1", 3)).await;
-    eventually("five parts", async || hub.parts().len() == 5).await;
+    eventually("the end", async || !hub.ends().is_empty()).await;
     assert_eq!(
         hub.parts().iter().map(|(_, p)| p.seq).collect::<Vec<_>>(),
         [1, 2, 3, 4, 5]
     );
-    // The handler's stream is never polled without credit, so its end is found by a poll that
-    // needs one credit beyond the last item (the sender's refills always grant it).
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(hub.ends().is_empty(), "no credit left to find the end");
-    hub.send_to_clients(flow("s#1", 1)).await;
-    eventually("the end", async || !hub.ends().is_empty()).await;
-    assert_eq!(hub.parts().len(), 5);
     let (_, end) = &hub.ends()[0];
     assert_eq!(end.request_id, "s#1");
     assert!(end.error.is_none(), "{end:?}");
@@ -457,6 +451,27 @@ async fn a_streaming_handler_sends_parts_under_credit_then_the_end() {
     .await;
     assert_eq!(probe.dropped.load(Ordering::SeqCst), 1);
     assert_eq!(hub.replies().await.len(), 0, "no unary reply for a stream");
+    h.shutdown().await;
+}
+
+/// A sender that grants exactly as many credits as there are items (and never a `Flow`) gets
+/// the end: it must not wait for the idle timeout.
+#[tokio::test]
+async fn the_end_arrives_with_exactly_as_many_credits_as_items() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let h = handler(&hub.address(), "svc-h", "h1", &probe, 2).await;
+    let payload = serde_json::to_vec(&export(5, 0, None)).unwrap();
+    hub.send_to_clients(forwarded("s#1", "t.Export", &payload, 5))
+        .await;
+    eventually("the end", async || !hub.ends().is_empty()).await;
+    assert_eq!(hub.parts().len(), 5);
+    assert!(hub.ends()[0].1.error.is_none());
+    assert_eq!(probe.polled.load(Ordering::SeqCst), 5);
+    eventually("permits released", async || {
+        h.dispatcher.available_permits() == 2 && hub.permits_held(1) == Some(2)
+    })
+    .await;
     h.shutdown().await;
 }
 
@@ -781,8 +796,8 @@ async fn the_handler_stalls_at_zero_credit_until_the_consumer_pulls_half_the_win
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(
         probe.polled.load(Ordering::SeqCst),
-        4,
-        "the handler sent its window and stalled"
+        5,
+        "the handler sent its window, holds one item and stalled"
     );
     assert!(
         hub.flows().is_empty(),
@@ -792,11 +807,11 @@ async fn the_handler_stalls_at_zero_credit_until_the_consumer_pulls_half_the_win
     eventually("the refill", async || !hub.flows().is_empty()).await;
     assert_eq!(hub.flows()[0].1.credits, 2);
     eventually("the handler resumed", async || {
-        probe.polled.load(Ordering::SeqCst) == 6
+        probe.polled.load(Ordering::SeqCst) == 7
     })
     .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(probe.polled.load(Ordering::SeqCst), 6, "stalled again");
+    assert_eq!(probe.polled.load(Ordering::SeqCst), 7, "stalled again");
     drop(stream);
     eventually("the handler cancelled", async || {
         probe.dropped.load(Ordering::SeqCst) == 1

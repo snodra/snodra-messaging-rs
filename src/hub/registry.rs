@@ -106,8 +106,9 @@ impl HandlerRegistry {
     }
 
     /// An exclusive streaming query (ADR 0017, P4b): the handler returns a stream of items the
-    /// library sends one `ReplyPart` at a time under the sender's credits (the stream is not
-    /// polled while the credit is 0), then a `ReplyEnd`. An `Err` item ends the stream with
+    /// library sends one `ReplyPart` at a time under the sender's credits (the stream is polled
+    /// at most one item ahead of the credit; its end is sent at once, with or without credit),
+    /// then a `ReplyEnd`. An `Err` item ends the stream with
     /// that error (`ReplyEnd{error}`, the stream dropped); a hub `Cancel` drops it silently. The
     /// handler permit is held for the whole stream. The type is announced in
     /// `Register.query_types`; only a streaming request (`Sender::stream`) reaches the handler, a

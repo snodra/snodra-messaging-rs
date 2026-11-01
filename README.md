@@ -357,8 +357,8 @@ struct Row { id: String }
 message_type!(Export, "files.Export");
 impl StreamingQuery for Export { type Item = Row; }
 
-// Handler side: return any `Stream<Item = Result<Row, MessagingError>>`; it is pulled only while
-// the sender has credit. An `Err` item ends the stream with that error.
+// Handler side: return any `Stream<Item = Result<Row, MessagingError>>`; it is pulled at most
+// one item ahead of the sender's credit. An `Err` item ends the stream with that error.
 let app = KrakenMessaging::builder(config).await?
     .streaming_query::<Export, _, _, _>(|q, ctx| async move { Ok(rows_since(q.since)) })
     // .shared_streaming_query::<Search, _, _, _>(..)   // many services may own it
@@ -398,12 +398,14 @@ while let Some(row) = rows.next().await { let row = row?; /* in the handler's or
   query: send it with Sender::stream (mode STREAMING)"): the caller used the wrong mode, which no
   retry fixes (`InvalidMessage`, never retried), unlike `NoHandler` for a type the instance does
   not serve at all.
-- **Credits.** The handler's stream is pulled only while there is credit (`initial_credit` plus
-  every `Flow`), one `ReplyPart` per item (`seq` from 1), then `ReplyEnd`; the end of its stream
-  is found by a poll, which needs one credit beyond the last item. The sender refills
-  `max(1, initial_credit / 2)` credits every time that many items were pulled by the caller (not
-  on arrival), so a handler never runs more than a window ahead of the consumer and always gets
-  the credit to find its end. Items use the unary reply codec (`()` accepts `{}`).
+- **Credits.** The handler's stream is pulled at most one item ahead of the credit
+  (`initial_credit` plus every `Flow`): an item is held until there is credit to send it, one
+  `ReplyPart` per item (`seq` from 1); its end (or failure) is sent as `ReplyEnd` as soon as the
+  stream reports it, with or without credit, so a sender that grants exactly as many credits as
+  there are items gets the end. The sender refills `max(1, initial_credit / 2)` credits every
+  time that many items were pulled by the caller (not on arrival), so a handler never runs more
+  than a window (plus the held item) ahead of the consumer. Items use the unary reply codec
+  (`()` accepts `{}`).
 - **Open.** `stream().await` returns once the first item is in (or the end: an empty stream), so
   everything before that is the call's error: `UnsupportedByHub`, `NoHandler` (no owner),
   `InvalidMessage` (a command type), `Timeout` (no first item within the idle timeout), the
