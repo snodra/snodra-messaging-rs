@@ -296,7 +296,7 @@ impl Config {
     }
 
     /// Rejects what cannot work: an empty service name, a `hub_address` that names no hub (or a
-    /// malformed `dns:///` target), a zero `reconnect_backoff_max` or a `reconnect_backoff_min` above it, a zero `hub_status_interval`, `jwks_url` without `issuer`,
+    /// malformed `dns:///` target), a zero `reconnect_backoff_max`, a zero `reconnect_backoff_min` or one above the max, a zero `hub_status_interval`, `jwks_url` without `issuer`,
     /// `max_concurrent_handlers` 0, an invalid `hub_retry` policy, a zero
     /// `hub_stream_credit_timeout`, a zero `hub_max_subscriptions`, a `hub_token_file` that cannot
     /// be read, a `hub_tls` CA file that cannot be read or holds no certificate, an empty
@@ -312,6 +312,12 @@ impl Config {
         if self.reconnect_backoff_max.is_zero() {
             return Err(MessagingError::InvalidMessage(
                 "reconnect_backoff_max (KRAKEN_RECONNECT_BACKOFF_MAX_MS) must be at least 1 ms"
+                    .into(),
+            ));
+        }
+        if self.reconnect_backoff_min.is_zero() {
+            return Err(MessagingError::InvalidMessage(
+                "reconnect_backoff_min (KRAKEN_RECONNECT_BACKOFF_MIN_MS) must be at least 1 ms (0 doubles to 0 forever)"
                     .into(),
             ));
         }
@@ -681,6 +687,29 @@ mod tests {
         ]);
         assert_eq!(c.reconnect_backoff_max, Duration::from_secs(1));
         assert!(code_config().validate().is_ok());
+    }
+
+    #[test]
+    fn a_zero_reconnect_backoff_min_is_rejected() {
+        // 0 doubles to 0 forever: the same hot loop as a zero max.
+        let result = try_from(&[
+            ("KRAKEN_RECONNECT_BACKOFF_MIN_MS", "0"),
+            ("KRAKEN_RECONNECT_BACKOFF_MAX_MS", "5000"),
+        ]);
+        assert!(
+            matches!(result, Err(MessagingError::InvalidMessage(ref m)) if m.contains("reconnect_backoff_min")),
+            "{result:?}"
+        );
+        let in_code = Config {
+            reconnect_backoff_min: Duration::ZERO,
+            ..code_config()
+        };
+        assert!(
+            matches!(in_code.validate(), Err(MessagingError::InvalidMessage(ref m)) if m.contains("reconnect_backoff_min")),
+            "min 0 accepted"
+        );
+        let one = from(&[("KRAKEN_RECONNECT_BACKOFF_MIN_MS", "1")]);
+        assert_eq!(one.reconnect_backoff_min, Duration::from_millis(1));
     }
 
     #[test]
