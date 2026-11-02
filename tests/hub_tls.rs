@@ -167,6 +167,77 @@ async fn a_dns_target_and_a_static_list_both_use_tls() {
     b.stop();
 }
 
+async fn dns_pool(address: String, tls: HubTls) -> Arc<HubPool> {
+    let (tx, mut rx) = mpsc::channel::<Inbound>(16);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    HubPool::new(
+        settings(address, Some(tls)),
+        "svc".into(),
+        uuid::Uuid::new_v4().to_string(),
+        tx,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_dns_target_is_verified_against_its_name_not_the_resolved_ip() {
+    // The certificate names `localhost` and nothing else (no IP SAN), as one issued for a service
+    // name does. `dns:///` resolves to `127.0.0.1:port`; the certificate must be checked against
+    // the DNS name, like kraken-messaging (Kotlin) does, without `server_name`.
+    let (dir, pki) = (TempDir::new(), Pki::new("test CA"));
+    let (cert, key) = pki.server_names_only(&["localhost"]);
+    let hub = FakeHub::start_tls(&cert, &key).await;
+    let dns = format!("dns:///localhost:{}", hub.addr.port());
+
+    let pool = dns_pool(dns.clone(), ca(&dir, &pki)).await;
+    pool.start();
+    assert!(
+        pool.await_all_registered(Duration::from_secs(5)).await,
+        "the certificate was not verified against the DNS name"
+    );
+    pool.shutdown().await;
+
+    // An explicit `server_name` still wins over the DNS name.
+    let pool = dns_pool(
+        dns.clone(),
+        HubTls {
+            server_name: Some("not-the-hub".into()),
+            ..ca(&dir, &pki)
+        },
+    )
+    .await;
+    pool.start();
+    assert!(!pool.await_registered(Duration::from_millis(600)).await);
+    pool.shutdown().await;
+
+    let right = dns_pool(
+        dns,
+        HubTls {
+            server_name: Some("localhost".into()),
+            ..ca(&dir, &pki)
+        },
+    )
+    .await;
+    right.start();
+    assert!(right.await_all_registered(Duration::from_secs(5)).await);
+    right.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn a_static_address_is_still_verified_against_its_host() {
+    // The same certificate (a name, no IP) does not match `127.0.0.1`: a static `host:port` is
+    // checked against that host, unless `server_name` says otherwise.
+    let (dir, pki) = (TempDir::new(), Pki::new("test CA"));
+    let (cert, key) = pki.server_names_only(&["localhost"]);
+    let hub = FakeHub::start_tls(&cert, &key).await;
+    let conn = connection(settings(hub.address(), Some(ca(&dir, &pki))));
+    conn.start();
+    assert!(!conn.await_registered(Duration::from_millis(600)).await);
+    conn.shutdown().await;
+    hub.stop();
+}
+
 #[tokio::test]
 async fn plain_text_against_a_tls_hub_fails_fast_and_says_to_enable_tls() {
     let pki = Pki::new("test CA");

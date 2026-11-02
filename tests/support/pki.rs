@@ -30,13 +30,29 @@ impl Pki {
     /// `(certificate PEM, private key PEM)` for a server reachable as `localhost`, `127.0.0.1` and
     /// each of `names`.
     pub fn server(&self, names: &[&str]) -> (String, String) {
+        self.sign(names, true)
+    }
+
+    /// Like [`server`](Self::server) but the certificate names exactly `names` (DNS only): no
+    /// `localhost`, no IP address, as a certificate issued for a service name.
+    pub fn server_names_only(&self, names: &[&str]) -> (String, String) {
+        self.sign(names, false)
+    }
+
+    fn sign(&self, names: &[&str], with_local: bool) -> (String, String) {
         let key = rcgen::KeyPair::generate().unwrap();
-        let mut sans = vec!["localhost".to_string()];
+        let mut sans = if with_local {
+            vec!["localhost".to_string()]
+        } else {
+            vec![]
+        };
         sans.extend(names.iter().map(|n| n.to_string()));
         let mut params = rcgen::CertificateParams::new(sans).unwrap();
-        params.subject_alt_names.push(rcgen::SanType::IpAddress(
-            std::net::Ipv4Addr::LOCALHOST.into(),
-        ));
+        if with_local {
+            params.subject_alt_names.push(rcgen::SanType::IpAddress(
+                std::net::Ipv4Addr::LOCALHOST.into(),
+            ));
+        }
         let issuer = rcgen::Issuer::from_params(&self.ca_params, &self.ca_key);
         let cert = params.signed_by(&key, &issuer).unwrap();
         (cert.pem(), key.serialize_pem())

@@ -130,7 +130,7 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 | `KRAKEN_HUB_TOKEN_FILE` | none | a file holding the token, for container secrets (`Config.hub_token_file`); read at startup (an unreadable file is a startup error) and again before every reconnect, so a rotated secret needs no restart; **wins over `KRAKEN_HUB_TOKEN` when both are set**; surrounding whitespace is trimmed, an empty file is no token at startup, and after a good read it keeps the last token |
 | `KRAKEN_HUB_TLS` | `false` | `true` makes every hub channel TLS (`Config.hub_tls = Some(HubTls { .. })`), for a static list and for `dns:///`; needed when the hub sets `KRAKEN_HUB_TLS_CERT`. An `https://` address turns TLS on by itself (system roots) |
 | `KRAKEN_HUB_TLS_CA` | none (system roots) | PEM file with the CA that signs the hub's certificate (`HubTls.ca_file`), re-read on every connect; needs `KRAKEN_HUB_TLS=true` |
-| `KRAKEN_HUB_TLS_SERVER_NAME` | the host of the address | the name the hub's certificate must carry, also sent as SNI (`HubTls.server_name`); needs `KRAKEN_HUB_TLS=true` |
+| `KRAKEN_HUB_TLS_SERVER_NAME` | the host of the address (for `dns:///name:port`, `name`) | the name the hub's certificate must carry, also sent as SNI (`HubTls.server_name`); needs `KRAKEN_HUB_TLS=true` |
 | `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS` | true, 5 | consumer starts only when event handlers are registered |
 | `KRAKEN_OUTBOX_ENABLED`, `KRAKEN_OUTBOX_POLL_INTERVAL_MS`, `KRAKEN_OUTBOX_BATCH_SIZE`, `KRAKEN_OUTBOX_MAX_ATTEMPTS` | true, 200, 100, 10 | |
 | `KRAKEN_FORWARD_JWT` | true | |
@@ -673,7 +673,10 @@ is the existing variant; a handler that returns it replies `PERMISSION_DENIED` a
 `https://` address turns it on by itself). Without `KRAKEN_HUB_TLS_CA` the platform's root certificates
 are trusted; with it, that PEM file's CA is (re-read on every connect, so a CA rotation needs no
 restart). `KRAKEN_HUB_TLS_SERVER_NAME` sets the name the certificate must carry and the SNI, for a
-hub reached by an address that is not in its certificate. If the application installs its own
+hub reached by an address that is not in its certificate. With `dns:///name:port` the certificate is
+checked against **`name`** (the DNS host, not the `ip:port` it resolves to; as kraken-messaging does)
+unless `KRAKEN_HUB_TLS_SERVER_NAME` is set, which wins; a static `host:port` is checked against its
+host. If the application installs its own
 process-wide rustls provider, tonic uses that one. Client certificates (mTLS) are P5c: the channel
 setup has a named hook for them (`client_identity` in `src/hub/tls.rs`), not implemented.
 

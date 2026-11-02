@@ -53,7 +53,7 @@ pub struct HubTls {
     /// `None`: the platform's root store. Re-read on every (re)connect.
     pub ca_file: Option<PathBuf>,
     /// The name the hub's certificate must carry and the SNI sent (`KRAKEN_HUB_TLS_SERVER_NAME`).
-    /// `None`: the host of the address.
+    /// `None`: the host of the address (for `dns:///name:port`, `name`, not the resolved IP).
     pub server_name: Option<String>,
 }
 

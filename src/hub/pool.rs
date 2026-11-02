@@ -478,10 +478,22 @@ impl HubPool {
     }
 
     fn add(self: &Arc<Self>, address: String) -> Arc<Member> {
-        let settings = HubSettings {
+        let mut settings = HubSettings {
             address: address.clone(),
             ..self.settings.clone()
         };
+        // `dns:///name:port` resolves to `ip:port`, and tonic would check the certificate against
+        // the IP. Check it against the DNS name unless `server_name` says otherwise (kraken-messaging
+        // does the same).
+        if let (HubTargets::Dns { host, .. }, Some(tls)) = (&self.targets, settings.tls.as_mut())
+            && tls
+                .server_name
+                .as_deref()
+                .is_none_or(|n| n.trim().is_empty())
+            && host.parse::<std::net::IpAddr>().is_err()
+        {
+            tls.server_name = Some(host.clone());
+        }
         let conn = HubConnection::new(
             settings,
             self.service_name.clone(),
