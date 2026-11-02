@@ -911,6 +911,8 @@ impl HubConnection {
         let mut failures: u32 = 0;
         // The rejection logged at `error` last, so a repeat goes to `debug`.
         let mut logged_rejection: Option<(Code, String)> = None;
+        // The plain-text/TLS hint went to `warn` already (once, whatever the attempt number).
+        let mut logged_hint = false;
         while !self.cancel.is_cancelled() {
             let stream = NEXT_STREAM.fetch_add(1, Ordering::SeqCst);
             let outcome = self.run_stream(stream).await;
@@ -942,6 +944,7 @@ impl HubConnection {
                 backoff = self.settings.backoff_min;
                 failures = 0;
                 logged_rejection = None;
+                logged_hint = false;
             }
             failures += 1;
             let max = self.settings.backoff_max;
@@ -958,7 +961,16 @@ impl HubConnection {
                 wait
             } else {
                 let wait = jittered(backoff, max, random_unit());
-                if failures == 1 {
+                // The first failure is logged at `warn`; so is the first one that carries the TLS
+                // hint, which a later attempt may be the first to show (the hub came up as a TLS
+                // one after a refused connect).
+                let hinted = status.message().contains(PLAIN_TEXT_HINT);
+                let loud = if hinted {
+                    !std::mem::replace(&mut logged_hint, true)
+                } else {
+                    failures == 1
+                };
+                if loud {
                     tracing::warn!(service = %self.service_name, instance = %self.instance_id, address = %self.settings.address, reason = %describe(&status), retry_in = ?wait, "hub stream closed; reconnecting");
                 } else {
                     tracing::debug!(service = %self.service_name, instance = %self.instance_id, address = %self.settings.address, reason = %describe(&status), retry_in = ?wait, "hub stream closed; reconnecting");
@@ -1273,6 +1285,8 @@ fn is_rejection(code: Code) -> bool {
     )
 }
 
+const PLAIN_TEXT_HINT: &str = "the connection was dropped before the registration; a hub that serves TLS does that to plain text: set hub_tls / KRAKEN_HUB_TLS=true";
+
 /// A plain-text connection that the peer drops before the handshake is most likely one to a hub
 /// that serves TLS only (it drops anything that is not a TLS handshake): say so.
 fn plain_text_hint(plain: bool, status: Status) -> Status {
@@ -1284,10 +1298,7 @@ fn plain_text_hint(plain: bool, status: Status) -> Status {
     {
         Status::new(
             status.code(),
-            format!(
-                "{} (the connection was dropped before the registration; a hub that serves TLS does that to plain text: set hub_tls / KRAKEN_HUB_TLS=true)",
-                status.message()
-            ),
+            format!("{} ({PLAIN_TEXT_HINT})", status.message()),
         )
     } else {
         status

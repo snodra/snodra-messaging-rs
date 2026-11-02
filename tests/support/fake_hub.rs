@@ -1846,16 +1846,22 @@ pub struct FakeHub {
 
 impl FakeHub {
     pub async fn start() -> FakeHub {
-        Self::start_with(None).await
+        Self::start_with(None, 0).await
     }
 
     /// A hub that serves TLS only, with the given certificate and key (PEM): a plain-text client
     /// is dropped at the handshake, like the real hub's TLS listener does.
     pub async fn start_tls(cert_pem: &str, key_pem: &str) -> FakeHub {
-        Self::start_with(Some((cert_pem.to_string(), key_pem.to_string()))).await
+        Self::start_with(Some((cert_pem.to_string(), key_pem.to_string())), 0).await
     }
 
-    async fn start_with(tls: Option<(String, String)>) -> FakeHub {
+    /// Like [`start_tls`](Self::start_tls), on a given port (a hub that comes up where nothing
+    /// listened a moment ago).
+    pub async fn start_tls_on(port: u16, cert_pem: &str, key_pem: &str) -> FakeHub {
+        Self::start_with(Some((cert_pem.to_string(), key_pem.to_string())), port).await
+    }
+
+    async fn start_with(tls: Option<(String, String)>, port: u16) -> FakeHub {
         if tls.is_some() {
             // tonic's server side builds its rustls config from the process-wide provider.
             let _ = rustls::crypto::ring::default_provider().install_default();
@@ -1912,7 +1918,7 @@ impl FakeHub {
             flows: StdMutex::new(vec![]),
             cancels: StdMutex::new(vec![]),
         });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let svc = Service(state.clone());

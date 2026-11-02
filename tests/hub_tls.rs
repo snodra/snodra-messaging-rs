@@ -195,6 +195,63 @@ async fn plain_text_against_a_tls_hub_fails_fast_and_says_to_enable_tls() {
     hub.stop();
 }
 
+/// A port nothing listens on.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+#[tokio::test]
+async fn the_tls_hint_is_logged_at_warn_once_whatever_the_attempt_number() {
+    let pki = Pki::new("test CA");
+    let (cert, key) = pki.server(&["kraken-hub"]);
+    let port = free_port();
+    let captured = Captured::default();
+    let _logs = captured.install();
+    // Attempt 1 is a refused connect (nothing listens yet, so no hint applies) ...
+    let conn = connection(settings(format!("static://127.0.0.1:{port}"), None));
+    conn.start();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !captured.text().contains("hub stream closed") {
+        assert!(Instant::now() < deadline, "no first failure");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // ... then a TLS-only hub comes up on that port: the first failure it causes is a later attempt.
+    let hub = FakeHub::start_tls_on(port, &cert, &key).await;
+    let hint = |l: &String| l.contains("KRAKEN_HUB_TLS=true");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !captured
+        .lines()
+        .iter()
+        .any(|l| hint(l) && l.contains(" WARN "))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "no hint at warn: {}",
+            captured.text()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Further attempts keep failing the same way: the repeats are debug, not warn.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let lines = captured.lines();
+    let warns = lines
+        .iter()
+        .filter(|l| hint(l) && l.contains(" WARN "))
+        .count();
+    let debugs = lines
+        .iter()
+        .filter(|l| hint(l) && l.contains(" DEBUG "))
+        .count();
+    assert_eq!(warns, 1, "{lines:#?}");
+    assert!(debugs >= 1, "{lines:#?}");
+    conn.shutdown().await;
+    hub.stop();
+}
+
 #[tokio::test]
 async fn tls_against_a_plain_text_hub_fails_and_says_to_check_tls() {
     let (dir, pki) = (TempDir::new(), Pki::new("test CA"));
