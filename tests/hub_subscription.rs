@@ -492,6 +492,85 @@ async fn the_end_of_a_subscription_counts_the_parts_it_sent() {
     a.shutdown().await;
 }
 
+/// The user's filter runs outside the subscriptions' lock: one that panics skips its
+/// subscription (the others still get the update) and leaves the instance serving: a later hub
+/// `Cancel` and a lost stream are still processed.
+#[tokio::test]
+async fn a_panicking_filter_skips_its_subscription_and_leaves_the_instance_serving() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let a = owner(&hub.address(), "svc-a", "a1", &probe).await;
+    for (id, symbol) in [("s1#1", "boom"), ("s2#1", "acme"), ("s3#1", "acme")] {
+        hub.send_to_clients(subscribed(id, &prices(symbol))).await;
+    }
+    eventually("registered", async || a.emitter.open_subscriptions() == 3).await;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        a.emitter.emit::<Prices>(
+            |q| {
+                if q.symbol == "boom" {
+                    panic!("filter bug");
+                }
+                true
+            },
+            &tick("acme", 1),
+        );
+    }));
+    assert!(outcome.is_ok(), "the emitter contains the filter's panic");
+    eventually("the other two get the update", async || {
+        hub.parts().len() == 2
+    })
+    .await;
+    assert!(hub.parts().iter().all(|(_, p)| p.request_id != "s1#1"));
+    // The lock is usable: a hub Cancel is processed, and so are further emits and a lost stream.
+    hub.send_to_clients(cancel("s2#1", "max results")).await;
+    eventually("the cancel is processed", async || {
+        a.emitter.open_subscriptions() == 2
+    })
+    .await;
+    a.emitter
+        .emit::<Prices>(|q| q.symbol == "acme", &tick("acme", 2));
+    eventually("a later emit reaches s3", async || hub.parts().len() == 3).await;
+    hub.drop_streams();
+    eventually("the lost stream is processed", async || {
+        a.emitter.open_subscriptions() == 0
+    })
+    .await;
+    a.shutdown().await;
+}
+
+/// A filter that calls the emitter again (to emit, or to read the count) does not deadlock: the
+/// filters run outside the subscriptions' lock.
+#[tokio::test]
+async fn a_filter_that_calls_the_emitter_again_completes() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let a = owner(&hub.address(), "svc-a", "a1", &probe).await;
+    hub.send_to_clients(subscribed("s1#1", &prices("acme")))
+        .await;
+    eventually("registered", async || a.emitter.open_subscriptions() == 1).await;
+    let emitter = a.emitter.clone();
+    let nested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let call = tokio::task::spawn_blocking(move || {
+        let inner = emitter.clone();
+        emitter.emit::<Prices>(
+            move |_| {
+                if !nested.swap(true, Ordering::SeqCst) {
+                    assert_eq!(inner.open_subscriptions(), 1);
+                    inner.emit::<Prices>(|_| true, &tick("acme", 1));
+                }
+                true
+            },
+            &tick("acme", 2),
+        );
+    });
+    tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .expect("no deadlock")
+        .unwrap();
+    eventually("both updates sent", async || hub.parts().len() == 2).await;
+    a.shutdown().await;
+}
+
 #[tokio::test]
 async fn the_initial_request_is_answered_by_the_handler_like_a_unary_query() {
     let hub = FakeHub::start().await;

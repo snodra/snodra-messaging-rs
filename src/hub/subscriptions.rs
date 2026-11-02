@@ -7,8 +7,9 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -41,11 +42,12 @@ enum Outgoing {
 /// One open subscription.
 struct Open {
     type_name: String,
-    /// The decoded query, as the registered handler's type, for the emitter's filters.
-    query: Box<dyn Any + Send + Sync>,
+    /// The decoded query, as the registered handler's type, for the emitter's filters (shared
+    /// with the filters' snapshot, which runs them outside the lock).
+    query: Arc<dyn Any + Send + Sync>,
     /// The query as sent, decoded again when a filter is typed with another struct of the same
     /// wire name.
-    payload: Vec<u8>,
+    payload: Arc<Vec<u8>>,
     /// The hub stream the request arrived on.
     stream: StreamId,
     /// Updates sent so far (the `seq` of the last part).
@@ -56,7 +58,14 @@ struct Open {
     pump: JoinHandle<()>,
 }
 
-impl Open {
+/// What an emit reads of an open subscription under the lock, to run the filter on it outside.
+struct Candidate {
+    id: String,
+    query: Arc<dyn Any + Send + Sync>,
+    payload: Arc<Vec<u8>>,
+}
+
+impl Candidate {
     fn matches<Q: SubscriptionQuery>(&self, filter: &dyn Fn(&Q) -> bool) -> bool {
         match self.query.downcast_ref::<Q>() {
             Some(query) => filter(query),
@@ -91,8 +100,14 @@ impl Subscriptions {
         self.max.load(Ordering::SeqCst)
     }
 
+    /// The lock, whatever happened to a holder: nothing user-supplied runs under it, but a
+    /// poisoned lock must never stop the inbound loop's `cancel` or `stream_lost`.
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, Open>> {
+        self.open.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub(crate) fn len(&self) -> usize {
-        self.open.lock().unwrap().len()
+        self.lock().len()
     }
 
     /// Registers subscription `id` of `type_name` with its decoded `query`, its parts and end to
@@ -107,7 +122,7 @@ impl Subscriptions {
         payload: Vec<u8>,
         reply_to: ReplyTo,
     ) -> Result<(), usize> {
-        let mut open = self.open.lock().unwrap();
+        let mut open = self.lock();
         let max = self.max();
         if open.len() >= max && !open.contains_key(id) {
             return Err(max);
@@ -119,8 +134,8 @@ impl Subscriptions {
             id.to_string(),
             Open {
                 type_name: type_name.to_string(),
-                query,
-                payload,
+                query: Arc::from(query),
+                payload: Arc::new(payload),
                 stream: reply_to.stream(),
                 seq: 0,
                 tx,
@@ -141,7 +156,7 @@ impl Subscriptions {
     /// Removes subscription `id` (a hub `Cancel`): nothing more is sent for it. False when there
     /// is none.
     pub(crate) fn cancel(&self, id: &str) -> bool {
-        match self.open.lock().unwrap().remove(id) {
+        match self.lock().remove(id) {
             Some(open) => {
                 open.cancel.cancel();
                 true
@@ -153,7 +168,7 @@ impl Subscriptions {
     /// Removes every subscription that arrived on hub stream `stream` (the hub forgot them with
     /// the session). Returns how many.
     pub(crate) fn stream_lost(&self, stream: StreamId) -> usize {
-        let mut open = self.open.lock().unwrap();
+        let mut open = self.lock();
         let lost: Vec<String> = open
             .iter()
             .filter(|(_, o)| o.stream == stream)
@@ -170,7 +185,7 @@ impl Subscriptions {
     /// Completes every subscription cleanly (shutdown): each gets a `ReplyEnd`, best effort.
     /// Returns the pumps, so the caller can wait (bounded) for the ends to be written.
     pub(crate) fn end_all(&self) -> Vec<JoinHandle<()>> {
-        let mut open = self.open.lock().unwrap();
+        let mut open = self.lock();
         open.drain()
             .map(|(_, o)| {
                 let _ = o.tx.send(Outgoing::End {
@@ -183,31 +198,65 @@ impl Subscriptions {
     }
 
     /// Sends `outgoing` to every subscription of `Q` whose query passes `filter`, in call order
-    /// per subscription (under the lock); with `remove`, the subscription is taken out first (an
-    /// end). Returns how many matched.
+    /// per subscription; with `remove`, the subscription is taken out first (an end). Returns
+    /// how many matched.
+    ///
+    /// The filters (user code, and a decode when typed with another struct) run on a snapshot,
+    /// outside the lock: a filter may call the emitter again, and one that panics skips its
+    /// subscription (logged) instead of poisoning the lock the inbound loop needs.
     fn deliver<Q: SubscriptionQuery>(
         &self,
         filter: &dyn Fn(&Q) -> bool,
         outgoing: impl Fn(u64) -> Outgoing,
         remove: bool,
     ) -> usize {
-        let mut open = self.open.lock().unwrap();
-        let matching: Vec<String> = open
+        let candidates: Vec<Candidate> = self
+            .lock()
             .iter()
-            .filter(|(_, o)| o.type_name == Q::TYPE && o.matches(filter))
-            .map(|(id, _)| id.clone())
+            .filter(|(_, o)| o.type_name == Q::TYPE)
+            .map(|(id, o)| Candidate {
+                id: id.clone(),
+                query: Arc::clone(&o.query),
+                payload: Arc::clone(&o.payload),
+            })
             .collect();
-        for id in &matching {
+        let matching: Vec<Candidate> = candidates
+            .into_iter()
+            .filter(
+                |c| match catch_unwind(AssertUnwindSafe(|| c.matches(filter))) {
+                    Ok(matched) => matched,
+                    Err(_) => {
+                        tracing::warn!(
+                            r#type = Q::TYPE,
+                            request = %c.id,
+                            "an emitter filter panicked: the subscription is skipped"
+                        );
+                        false
+                    }
+                },
+            )
+            .collect();
+        let mut open = self.lock();
+        let mut sent = 0;
+        for candidate in &matching {
+            // Cancelled, ended or replaced meanwhile: it is not this call's to send to.
+            let Some(o) = open.get(&candidate.id) else {
+                continue;
+            };
+            if !Arc::ptr_eq(&o.query, &candidate.query) {
+                continue;
+            }
+            sent += 1;
             if remove {
-                if let Some(o) = open.remove(id) {
+                if let Some(o) = open.remove(&candidate.id) {
                     let _ = o.tx.send(outgoing(o.seq));
                 }
-            } else if let Some(o) = open.get_mut(id) {
+            } else if let Some(o) = open.get_mut(&candidate.id) {
                 o.seq += 1;
                 let _ = o.tx.send(outgoing(o.seq));
             }
         }
-        matching.len()
+        sent
     }
 }
 
