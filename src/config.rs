@@ -2,11 +2,13 @@
 //! compose files use).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::error::MessagingError;
 use crate::hub::HubTargets;
 use crate::retry::RetryPolicy;
+use crate::security::{HubTls, SecretString};
 
 /// `Config.hub_stream_credit_timeout` when nothing sets it: the hub's default maximum stream
 /// duration (`KRAKEN_HUB_MAX_STREAM_DURATION`, 10 minutes), after which the hub ends any stream
@@ -64,6 +66,21 @@ pub struct Config {
     /// `KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE`, 1024). Default 1024; at least 1
     /// ([`Config::validate`]).
     pub hub_max_subscriptions: usize,
+    /// The static token sent in `Register.credentials.token` on every hub stream (ADR 0018;
+    /// `KRAKEN_HUB_TOKEN`). Needed when the hub runs with `KRAKEN_HUB_AUTH_MODE=enforce`; ignored
+    /// by a hub in `off` mode and by hubs older than P5a. Never logged (`Debug` prints `"***"`).
+    /// An empty token is the same as none. Overridden by `hub_token_file` when that is set.
+    pub hub_token: Option<SecretString>,
+    /// A file holding the token (`KRAKEN_HUB_TOKEN_FILE`), for container secrets. Read at
+    /// startup ([`Config::validate`]) and again on every reconnect, so a rotated secret is picked
+    /// up without a restart. **It wins over `hub_token` when both are set.** Surrounding
+    /// whitespace is trimmed; an empty file is no token.
+    pub hub_token_file: Option<PathBuf>,
+    /// TLS to the hubs (`KRAKEN_HUB_TLS=true`, with `KRAKEN_HUB_TLS_CA` and
+    /// `KRAKEN_HUB_TLS_SERVER_NAME`). `None` (the default): plain text, unless an address starts
+    /// with `https://` (then TLS with the platform roots). Needed when the hub sets
+    /// `KRAKEN_HUB_TLS_CERT`.
+    pub hub_tls: Option<HubTls>,
     pub kafka_bootstrap: String,
     pub kafka_topic: String,
     pub consumer_enabled: bool,
@@ -105,6 +122,9 @@ impl Config {
             hub_retry: None,
             hub_stream_credit_timeout: DEFAULT_STREAM_CREDIT_TIMEOUT,
             hub_max_subscriptions: crate::hub::DEFAULT_MAX_SUBSCRIPTIONS,
+            hub_token: None,
+            hub_token_file: None,
+            hub_tls: None,
             kafka_bootstrap: kafka_bootstrap.to_string(),
             kafka_topic: crate::kafka::EVENTS_TOPIC.to_string(),
             consumer_enabled: true,
@@ -133,6 +153,8 @@ impl Config {
     /// `KRAKEN_HUB_RETRY_ENABLED`, `KRAKEN_HUB_RETRY_MAX_ATTEMPTS`,
     /// `KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS`, `KRAKEN_HUB_RETRY_MULTIPLIER`,
     /// `KRAKEN_HUB_RETRY_MAX_BACKOFF_MS`, `KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS`,
+    /// `KRAKEN_HUB_TOKEN`, `KRAKEN_HUB_TOKEN_FILE`, `KRAKEN_HUB_TLS` (`true` turns TLS on),
+    /// `KRAKEN_HUB_TLS_CA`, `KRAKEN_HUB_TLS_SERVER_NAME` (both need `KRAKEN_HUB_TLS=true`),
     /// `KRAKEN_HUB_MAX_SUBSCRIPTIONS`.
     /// `KRAKEN_HUB_RETRY_ENABLED=true` sets `hub_retry` to the
     /// policy the other `KRAKEN_HUB_RETRY_*` variables describe (defaults: 3 attempts, 100 ms
@@ -230,6 +252,24 @@ impl Config {
         if let Some(v) = optional("KRAKEN_HUB_MAX_SUBSCRIPTIONS") {
             c.hub_max_subscriptions = number("KRAKEN_HUB_MAX_SUBSCRIPTIONS", &v)? as usize;
         }
+        c.hub_token = optional("KRAKEN_HUB_TOKEN").map(|v| SecretString::new(v.trim()));
+        c.hub_token_file = optional("KRAKEN_HUB_TOKEN_FILE").map(|v| PathBuf::from(v.trim()));
+        let tls_on = match optional("KRAKEN_HUB_TLS") {
+            Some(v) => flag("KRAKEN_HUB_TLS", &v)?,
+            None => false,
+        };
+        let tls_ca = optional("KRAKEN_HUB_TLS_CA").map(|v| PathBuf::from(v.trim()));
+        let tls_name = optional("KRAKEN_HUB_TLS_SERVER_NAME").map(|v| v.trim().to_string());
+        if tls_on {
+            c.hub_tls = Some(HubTls {
+                ca_file: tls_ca,
+                server_name: tls_name,
+            });
+        } else if tls_ca.is_some() || tls_name.is_some() {
+            return Err(MessagingError::InvalidMessage(
+                "KRAKEN_HUB_TLS_CA and KRAKEN_HUB_TLS_SERVER_NAME need KRAKEN_HUB_TLS=true".into(),
+            ));
+        }
         if let Some(v) = optional("KRAKEN_CONSUMER_ENABLED") {
             c.consumer_enabled = flag("KRAKEN_CONSUMER_ENABLED", &v)?;
         }
@@ -258,8 +298,10 @@ impl Config {
     /// Rejects what cannot work: an empty service name, a `hub_address` that names no hub (or a
     /// malformed `dns:///` target), a zero `hub_status_interval`, `jwks_url` without `issuer`,
     /// `max_concurrent_handlers` 0, an invalid `hub_retry` policy, a zero
-    /// `hub_stream_credit_timeout`, a zero `hub_max_subscriptions`. Called by `from_env` and by
-    /// `KrakenMessaging::builder`.
+    /// `hub_stream_credit_timeout`, a zero `hub_max_subscriptions`, a `hub_token_file` that cannot
+    /// be read, a `hub_tls` CA file that cannot be read or holds no certificate, an empty
+    /// `hub_tls` server name. Called by `from_env` and by `KrakenMessaging::builder`; error
+    /// messages never carry the token.
     pub fn validate(&self) -> Result<(), MessagingError> {
         if self.service_name.trim().is_empty() {
             return Err(MessagingError::InvalidMessage(
@@ -296,6 +338,33 @@ impl Config {
             return Err(MessagingError::InvalidMessage(
                 "hub_max_subscriptions (KRAKEN_HUB_MAX_SUBSCRIPTIONS) must be at least 1".into(),
             ));
+        }
+        if let Some(path) = &self.hub_token_file {
+            crate::security::read_token_file(path).map_err(|e| {
+                MessagingError::InvalidMessage(format!(
+                    "hub_token_file (KRAKEN_HUB_TOKEN_FILE) '{}' cannot be read: {e}",
+                    path.display()
+                ))
+            })?;
+        }
+        if let Some(tls) = &self.hub_tls {
+            if tls
+                .server_name
+                .as_deref()
+                .is_some_and(|n| n.trim().is_empty())
+            {
+                return Err(MessagingError::InvalidMessage(
+                    "hub_tls.server_name (KRAKEN_HUB_TLS_SERVER_NAME) must not be empty".into(),
+                ));
+            }
+            if let Some(ca) = &tls.ca_file {
+                crate::hub::read_ca_file(ca).map_err(|e| {
+                    MessagingError::InvalidMessage(format!(
+                        "hub_tls.ca_file (KRAKEN_HUB_TLS_CA) '{}': {e}",
+                        ca.display()
+                    ))
+                })?;
+            }
         }
         Ok(())
     }
@@ -647,5 +716,105 @@ mod tests {
         assert_eq!(c.reconnect_backoff_max, Duration::from_secs(5));
         // Fallback for hubs that announce no interval (legacy hubs evict after 30 s).
         assert_eq!(c.heartbeat_interval, Duration::from_secs(10));
+    }
+
+    fn secret_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kraken-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_token_comes_from_the_environment_and_never_prints() {
+        assert!(from(&[]).hub_token.is_none());
+        assert!(from(&[("KRAKEN_HUB_TOKEN", "  ")]).hub_token.is_none());
+        let c = from(&[("KRAKEN_HUB_TOKEN", "s3cr3t-token-value\n")]);
+        assert_eq!(c.hub_token.as_ref().unwrap().expose(), "s3cr3t-token-value");
+        for printed in [format!("{c:?}"), format!("{c:#?}")] {
+            assert!(!printed.contains("s3cr3t-token-value"), "{printed}");
+            assert!(printed.contains("\"***\""), "{printed}");
+        }
+    }
+
+    #[test]
+    fn the_token_file_is_read_by_validate_and_may_be_missing_only_if_unset() {
+        let dir = secret_dir();
+        let path = dir.join("token");
+        let missing = try_from(&[("KRAKEN_HUB_TOKEN_FILE", path.to_str().unwrap())]);
+        assert!(
+            matches!(missing, Err(MessagingError::InvalidMessage(ref m)) if m.contains("KRAKEN_HUB_TOKEN_FILE")),
+            "{missing:?}"
+        );
+        std::fs::write(&path, "from-the-file\n").unwrap();
+        let c = from(&[("KRAKEN_HUB_TOKEN_FILE", path.to_str().unwrap())]);
+        assert_eq!(c.hub_token_file.as_deref(), Some(path.as_path()));
+        assert!(
+            c.hub_token.is_none(),
+            "the file is read per connect, not stored here"
+        );
+        assert!(!format!("{c:?}").contains("from-the-file"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tls_is_off_unless_asked_and_its_options_need_it() {
+        assert_eq!(from(&[]).hub_tls, None);
+        assert_eq!(from(&[("KRAKEN_HUB_TLS", "false")]).hub_tls, None);
+        assert_eq!(
+            from(&[("KRAKEN_HUB_TLS", "true")]).hub_tls,
+            Some(HubTls::default())
+        );
+        let dir = secret_dir();
+        let ca = dir.join("ca.pem");
+        std::fs::write(
+            &ca,
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let c = from(&[
+            ("KRAKEN_HUB_TLS", "true"),
+            ("KRAKEN_HUB_TLS_CA", ca.to_str().unwrap()),
+            ("KRAKEN_HUB_TLS_SERVER_NAME", "kraken-hub"),
+        ]);
+        assert_eq!(
+            c.hub_tls,
+            Some(HubTls {
+                ca_file: Some(ca.clone()),
+                server_name: Some("kraken-hub".into())
+            })
+        );
+        for vars in [
+            vec![("KRAKEN_HUB_TLS_CA", ca.to_str().unwrap())],
+            vec![("KRAKEN_HUB_TLS_SERVER_NAME", "kraken-hub")],
+            vec![("KRAKEN_HUB_TLS", "maybe")],
+            vec![
+                ("KRAKEN_HUB_TLS", "true"),
+                ("KRAKEN_HUB_TLS_CA", "/no/such/ca.pem"),
+            ],
+        ] {
+            assert!(
+                matches!(try_from(&vars), Err(MessagingError::InvalidMessage(_))),
+                "{vars:?} accepted"
+            );
+        }
+        // A CA file without a certificate is a startup error, not a handshake failure later.
+        let junk = dir.join("junk.pem");
+        std::fs::write(&junk, "not a certificate").unwrap();
+        assert!(
+            try_from(&[
+                ("KRAKEN_HUB_TLS", "true"),
+                ("KRAKEN_HUB_TLS_CA", junk.to_str().unwrap())
+            ])
+            .is_err()
+        );
+        let blank_name = Config {
+            hub_tls: Some(HubTls {
+                server_name: Some(" ".into()),
+                ..HubTls::default()
+            }),
+            ..code_config()
+        };
+        assert!(blank_name.validate().is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

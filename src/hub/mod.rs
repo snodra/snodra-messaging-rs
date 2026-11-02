@@ -10,6 +10,7 @@ mod registry;
 mod sender;
 mod subscriptions;
 mod targets;
+mod tls;
 
 pub use connection::{
     CAPABILITIES, CLIENT_VERSION, FLOW_CONTROL, Handshake, HubConnection, HubSettings,
@@ -28,3 +29,4 @@ pub use subscriptions::{DEFAULT_MAX_SUBSCRIPTIONS, QueryUpdateEmitter};
 pub use targets::{
     DNS_REFRESH, HubTargets, permit_share, rendezvous_score, resolved_targets, target_id,
 };
+pub use tls::read_ca_file;

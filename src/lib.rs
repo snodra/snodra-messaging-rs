@@ -12,6 +12,7 @@ pub mod identity;
 pub mod kafka;
 pub mod proto;
 pub mod retry;
+pub mod security;
 pub mod types;
 
 pub use app::{KrakenMessaging, KrakenMessagingBuilder};
@@ -23,4 +24,5 @@ pub use hub::{
 };
 pub use identity::{Guard, Identity};
 pub use retry::RetryPolicy;
+pub use security::{HubTls, SecretString};
 pub use types::{Command, Event, MessageType, Query, StreamingQuery, SubscriptionQuery};
