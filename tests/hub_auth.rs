@@ -246,7 +246,8 @@ async fn the_token_file_is_reread_on_reconnect_and_a_fixed_token_registers() {
     conn.start();
     // The first attempt carries the file's (wrong) token and is refused.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while hub.rejections().is_empty() {
+    // The fake hub records the refusal before the client reads it: wait for both sides.
+    while hub.rejections().is_empty() || conn.last_rejection().is_none() {
         assert!(tokio::time::Instant::now() < deadline, "no attempt");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -423,7 +424,8 @@ async fn an_empty_token_file_at_startup_is_no_token() {
     );
     conn.start();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while hub.rejections().is_empty() {
+    // The fake hub records the refusal before the client reads it: wait for both sides.
+    while hub.rejections().is_empty() || conn.last_rejection().is_none() {
         assert!(tokio::time::Instant::now() < deadline, "no attempt");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -617,7 +619,8 @@ async fn a_prefix_wildcard_needs_something_after_the_dot() {
     conn.set_types(vec!["orders.".into()], vec![]);
     conn.start();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while hub.rejections().is_empty() {
+    // The fake hub records the refusal before the client reads it: wait for both sides.
+    while hub.rejections().is_empty() || conn.last_rejection().is_none() {
         assert!(tokio::time::Instant::now() < deadline, "no attempt");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
