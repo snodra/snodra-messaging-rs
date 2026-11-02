@@ -57,6 +57,13 @@ pub struct Config {
     /// would otherwise leave the handler task waiting for ever). Default 10 minutes, the hub's
     /// default `KRAKEN_HUB_MAX_STREAM_DURATION`; at least 1 ms ([`Config::validate`]).
     pub hub_stream_credit_timeout: Duration,
+    /// The most subscription queries (ADR 0017, P4c) this instance serves at once: a
+    /// subscription request beyond it is refused with `ReplyEnd{error = RESOURCE_EXHAUSTED
+    /// "subscription limit (N) reached"}`. Subscriptions hold no handler permit, so this is
+    /// their only bound here (the hub has its own per-instance limit,
+    /// `KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE`, 1024). Default 1024; at least 1
+    /// ([`Config::validate`]).
+    pub hub_max_subscriptions: usize,
     pub kafka_bootstrap: String,
     pub kafka_topic: String,
     pub consumer_enabled: bool,
@@ -97,6 +104,7 @@ impl Config {
             hub_priorities: HashMap::new(),
             hub_retry: None,
             hub_stream_credit_timeout: DEFAULT_STREAM_CREDIT_TIMEOUT,
+            hub_max_subscriptions: crate::hub::DEFAULT_MAX_SUBSCRIPTIONS,
             kafka_bootstrap: kafka_bootstrap.to_string(),
             kafka_topic: crate::kafka::EVENTS_TOPIC.to_string(),
             consumer_enabled: true,
@@ -124,7 +132,8 @@ impl Config {
     /// `KRAKEN_HUB_TAGS` (`k=v,k=v`), `KRAKEN_HUB_PRIORITIES` (`type=n,type=n`),
     /// `KRAKEN_HUB_RETRY_ENABLED`, `KRAKEN_HUB_RETRY_MAX_ATTEMPTS`,
     /// `KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS`, `KRAKEN_HUB_RETRY_MULTIPLIER`,
-    /// `KRAKEN_HUB_RETRY_MAX_BACKOFF_MS`, `KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS`.
+    /// `KRAKEN_HUB_RETRY_MAX_BACKOFF_MS`, `KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS`,
+    /// `KRAKEN_HUB_MAX_SUBSCRIPTIONS`.
     /// `KRAKEN_HUB_RETRY_ENABLED=true` sets `hub_retry` to the
     /// policy the other `KRAKEN_HUB_RETRY_*` variables describe (defaults: 3 attempts, 100 ms
     /// doubling to 2 s); those are validated whether or not retry is enabled.
@@ -218,6 +227,9 @@ impl Config {
         if let Some(v) = optional("KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS") {
             c.hub_stream_credit_timeout = millis("KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS", &v)?;
         }
+        if let Some(v) = optional("KRAKEN_HUB_MAX_SUBSCRIPTIONS") {
+            c.hub_max_subscriptions = number("KRAKEN_HUB_MAX_SUBSCRIPTIONS", &v)? as usize;
+        }
         if let Some(v) = optional("KRAKEN_CONSUMER_ENABLED") {
             c.consumer_enabled = flag("KRAKEN_CONSUMER_ENABLED", &v)?;
         }
@@ -246,7 +258,8 @@ impl Config {
     /// Rejects what cannot work: an empty service name, a `hub_address` that names no hub (or a
     /// malformed `dns:///` target), a zero `hub_status_interval`, `jwks_url` without `issuer`,
     /// `max_concurrent_handlers` 0, an invalid `hub_retry` policy, a zero
-    /// `hub_stream_credit_timeout`. Called by `from_env` and by `KrakenMessaging::builder`.
+    /// `hub_stream_credit_timeout`, a zero `hub_max_subscriptions`. Called by `from_env` and by
+    /// `KrakenMessaging::builder`.
     pub fn validate(&self) -> Result<(), MessagingError> {
         if self.service_name.trim().is_empty() {
             return Err(MessagingError::InvalidMessage(
@@ -277,6 +290,11 @@ impl Config {
             return Err(MessagingError::InvalidMessage(
                 "hub_stream_credit_timeout (KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS) must be at least 1 ms"
                     .into(),
+            ));
+        }
+        if self.hub_max_subscriptions == 0 {
+            return Err(MessagingError::InvalidMessage(
+                "hub_max_subscriptions (KRAKEN_HUB_MAX_SUBSCRIPTIONS) must be at least 1".into(),
             ));
         }
         Ok(())
@@ -389,6 +407,26 @@ mod tests {
         );
         let mut c = code_config();
         c.hub_stream_credit_timeout = Duration::ZERO;
+        assert!(c.validate().is_err(), "zero rejected in code too");
+    }
+
+    #[test]
+    fn max_subscriptions_defaults_to_the_hubs_limit_and_reads_the_environment() {
+        assert_eq!(code_config().hub_max_subscriptions, 1024);
+        assert_eq!(from(&[]).hub_max_subscriptions, 1024);
+        assert_eq!(
+            from(&[("KRAKEN_HUB_MAX_SUBSCRIPTIONS", "5")]).hub_max_subscriptions,
+            5
+        );
+        for value in ["0", "-1", "many"] {
+            let e = try_from(&[("KRAKEN_HUB_MAX_SUBSCRIPTIONS", value)]).unwrap_err();
+            assert!(
+                e.to_string().contains("KRAKEN_HUB_MAX_SUBSCRIPTIONS"),
+                "{value}: {e}"
+            );
+        }
+        let mut c = code_config();
+        c.hub_max_subscriptions = 0;
         assert!(c.validate().is_err(), "zero rejected in code too");
     }
 
