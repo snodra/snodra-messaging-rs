@@ -28,6 +28,7 @@ indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
 | Send commands and queries, typed replies, timeouts, error mapping | `hub::Sender` (`app.commands()`, `app.queries()`) |
 | Shared query types and scatter-gather queries | `shared_query`, `Sender::scatter_gather` (see [Scatter-gather](#scatter-gather)) |
 | Streaming queries under the caller's credits | `streaming_query`, `Sender::stream` / `stream_owned` (see [Streaming queries](#streaming-queries)) |
+| Subscription queries: an initial result, then updates pushed by every owner instance | `subscription_query`, `QueryUpdateEmitter`, `Sender::subscribe` (see [Subscription queries](#subscription-queries)) |
 | Publish events through the Mongo outbox, relay to Kafka | `kafka::EventBus`, `kafka::OutboxPublisher` |
 | Consume events idempotently (marker + handler in one transaction) | `kafka::EventConsumer` |
 | Identity from the forwarded JWT: JWKS verification or unverified parsing; handler guards | `identity::{IdentityResolver, JwksVerifier, Guard}` |
@@ -41,6 +42,7 @@ indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
 - [Multiple hubs](#multiple-hubs)
 - [Scatter-gather](#scatter-gather)
 - [Streaming queries](#streaming-queries)
+- [Subscription queries](#subscription-queries)
 - [Upgrading](#upgrading)
 - [Build and test](#build-and-test)
 - [Example](#example)
@@ -122,6 +124,7 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 | `KRAKEN_HUB_RETRY_MAX_ATTEMPTS` | 3 | attempts in total, the first included; at least 1 (`0` is rejected at startup, also while retry is disabled) |
 | `KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS`, `_MULTIPLIER`, `_MAX_BACKOFF_MS` | 100, 2, 2000 | wait before the second attempt, growth factor (a finite number >= 1, else rejected at startup), cap of one wait; each wait is jittered by ±20 % and never above the cap (at the cap: 80-100 % of it), like the reconnect backoff |
 | `KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS` | 600000 | how long a streaming query handler waits for credit before it ends its stream with `TIMEOUT` "no credit within <d>" and releases its permits (see [Streaming queries](#streaming-queries)); the default is the hub's default `KRAKEN_HUB_MAX_STREAM_DURATION` (10 min); at least 1 (`0` is rejected at startup, also when set in code) |
+| `KRAKEN_HUB_MAX_SUBSCRIPTIONS` | 1024 | the most subscription queries this instance serves at once (see [Subscription queries](#subscription-queries)): a subscription request beyond it is refused with `ReplyEnd{error = RESOURCE_EXHAUSTED}` `subscription limit (N) reached`, which the subscriber sees as `HandlerBusy`; subscriptions hold no handler permit, so this is their only bound here; the hub has its own per-instance limit (`KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE`, 1024); at least 1 (`0` is rejected at startup, also when set in code) |
 | `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS` | true, 5 | consumer starts only when event handlers are registered |
 | `KRAKEN_OUTBOX_ENABLED`, `KRAKEN_OUTBOX_POLL_INTERVAL_MS`, `KRAKEN_OUTBOX_BATCH_SIZE`, `KRAKEN_OUTBOX_MAX_ATTEMPTS` | true, 200, 100, 10 | |
 | `KRAKEN_FORWARD_JWT` | true | |
@@ -161,7 +164,7 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
   not count). `app.hub_ids()` lists the hubs registered on now. kraken-messaging (Kotlin) differs
   here: its `HubConnections.awaitRegistered` waits for every hub, like `await_all_hubs`.
 - **Handshake** (hub protocol v2, ADR 0013): `Register` carries `protocol_version = 2`, the
-  capabilities (`flow-control`, `instance-status`) and `client_version = kraken-messaging-rs/<version>`. A v2 hub answers with a
+  capabilities (`flow-control`, `instance-status`, `scatter-gather`, `streaming`, `subscription`) and `client_version = kraken-messaging-rs/<version>`. A v2 hub answers with a
   `RegisterAck` before it echoes the first heartbeat; the client then heartbeats at the announced
   interval (3 s; the hub evicts after 10 s) and sends `timeout_ms = 0` unless a timeout was chosen,
   guarding locally with the ack's per-type or maximum timeout plus 1 s. When the echo arrives without
@@ -461,10 +464,169 @@ tokio::spawn(async move { rows.try_for_each(|row| async { Ok(()) }).await });
 - **Compat.** Against a P3 / P4a hub `stream` fails with `UnsupportedByHub` (`tests/hub_compat.rs`);
   the P4b hub serves it (`tests/e2e_stream.rs`, image `kraken-hub:p4b-hub`, `KRAKEN_HUB_P4B_IMAGE`).
 
+## Subscription queries
+
+A query whose result is an initial value followed by the updates every owner instance pushes,
+until the subscriber cancels or the owners complete ([ADR 0017, P4c](../kraken/docs/adr/0017-query-modes-and-shared-query-types.md)),
+the counterpart of kraken-messaging's subscription query API.
+
+```rust
+use futures::StreamExt;
+use kraken_messaging::{SubscriptionOptions, SubscriptionQuery};
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Prices { symbol: String }
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Quote { symbol: String, price: u32 }
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Tick { symbol: String, price: u32 }
+message_type!(Prices, "market.Prices");
+impl SubscriptionQuery for Prices { type Initial = Quote; type Update = Tick; }
+
+// Handler side: the handler answers the initial result; the updates are pushed through the
+// emitter by whatever changes the data. Capture the emitter before `start()`.
+let builder = KrakenMessaging::builder(config).await?;
+let emitter = builder.emitter();
+let app = builder
+    .subscription_query::<Prices, _, _>(|q, ctx| async move { Ok(latest_quote(&q.symbol).await?) })
+    // .shared_subscription_query::<Prices, _, _>(..)   // many services may own it
+    .start().await?;
+
+// ... wherever the data changes (after the commit of the write that changed it):
+emitter.emit::<Prices>(|q| q.symbol == "ACME", &Tick { symbol: "ACME".into(), price: 101 });
+emitter.complete::<Prices>(|q| q.symbol == "ACME");                       // a clean end
+emitter.complete_exceptionally::<Prices>(|_| true, &MessagingError::Storage("feed down".into()));
+
+// Sender side: `subscribe` returns once the initial result is in.
+let sub = app.sender().subscribe(&Prices { symbol: "ACME".into() }, SubscriptionOptions {
+    timeout: None,        // the initial result's timeout (queue wait + handler); else Config.hub_request_timeout, else the hub's
+    max_results: 0,       // end after this many updates (the initial result does not count); 0: no limit
+    priority: None,       // the initial request's; else KRAKEN_HUB_PRIORITIES for the type, else 0
+    initial_credit: 64,   // the credit window; half of it is refilled every time half was consumed
+}).await?;
+println!("{}", sub.initial.price);
+let mut updates = sub.updates;                      // hot: fed by the hub from the open on
+while let Some(update) = updates.next().await { let tick = update?; /* in the hub's arrival order */ }
+// `sub.cancel()` (or dropping the subscription, or just its `updates`) cancels it at the hub.
+```
+
+| API | Signature |
+|---|---|
+| Trait | `trait SubscriptionQuery: MessageType + Serialize + DeserializeOwned + Send + Sync + 'static { type Initial: Serialize + DeserializeOwned + Send + 'static; type Update: Serialize + DeserializeOwned + Send + 'static; }` |
+| Register a handler | `KrakenMessagingBuilder::subscription_query::<Q, F, Fut>(handler) -> Self` and `shared_subscription_query` (also on `HandlerRegistry`), with `F: Fn(Q, MessageContext) -> Fut`, `Fut: Future<Output = Result<Q::Initial, MessagingError>>`: the handler answers the initial result |
+| Registered types | `HandlerRegistry::subscription_query_types()` (exclusive and shared); `registered_types()` has `subscription_queries`, the exclusive ones, announced in `Register.query_types` with `queries`; a shared subscription type is in `shared_queries` like any shared query |
+| Emitter | `QueryUpdateEmitter` (`Clone`): `emit<Q: SubscriptionQuery>(&self, filter: impl Fn(&Q) -> bool, update: &Q::Update)`, `complete<Q>(&self, filter)`, `complete_exceptionally<Q>(&self, filter, error: &MessagingError)`. From `KrakenMessagingBuilder::emitter()` (to capture in handlers and in the code that changes the data) or `KrakenMessaging::emitter()`; also `open_subscriptions()` |
+| Subscribe | `Sender::subscribe<Q: SubscriptionQuery>(self: &Arc<Self>, &Q, SubscriptionOptions) -> Result<Subscription<Q>, MessagingError>` (`async`): owned, like `stream_owned` (`app.sender()` is the `Arc`); there is no borrowed variant |
+| Result | `Subscription<Q> { initial: Q::Initial, updates: BoxStream<'static, Result<Q::Update, MessagingError>> }` with `cancel(self)` |
+| Options | `SubscriptionOptions { timeout: Option<Duration>, max_results: u32, priority: Option<i32>, initial_credit: u32 }` (`Default`: `initial_credit` 64, `hub::DEFAULT_CREDIT`; 0 reads as 64; retry: `Config.hub_retry`) |
+| Handler limit | `Config.hub_max_subscriptions` (`KRAKEN_HUB_MAX_SUBSCRIPTIONS`, 1024; `Dispatcher::max_subscriptions` when wired by hand) |
+| Errors | `MessagingError::UnsupportedByHub`, `NoHandler`, `InvalidMessage`, `Timeout`, `RemoteHandler`, `HandlerDisconnected`, `HandlerBusy`, `Cancelled` (the hub's max duration), `HubUnavailable`, `HubConnectionLost`, `Serialization` |
+
+- **Capability.** The client declares `subscription`, as sender and as handler. A subscription
+  goes only to a hub whose `RegisterAck` lists it (`Handshake::subscription`), checked again on
+  the very stream it is written to; with none (a P4b or older hub, a legacy hub) `subscribe`
+  fails at once with `UnsupportedByHub`, nothing sent. The hub subscribes only instances that
+  negotiated `subscription` and list the type: an owner whose instances run an older library
+  is `UnsupportedByHub` too (the hub names the services). Unary queries, gathers and streams
+  are untouched (`tests/hub_compat.rs` runs `kraken-hub:p4b-hub`).
+- **Who is asked.** The hub asks every live instance of every owner (exclusive or shared type)
+  that lists the type and negotiated `subscription`, **as they are at the open**: an instance
+  registering later is not added and one that leaves is not replaced. Updates are delivered
+  **at most once** and neither the hub nor this library resubscribes: after a rolling restart a
+  subscription listens to fewer instances than serve the type (an update emitted on a new
+  instance is lost), and the subscriber only learns of it when the last instance left
+  (`HandlerDisconnected`). A subscriber that needs every instance subscribes again.
+- **Initial result and updates.** One capable instance, chosen as for a point query, also gets
+  `Request{id = <id>#0, mode = UNARY}`: the registered handler answers it like a unary query
+  (it holds a handler permit and is bounded by the timeout). Every capable instance gets
+  `Request{id = <id>#n, mode = SUBSCRIPTION}`, which registers a subscription on it (the decoded
+  query, the request id and the arrival stream; no handler runs, no permit is held here or at
+  the hub). The sender gets the initial result as `ReplyPart{seq = 1}` and then the updates as
+  `ReplyPart{seq = 2, 3, ...}` in the hub's arrival order (the hub renumbers: per-source order
+  is kept, there is no order between sources). A unary query to a subscription type (an id
+  without the `#0` suffix) is answered `INVALID_REQUEST` ("`<type>` is a subscription query:
+  send it with Sender::subscribe"), a subscription request to a type whose handler is unary or
+  streaming ends with `INVALID_REQUEST` ("`<type>` is not a subscription query handler (it
+  answers mode ...)"): the caller used the wrong mode, which no retry fixes.
+- **Emitting.** `emit` sends one `ReplyPart` (the update serialized with the crate's codec,
+  `seq` from 1 per subscription) to every open subscription of `Q` on this instance whose query
+  passes the filter, in call order; `complete` a clean `ReplyEnd` and removes it;
+  `complete_exceptionally` a `ReplyEnd{HANDLER_ERROR, message}` and removes it. No matching
+  subscription: a no-op. A call never waits for the hub stream (one task per subscription
+  writes in order). A clean end removes the instance silently at the hub; the last instance's
+  clean end completes the subscription for the subscriber. An error end from any instance ends
+  the whole subscription with that error (`RemoteHandler`) and cancels the others.
+  **There are no transactions to defer to here** (the Kotlin library emits after the commit of
+  the surrounding Spring transaction automatically): a handler that writes in a Mongo
+  transaction must emit after its commit, or subscribers see an update of a write that may roll
+  back.
+- **Credits and the hub's buffer.** The credit is `initial_credit` plus every `Flow`; the
+  initial result takes one, every update one. Updates beyond it wait at the hub, up to
+  `KRAKEN_HUB_SUBSCRIPTION_BUFFER` (256) per subscription; one more ends the subscription with
+  `ReplyEnd{RESOURCE_EXHAUSTED}`, which `updates` yields as its last item `HandlerBusy` (the
+  hub's message, "subscriber buffer (256) exceeded", is logged at debug: the variant carries
+  the type). Nothing is relayed to the owners: updates are pushed, and a consumer that falls
+  further behind than the buffer resubscribes and gets a fresh initial result. The sender
+  refills `max(1, initial_credit / 2)` credits every time that many parts were consumed; the
+  initial result counts as consumed (it took a credit, so a window of 1 does not stall).
+- **Open.** `subscribe().await` returns once the initial result is in, so everything before
+  that is the call's error: `UnsupportedByHub`, `NoHandler` (no owner), `InvalidMessage` (a
+  command type, or a handler of another mode), `Timeout` (no initial result within the
+  timeout), the handler's error (`RemoteHandler`, ...), `HandlerBusy` (an instance at its
+  subscription limit or a full queue), `HubUnavailable` / `HubConnectionLost`. An owner instance
+  at its limit refuses its subscription with `ReplyEnd{RESOURCE_EXHAUSTED}` and the hub ends the
+  whole subscription with it (the error is the call's, or comes right after the initial
+  result). The hub itself refuses a subscription whose target already serves
+  `KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE` (1024), before anything is sent.
+- **Endings.** `updates` ends when the last owner instance completed cleanly or `max_results`
+  updates were relayed (the hub then cancels the owners); an error is its last item, mapped like
+  a unary error of that code: `RemoteHandler` (an owner's `complete_exceptionally`),
+  `HandlerDisconnected` (the last owner left), `HandlerBusy` (the buffer), `Cancelled`
+  (`KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION`, off by default), `HubConnectionLost` (the hub stream
+  was lost), `Serialization` (an update that does not decode; the subscription is cancelled).
+  There is no idle timeout and no local guard on updates: a quiet subscription is not a broken
+  one. The only local guard is on the initial result (the hub's bound plus 1 s, as for a
+  unary request).
+- **Lost parts.** As for a stream, `seq` must run 1, 2, 3, ... in arrival order and a clean
+  `ReplyEnd.parts` must equal the parts that arrived (the hub's count includes the initial
+  result); otherwise the last item is `InvalidMessage` "subscription `<type>` lost N part(s)" and
+  the subscription is cancelled at the hub (reason `lost parts`).
+- **Cancel.** `Subscription::cancel`, dropping the `Subscription` or dropping its `updates`
+  before the end sends `Cancel{id, "dropped by the sender"}` (best effort, from the drop) and
+  forgets the request: the hub cancels every owner instance, which removes the subscription.
+  The owners also drop a subscription on a hub `Cancel` (the subscriber left, `max_results`, the
+  buffer, the hub's limits) and every subscription that arrived on a hub stream that was lost
+  (the hub forgot it with the session). A shutdown (`KrakenMessaging::shutdown`) completes the
+  subscriptions served here with a clean `ReplyEnd`, best effort and bounded to 2 s.
+- **Retry.** `Config.hub_retry` applies until the initial result, for the same errors as a unary
+  query (`HubUnavailable`, `NoHandler`, `HandlerBusy`, `HandlerDisconnected`, `Timeout`,
+  `HubConnectionLost`): a retry is a new subscription with a fresh id; the timeout bounds the
+  initial request like a unary one, so each attempt sends what is left of the call's budget. A
+  hub stream lost while the request still sat in its outbound buffer moves to the next capable
+  hub with the same id. Nothing is retried once the initial result is in.
+- **Limits.** `Config.hub_max_subscriptions` bounds the subscriptions one instance serves (a
+  subscription holds no permit: `max_concurrent_handlers` does not apply to it); beyond it a new
+  request is refused with `ReplyEnd{RESOURCE_EXHAUSTED}` `subscription limit (N) reached`. The
+  hub's buffer, per-instance limit and maximum duration are its own settings.
+- **Compat.** Against a P4b or older hub `subscribe` fails with `UnsupportedByHub`
+  (`tests/hub_compat.rs`); the P4c hub serves it (`tests/e2e_subscription.rs`, image
+  `kraken-hub:p4c-hub`, `KRAKEN_HUB_P4C_IMAGE`).
+
 ## Upgrading
 
-What changes for a service moving to this version (P4b):
+What changes for a service moving to this version (P4c, then P4b):
 
+- **`Config.hub_max_subscriptions`** (`KRAKEN_HUB_MAX_SUBSCRIPTIONS`, default 1024, at least 1)
+  is new. Code that builds `Config` as a struct literal needs the field (`Config::new` sets the
+  default). `RegisteredTypes` gained `subscription_queries` too, for code that builds one as a
+  struct literal (`..RegisteredTypes::default()` keeps compiling).
+- **The `subscription` capability** is declared in every `Register`
+  (`hub::CAPABILITIES`): a P4c hub then subscribes this instance to the subscription queries it
+  lists, which only a `subscription_query` handler serves. Nothing changes for a service that
+  registers none. A subscription type has one handler, like any type
+  (`subscription_query` and `query` on the same type panic at startup).
+- **Updates are at most once and the instances are fixed at the open**: see
+  [Subscription queries](#subscription-queries); the library never resubscribes.
 - **Handlers are aborted by a hub `Cancel`.** A unary command or query handler, and a
   scatter-gather target, used to run to completion whatever happened; now any hub `Cancel` for
   the request drops the handler's future (`AbortOnDrop`), as a streaming handler's stream is
@@ -504,7 +666,9 @@ previous hub releases: `kraken-hub:p0` (protocol v2 without flow control, overri
 `KRAKEN_HUB_P0_IMAGE`), `kraken-hub:p2` (flow control without `instance-status`, override with
 `KRAKEN_HUB_P2_IMAGE`) and `kraken-hub:v1-baseline` (override with `KRAKEN_HUB_BASELINE_IMAGE`), to
 prove the client behaves as before against them. `tests/e2e_multi_hub.rs` and the P3 compat test
-run two or one `kraken-hub:p3-hub` (override with `KRAKEN_HUB_P3_IMAGE`); `tests/hub_pool.rs` runs
+run two or one `kraken-hub:p3-hub` (override with `KRAKEN_HUB_P3_IMAGE`); `tests/e2e_stream.rs` and the P4a compat test run `kraken-hub:p4b-hub` and
+`kraken-hub:p4a-hub` (`KRAKEN_HUB_P4B_IMAGE`, `KRAKEN_HUB_P4A_IMAGE`) and `tests/e2e_subscription.rs`
+two `kraken-hub:p4c-hub` (`KRAKEN_HUB_P4C_IMAGE`); `tests/hub_pool.rs` runs
 the multi-hub rules against in-process fake hubs. Without Docker the integration tests print a notice and skip; with Docker but no hub
 image they fail with the build command. On Rancher Desktop export
 `DOCKER_HOST=unix://$HOME/.rd/docker.sock` first. A unit test and `scripts/check-proto-sync.sh` (CI
