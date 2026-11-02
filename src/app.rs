@@ -8,6 +8,7 @@
 //!     .query::<Reverse, _, _>(|q, ctx| async move { ... })
 //!     .shared_query::<Search, _, _>(|q, ctx| async move { ... }) // many services may own it
 //!     .streaming_query::<Export, _, _, _>(|q, ctx| async move { Ok(rows(q)) }) // a stream of items
+//!     .subscription_query::<Prices, _, _>(|q, ctx| async move { Ok(latest(q)) }) // initial result; updates via `emitter`
 //!     .event::<GreetingDelivered, _, _>(|e, ctx| async move { ... })
 //!     .start()
 //!     .await?;
@@ -27,12 +28,15 @@ use crate::config::Config;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
 use crate::hub::{
-    Dispatcher, EventContext, HandlerRegistry, HubPool, HubSettings, Inbound, Sender,
-    SenderSettings,
+    Dispatcher, EventContext, HandlerRegistry, HubPool, HubSettings, Inbound, QueryUpdateEmitter,
+    Sender, SenderSettings,
 };
 use crate::identity::{Guard, IdentityResolver, JwksVerifier};
 use crate::kafka::{EventBus, EventConsumer, OutboxPublisher, ensure_indexes};
-use crate::types::{Command, Event, MessageType, Query, StreamingQuery};
+use crate::types::{Command, Event, MessageType, Query, StreamingQuery, SubscriptionQuery};
+
+/// How long a shutdown waits for the subscriptions' `ReplyEnd`s to be written.
+const SUBSCRIPTION_END_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct KrakenMessagingBuilder {
     config: Config,
@@ -43,11 +47,14 @@ pub struct KrakenMessagingBuilder {
     hubs: Arc<HubPool>,
     inbound: mpsc::Receiver<Inbound>,
     sender: Arc<Sender>,
+    emitter: QueryUpdateEmitter,
 }
 
 pub struct KrakenMessaging {
     hubs: Arc<HubPool>,
     sender: Arc<Sender>,
+    dispatcher: Arc<Dispatcher>,
+    emitter: QueryUpdateEmitter,
     events: EventBus,
     client: mongodb::Client,
     db: mongodb::Database,
@@ -94,7 +101,6 @@ impl KrakenMessaging {
             },
         );
         Ok(KrakenMessagingBuilder {
-            config,
             registry: HandlerRegistry::new(),
             client,
             db,
@@ -102,6 +108,8 @@ impl KrakenMessaging {
             hubs,
             inbound,
             sender,
+            emitter: QueryUpdateEmitter::new(config.hub_max_subscriptions),
+            config,
         })
     }
 
@@ -125,6 +133,13 @@ impl KrakenMessaging {
     /// Publishes events through the outbox.
     pub fn events(&self) -> &EventBus {
         &self.events
+    }
+
+    /// The emitter that pushes updates to the subscription queries this instance serves (ADR
+    /// 0017, P4c): the same one the builder's `emitter()` gave to handlers. See
+    /// [`QueryUpdateEmitter`].
+    pub fn emitter(&self) -> QueryUpdateEmitter {
+        self.emitter.clone()
     }
 
     pub fn instance_id(&self) -> &str {
@@ -161,8 +176,10 @@ impl KrakenMessaging {
         self.hubs.await_all_registered(timeout).await
     }
 
-    /// Drains in-flight handlers (bounded), closes every hub stream (each hub drops this instance at once),
-    /// stops the outbox publisher and the consumer. Pending outgoing requests fail with `HubConnectionLost`.
+    /// Drains in-flight handlers (bounded), completes the subscriptions served here with a
+    /// `ReplyEnd` (best effort, bounded), closes every hub stream (each hub drops this instance
+    /// at once), stops the outbox publisher and the consumer. Pending outgoing requests fail
+    /// with `HubConnectionLost`.
     pub async fn shutdown(self) {
         self.handlers.close();
         if tokio::time::timeout(Duration::from_secs(10), self.handlers.wait())
@@ -170,6 +187,13 @@ impl KrakenMessaging {
             .is_err()
         {
             tracing::warn!("handlers still running after 10 s, closing the hub stream anyway");
+        }
+        let ends = futures::future::join_all(self.dispatcher.end_subscriptions());
+        if tokio::time::timeout(SUBSCRIPTION_END_TIMEOUT, ends)
+            .await
+            .is_err()
+        {
+            tracing::warn!("subscription ends not written in time, closing the hub stream anyway");
         }
         // Close the stream before stopping the inbound loop, then fail whatever is still pending:
         // those requests were written, so the outcome is unknown (the Disconnected of the closed
@@ -270,6 +294,40 @@ impl KrakenMessagingBuilder {
         self
     }
 
+    /// A subscription query handler (ADR 0017, P4c): `handler` answers the initial result of
+    /// `Q` for [`Sender::subscribe`] callers; this service is its only owner. The updates come
+    /// from the [`QueryUpdateEmitter`] (`emitter()`), called by whatever changes the data. See
+    /// [`HandlerRegistry::subscription_query`].
+    ///
+    /// # Panics
+    /// When `Q` already has a handler here.
+    pub fn subscription_query<Q, F, Fut>(mut self, handler: F) -> Self
+    where
+        Q: SubscriptionQuery,
+        F: Fn(Q, MessageContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Q::Initial, MessagingError>> + Send + 'static,
+    {
+        self.registry.subscription_query::<Q, F, Fut>(handler);
+        self
+    }
+
+    /// A shared subscription query handler: several services may own `Q`; a subscription
+    /// reaches every capable instance of every owner. See
+    /// [`HandlerRegistry::shared_subscription_query`].
+    ///
+    /// # Panics
+    /// When `Q` already has a handler here (shared or exclusive).
+    pub fn shared_subscription_query<Q, F, Fut>(mut self, handler: F) -> Self
+    where
+        Q: SubscriptionQuery,
+        F: Fn(Q, MessageContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Q::Initial, MessagingError>> + Send + 'static,
+    {
+        self.registry
+            .shared_subscription_query::<Q, F, Fut>(handler);
+        self
+    }
+
     /// Opt-in authorization for a command or query registered before this call.
     pub fn requires<M: MessageType>(mut self, guard: Guard) -> Self {
         self.registry.requires::<M>(guard);
@@ -284,6 +342,13 @@ impl KrakenMessagingBuilder {
     /// The command/query sender, to capture in handlers that send.
     pub fn sender(&self) -> Arc<Sender> {
         Arc::clone(&self.sender)
+    }
+
+    /// The emitter that pushes updates to the subscription queries this instance serves (ADR
+    /// 0017, P4c), to capture in the code that changes the data: `app.emitter()` is the same
+    /// one. See [`QueryUpdateEmitter`].
+    pub fn emitter(&self) -> QueryUpdateEmitter {
+        self.emitter.clone()
     }
 
     /// The crate's Mongo client; handlers that write transactionally start their sessions here.
@@ -308,6 +373,7 @@ impl KrakenMessagingBuilder {
             hubs,
             mut inbound,
             sender,
+            emitter,
         } = self;
         ensure_indexes(&db, config.outbox_retention, config.idempotency_retention).await?;
         let registry = Arc::new(registry);
@@ -321,7 +387,8 @@ impl KrakenMessagingBuilder {
                 Arc::new(IdentityResolver::new(verifier)),
                 config.max_concurrent_handlers,
             )
-            .stream_credit_timeout(config.hub_stream_credit_timeout),
+            .stream_credit_timeout(config.hub_stream_credit_timeout)
+            .with_emitter(emitter.clone()),
         );
         let cancel = CancellationToken::new();
         let handlers = TaskTracker::new();
@@ -332,6 +399,7 @@ impl KrakenMessagingBuilder {
         let loop_sender = Arc::clone(&sender);
         let loop_cancel = cancel.clone();
         let loop_handlers = handlers.clone();
+        let loop_dispatcher = Arc::clone(&dispatcher);
         tasks.push(tokio::spawn(async move {
             loop {
                 let msg = tokio::select! {
@@ -342,14 +410,14 @@ impl KrakenMessagingBuilder {
                     // Served on the stream it arrived on; registered before the spawn so that a
                     // Flow or Cancel right behind it finds it.
                     Inbound::Request { request, reply_to } => {
-                        loop_handlers.spawn(dispatcher.serve(request, reply_to));
+                        loop_handlers.spawn(loop_dispatcher.serve(request, reply_to));
                     }
-                    Inbound::Flow(f) => dispatcher.flow(&f.request_id, f.credits),
-                    Inbound::Cancel(c) => dispatcher.cancel(&c.request_id, &c.reason),
+                    Inbound::Flow(f) => loop_dispatcher.flow(&f.request_id, f.credits),
+                    Inbound::Cancel(c) => loop_dispatcher.cancel(&c.request_id, &c.reason),
                     // A lost stream fails what was sent on it and cancels the streaming
                     // queries that arrived on it.
                     Inbound::Disconnected { stream, .. } => {
-                        dispatcher.stream_lost(stream);
+                        loop_dispatcher.stream_lost(stream);
                         loop_sender.on_inbound(msg);
                     }
                     other => loop_sender.on_inbound(other),
@@ -382,10 +450,12 @@ impl KrakenMessagingBuilder {
             )?;
             tasks.push(consumer.start(cancel.clone()));
         }
-        tracing::info!(service = %config.service_name, instance = %hubs.instance_id(), hubs = ?hubs.targets(), commands = ?registry.command_types(), queries = ?registry.exclusive_query_types(), shared_queries = ?registry.shared_query_types(), streaming_queries = ?registry.streaming_query_types(), events = ?registry.event_types(), "kraken messaging started");
+        tracing::info!(service = %config.service_name, instance = %hubs.instance_id(), hubs = ?hubs.targets(), commands = ?registry.command_types(), queries = ?registry.exclusive_query_types(), shared_queries = ?registry.shared_query_types(), streaming_queries = ?registry.streaming_query_types(), subscription_queries = ?registry.subscription_query_types(), events = ?registry.event_types(), "kraken messaging started");
         Ok(KrakenMessaging {
             hubs,
             sender,
+            dispatcher,
+            emitter,
             events,
             client,
             db,

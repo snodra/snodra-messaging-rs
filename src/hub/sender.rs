@@ -24,6 +24,13 @@
 //! local guard is an idle guard (reset by every part), like the hub's idle timeout, with twice
 //! the bound for the first part (the hub bounds a queue wait by the timeout, then restarts the
 //! idle clock at the forward); when it fires the stream is cancelled at the hub, best effort.
+//!
+//! Subscription queries (ADR 0017 P4c, [`Sender::subscribe`]): the same machinery with
+//! `mode = SUBSCRIPTION` to one hub whose ack lists `subscription`. The first part is the initial
+//! result (bounded by the timeout like a unary request, local guard: the hub's bound plus the
+//! margin); every later part is an update, with no idle timeout and no guard at all (a quiet
+//! subscription is not a broken one). The initial part takes one credit, so it counts toward the
+//! refill like a part the consumer pulled.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -43,9 +50,11 @@ use crate::proto::{
     self, ClientMessage, ErrorCode, RequestKind, RequestMode, client_message, reply,
 };
 use crate::retry::{self, RetryPolicy};
-use crate::types::{Command, Query, StreamingQuery};
+use crate::types::{Command, Query, StreamingQuery, SubscriptionQuery};
 
-use super::connection::{Handshake, HubConnection, Inbound, SCATTER_GATHER, STREAMING, StreamId};
+use super::connection::{
+    Handshake, HubConnection, Inbound, SCATTER_GATHER, STREAMING, SUBSCRIPTION, StreamId,
+};
 use super::pool::{HubPool, weak_probe};
 
 /// The timeout sent to a hub older than protocol v2 when the caller chose none (today's default).
@@ -211,6 +220,59 @@ impl Default for StreamOptions {
             priority: None,
             initial_credit: DEFAULT_CREDIT,
         }
+    }
+}
+
+/// Options of one subscription query ([`Sender::subscribe`]).
+#[derive(Clone, Debug)]
+pub struct SubscriptionOptions {
+    /// The timeout of the initial result, sent as `timeout_ms` under the rules of
+    /// [`SendOptions::timeout`] (without one, `Config.hub_request_timeout`, else the hub's
+    /// per-type override or default): it bounds the queue wait plus the handler of the initial
+    /// request, like a unary request. The updates have no timeout.
+    pub timeout: Option<Duration>,
+    /// End the subscription after this many updates (the initial result does not count; the hub
+    /// cancels the owners); 0 is no limit.
+    pub max_results: u32,
+    /// `Request.priority` of the initial request. Without one, `Config.hub_priorities` for the
+    /// type, else 0.
+    pub priority: Option<i32>,
+    /// The credit window: parts (the initial one included) the hub may relay before the first
+    /// refill (`initial_credit`); the subscription refills half of it every time half was
+    /// consumed. 0 reads as [`DEFAULT_CREDIT`] (64), the default.
+    pub initial_credit: u32,
+}
+
+impl Default for SubscriptionOptions {
+    fn default() -> Self {
+        SubscriptionOptions {
+            timeout: None,
+            max_results: 0,
+            priority: None,
+            initial_credit: DEFAULT_CREDIT,
+        }
+    }
+}
+
+/// An open subscription query ([`Sender::subscribe`]): the initial result and the updates that
+/// follow it until the owners complete, the hub ends it or this is cancelled.
+pub struct Subscription<Q: SubscriptionQuery> {
+    /// The initial result, answered by one owner instance.
+    pub initial: Q::Initial,
+    /// The updates of every owner instance in the hub's arrival order, hot (fed by the hub
+    /// from the open on, whether or not it is polled; the hub buffers up to its limit beyond
+    /// the credit) and ending when the last owner completed. An `Err` item (`HandlerBusy` the
+    /// hub's buffer overflowed, `HandlerDisconnected` the last owner left, `Cancelled` the
+    /// hub's max duration, `RemoteHandler` an owner failed, `InvalidMessage` an update was
+    /// lost, `HubConnectionLost`, ...) is the last item. Dropping it cancels the subscription.
+    pub updates: BoxStream<'static, Result<Q::Update, MessagingError>>,
+}
+
+impl<Q: SubscriptionQuery> Subscription<Q> {
+    /// Cancels the subscription at the hub (every owner instance is told), best effort. Dropping
+    /// the subscription, or just its `updates`, does the same.
+    pub fn cancel(self) {
+        drop(self);
     }
 }
 
@@ -481,9 +543,20 @@ struct StreamCall {
     max_results: u32,
     /// The credit window (`initial_credit`, never 0).
     window: u32,
+    /// A subscription query (`mode = SUBSCRIPTION`) rather than a streaming one.
+    subscription: bool,
 }
 
 impl StreamCall {
+    /// The request mode, the capability the hub must list and the word the errors use.
+    fn mode(&self) -> (RequestMode, &'static str, &'static str) {
+        if self.subscription {
+            (RequestMode::Subscription, SUBSCRIPTION, "subscription")
+        } else {
+            (RequestMode::Streaming, STREAMING, "stream")
+        }
+    }
+
     /// The credit given back every time this many parts were consumed: half the window, at
     /// least one.
     fn refill(&self) -> u32 {
@@ -561,19 +634,27 @@ impl Streaming<'_> {
             return None;
         }
         loop {
-            let guard = if self.first {
-                first_part_guard(self.guard)
+            // A stream has an idle guard (twice the bound for the first part); a subscription
+            // only the initial request's bound, then nothing: a quiet one is not a broken one.
+            let guard = if self.call.subscription {
+                self.first.then_some(self.guard)
+            } else if self.first {
+                Some(first_part_guard(self.guard))
             } else {
-                self.guard
+                Some(self.guard)
             };
-            let event = match tokio::time::timeout(guard, self.events.recv()).await {
-                Ok(Some(event)) => event,
-                Ok(None) => GatherEvent::Ended(Outcome::Done(Err(MessagingError::HubUnavailable(
-                    "sender closed".into(),
-                )))),
+            let received = match guard {
+                Some(guard) => tokio::time::timeout(guard, self.events.recv()).await.ok(),
+                None => Some(self.events.recv().await),
+            };
+            let event = match received {
+                Some(Some(event)) => event,
+                Some(None) => GatherEvent::Ended(Outcome::Done(Err(
+                    MessagingError::HubUnavailable("sender closed".into()),
+                ))),
                 // The hub ends an idle stream itself; the guard covers a hub that never does
                 // (told to cancel, best effort, so a handler stops holding its permit).
-                Err(_) => {
+                None => {
                     self.cancel("local guard timeout").await;
                     return Some(Err(MessagingError::Timeout(
                         self.call.type_name.to_string(),
@@ -593,8 +674,10 @@ impl Streaming<'_> {
                             (
                                 "part out of order",
                                 MessagingError::InvalidMessage(format!(
-                                    "stream {} part {} out of order (expected {expected})",
-                                    self.call.type_name, part.seq
+                                    "{} {} part {} out of order (expected {expected})",
+                                    self.call.mode().2,
+                                    self.call.type_name,
+                                    part.seq
                                 )),
                             )
                         };
@@ -611,12 +694,22 @@ impl Streaming<'_> {
                 GatherEvent::End(end) => {
                     self.done = true;
                     return match end.error {
-                        Some(e) => Some(Err(MessagingError::from_hub(
-                            self.call.type_name,
-                            e.code,
-                            &e.message,
-                            &e.details,
-                        ))),
+                        Some(e) => {
+                            tracing::debug!(request = %self.id, code = e.code, "{} ended by the hub: {}", self.call.mode().2, e.message);
+                            Some(Err(MessagingError::from_hub(
+                                self.call.type_name,
+                                e.code,
+                                &e.message,
+                                &e.details,
+                            )))
+                        }
+                        // The hub never ends a subscription before its initial part.
+                        None if self.call.subscription && self.received == 0 => {
+                            Some(Err(MessagingError::InvalidMessage(format!(
+                                "subscription {} ended without an initial result",
+                                self.call.type_name
+                            ))))
+                        }
                         None if u64::from(end.parts) > self.received => {
                             let e = self.lost(u64::from(end.parts) - self.received);
                             tracing::debug!(request = %self.id, parts = end.parts, received = self.received, "{e}");
@@ -712,7 +805,11 @@ impl Streaming<'_> {
 
     /// The error of `n` parts the hub sent (or counted) that never arrived.
     fn lost(&self, n: u64) -> MessagingError {
-        MessagingError::InvalidMessage(format!("stream {} lost {n} part(s)", self.call.type_name))
+        MessagingError::InvalidMessage(format!(
+            "{} {} lost {n} part(s)",
+            self.call.mode().2,
+            self.call.type_name
+        ))
     }
 }
 
@@ -1154,6 +1251,7 @@ impl Sender {
             } else {
                 options.initial_credit
             },
+            subscription: false,
         });
         let chosen = chosen_timeout(options.timeout, sender.default_timeout);
         // Retried (new streams, fresh ids) until the first part, the end or a final error. The
@@ -1198,6 +1296,105 @@ impl Sender {
             }
         });
         Ok(items.boxed())
+    }
+
+    /// Subscribes to `Q` (ADR 0017, P4c): one `Request` with `mode = SUBSCRIPTION` to one hub
+    /// whose `RegisterAck` lists `subscription` (unkeyed round-robin over those; the capability
+    /// is checked again on the stream it is written to). The hub asks one capable owner instance
+    /// for the initial result and subscribes every capable instance of every owner to the
+    /// updates, as they are at this moment: an instance registering later is not added and one
+    /// that leaves is not replaced (updates are delivered at most once; the hub never
+    /// resubscribes, and neither does this library).
+    ///
+    /// Returns once the initial result arrived, so the errors before it are the call's:
+    /// [`MessagingError::UnsupportedByHub`] when no hub lists the capability (nothing is sent) or
+    /// the hub answers `UNSUPPORTED` (no owner instance negotiated `subscription`), `NoHandler`
+    /// without an owner, `InvalidMessage` for a command type or a handler that serves another
+    /// mode, `Timeout` when the initial result is not in time, the handler's error when it fails
+    /// (`RemoteHandler`), `HandlerBusy` when the hub or an owner instance refused it for
+    /// capacity, `HubUnavailable` / `HubConnectionLost` as for a unary query.
+    /// `Config.hub_retry` applies until then, for the same errors as a unary query (a retry is a
+    /// new subscription with a fresh id, sending what is left of the call's budget as
+    /// `timeout_ms`); once the initial result is in nothing is retried.
+    ///
+    /// The updates are hot: they are fed by the hub from the open on, up to the credit window
+    /// ([`SubscriptionOptions::initial_credit`]; the initial result takes one credit), and the
+    /// hub buffers up to its own limit (256) beyond it, ending the subscription with
+    /// `HandlerBusy` when the consumer falls further behind. Pulling them refills credit: half
+    /// the window every time half of it was consumed (the initial result counts as consumed).
+    /// The stream checks that parts arrive as `seq` 1, 2, 3, ... and that a clean end counts
+    /// what arrived; otherwise its last item is `InvalidMessage` "subscription `<type>` lost N
+    /// part(s)" (the subscription is cancelled at the hub). It ends on a clean `ReplyEnd` (every
+    /// owner completed, or `max_results` updates were relayed); a `ReplyEnd{error}` is its last
+    /// item, mapped like a unary error of that code.
+    ///
+    /// The subscription is owned (`'static`): it holds a clone of this `Arc<Sender>` and can be
+    /// moved into a task or returned. Dropping it, or its `updates`, before the end cancels it
+    /// at the hub (every owner instance is told) and forgets the request.
+    pub async fn subscribe<Q: SubscriptionQuery>(
+        self: &Arc<Self>,
+        query: &Q,
+        options: SubscriptionOptions,
+    ) -> Result<Subscription<Q>, MessagingError> {
+        let sender = SenderRef::Shared(Arc::clone(self));
+        let call = Arc::new(StreamCall {
+            type_name: Q::TYPE,
+            payload: codec::encode(query)?,
+            headers: self.headers(None),
+            priority: self.priority(Q::TYPE, options.priority),
+            max_results: options.max_results,
+            window: if options.initial_credit == 0 {
+                DEFAULT_CREDIT
+            } else {
+                options.initial_credit
+            },
+            subscription: true,
+        });
+        let chosen = chosen_timeout(options.timeout, self.default_timeout);
+        // Retried (new subscriptions, fresh ids) until the initial part or a final error. The
+        // timeout bounds the initial request like a unary request's, so a retry sends what is
+        // left of the budget.
+        let (mut streaming, initial) = self
+            .retrying(
+                RequestKind::Query,
+                Q::TYPE,
+                self.retry.clone(),
+                chosen,
+                "",
+                |timeout| {
+                    let call = Arc::clone(&call);
+                    let sender = sender.clone();
+                    async move {
+                        let mut streaming = Self::open_stream(sender, &call, timeout).await?;
+                        match streaming.next().await {
+                            Some(Ok(part)) => Ok((streaming, part)),
+                            Some(Err(e)) => Err(e),
+                            None => Err(MessagingError::InvalidMessage(format!(
+                                "subscription {} ended without an initial result",
+                                Q::TYPE
+                            ))),
+                        }
+                    }
+                },
+            )
+            .await?;
+        // The initial part took one credit: it counts as consumed.
+        let initial = streaming.item::<Q::Initial>(initial).await?;
+        let updates = futures::stream::unfold(Some(streaming), |state| async move {
+            let mut streaming = state?;
+            match streaming.next().await {
+                Some(Ok(part)) => match streaming.item::<Q::Update>(part).await {
+                    Ok(update) => Some((Ok(update), Some(streaming))),
+                    Err(e) => Some((Err(e), None)),
+                },
+                Some(Err(e)) => Some((Err(e), None)),
+                None => None,
+            }
+        });
+        Ok(Subscription {
+            initial,
+            updates: updates.boxed(),
+        })
     }
 
     /// Writes a new streaming query of `call` (fresh id) to a hub that shares the capability.
@@ -1245,15 +1442,16 @@ impl Sender {
         chosen: Option<Duration>,
     ) -> Result<(mpsc::UnboundedReceiver<GatherEvent>, Duration, StreamId), MessagingError> {
         let mut events = None;
+        let (mode, capability, _) = call.mode();
         let sent = self
             .hubs
-            .send_where("", Some(STREAMING), |stream, handshake| {
+            .send_where("", Some(capability), |stream, handshake| {
                 // Ranked on a snapshot: the stream current now may belong to a re-handshake with
                 // an older hub, which would answer UNSUPPORTED (a P4a hub) or serve the request
                 // as a unary query (older). Refused, nothing written: the next capable hub is tried.
-                if !handshake.streaming() {
+                if !handshake.shares(capability) {
                     return Err(MessagingError::UnsupportedByHub(format!(
-                        "the hub stream {stream} no longer lists the \"{STREAMING}\" capability"
+                        "the hub stream {stream} no longer lists the \"{capability}\" capability"
                     )));
                 }
                 let (timeout_ms, guard) = request_timing(handshake, call.type_name, chosen);
@@ -1275,7 +1473,7 @@ impl Sender {
                     headers: call.headers.clone(),
                     timeout_ms,
                     priority: call.priority,
-                    mode: RequestMode::Streaming as i32,
+                    mode: mode as i32,
                     initial_credit: call.window,
                     max_results: call.max_results,
                     ..proto::Request::default()
@@ -1860,6 +2058,7 @@ mod tests {
             priority: 0,
             max_results: 0,
             window,
+            subscription: false,
         };
         assert_eq!(call(64).refill(), 32);
         assert_eq!(call(3).refill(), 1);

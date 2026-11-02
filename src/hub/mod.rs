@@ -22,7 +22,7 @@ pub use registry::{EventContext, HandlerRegistry};
 pub use sender::{
     DEFAULT_CREDIT, LEGACY_REQUEST_TIMEOUT, LOCAL_GUARD_MARGIN, RETRY_MIN_REMAINING, RemoteError,
     ScatterOptions, ScatterPart, ScatterResult, SendOptions, Sender, SenderSettings, StreamOptions,
-    request_timing, retry_budget,
+    Subscription, SubscriptionOptions, request_timing, retry_budget,
 };
 pub use subscriptions::{DEFAULT_MAX_SUBSCRIPTIONS, QueryUpdateEmitter};
 pub use targets::{
