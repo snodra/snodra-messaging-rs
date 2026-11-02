@@ -86,7 +86,8 @@
 //! `Permissive` every violation is recorded ([`FakeHub::violations`]) and allowed; in `Off`
 //! (default) nothing is checked. A refused `Register` is not in [`FakeHub::registers`]; it is in
 //! [`FakeHub::rejections`] with the token it carried and when it arrived. A session without a
-//! valid token (permissive) is not judged per request. Patterns: exact, `prefix.*`, `*`.
+//! valid token (permissive) is not judged per request. Patterns as the hub parses them: exact, `prefix.*` (a type longer than `prefix.`), `*`; `Acl::new`
+//! panics on any other wildcard.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -246,7 +247,13 @@ pub struct Acl {
 }
 
 impl Acl {
+    /// Panics on a pattern the real hub's ACL parser refuses to load.
     pub fn new(service: &str, handle: &[&str], send: &[&str]) -> Acl {
+        for pattern in handle.iter().chain(send) {
+            if let Err(e) = parse_pattern(pattern) {
+                panic!("{e}");
+            }
+        }
         Acl {
             service: service.to_string(),
             handle: handle.iter().map(|p| p.to_string()).collect(),
@@ -255,11 +262,46 @@ impl Acl {
     }
 }
 
+/// A type pattern as the hub's ACL parser reads it: `*`, `prefix.*` or an exact name. `Err` for
+/// what the hub refuses to load (a `*` anywhere else, or a `prefix` shorter than one character
+/// before the dot).
+fn parse_pattern(pattern: &str) -> Result<Pattern, String> {
+    if pattern.is_empty() || pattern.chars().any(char::is_whitespace) {
+        return Err(format!("pattern {pattern:?} is empty or has whitespace"));
+    }
+    if pattern == "*" {
+        return Ok(Pattern::Any);
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        if prefix.len() < 2 || !prefix.ends_with('.') || prefix.contains('*') {
+            return Err(format!(
+                "pattern {pattern:?}: a wildcard must be `*` or `prefix.*`"
+            ));
+        }
+        return Ok(Pattern::Prefix(prefix.to_string()));
+    }
+    if pattern.contains('*') {
+        return Err(format!(
+            "pattern {pattern:?}: a wildcard must be `*` or `prefix.*`"
+        ));
+    }
+    Ok(Pattern::Exact(pattern.to_string()))
+}
+
+enum Pattern {
+    Any,
+    /// With its trailing dot.
+    Prefix(String),
+    Exact(String),
+}
+
 fn pattern_matches(pattern: &str, ty: &str) -> bool {
-    match pattern.strip_suffix(".*") {
-        _ if pattern == "*" => true,
-        Some(prefix) => ty.starts_with(&format!("{prefix}.")),
-        None => pattern == ty,
+    match parse_pattern(pattern) {
+        Ok(Pattern::Any) => true,
+        // Longer than the prefix: `orders.` is not an `orders.*` type.
+        Ok(Pattern::Prefix(p)) => ty.len() > p.len() && ty.starts_with(&p),
+        Ok(Pattern::Exact(e)) => e == ty,
+        Err(_) => false,
     }
 }
 

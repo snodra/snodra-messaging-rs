@@ -604,6 +604,42 @@ async fn a_handled_type_outside_the_acl_is_a_permission_denied_rejection() {
 }
 
 #[tokio::test]
+async fn a_prefix_wildcard_needs_something_after_the_dot() {
+    // The real hub's `Pattern::Prefix` matches a type longer than `orders.`; `orders.` itself is not
+    // an `orders.*` type.
+    let token = random_token();
+    let hub = FakeHub::start().await;
+    hub.set_auth(
+        AuthMode::Enforce,
+        &[(&token, Acl::new("orders", &["orders.*"], &[]))],
+    );
+    let conn = connection(settings(hub.address(), Some(&token)), "orders");
+    conn.set_types(vec!["orders.".into()], vec![]);
+    conn.start();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while hub.rejections().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "no attempt");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let first = hub.rejections()[0].clone();
+    assert_eq!(first.code, tonic::Code::PermissionDenied);
+    assert!(first.message.contains("orders."), "{}", first.message);
+    assert!(hub.registers().await.is_empty());
+    // A type under the prefix registers.
+    conn.set_types(vec!["orders.Do".into()], vec![]);
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[test]
+#[should_panic(expected = "wildcard")]
+fn the_fake_hub_refuses_a_pattern_the_real_hub_cannot_load() {
+    // The hub's ACL parser accepts `*` and `prefix.*` only.
+    let _ = Acl::new("svc", &["orders*"], &[]);
+}
+
+#[tokio::test]
 async fn a_pool_reports_a_rejected_hub_as_not_registered() {
     let hub = FakeHub::start().await;
     hub.set_auth(AuthMode::Enforce, &[]);
