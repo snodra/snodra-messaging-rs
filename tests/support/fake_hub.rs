@@ -95,6 +95,8 @@ use tonic::{Request, Response, Status, Streaming};
 
 type Responder = Box<dyn Fn(proto::Request) -> Option<ServerMessage> + Send + Sync>;
 type Outbound = mpsc::Sender<Result<ServerMessage, Status>>;
+/// A subscription target: (stream number, service, instance, outbound).
+type Target = (usize, String, String, Outbound);
 
 /// The ack a default kraken-hub sends.
 pub fn default_ack() -> proto::RegisterAck {
@@ -132,9 +134,9 @@ struct SubState {
     sender: Outbound,
     sender_no: usize,
     /// The update targets still serving: target id → (stream number, service, instance, outbound).
-    targets: HashMap<String, (usize, String, String, Outbound)>,
+    targets: HashMap<String, Target>,
     /// The initial request `<id>#0` while forwarded: (stream number, service, instance, outbound).
-    initial: Option<(usize, String, String, Outbound)>,
+    initial: Option<Target>,
     initial_done: bool,
     credit: u32,
     /// Parts sent to the sender: the hub's `seq`.
@@ -642,6 +644,9 @@ impl State {
         let id = req.id.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(timeout.into())).await;
+            if !me.stream_timeouts.load(Ordering::SeqCst) {
+                return;
+            }
             let pending = me
                 .subscriptions
                 .lock()
@@ -831,8 +836,7 @@ impl State {
             if let Some((_, _, _, initial_tx)) = &st.initial {
                 out.push((initial_tx.clone(), cancel_msg(&format!("{id}#0"), reason)));
             }
-            let mut targets: Vec<(&String, &(usize, String, String, Outbound))> =
-                st.targets.iter().collect();
+            let mut targets: Vec<(&String, &Target)> = st.targets.iter().collect();
             targets.sort_by(|a, b| a.0.cmp(b.0));
             for (target_id, (_, _, _, target)) in targets {
                 out.push((target.clone(), cancel_msg(target_id, reason)));
@@ -1831,6 +1835,17 @@ impl FakeHub {
         self.state.subscriptions.lock().unwrap().len()
     }
 
+    /// Updates of subscription `id` waiting for credit (or for the initial part); `None` once it
+    /// ended.
+    pub fn subscription_buffered(&self, id: &str) -> Option<usize> {
+        self.state
+            .subscriptions
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|s| s.buffered.len())
+    }
+
     /// Update targets still serving, over every open subscription (the hub's
     /// `kraken_hub_subscriptions_open` summed over the instances).
     pub fn subscription_targets_open(&self) -> usize {
@@ -1848,8 +1863,9 @@ impl FakeHub {
         self.state.gathers.lock().unwrap().len()
     }
 
-    /// Whether idle streams end with `TIMEOUT` (default `true`, as kraken-hub); `false` is a hub
-    /// that never ends them, so the client's local guard is what fires.
+    /// Whether idle streams and unanswered initial subscription requests end with `TIMEOUT`
+    /// (default `true`, as kraken-hub); `false` is a hub that never ends them, so the client's
+    /// local guard is what fires.
     pub fn set_stream_timeouts(&self, on: bool) {
         self.state.stream_timeouts.store(on, Ordering::SeqCst);
     }

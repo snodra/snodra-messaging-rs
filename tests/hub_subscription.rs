@@ -10,18 +10,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+use futures::stream::BoxStream;
 use kraken_messaging::hub::{
     Dispatcher, HandlerRegistry, HubPool, HubSettings, Inbound, QueryUpdateEmitter,
-    RegisteredTypes, Sender, SenderSettings,
+    RegisteredTypes, SendOptions, Sender, SenderSettings, SubscriptionOptions, rendezvous_score,
 };
 use kraken_messaging::identity::{Guard, IdentityResolver};
 use kraken_messaging::proto::{self, ErrorCode, ServerMessage, server_message};
 use kraken_messaging::{
-    Command, MessagingError, Query, StreamingQuery, SubscriptionQuery, message_type,
+    Command, MessagingError, Query, RetryPolicy, StreamingQuery, SubscriptionQuery, message_type,
 };
 use serde::{Deserialize, Serialize};
 use support::fake_hub::FakeHub;
 use tokio::sync::mpsc;
+use tokio_stream::StreamExt;
 
 /// A unary query, next to the subscription ones.
 #[derive(Serialize, Deserialize)]
@@ -154,7 +156,7 @@ struct Probe {
 }
 
 /// The handlers of a node of `instance`: `t.Prices` (the initial quote names the instance;
-/// a symbol `fail` fails the initial result), `t.Lookup` (unary).
+/// a symbol `fail` fails the initial result, `hang` never answers it), `t.Lookup` (unary).
 fn registry(instance: &str, probe: &Arc<Probe>) -> HandlerRegistry {
     let mut r = HandlerRegistry::new();
     let p = Arc::clone(probe);
@@ -166,6 +168,9 @@ fn registry(instance: &str, probe: &Arc<Probe>) -> HandlerRegistry {
             probe.initials.fetch_add(1, Ordering::SeqCst);
             if q.symbol == "fail" {
                 return Err(MessagingError::Storage("quotes gone".into()));
+            }
+            if q.symbol == "hang" {
+                std::future::pending::<()>().await;
             }
             Ok(Quote {
                 symbol: q.symbol,
@@ -703,4 +708,1188 @@ async fn a_subscription_holds_no_permit_and_grants_none_back() {
     })
     .await;
     a.shutdown().await;
+}
+
+// Sender side: `Sender::subscribe` against owners served by the dispatcher.
+
+/// Subscription requests the hub received from senders.
+async fn subscriptions(hub: &FakeHub) -> Vec<proto::Request> {
+    hub.requests()
+        .await
+        .into_iter()
+        .filter(|r| r.mode == proto::RequestMode::Subscription as i32)
+        .collect()
+}
+
+type Updates = BoxStream<'static, Result<Tick, MessagingError>>;
+
+/// The next update within 5 s.
+async fn next_update(updates: &mut Updates) -> Result<Tick, MessagingError> {
+    tokio::time::timeout(Duration::from_secs(5), updates.next())
+        .await
+        .expect("an update within 5 s")
+        .expect("the subscription is open")
+}
+
+/// The updates until the end or the first error (bounded by 5 s).
+async fn drain(updates: &mut Updates) -> (Vec<u32>, Option<MessagingError>) {
+    let mut prices = vec![];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), updates.next())
+            .await
+            .expect("the end within 5 s")
+        {
+            Some(Ok(tick)) => prices.push(tick.price),
+            Some(Err(e)) => return (prices, Some(e)),
+            None => return (prices, None),
+        }
+    }
+}
+
+/// The updates until a clean end: exactly `expected`, no error.
+async fn ends_cleanly(updates: &mut Updates, expected: Vec<u32>) {
+    let (prices, error) = drain(updates).await;
+    assert!(error.is_none(), "{error:?}");
+    assert_eq!(prices, expected);
+}
+
+/// Two instances of `svc-a` owning `t.Prices` and a caller.
+async fn two_owners_and_a_caller(hub: &FakeHub, probe: &Arc<Probe>) -> (Node, Node, Node) {
+    let a1 = owner(&hub.address(), "svc-a", "a1", probe).await;
+    let a2 = owner(&hub.address(), "svc-a", "a2", probe).await;
+    let c = caller(&hub.address()).await;
+    (a1, a2, c)
+}
+
+#[tokio::test]
+async fn a_subscription_yields_the_initial_then_the_updates_of_every_owner_instance_then_ends() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let (a1, a2, c) = two_owners_and_a_caller(&hub, &probe).await;
+    let sub = c
+        .sender
+        .subscribe(&prices("acme"), SubscriptionOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(sub.initial.symbol, "acme");
+    assert!(
+        ["a1", "a2"].contains(&sub.initial.instance.as_str()),
+        "{:?}",
+        sub.initial
+    );
+    assert_eq!(
+        probe.initials.load(Ordering::SeqCst),
+        1,
+        "one initial request"
+    );
+    eventually("both instances subscribed", async || {
+        a1.emitter.open_subscriptions() == 1 && a2.emitter.open_subscriptions() == 1
+    })
+    .await;
+    let request = &subscriptions(&hub).await[0];
+    assert_eq!(
+        (
+            request.initial_credit,
+            request.max_results,
+            request.timeout_ms,
+            request.priority
+        ),
+        (64, 0, 0, 0)
+    );
+    assert_eq!(c.sender.in_flight(), 1, "pending until the end");
+
+    let mut updates = sub.updates;
+    a1.emitter
+        .emit::<Prices>(|q| q.symbol == "acme", &tick("acme", 1));
+    a2.emitter
+        .emit::<Prices>(|q| q.symbol == "acme", &tick("acme", 2));
+    let mut got = vec![
+        next_update(&mut updates).await.unwrap().price,
+        next_update(&mut updates).await.unwrap().price,
+    ];
+    got.sort();
+    assert_eq!(got, [1, 2], "one update from each instance");
+    // One instance completes: the subscription lives on with the other.
+    a1.emitter.complete::<Prices>(|_| true);
+    eventually("a1's target removed", async || {
+        hub.subscription_targets_open() == 1
+    })
+    .await;
+    a2.emitter.emit::<Prices>(|_| true, &tick("acme", 3));
+    assert_eq!(next_update(&mut updates).await.unwrap().price, 3);
+    // The last one completes: the subscription ends cleanly.
+    a2.emitter.complete::<Prices>(|_| true);
+    ends_cleanly(&mut updates, vec![]).await;
+    assert_eq!(hub.open_subscriptions(), 0);
+    assert_eq!(c.sender.in_flight(), 0);
+    assert!(
+        hub.cancels().is_empty(),
+        "nothing to cancel after a clean end"
+    );
+    for n in [a1, a2, c] {
+        n.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn options_become_the_request_fields() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let a1 = owner(&hub.address(), "svc-a", "a1", &probe).await;
+    let c = caller(&hub.address()).await;
+    let sub = c
+        .sender
+        .subscribe(
+            &prices("acme"),
+            SubscriptionOptions {
+                timeout: Some(Duration::from_secs(2)),
+                max_results: 5,
+                priority: Some(7),
+                initial_credit: 3,
+            },
+        )
+        .await
+        .unwrap();
+    let request = &subscriptions(&hub).await[0];
+    assert_eq!(
+        (
+            request.timeout_ms,
+            request.max_results,
+            request.priority,
+            request.initial_credit
+        ),
+        (2_000, 5, 7, 3)
+    );
+    assert_eq!(request.kind, proto::RequestKind::Query as i32);
+    assert_eq!(request.r#type, "t.Prices");
+    assert_eq!(
+        serde_json::from_slice::<Prices>(&request.payload).unwrap(),
+        prices("acme")
+    );
+    // 0 reads as 64, as on the hub.
+    sub.cancel();
+    let sub = c
+        .sender
+        .subscribe(
+            &prices("acme"),
+            SubscriptionOptions {
+                initial_credit: 0,
+                ..SubscriptionOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(subscriptions(&hub).await[1].initial_credit, 64);
+    drop(sub);
+    a1.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_emitter_filter_selects_the_subscriptions_by_their_query() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let a1 = owner(&hub.address(), "svc-a", "a1", &probe).await;
+    let c = caller(&hub.address()).await;
+    let acme = c
+        .sender
+        .subscribe(&prices("acme"), SubscriptionOptions::default())
+        .await
+        .unwrap();
+    let other = c
+        .sender
+        .subscribe(&prices("other"), SubscriptionOptions::default())
+        .await
+        .unwrap();
+    eventually("both subscribed", async || {
+        a1.emitter.open_subscriptions() == 2
+    })
+    .await;
+    let (mut acme_updates, mut other_updates) = (acme.updates, other.updates);
+    a1.emitter
+        .emit::<Prices>(|q| q.symbol == "other", &tick("other", 9));
+    a1.emitter
+        .emit::<Prices>(|q| q.symbol == "acme", &tick("acme", 1));
+    assert_eq!(next_update(&mut acme_updates).await.unwrap().price, 1);
+    assert_eq!(next_update(&mut other_updates).await.unwrap().price, 9);
+    a1.emitter.complete::<Prices>(|q| q.symbol == "acme");
+    ends_cleanly(&mut acme_updates, vec![]).await;
+    a1.emitter.emit::<Prices>(|_| true, &tick("other", 10));
+    assert_eq!(next_update(&mut other_updates).await.unwrap().price, 10);
+    assert_eq!(hub.open_subscriptions(), 1);
+    drop(other_updates);
+    a1.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn complete_exceptionally_fails_the_subscription_and_cancels_the_other_targets() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let (a1, a2, c) = two_owners_and_a_caller(&hub, &probe).await;
+    let sub = c
+        .sender
+        .subscribe(&prices("acme"), SubscriptionOptions::default())
+        .await
+        .unwrap();
+    eventually("both subscribed", async || {
+        a1.emitter.open_subscriptions() == 1 && a2.emitter.open_subscriptions() == 1
+    })
+    .await;
+    let mut updates = sub.updates;
+    a1.emitter.emit::<Prices>(|_| true, &tick("acme", 1));
+    assert_eq!(next_update(&mut updates).await.unwrap().price, 1);
+    a1.emitter
+        .complete_exceptionally::<Prices>(|_| true, &MessagingError::Storage("feed down".into()));
+    let (rest, error) = drain(&mut updates).await;
+    assert!(rest.is_empty());
+    assert!(
+        matches!(error, Some(MessagingError::RemoteHandler { ref type_name, ref message, .. }) if type_name == "t.Prices" && message.contains("feed down")),
+        "{error:?}"
+    );
+    eventually("a2's target cancelled by the hub", async || {
+        a2.emitter.open_subscriptions() == 0
+    })
+    .await;
+    assert_eq!(hub.open_subscriptions(), 0);
+    assert_eq!(c.sender.in_flight(), 0);
+    for n in [a1, a2, c] {
+        n.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn updates_beyond_the_credit_wait_at_the_hub_until_the_consumer_pulls_half_the_window() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let a1 = owner(&hub.address(), "svc-a", "a1", &probe).await;
+    let c = caller(&hub.address()).await;
+    // Window 4: the initial part takes one credit, three updates may follow at once.
+    let sub = c
+        .sender
+        .subscribe(
+            &prices("acme"),
+            SubscriptionOptions {
+                initial_credit: 4,
+                ..SubscriptionOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let id = subscriptions(&hub).await[0].id.clone();
+    eventually("subscribed", async || a1.emitter.open_subscriptions() == 1).await;
+    for price in 1..=5 {
+        a1.emitter.emit::<Prices>(|_| true, &tick("acme", price));
+    }
+    eventually("two updates wait for credit", async || {
+        hub.subscription_buffered(&id) == Some(2)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(hub.flows().is_empty(), "nothing consumed yet: no refill");
+    let mut updates = sub.updates;
+    // The initial part counted as consumed; the first update pulled makes half the window.
+    assert_eq!(next_update(&mut updates).await.unwrap().price, 1);
+    eventually("a refill of half the window", async || {
+        hub.flows()
+            .iter()
+            .any(|(_, f)| f.request_id == id && f.credits == 2)
+    })
+    .await;
+    eventually("the buffer drained", async || {
+        hub.subscription_buffered(&id) == Some(0)
+    })
+    .await;
+    assert_eq!(next_update(&mut updates).await.unwrap().price, 2);
+    assert_eq!(next_update(&mut updates).await.unwrap().price, 3);
+    assert_eq!(next_update(&mut updates).await.unwrap().price, 4);
+    assert_eq!(next_update(&mut updates).await.unwrap().price, 5);
+    eventually("a second refill", async || {
+        hub.flows()
+            .iter()
+            .filter(|(_, f)| f.request_id == id && f.credits == 2)
+            .count()
+            >= 2
+    })
+    .await;
+    drop(updates);
+    a1.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_consumer_further_behind_than_the_hubs_buffer_loses_the_subscription_as_handler_busy() {
+    let hub = FakeHub::start().await;
+    hub.set_subscription_buffer(4);
+    let probe = Arc::new(Probe::default());
+    let (a1, a2, c) = two_owners_and_a_caller(&hub, &probe).await;
+    // Credit 1: the initial part takes it; consuming it refills 1 (the window's half, at least
+    // one), so at most one update is relayed and the next ones wait at the hub, up to 4.
+    let sub = c
+        .sender
+        .subscribe(
+            &prices("acme"),
+            SubscriptionOptions {
+                initial_credit: 1,
+                ..SubscriptionOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    eventually("both subscribed", async || {
+        a1.emitter.open_subscriptions() == 1 && a2.emitter.open_subscriptions() == 1
+    })
+    .await;
+    for price in 1..=12 {
+        a1.emitter.emit::<Prices>(|_| true, &tick("acme", price));
+    }
+    let mut updates = sub.updates;
+    let (got, error) = drain(&mut updates).await;
+    assert!(
+        got.len() <= 1,
+        "the buffered updates are dropped with it: {got:?}"
+    );
+    assert!(
+        matches!(error, Some(MessagingError::HandlerBusy(ref t)) if t == "t.Prices"),
+        "{error:?}"
+    );
+    eventually("every target cancelled", async || {
+        a1.emitter.open_subscriptions() == 0 && a2.emitter.open_subscriptions() == 0
+    })
+    .await;
+    assert_eq!(hub.open_subscriptions(), 0);
+    assert_eq!(c.sender.in_flight(), 0);
+    for n in [a1, a2, c] {
+        n.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn max_results_counts_updates_and_ends_the_subscription_from_the_hub() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let (a1, a2, c) = two_owners_and_a_caller(&hub, &probe).await;
+    let sub = c
+        .sender
+        .subscribe(
+            &prices("acme"),
+            SubscriptionOptions {
+                max_results: 2,
+                ..SubscriptionOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    eventually("both subscribed", async || {
+        a1.emitter.open_subscriptions() == 1 && a2.emitter.open_subscriptions() == 1
+    })
+    .await;
+    for price in 1..=3 {
+        a1.emitter.emit::<Prices>(|_| true, &tick("acme", price));
+    }
+    let mut updates = sub.updates;
+    ends_cleanly(&mut updates, vec![1, 2]).await;
+    eventually("every target cancelled at max results", async || {
+        a1.emitter.open_subscriptions() == 0 && a2.emitter.open_subscriptions() == 0
+    })
+    .await;
+    assert_eq!(hub.open_subscriptions(), 0);
+    for n in [a1, a2, c] {
+        n.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn cancelling_or_dropping_the_subscription_cancels_it_at_the_hub_and_at_every_target() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let (a1, a2, c) = two_owners_and_a_caller(&hub, &probe).await;
+    let sub = c
+        .sender
+        .subscribe(&prices("acme"), SubscriptionOptions::default())
+        .await
+        .unwrap();
+    eventually("both subscribed", async || {
+        a1.emitter.open_subscriptions() == 1 && a2.emitter.open_subscriptions() == 1
+    })
+    .await;
+    let id = subscriptions(&hub).await[0].id.clone();
+    sub.cancel();
+    eventually("cancelled at the hub", async || {
+        hub.cancels().iter().any(|(_, c)| c.request_id == id)
+    })
+    .await;
+    let (_, cancel) = hub
+        .cancels()
+        .into_iter()
+        .find(|(_, c)| c.request_id == id)
+        .unwrap();
+    assert_eq!(cancel.reason, "dropped by the sender");
+    eventually("every target cancelled", async || {
+        a1.emitter.open_subscriptions() == 0 && a2.emitter.open_subscriptions() == 0
+    })
+    .await;
+    assert_eq!(hub.open_subscriptions(), 0);
+    assert_eq!(c.sender.in_flight(), 0);
+    // Dropping the subscription (its updates) does the same.
+    let sub = c
+        .sender
+        .subscribe(&prices("acme"), SubscriptionOptions::default())
+        .await
+        .unwrap();
+    eventually("both subscribed again", async || {
+        a1.emitter.open_subscriptions() == 1 && a2.emitter.open_subscriptions() == 1
+    })
+    .await;
+    drop(sub);
+    eventually("cancelled at the hub and at every target", async || {
+        hub.cancels().len() == 2
+            && a1.emitter.open_subscriptions() == 0
+            && a2.emitter.open_subscriptions() == 0
+    })
+    .await;
+    assert_eq!(c.sender.in_flight(), 0);
+    // Not after a clean end: nothing to cancel.
+    let sub = c
+        .sender
+        .subscribe(&prices("acme"), SubscriptionOptions::default())
+        .await
+        .unwrap();
+    eventually("both subscribed once more", async || {
+        a1.emitter.open_subscriptions() == 1 && a2.emitter.open_subscriptions() == 1
+    })
+    .await;
+    a1.emitter.complete::<Prices>(|_| true);
+    a2.emitter.complete::<Prices>(|_| true);
+    let mut updates = sub.updates;
+    ends_cleanly(&mut updates, vec![]).await;
+    drop(updates);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(hub.cancels().len(), 2);
+    for n in [a1, a2, c] {
+        n.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn a_target_leaving_is_silent_unless_it_was_the_last_one() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let (a1, a2, c) = two_owners_and_a_caller(&hub, &probe).await;
+    let sub = c
+        .sender
+        .subscribe(&prices("acme"), SubscriptionOptions::default())
+        .await
+        .unwrap();
+    eventually("both subscribed", async || {
+        a1.emitter.open_subscriptions() == 1 && a2.emitter.open_subscriptions() == 1
+    })
+    .await;
+    let mut updates = sub.updates;
+    a1.shutdown().await;
+    eventually("one target left", async || {
+        hub.subscription_targets_open() == 1
+    })
+    .await;
+    a2.emitter.emit::<Prices>(|_| true, &tick("acme", 1));
+    assert_eq!(next_update(&mut updates).await.unwrap().price, 1);
+    a2.shutdown().await;
+    let (rest, error) = drain(&mut updates).await;
+    assert!(rest.is_empty());
+    assert!(
+        matches!(error, Some(MessagingError::HandlerDisconnected(ref t)) if t == "t.Prices"),
+        "{error:?}"
+    );
+    assert_eq!(c.sender.in_flight(), 0);
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn failures_of_the_initial_result_are_the_calls_error_and_cancel_the_targets() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let (a1, a2, c) = two_owners_and_a_caller(&hub, &probe).await;
+    let e = c
+        .sender
+        .subscribe(&prices("fail"), SubscriptionOptions::default())
+        .await
+        .err()
+        .expect("the handler's error");
+    assert!(
+        matches!(e, MessagingError::RemoteHandler { ref message, .. } if message.contains("quotes gone")),
+        "{e:?}"
+    );
+    eventually("every target cancelled", async || {
+        a1.emitter.open_subscriptions() == 0 && a2.emitter.open_subscriptions() == 0
+    })
+    .await;
+    assert_eq!(hub.open_subscriptions(), 0);
+    // No initial result within the timeout: the hub's TIMEOUT.
+    let e = c
+        .sender
+        .subscribe(
+            &prices("hang"),
+            SubscriptionOptions {
+                timeout: Some(Duration::from_millis(300)),
+                ..SubscriptionOptions::default()
+            },
+        )
+        .await
+        .err()
+        .expect("timed out");
+    assert!(
+        matches!(e, MessagingError::Timeout(ref t) if t == "t.Prices"),
+        "{e:?}"
+    );
+    eventually("every target cancelled again", async || {
+        a1.emitter.open_subscriptions() == 0 && a2.emitter.open_subscriptions() == 0
+    })
+    .await;
+    assert_eq!(c.sender.in_flight(), 0);
+    for n in [a1, a2, c] {
+        n.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn the_max_subscription_duration_ends_it_with_cancelled() {
+    let hub = FakeHub::start().await;
+    hub.set_subscription_max_duration(Some(Duration::from_millis(300)));
+    let probe = Arc::new(Probe::default());
+    let a1 = owner(&hub.address(), "svc-a", "a1", &probe).await;
+    let c = caller(&hub.address()).await;
+    let sub = c
+        .sender
+        .subscribe(&prices("acme"), SubscriptionOptions::default())
+        .await
+        .unwrap();
+    let mut updates = sub.updates;
+    let (_, error) = drain(&mut updates).await;
+    assert!(
+        matches!(error, Some(MessagingError::Cancelled(ref m)) if m.contains("max subscription duration")),
+        "{error:?}"
+    );
+    eventually("the target cancelled", async || {
+        a1.emitter.open_subscriptions() == 0
+    })
+    .await;
+    a1.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_subscription_to_a_type_whose_handler_answers_another_mode_is_invalid_request() {
+    let hub = FakeHub::start().await;
+    let mut r = HandlerRegistry::new();
+    r.query::<PricesOnce, _, _>(|_, _| async move {
+        Ok(Quote {
+            symbol: "acme".into(),
+            price: 1,
+            instance: "u1".into(),
+        })
+    });
+    let unary = node_with(
+        &hub.address(),
+        "svc-u",
+        "u1",
+        r,
+        4,
+        SenderSettings::default(),
+        None,
+    )
+    .await;
+    let c = caller(&hub.address()).await;
+    // The target's INVALID_REQUEST end and the initial result (the unary handler answers the
+    // `<id>#0` request) race: the error is the call's, or the first item of the updates.
+    let error = match c
+        .sender
+        .subscribe(&prices("acme"), SubscriptionOptions::default())
+        .await
+    {
+        Err(e) => e,
+        Ok(sub) => {
+            let mut updates = sub.updates;
+            drain(&mut updates).await.1.expect("the error end")
+        }
+    };
+    assert!(
+        matches!(error, MessagingError::InvalidMessage(ref m) if m.contains("not a subscription query handler")),
+        "{error:?}"
+    );
+    assert_eq!(hub.open_subscriptions(), 0);
+    assert_eq!(c.sender.in_flight(), 0);
+    // The other way round (a unary query to a subscription type) is answered by the handler's
+    // library: see `the_initial_request_is_answered_by_the_handler_like_a_unary_query`.
+    unary.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_hub_without_the_capability_is_unsupported_and_gets_nothing() {
+    for legacy in [false, true] {
+        let hub = FakeHub::start().await;
+        if legacy {
+            hub.set_ack(None);
+        } else {
+            hub.set_subscription(false);
+        }
+        let c = caller(&hub.address()).await;
+        assert!(!c.pool.handshake_for("").unwrap().subscription());
+        let e = c
+            .sender
+            .subscribe(&prices("acme"), SubscriptionOptions::default())
+            .await
+            .err()
+            .expect("unsupported");
+        assert!(
+            matches!(e, MessagingError::UnsupportedByHub(ref m) if m.contains("subscription")),
+            "legacy {legacy}: {e:?}"
+        );
+        assert!(hub.requests().await.is_empty(), "nothing is sent");
+        assert_eq!(c.sender.in_flight(), 0);
+        c.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn gating_errors_map_to_the_unary_errors() {
+    let hub = FakeHub::start().await;
+    let c = caller(&hub.address()).await;
+    // No owner.
+    let e = c
+        .sender
+        .subscribe(&prices("acme"), SubscriptionOptions::default())
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(e, MessagingError::NoHandler(ref t) if t == "t.Prices"),
+        "{e:?}"
+    );
+    // An owner whose session did not negotiate subscription (an older library).
+    hub.set_subscription(false);
+    let probe = Arc::new(Probe::default());
+    let old = owner(&hub.address(), "svc-old", "o1", &probe).await;
+    hub.set_subscription(true);
+    let e = c
+        .sender
+        .subscribe(&prices("acme"), SubscriptionOptions::default())
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(e, MessagingError::UnsupportedByHub(ref m) if m.contains("svc-old")),
+        "{e:?}"
+    );
+    assert_eq!(probe.initials.load(Ordering::SeqCst), 0);
+    old.shutdown().await;
+    // The type is a command.
+    let owner = node_with(
+        &hub.address(),
+        "svc-cmd",
+        "x1",
+        {
+            let mut r = HandlerRegistry::new();
+            r.command::<Fill, _, _>(|_, _| async move { Ok(()) });
+            r
+        },
+        2,
+        SenderSettings::default(),
+        None,
+    )
+    .await;
+    #[derive(Serialize, Deserialize)]
+    struct AsSubscription {}
+    message_type!(AsSubscription, "t.Fill");
+    impl SubscriptionQuery for AsSubscription {
+        type Initial = ();
+        type Update = ();
+    }
+    let e = c
+        .sender
+        .subscribe(&AsSubscription {}, SubscriptionOptions::default())
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(e, MessagingError::InvalidMessage(_)), "{e:?}");
+    // The hub stopped sharing the capability after the handshake: it answers UNSUPPORTED.
+    hub.set_subscription(false);
+    let e = c
+        .sender
+        .subscribe(&prices("acme"), SubscriptionOptions::default())
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(e, MessagingError::UnsupportedByHub(_)), "{e:?}");
+    assert_eq!(c.sender.in_flight(), 0);
+    owner.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_retry_policy_applies_until_the_initial_part_only() {
+    let hub = FakeHub::start().await;
+    let c = caller_with(
+        &hub.address(),
+        SenderSettings {
+            retry: Some(RetryPolicy {
+                max_attempts: 20,
+                initial_backoff: Duration::from_millis(100),
+                multiplier: 1.0,
+                max_backoff: Duration::from_millis(100),
+            }),
+            default_timeout: Some(Duration::from_secs(5)),
+            ..SenderSettings::default()
+        },
+    )
+    .await;
+    // No owner yet: NO_HANDLER is retried until one registers.
+    let sender = Arc::clone(&c.sender);
+    let call = tokio::spawn(async move {
+        sender
+            .subscribe(&prices("acme"), SubscriptionOptions::default())
+            .await
+    });
+    eventually("a few attempts", async || {
+        subscriptions(&hub).await.len() >= 2
+    })
+    .await;
+    let probe = Arc::new(Probe::default());
+    let a1 = owner(&hub.address(), "svc-a", "a1", &probe).await;
+    let sub = call
+        .await
+        .unwrap()
+        .expect("subscribed once an owner is there");
+    assert_eq!(sub.initial.instance, "a1");
+    let attempts = subscriptions(&hub).await;
+    assert!(attempts.len() >= 2, "{}", attempts.len());
+    let mut ids: Vec<&String> = attempts.iter().map(|r| &r.id).collect();
+    ids.dedup();
+    assert_eq!(ids.len(), attempts.len(), "a fresh id per attempt");
+    // The initial request's timeout is a deadline, as a unary request's: the first attempt
+    // sends the chosen one, each retry what is left of the budget.
+    let timeouts: Vec<u32> = attempts.iter().map(|r| r.timeout_ms).collect();
+    assert!((4_900..=5_000).contains(&timeouts[0]), "{timeouts:?}");
+    assert!(
+        timeouts.windows(2).all(|w| w[1] < w[0]) && *timeouts.last().unwrap() >= 1,
+        "{timeouts:?}"
+    );
+    // After the initial part nothing is retried: the owner leaving ends the subscription.
+    let before = attempts.len();
+    let mut updates = sub.updates;
+    a1.shutdown().await;
+    let (_, error) = drain(&mut updates).await;
+    assert!(
+        matches!(error, Some(MessagingError::HandlerDisconnected(_))),
+        "{error:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(subscriptions(&hub).await.len(), before, "no new attempt");
+    assert_eq!(c.sender.in_flight(), 0);
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_gap_in_seq_fails_the_subscription_as_lost_parts_and_cancels_it() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let a1 = owner(&hub.address(), "svc-a", "a1", &probe).await;
+    let c = caller(&hub.address()).await;
+    let sub = c
+        .sender
+        .subscribe(&prices("acme"), SubscriptionOptions::default())
+        .await
+        .unwrap();
+    let id = subscriptions(&hub).await[0].id.clone();
+    // A part the hub numbered 5 after the initial (seq 1): three were lost in between.
+    hub.send_to_clients(ServerMessage {
+        message: Some(server_message::Message::Part(proto::ReplyPart {
+            request_id: id.clone(),
+            payload: serde_json::to_vec(&tick("acme", 5)).unwrap(),
+            seq: 5,
+            ..Default::default()
+        })),
+    })
+    .await;
+    let mut updates = sub.updates;
+    let (got, error) = drain(&mut updates).await;
+    assert!(got.is_empty());
+    assert!(
+        matches!(error, Some(MessagingError::InvalidMessage(ref m)) if m == "subscription t.Prices lost 3 part(s)"),
+        "{error:?}"
+    );
+    eventually("cancelled at the hub, reason lost parts", async || {
+        hub.cancels()
+            .iter()
+            .any(|(_, c)| c.request_id == id && c.reason == "lost parts")
+    })
+    .await;
+    eventually("the target cancelled", async || {
+        a1.emitter.open_subscriptions() == 0
+    })
+    .await;
+    assert_eq!(c.sender.in_flight(), 0);
+    a1.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_shared_subscription_type_subscribes_every_capable_instance_of_every_owner() {
+    let hub = FakeHub::start().await;
+    let shared = |instance: &'static str| {
+        let mut r = HandlerRegistry::new();
+        r.shared_subscription_query::<SharedPrices, _, _>(move |q, _| async move {
+            Ok(Quote {
+                symbol: q.symbol,
+                price: 1,
+                instance: instance.into(),
+            })
+        });
+        r
+    };
+    let a = node_with(
+        &hub.address(),
+        "svc-a",
+        "a1",
+        shared("a1"),
+        4,
+        SenderSettings::default(),
+        None,
+    )
+    .await;
+    let b = node_with(
+        &hub.address(),
+        "svc-b",
+        "b1",
+        shared("b1"),
+        4,
+        SenderSettings::default(),
+        None,
+    )
+    .await;
+    let c = caller(&hub.address()).await;
+    let registers = hub.registers().await;
+    let b1 = registers.iter().find(|r| r.instance_id == "b1").unwrap();
+    assert_eq!(b1.shared_query_types, ["t.SharedPrices"]);
+    assert!(b1.query_types.is_empty());
+    let mut initials = vec![];
+    for _ in 0..2 {
+        let sub = c
+            .sender
+            .subscribe(
+                &SharedPrices {
+                    symbol: "acme".into(),
+                },
+                SubscriptionOptions::default(),
+            )
+            .await
+            .unwrap();
+        initials.push(sub.initial.instance.clone());
+        eventually("both owners subscribed", async || {
+            a.emitter.open_subscriptions() == 1 && b.emitter.open_subscriptions() == 1
+        })
+        .await;
+        let mut updates = sub.updates;
+        a.emitter.emit::<SharedPrices>(|_| true, &tick("acme", 1));
+        b.emitter.emit::<SharedPrices>(|_| true, &tick("acme", 2));
+        let mut got = vec![
+            next_update(&mut updates).await.unwrap().price,
+            next_update(&mut updates).await.unwrap().price,
+        ];
+        got.sort();
+        assert_eq!(got, [1, 2], "an update from each owner");
+        a.emitter.complete::<SharedPrices>(|_| true);
+        b.emitter.complete::<SharedPrices>(|_| true);
+        ends_cleanly(&mut updates, vec![]).await;
+    }
+    initials.sort();
+    assert_eq!(
+        initials,
+        ["a1", "b1"],
+        "the initial result round-robins over the targets"
+    );
+    a.shutdown().await;
+    b.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_pool_subscribes_through_capable_hubs_only() {
+    // hub-3 is a P4b hub: every subscription goes to hub-4.
+    let (h3, h4) = (
+        FakeHub::start_with_id("hub-3").await,
+        FakeHub::start_with_id("hub-4").await,
+    );
+    h3.set_subscription(false);
+    let both = format!("{},{}", h3.address(), h4.address());
+    let probe = Arc::new(Probe::default());
+    let a1 = owner(&both, "svc-a", "a1", &probe).await;
+    let c = caller(&both).await;
+    for _ in 0..4 {
+        let sub = c
+            .sender
+            .subscribe(&prices("acme"), SubscriptionOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(sub.initial.instance, "a1");
+        eventually("subscribed", async || a1.emitter.open_subscriptions() == 1).await;
+        a1.emitter.complete::<Prices>(|_| true);
+        let mut updates = sub.updates;
+        ends_cleanly(&mut updates, vec![]).await;
+    }
+    assert_eq!(
+        (
+            subscriptions(&h3).await.len(),
+            subscriptions(&h4).await.len()
+        ),
+        (0, 4)
+    );
+    a1.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_subscription_is_not_written_to_a_hub_that_lost_the_capability_after_ranking() {
+    let (h1, h2) = (
+        FakeHub::start_with_id("hub-1").await,
+        FakeHub::start_with_id("hub-2").await,
+    );
+    let both = format!("{},{}", h1.address(), h2.address());
+    let c = caller(&both).await;
+    assert_eq!(c.pool.hub_ids(), ["hub-1", "hub-2"]);
+    h1.set_stall_reads(true);
+    let key_on_1 = (0..)
+        .map(|i| format!("k{i}"))
+        .find(|k| rendezvous_score("hub-1", k) > rendezvous_score("hub-2", k))
+        .unwrap();
+    let fillers: Vec<_> = (0..324)
+        .map(|i| {
+            let sender = Arc::clone(&c.sender);
+            let opts = SendOptions {
+                routing_key: Some(key_on_1.clone()),
+                retry: Some(RetryPolicy::NONE),
+                timeout: Some(Duration::from_secs(30)),
+                ..SendOptions::default()
+            };
+            let size = if i < 24 { 256 * 1024 } else { 1 };
+            tokio::spawn(async move {
+                let fill = Fill {
+                    data: "x".repeat(size),
+                };
+                sender.send_command(&fill, opts).await
+            })
+        })
+        .collect();
+    eventually("every filler handed to hub-1's stream", async || {
+        c.sender.in_flight() == fillers.len()
+    })
+    .await;
+    for filler in &fillers {
+        filler.abort();
+    }
+    for filler in fillers {
+        let _ = filler.await;
+    }
+    // Subscriptions go round-robin: the one ranked [hub-1, hub-2] waits in the write to hub-1
+    // (the one ranked the other way round ends at once with NO_HANDLER on hub-2).
+    let mut probes = 0;
+    let waiting = loop {
+        probes += 1;
+        assert!(probes <= 3, "no subscription went to hub-1 first");
+        let sender = Arc::clone(&c.sender);
+        let call = tokio::spawn(async move {
+            sender
+                .subscribe(&prices("acme"), SubscriptionOptions::default())
+                .await
+                .map(|_| ())
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if !call.is_finished() {
+            break call;
+        }
+        let e = call.await.unwrap().unwrap_err();
+        assert!(matches!(e, MessagingError::NoHandler(_)), "{e:?}");
+    };
+    assert!(
+        subscriptions(&h2).await.len() < probes,
+        "the waiting subscription reached no hub"
+    );
+    h2.set_subscription(false);
+    h2.drop_streams();
+    eventually("hub-2 re-handshaken without the capability", async || {
+        c.pool.connections().iter().any(|conn| {
+            conn.address() == h2.address() && conn.handshake().is_some_and(|h| !h.subscription())
+        })
+    })
+    .await;
+    let on_h2_before = subscriptions(&h2).await.len();
+    h1.drop_streams();
+    let e = tokio::time::timeout(Duration::from_secs(3), waiting)
+        .await
+        .expect("the open ends at once, not at the local guard")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(e, MessagingError::UnsupportedByHub(_)), "{e:?}");
+    assert_eq!(
+        subscriptions(&h2).await.len(),
+        on_h2_before,
+        "the subscription was not written to hub-2's stream"
+    );
+    assert_eq!(c.sender.in_flight(), 0);
+    c.shutdown().await;
+}
+
+/// The hub may drop a part it could not buffer: the sender checks `seq` and the end's count, as
+/// for a stream. The end counts parts that never arrived, so it is `InvalidMessage`, not clean.
+#[tokio::test]
+async fn an_end_counting_more_parts_than_arrived_fails_the_subscription_as_lost_parts() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let a1 = owner(&hub.address(), "svc-a", "a1", &probe).await;
+    let c = caller(&hub.address()).await;
+    let sub = c
+        .sender
+        .subscribe(&prices("acme"), SubscriptionOptions::default())
+        .await
+        .unwrap();
+    let id = subscriptions(&hub).await[0].id.clone();
+    // The initial part (seq 1) arrived; the hub counted 3 parts before this clean end.
+    hub.send_to_clients(ServerMessage {
+        message: Some(server_message::Message::End(proto::ReplyEnd {
+            request_id: id,
+            error: None,
+            parts: 3,
+            ..Default::default()
+        })),
+    })
+    .await;
+    let mut updates = sub.updates;
+    let (got, error) = drain(&mut updates).await;
+    assert!(got.is_empty());
+    assert!(
+        matches!(&error, Some(MessagingError::InvalidMessage(m)) if m == "subscription t.Prices lost 2 part(s)"),
+        "{error:?}"
+    );
+    assert_eq!(c.sender.in_flight(), 0);
+    a1.shutdown().await;
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_undecodable_update_fails_the_subscription_and_cancels_it() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let a1 = owner(&hub.address(), "svc-a", "a1", &probe).await;
+    let c = caller(&hub.address()).await;
+    let sub = c
+        .sender
+        .subscribe(&prices("acme"), SubscriptionOptions::default())
+        .await
+        .unwrap();
+    let id = subscriptions(&hub).await[0].id.clone();
+    hub.send_to_clients(ServerMessage {
+        message: Some(server_message::Message::Part(proto::ReplyPart {
+            request_id: id.clone(),
+            payload: b"not a tick".to_vec(),
+            seq: 2,
+            ..Default::default()
+        })),
+    })
+    .await;
+    let mut updates = sub.updates;
+    let e = updates.next().await.unwrap().unwrap_err();
+    assert!(matches!(e, MessagingError::Serialization(_)), "{e:?}");
+    assert!(updates.next().await.is_none());
+    eventually(
+        "cancelled at the hub, reason undecodable part",
+        async || {
+            hub.cancels()
+                .iter()
+                .any(|(_, c)| c.request_id == id && c.reason == "undecodable part")
+        },
+    )
+    .await;
+    eventually("the target cancelled", async || {
+        a1.emitter.open_subscriptions() == 0
+    })
+    .await;
+    assert_eq!(c.sender.in_flight(), 0);
+    a1.shutdown().await;
+    c.shutdown().await;
+}
+
+/// A shutdown completes every subscription of the instance with a clean `ReplyEnd` (a target
+/// that just vanished would end the last one with `HANDLER_DISCONNECTED`).
+#[tokio::test]
+async fn ending_the_subscriptions_at_shutdown_completes_them_cleanly() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let a1 = owner(&hub.address(), "svc-a", "a1", &probe).await;
+    let c = caller(&hub.address()).await;
+    let sub = c
+        .sender
+        .subscribe(&prices("acme"), SubscriptionOptions::default())
+        .await
+        .unwrap();
+    eventually("subscribed", async || a1.emitter.open_subscriptions() == 1).await;
+    a1.emitter.emit::<Prices>(|_| true, &tick("acme", 1));
+    for pump in a1.dispatcher.end_subscriptions() {
+        pump.await.unwrap();
+    }
+    assert_eq!(a1.emitter.open_subscriptions(), 0);
+    let mut updates = sub.updates;
+    ends_cleanly(&mut updates, vec![1]).await;
+    assert_eq!(c.sender.in_flight(), 0);
+    a1.shutdown().await;
+    c.shutdown().await;
+}
+
+/// The initial result is bounded like a unary request: the hub's bound plus the margin is the
+/// local guard of a hub that never answers it (the subscription is cancelled at the hub).
+#[tokio::test]
+async fn the_local_guard_bounds_the_initial_result_only() {
+    let hub = FakeHub::start().await;
+    hub.set_stream_timeouts(false);
+    let probe = Arc::new(Probe::default());
+    let a1 = owner(&hub.address(), "svc-a", "a1", &probe).await;
+    let c = caller(&hub.address()).await;
+    let options = SubscriptionOptions {
+        timeout: Some(Duration::from_secs(1)),
+        ..SubscriptionOptions::default()
+    };
+    // No initial result ever: the open fails at the bound (1 s) plus the margin (1 s).
+    let started = Instant::now();
+    let e = c
+        .sender
+        .subscribe(&prices("hang"), options.clone())
+        .await
+        .err()
+        .expect("the local guard");
+    let took = started.elapsed();
+    assert!(
+        matches!(e, MessagingError::Timeout(ref t) if t == "t.Prices"),
+        "{e:?}"
+    );
+    assert!(
+        took >= Duration::from_millis(1_950) && took < Duration::from_millis(3_500),
+        "the guard is bound + 1 s, took {took:?}"
+    );
+    eventually("cancelled at the hub", async || {
+        hub.cancels()
+            .iter()
+            .any(|(_, c)| c.reason == "local guard timeout")
+    })
+    .await;
+    assert_eq!(c.sender.in_flight(), 0);
+    // An initial result at once, then silence for longer than the guard: no idle timeout, no
+    // guard on the updates.
+    let sub = c.sender.subscribe(&prices("acme"), options).await.unwrap();
+    let mut updates = sub.updates;
+    let quiet = tokio::time::timeout(Duration::from_millis(2_500), updates.next()).await;
+    assert!(quiet.is_err(), "a quiet subscription stays open: {quiet:?}");
+    a1.emitter.emit::<Prices>(|_| true, &tick("acme", 7));
+    assert_eq!(next_update(&mut updates).await.unwrap().price, 7);
+    drop(updates);
+    a1.shutdown().await;
+    c.shutdown().await;
 }
