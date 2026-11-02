@@ -639,6 +639,103 @@ fn the_fake_hub_refuses_a_pattern_the_real_hub_cannot_load() {
     let _ = Acl::new("svc", &["orders*"], &[]);
 }
 
+fn connection_with_id(settings: HubSettings, service: &str, instance: &str) -> Arc<HubConnection> {
+    let (tx, rx) = mpsc::channel::<Inbound>(64);
+    tokio::spawn(async move {
+        let mut rx = rx;
+        while rx.recv().await.is_some() {}
+    });
+    HubConnection::new(settings, service.into(), instance.into(), tx)
+}
+
+#[tokio::test]
+async fn another_services_instance_id_is_a_permission_denied_rejection() {
+    // The hub refuses a Register whose instance id a session of another service holds, in
+    // `enforce` and `permissive` alike (and changes nothing: the holder keeps its session).
+    for mode in [AuthMode::Enforce, AuthMode::Permissive] {
+        let (billing, orders) = (random_token(), random_token());
+        let hub = FakeHub::start().await;
+        hub.set_auth(
+            mode,
+            &[
+                (&billing, Acl::new("billing", &["*"], &["*"])),
+                (&orders, Acl::new("orders", &["*"], &["*"])),
+            ],
+        );
+        let instance = uuid::Uuid::new_v4().to_string();
+        let holder = connection_with_id(
+            settings(hub.address(), Some(&billing)),
+            "billing",
+            &instance,
+        );
+        holder.start();
+        assert!(holder.await_registered(Duration::from_secs(5)).await);
+
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let thief = connection_with_id(settings(hub.address(), Some(&orders)), "orders", &instance);
+        thief.start();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while hub.rejections().len() < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{mode:?}: no attempts"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let expected = format!(
+            "instance id {} belongs to another service",
+            instance.chars().take(8).collect::<String>()
+        );
+        assert!(
+            hub.rejections()
+                .iter()
+                .all(|r| r.code == tonic::Code::PermissionDenied && r.message == expected),
+            "{mode:?}: {:?}",
+            hub.rejections()
+        );
+        // The library surfaces it as a registration rejection, logged once at error.
+        assert_eq!(thief.last_rejection().as_deref(), Some(expected.as_str()));
+        assert!(!thief.is_connected());
+        assert!(!thief.await_registered(Duration::from_millis(50)).await);
+        let errors = captured
+            .lines()
+            .iter()
+            .filter(|l| l.contains(" ERROR ") && l.contains("hub rejected the registration"))
+            .count();
+        assert_eq!(errors, 1, "{mode:?}");
+        // Nothing moved: the holder is still registered on its stream.
+        assert!(holder.is_connected(), "{mode:?}");
+        assert_eq!(hub.registers().await.len(), 1);
+        assert_eq!(hub.evictions(), 0);
+        thief.shutdown().await;
+        holder.shutdown().await;
+        hub.stop();
+    }
+}
+
+#[tokio::test]
+async fn the_same_service_may_take_over_its_own_instance_id() {
+    let token = random_token();
+    let hub = FakeHub::start().await;
+    hub.set_auth(
+        AuthMode::Enforce,
+        &[(&token, Acl::new("billing", &["*"], &["*"]))],
+    );
+    let instance = uuid::Uuid::new_v4().to_string();
+    let first = connection_with_id(settings(hub.address(), Some(&token)), "billing", &instance);
+    first.start();
+    assert!(first.await_registered(Duration::from_secs(5)).await);
+    let second = connection_with_id(settings(hub.address(), Some(&token)), "billing", &instance);
+    second.start();
+    assert!(second.await_registered(Duration::from_secs(5)).await);
+    assert!(hub.rejections().is_empty());
+    assert!(hub.evictions() >= 1);
+    first.shutdown().await;
+    second.shutdown().await;
+    hub.stop();
+}
+
 #[tokio::test]
 async fn a_pool_reports_a_rejected_hub_as_not_registered() {
     let hub = FakeHub::start().await;

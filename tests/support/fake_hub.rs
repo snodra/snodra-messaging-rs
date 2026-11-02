@@ -86,8 +86,11 @@
 //! `Permissive` every violation is recorded ([`FakeHub::violations`]) and allowed; in `Off`
 //! (default) nothing is checked. A refused `Register` is not in [`FakeHub::registers`]; it is in
 //! [`FakeHub::rejections`] with the token it carried and when it arrived. A session without a
-//! valid token (permissive) is not judged per request. Patterns as the hub parses them: exact, `prefix.*` (a type longer than `prefix.`), `*`; `Acl::new`
-//! panics on any other wildcard.
+//! valid token (permissive) is not judged per request. Patterns as the hub parses them: exact,
+//! `prefix.*` (a type longer than `prefix.`), `*`; `Acl::new` panics on any other wildcard.
+//! Whatever the mode but `Off`, a `Register` whose instance id an open session of another service
+//! holds is closed with `PERMISSION_DENIED "instance id <first 8 chars> belongs to another
+//! service"` and nothing changes (the holder keeps its session); `Off` replaces it as before.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -402,7 +405,12 @@ impl State {
 
     /// Judges a `Register`: `Err` closes the stream (enforce); violations of a permissive hub are
     /// recorded and allowed.
-    fn admit(&self, r: &proto::Register, principal: &mut Principal) -> Result<(), tonic::Status> {
+    fn admit(
+        &self,
+        stream_no: usize,
+        r: &proto::Register,
+        principal: &mut Principal,
+    ) -> Result<(), tonic::Status> {
         let mode = self.mode();
         if mode == AuthMode::Off {
             return Ok(());
@@ -445,6 +453,14 @@ impl State {
                 )));
             }
         }
+        // The hub refuses, in `permissive` too, a Register that would take over the instance id of
+        // a session of another service (nothing changes: the holder keeps its session).
+        if found.is_none() && self.held_by_another_service(stream_no, r) {
+            return Err(tonic::Status::permission_denied(format!(
+                "instance id {} belongs to another service",
+                r.instance_id.chars().take(8).collect::<String>()
+            )));
+        }
         match found {
             Some(status) if mode == AuthMode::Enforce => Err(status),
             Some(status) => {
@@ -457,6 +473,19 @@ impl State {
             }
             None => Ok(()),
         }
+    }
+
+    /// The instance id of `r` is held by an open session of another service.
+    fn held_by_another_service(&self, stream_no: usize, r: &proto::Register) -> bool {
+        let holder = match self.sessions.lock().unwrap().get(&r.instance_id) {
+            Some((holder, _)) if *holder != stream_no => *holder,
+            _ => return false,
+        };
+        self.routes
+            .lock()
+            .unwrap()
+            .get(&holder)
+            .is_some_and(|route| route.service != r.service_name)
     }
 
     /// An immediate `Error{PERMISSION_DENIED}` for a request outside the session's `send`.
@@ -1698,7 +1727,7 @@ impl Hub for Service {
                         None | Some(Err(_)) => break,
                         Some(Ok(ClientMessage { message: Some(m) })) => match m {
                             client_message::Message::Register(r) => {
-                                if let Err(status) = state.admit(&r, &mut principal) {
+                                if let Err(status) = state.admit(stream_no, &r, &mut principal) {
                                     state.rejections.lock().unwrap().push(Rejection {
                                         code: status.code(),
                                         message: status.message().to_string(),

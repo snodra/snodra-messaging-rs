@@ -650,7 +650,10 @@ the old one) all the same.
 **Rejections.** In `enforce` mode the hub closes the stream of a service it refuses: `UNAUTHENTICATED`
 (no token, an unknown token) or `PERMISSION_DENIED` (the token is for another service name, or the
 `Register` lists a command, query or shared query type outside the token's `handle` patterns, which
-the message names). Like `ALREADY_EXISTS` and `INVALID_ARGUMENT` before, these are registration
+the message names). A `Register` whose **instance id is held by a session of another service** is
+also `PERMISSION_DENIED` (`instance id 0190abcd belongs to another service`); the hub refuses that in
+`permissive` mode too, and the holder keeps its session, so give every instance a unique id (the
+default is a random UUID). Like `ALREADY_EXISTS` and `INVALID_ARGUMENT` before, these are registration
 rejections, not outages:
 
 - `HubConnection::last_rejection()` holds the hub's message (until a stream registers, which clears
