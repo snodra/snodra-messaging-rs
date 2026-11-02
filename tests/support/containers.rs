@@ -240,7 +240,10 @@ pub async fn hub_with(options: HubOptions) -> HubContainer {
         .with_wait_for(WaitFor::message_on_stdout("hub listening"))
         .with_env_var("KRAKEN_HUB_HTTP_LISTEN", "0.0.0.0:7001")
         .with_env_var("KRAKEN_HUB_OTLP_ENDPOINT", "")
-        .with_env_var("KRAKEN_HUB_LOG", "info");
+        .with_env_var(
+            "KRAKEN_HUB_LOG",
+            std::env::var("KRAKEN_TEST_HUB_LOG").unwrap_or_else(|_| "info".to_string()),
+        );
     for (k, v) in &options.env {
         image = image.with_env_var(k.clone(), v.clone());
     }
