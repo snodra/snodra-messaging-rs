@@ -470,7 +470,15 @@ async fn rejected(
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(!conn.is_connected());
+    // The hub records a refusal before the client has read it, and the client counts as connected
+    // from its Register on: wait (well within the retry gap) for the client to see the refusal.
+    while conn.is_connected() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "still connected after a refusal"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert!(
         conn.await_registered(Duration::from_millis(50))
             .await
