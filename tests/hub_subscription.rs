@@ -450,6 +450,48 @@ async fn a_subscription_request_registers_and_the_emitter_sends_parts_then_the_e
     a.shutdown().await;
 }
 
+/// `ReplyEnd.parts` is the number of parts this subscription sent (the hub's own count of
+/// relayed parts is its own business): a clean end, an error end and a shutdown end all carry it.
+#[tokio::test]
+async fn the_end_of_a_subscription_counts_the_parts_it_sent() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let a = owner(&hub.address(), "svc-a", "a1", &probe).await;
+    for id in ["s1#1", "s2#1", "s3#1", "s4#1"] {
+        hub.send_to_clients(subscribed(id, &prices(&format!("sym-{id}"))))
+            .await;
+    }
+    eventually("registered", async || a.emitter.open_subscriptions() == 4).await;
+    // s1 gets 3 updates, s2 gets 2, s3 gets 1, s4 none.
+    for (id, n) in [("s1#1", 3), ("s2#1", 2), ("s3#1", 1)] {
+        for price in 0..n {
+            a.emitter
+                .emit::<Prices>(|q| q.symbol == format!("sym-{id}"), &tick("x", price));
+        }
+    }
+    eventually("six parts", async || hub.parts().len() == 6).await;
+    a.emitter.complete::<Prices>(|q| q.symbol == "sym-s1#1");
+    a.emitter.complete_exceptionally::<Prices>(
+        |q| q.symbol == "sym-s2#1",
+        &MessagingError::Storage("gone".into()),
+    );
+    for pump in a.dispatcher.end_subscriptions() {
+        pump.await.unwrap();
+    }
+    eventually("four ends", async || hub.ends().len() == 4).await;
+    let parts_of = |id: &str| {
+        hub.ends()
+            .into_iter()
+            .find(|(_, e)| e.request_id == id)
+            .map(|(_, e)| e.parts)
+    };
+    assert_eq!(parts_of("s1#1"), Some(3), "clean end");
+    assert_eq!(parts_of("s2#1"), Some(2), "error end");
+    assert_eq!(parts_of("s3#1"), Some(1), "shutdown end");
+    assert_eq!(parts_of("s4#1"), Some(0), "no update sent");
+    a.shutdown().await;
+}
+
 #[tokio::test]
 async fn the_initial_request_is_answered_by_the_handler_like_a_unary_query() {
     let hub = FakeHub::start().await;

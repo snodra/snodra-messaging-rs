@@ -27,8 +27,15 @@ pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 1024;
 
 /// What a subscription's pump writes to its hub stream, in order.
 enum Outgoing {
-    Part { payload: Vec<u8>, seq: u64 },
-    End(Option<proto::Error>),
+    Part {
+        payload: Vec<u8>,
+        seq: u64,
+    },
+    /// `parts`: the updates this subscription sent before the end (`ReplyEnd.parts`).
+    End {
+        error: Option<proto::Error>,
+        parts: u64,
+    },
 }
 
 /// One open subscription.
@@ -166,7 +173,10 @@ impl Subscriptions {
         let mut open = self.open.lock().unwrap();
         open.drain()
             .map(|(_, o)| {
-                let _ = o.tx.send(Outgoing::End(None));
+                let _ = o.tx.send(Outgoing::End {
+                    error: None,
+                    parts: o.seq,
+                });
                 o.pump
             })
             .collect()
@@ -227,13 +237,14 @@ async fn pump(
                 }),
                 false,
             ),
-            Outgoing::End(error) => (
+            Outgoing::End { error, parts } => (
                 client_message::Message::End(proto::ReplyEnd {
                     request_id: id.clone(),
                     error: error.map(|mut e| {
                         e.request_id = id.clone();
                         e
                     }),
+                    parts: u32::try_from(parts).unwrap_or(u32::MAX),
                     ..Default::default()
                 }),
                 true,
@@ -315,9 +326,9 @@ impl QueryUpdateEmitter {
     /// from the subscription silently; the last target's clean end completes it for the
     /// subscriber.
     pub fn complete<Q: SubscriptionQuery>(&self, filter: impl Fn(&Q) -> bool) {
-        let ended = self
-            .inner
-            .deliver::<Q>(&filter, |_| Outgoing::End(None), true);
+        let ended =
+            self.inner
+                .deliver::<Q>(&filter, |parts| Outgoing::End { error: None, parts }, true);
         tracing::trace!(
             r#type = Q::TYPE,
             subscriptions = ended,
@@ -341,13 +352,14 @@ impl QueryUpdateEmitter {
         let message = error.to_string();
         let ended = self.inner.deliver::<Q>(
             &filter,
-            |_| {
-                Outgoing::End(Some(proto::Error {
+            |parts| Outgoing::End {
+                error: Some(proto::Error {
                     request_id: String::new(),
                     code: ErrorCode::HandlerError as i32,
                     message: message.clone(),
                     details: details.clone(),
-                }))
+                }),
+                parts,
             },
             true,
         );
