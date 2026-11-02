@@ -296,7 +296,7 @@ impl Config {
     }
 
     /// Rejects what cannot work: an empty service name, a `hub_address` that names no hub (or a
-    /// malformed `dns:///` target), a zero `hub_status_interval`, `jwks_url` without `issuer`,
+    /// malformed `dns:///` target), a zero `reconnect_backoff_max` or a `reconnect_backoff_min` above it, a zero `hub_status_interval`, `jwks_url` without `issuer`,
     /// `max_concurrent_handlers` 0, an invalid `hub_retry` policy, a zero
     /// `hub_stream_credit_timeout`, a zero `hub_max_subscriptions`, a `hub_token_file` that cannot
     /// be read, a `hub_tls` CA file that cannot be read or holds no certificate, an empty
@@ -309,6 +309,18 @@ impl Config {
             ));
         }
         HubTargets::parse(&self.hub_address)?;
+        if self.reconnect_backoff_max.is_zero() {
+            return Err(MessagingError::InvalidMessage(
+                "reconnect_backoff_max (KRAKEN_RECONNECT_BACKOFF_MAX_MS) must be at least 1 ms"
+                    .into(),
+            ));
+        }
+        if self.reconnect_backoff_min > self.reconnect_backoff_max {
+            return Err(MessagingError::InvalidMessage(format!(
+                "reconnect_backoff_min (KRAKEN_RECONNECT_BACKOFF_MIN_MS, {:?}) must not exceed reconnect_backoff_max (KRAKEN_RECONNECT_BACKOFF_MAX_MS, {:?})",
+                self.reconnect_backoff_min, self.reconnect_backoff_max
+            )));
+        }
         if self.hub_status_interval.is_zero() {
             return Err(MessagingError::InvalidMessage(
                 "hub_status_interval (KRAKEN_HUB_STATUS_INTERVAL_MS) must be at least 1 ms".into(),
@@ -635,6 +647,40 @@ mod tests {
                 Config::from_lookup(|n| vars.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone()));
             assert!(result.is_err(), "{name}={value} accepted");
         }
+    }
+
+    #[test]
+    fn the_reconnect_backoff_must_have_a_positive_max_not_below_the_min() {
+        for (min, max) in [("500", "0"), ("6000", "5000"), ("0", "0")] {
+            let result = try_from(&[
+                ("KRAKEN_RECONNECT_BACKOFF_MIN_MS", min),
+                ("KRAKEN_RECONNECT_BACKOFF_MAX_MS", max),
+            ]);
+            assert!(
+                matches!(result, Err(MessagingError::InvalidMessage(ref m)) if m.contains("reconnect_backoff_max")),
+                "min={min} max={max}: {result:?}"
+            );
+        }
+        for (min, max) in [
+            (Duration::from_millis(500), Duration::ZERO),
+            (Duration::from_secs(6), Duration::from_secs(5)),
+        ] {
+            let in_code = Config {
+                reconnect_backoff_min: min,
+                reconnect_backoff_max: max,
+                ..code_config()
+            };
+            assert!(
+                matches!(in_code.validate(), Err(MessagingError::InvalidMessage(_))),
+                "min={min:?} max={max:?} accepted"
+            );
+        }
+        let c = from(&[
+            ("KRAKEN_RECONNECT_BACKOFF_MIN_MS", "1000"),
+            ("KRAKEN_RECONNECT_BACKOFF_MAX_MS", "1000"),
+        ]);
+        assert_eq!(c.reconnect_backoff_max, Duration::from_secs(1));
+        assert!(code_config().validate().is_ok());
     }
 
     #[test]
