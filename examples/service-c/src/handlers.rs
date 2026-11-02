@@ -4,7 +4,10 @@
 use futures::stream::BoxStream;
 use kraken_messaging::MessagingError;
 
-use crate::messages::{InventoryLevel, Row};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use crate::messages::{Counter, CounterChanged, InventoryLevel, Row, SubscriptionCount};
 
 /// service-c's fixed count for every item (service-b answers 7).
 pub const INVENTORY_COUNT: i64 = 3;
@@ -73,12 +76,87 @@ pub fn rows(
     }))
 }
 
+/// The in-memory counters of `examples.WatchCounter`, one per name. The initial result of a
+/// subscription is the current value (0 for a name nobody incremented); `increment` adds one and
+/// calls `notify` with the new value **while holding the lock**, so two increments notify in the
+/// order of their values (a subscriber must see 1, then 2). `notify` must not block: the
+/// emitter's calls never wait.
+pub struct Counters {
+    service: String,
+    instance: String,
+    values: Mutex<HashMap<String, i64>>,
+}
+
+impl Counters {
+    pub fn new(service: &str, instance: &str) -> Counters {
+        Counters {
+            service: service.to_string(),
+            instance: instance.to_string(),
+            values: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn counter(&self, name: &str, value: i64) -> Counter {
+        Counter {
+            service: self.service.clone(),
+            instance: self.instance.clone(),
+            name: name.to_string(),
+            value,
+        }
+    }
+
+    /// `WatchCounter`'s initial result.
+    pub fn current(&self, name: &str) -> Counter {
+        let values = self.values.lock().expect("counters lock");
+        self.counter(name, values.get(name).copied().unwrap_or(0))
+    }
+
+    /// Adds one to the counter `name`, hands the change to `notify`, returns the new value.
+    pub fn increment(&self, name: &str, notify: impl FnOnce(&CounterChanged)) -> Counter {
+        let mut values = self.values.lock().expect("counters lock");
+        let value = values.entry(name.to_string()).or_insert(0);
+        *value += 1;
+        let counter = self.counter(name, *value);
+        notify(&CounterChanged {
+            service: counter.service.clone(),
+            instance: counter.instance.clone(),
+            name: counter.name.clone(),
+            value: counter.value,
+        });
+        counter
+    }
+}
+
+/// `OpenSubscriptions`: service-c's share of the shared query; `open` is the emitter's count.
+pub fn subscription_count(service: &str, instance: &str, open: usize) -> SubscriptionCount {
+    SubscriptionCount {
+        service: service.to_string(),
+        instance: instance.to_string(),
+        open: i64::try_from(open).unwrap_or(i64::MAX),
+    }
+}
+
+/// `IncrementCounter` is addressed to one service: refuse it when that is not this one.
+pub fn check_addressee(own: &str, addressed: &str) -> Result<(), MessagingError> {
+    if own == addressed {
+        return Ok(());
+    }
+    Err(MessagingError::RemoteHandler {
+        type_name: "examples.IncrementCounter".to_string(),
+        message: format!("IncrementCounter is for {addressed}, this is {own}"),
+        details: vec![],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use futures::StreamExt;
     use kraken_messaging::MessagingError;
 
-    use super::{INVENTORY_COUNT, inventory, reverse, rows, shout};
+    use super::{
+        Counters, INVENTORY_COUNT, check_addressee, inventory, reverse, rows, shout,
+        subscription_count,
+    };
 
     #[test]
     fn shout_uppercases() {
@@ -155,5 +233,86 @@ mod tests {
         let two: Vec<_> =
             futures::executor::block_on(rows("service-c", "c1", i32::MAX, 0).take(2).collect());
         assert_eq!(two.len(), 2);
+    }
+
+    #[test]
+    fn a_counter_nobody_incremented_is_zero() {
+        let counters = Counters::new("service-c", "c1");
+        let initial = counters.current("fresh");
+        assert_eq!(initial.service, "service-c");
+        assert_eq!(initial.instance, "c1");
+        assert_eq!(initial.name, "fresh");
+        assert_eq!(initial.value, 0);
+    }
+
+    #[test]
+    fn increment_counts_every_name_on_its_own_and_current_follows() {
+        let counters = Counters::new("service-c", "c1");
+        assert_eq!(counters.increment("a", |_| {}).value, 1);
+        assert_eq!(counters.increment("a", |_| {}).value, 2);
+        assert_eq!(counters.increment("b", |_| {}).value, 1);
+        assert_eq!(counters.current("a").value, 2);
+        assert_eq!(counters.current("b").value, 1);
+    }
+
+    #[test]
+    fn increment_notifies_with_the_new_value_in_order() {
+        let counters = Counters::new("service-c", "c1");
+        let mut seen = Vec::new();
+        counters.increment("a", |c| {
+            seen.push((
+                c.service.clone(),
+                c.instance.clone(),
+                c.name.clone(),
+                c.value,
+            ))
+        });
+        counters.increment("a", |c| {
+            seen.push((
+                c.service.clone(),
+                c.instance.clone(),
+                c.name.clone(),
+                c.value,
+            ))
+        });
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "service-c".to_string(),
+                    "c1".to_string(),
+                    "a".to_string(),
+                    1
+                ),
+                (
+                    "service-c".to_string(),
+                    "c1".to_string(),
+                    "a".to_string(),
+                    2
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn subscription_count_names_the_service_and_the_open_subscriptions() {
+        let count = subscription_count("service-c", "c1", 3);
+        assert_eq!(count.service, "service-c");
+        assert_eq!(count.instance, "c1");
+        assert_eq!(count.open, 3);
+    }
+
+    #[test]
+    fn increment_counter_is_refused_by_a_service_it_is_not_addressed_to() {
+        assert!(check_addressee("service-c", "service-c").is_ok());
+        let error = check_addressee("service-c", "service-b").unwrap_err();
+        assert!(
+            matches!(error, MessagingError::RemoteHandler { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "IncrementCounter is for service-b, this is service-c"
+        );
     }
 }

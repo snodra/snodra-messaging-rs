@@ -3284,6 +3284,7 @@ dependencies = [
  "futures",
  "kraken-messaging-rs",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

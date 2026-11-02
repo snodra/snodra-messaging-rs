@@ -1,7 +1,7 @@
 //! Wire types shared with the Kotlin `examples-api` (same names, same fields, same `@MessageType`s).
 
 use chrono::{DateTime, Utc};
-use kraken_messaging::{Command, Event, Query, StreamingQuery, message_type};
+use kraken_messaging::{Command, Event, Query, StreamingQuery, SubscriptionQuery, message_type};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -97,4 +97,101 @@ pub struct Row {
 message_type!(Rows, "examples.Rows");
 impl StreamingQuery for Rows {
     type Item = Row;
+}
+
+/// A shared subscription query type (ADR 0017, P4c): service-b (Kotlin) serves it too, so a
+/// subscription gets the current value of one of them as its initial result and then the changes
+/// of both.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct WatchCounter {
+    pub name: String,
+}
+/// The initial result of `WatchCounter`: the answering service and instance (the container's host
+/// name) and the counter's current value.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
+pub struct Counter {
+    pub service: String,
+    pub instance: String,
+    pub name: String,
+    pub value: i64,
+}
+/// An update of `WatchCounter`: the counter `name` of `service` / `instance` now has `value`.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct CounterChanged {
+    pub service: String,
+    pub instance: String,
+    pub name: String,
+    pub value: i64,
+}
+message_type!(WatchCounter, "examples.WatchCounter");
+impl SubscriptionQuery for WatchCounter {
+    type Initial = Counter;
+    type Update = CounterChanged;
+}
+
+/// Owned by service-c only: increments its counter `name` and emits the change. `service` says
+/// whose counter it is meant for; a handler that is not that service refuses it.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct IncrementCounter {
+    pub name: String,
+    pub service: String,
+}
+message_type!(IncrementCounter, "examples.IncrementCounter");
+impl Command for IncrementCounter {
+    type Reply = Counter;
+}
+
+/// Shared with service-b: how many subscriptions the answering instance serves now, whatever
+/// their type. `scope` is reserved (always "all").
+#[derive(Serialize, Deserialize, Debug)]
+pub struct OpenSubscriptions {
+    #[serde(default)]
+    pub scope: String,
+}
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct SubscriptionCount {
+    pub service: String,
+    pub instance: String,
+    pub open: i64,
+}
+message_type!(OpenSubscriptions, "examples.OpenSubscriptions");
+impl Query for OpenSubscriptions {
+    type Reply = SubscriptionCount;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Counter, CounterChanged, IncrementCounter, OpenSubscriptions, WatchCounter};
+    use kraken_messaging::MessageType;
+
+    #[test]
+    fn the_counter_types_use_the_wire_names_and_fields_of_the_kotlin_examples_api() {
+        assert_eq!(WatchCounter::TYPE, "examples.WatchCounter");
+        assert_eq!(IncrementCounter::TYPE, "examples.IncrementCounter");
+        assert_eq!(OpenSubscriptions::TYPE, "examples.OpenSubscriptions");
+
+        let counter: Counter =
+            serde_json::from_str(r#"{"service":"service-b","instance":"b1","name":"x","value":4}"#)
+                .unwrap();
+        assert_eq!(counter.value, 4);
+        let changed = serde_json::to_value(CounterChanged {
+            service: "service-c".into(),
+            instance: "c1".into(),
+            name: "x".into(),
+            value: 5,
+        })
+        .unwrap();
+        assert_eq!(
+            changed,
+            serde_json::json!({"service":"service-c","instance":"c1","name":"x","value":5})
+        );
+    }
+
+    #[test]
+    fn open_subscriptions_reads_with_or_without_its_reserved_scope() {
+        let with: OpenSubscriptions = serde_json::from_str(r#"{"scope":"all"}"#).unwrap();
+        let without: OpenSubscriptions = serde_json::from_str("{}").unwrap();
+        assert_eq!(with.scope, "all");
+        assert_eq!(without.scope, "");
+    }
 }

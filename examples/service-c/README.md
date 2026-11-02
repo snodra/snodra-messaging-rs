@@ -8,7 +8,15 @@ service name, its host name (the container id under Docker), a fixed count of 3 
 Inventory queries it answered. Shares the streaming query `examples.Rows` with service-b too
 (`shared_streaming_query`, ADR 0017 P4b): it streams the rows `1..=count`, each naming the service
 and instance, lazily under the sender's credits; with `failAt > 0` the item for that row is an
-`Err` (`HANDLER_ERROR` "Rows failed at row n") and the stream ends there.
+`Err` (`HANDLER_ERROR` "Rows failed at row n") and the stream ends there. Serves the shared
+subscription query `examples.WatchCounter` too (`shared_subscription_query`, ADR 0017 P4c): an
+in-memory counter per name; the handler answers the initial result (the current value, 0 for a
+name nobody incremented) and the command `examples.IncrementCounter(name, service)` (c owns it
+alone; service-b increments through its own HTTP endpoint) adds one and pushes a
+`CounterChanged` to every subscription of that name through the `QueryUpdateEmitter`, in the
+order of the values (service-c has no HTTP and no database write to commit first, so it emits
+right away). It also answers the shared query `examples.OpenSubscriptions` with
+`emitter.open_subscriptions()`.
 
 Configuration is the crate's `Config::from_env`: `KRAKEN_SERVICE_NAME` (`service-c`), `KRAKEN_HUB_ADDRESS`,
 `KRAKEN_KAFKA_BOOTSTRAP`, `KRAKEN_MONGODB_URI` (its own database), `RUST_LOG` (default `info`).

@@ -1,7 +1,9 @@
 //! Service C: the Rust participant of the examples sandbox. Owns `examples.Shout` (command) and
 //! `examples.Reverse` (query), publishes `examples.TextShouted` / `examples.TextReversed` while
 //! handling them, and logs `examples.GreetingDelivered` from service-b. Shares the query
-//! `examples.Inventory` and the streaming query `examples.Rows` with service-b (ADR 0017). No HTTP.
+//! `examples.Inventory`, the streaming query `examples.Rows` and the subscription query
+//! `examples.WatchCounter` (and `examples.OpenSubscriptions`) with service-b (ADR 0017). Owns the
+//! command `examples.IncrementCounter`, which drives its counters. No HTTP.
 
 mod handlers;
 mod messages;
@@ -13,8 +15,8 @@ use std::time::Duration;
 use chrono::Utc;
 use kraken_messaging::{Config, KrakenMessaging, MessagingError};
 use messages::{
-    GreetingDelivered, Inventory, Reverse, Reversed, Rows, Shout, Shouted, TextReversed,
-    TextShouted,
+    Counter, GreetingDelivered, IncrementCounter, Inventory, OpenSubscriptions, Reverse, Reversed,
+    Rows, Shout, Shouted, SubscriptionCount, TextReversed, TextShouted, WatchCounter,
 };
 
 #[tokio::main]
@@ -31,7 +33,13 @@ async fn main() -> Result<(), MessagingError> {
     let instance = std::env::var("HOSTNAME").unwrap_or_else(|_| "local".to_string());
     let answered = Arc::new(AtomicI64::new(0));
     let (rows_service, rows_instance) = (service.clone(), instance.clone());
+    let counters = Arc::new(handlers::Counters::new(&service, &instance));
+    let (watch_counters, increment_counters) = (counters.clone(), counters);
+    let (count_service, count_instance) = (service.clone(), instance.clone());
+    let increment_service = service.clone();
     let builder = KrakenMessaging::builder(config).await?;
+    let emitter = builder.emitter();
+    let count_emitter = emitter.clone();
     let shout_events = builder.events();
     let reverse_events = builder.events();
     let app = builder
@@ -88,6 +96,42 @@ async fn main() -> Result<(), MessagingError> {
                 tracing::info!("C: streaming Rows count={} failAt={}", q.count, q.fail_at);
                 Ok(handlers::rows(&service, &instance, q.count, q.fail_at))
             }
+        })
+        .shared_subscription_query::<WatchCounter, _, _>(move |q, _ctx| {
+            let counter = watch_counters.current(&q.name);
+            async move {
+                tracing::info!(
+                    "C: subscribed WatchCounter name={} value={}",
+                    counter.name,
+                    counter.value
+                );
+                Ok(counter)
+            }
+        })
+        .command::<IncrementCounter, _, _>(move |cmd, _ctx| {
+            let emitter = emitter.clone();
+            let counters = increment_counters.clone();
+            let own = increment_service.clone();
+            async move {
+                handlers::check_addressee(&own, &cmd.service)?;
+                let counter: Counter = counters.increment(&cmd.name, |changed| {
+                    emitter.emit::<WatchCounter>(|q| q.name == changed.name, changed)
+                });
+                tracing::info!(
+                    "C: incremented counter name={} -> {}",
+                    counter.name,
+                    counter.value
+                );
+                Ok(counter)
+            }
+        })
+        .shared_query::<OpenSubscriptions, _, _>(move |_q, _ctx| {
+            let count: SubscriptionCount = handlers::subscription_count(
+                &count_service,
+                &count_instance,
+                count_emitter.open_subscriptions(),
+            );
+            async move { Ok(count) }
         })
         .event::<GreetingDelivered, _, _>(|e, _ctx| async move {
             tracing::info!("C: received GreetingDelivered id={} name={}", e.id, e.name);
