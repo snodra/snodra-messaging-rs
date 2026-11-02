@@ -137,7 +137,8 @@ pub struct HubSettings {
     /// Replaced by `token_file` when that is set.
     pub token: Option<SecretString>,
     /// A file holding the token, read before every connect (`Config.hub_token_file`); wins over
-    /// `token`. When it cannot be read the last token read from it is kept.
+    /// `token`. When it cannot be read, or is empty after a good read (a rotation caught half
+    /// way), the last token read from it is kept; empty at startup is no token.
     pub token_file: Option<PathBuf>,
     /// TLS to the hub (`Config.hub_tls`); `None` is plain text unless the address is `https://`.
     pub tls: Option<HubTls>,
@@ -591,6 +592,8 @@ pub struct HubConnection {
     /// The token resolved for the stream being opened (the last one read from `token_file`); what
     /// every `Register` of the stream carries.
     token: Mutex<Option<SecretString>>,
+    /// The empty-token-file warning was logged and no good read has followed it.
+    empty_file_warned: AtomicBool,
     /// A stream of this connection failed or ended at least once.
     failed_once: AtomicBool,
     /// Requests that arrived on this connection's streams and are not finished yet.
@@ -653,6 +656,7 @@ impl HubConnection {
             handshake,
             last_rejection: Mutex::new(None),
             token: Mutex::new(None),
+            empty_file_warned: AtomicBool::new(false),
             failed_once: AtomicBool::new(false),
             in_flight: Arc::new(AtomicUsize::new(0)),
             hooks: OnceLock::new(),
@@ -1131,12 +1135,26 @@ impl HubConnection {
 
     /// Fixes the token the stream about to open registers with: the one in `token_file` (read now,
     /// so a rotated secret is picked up; when the file cannot be read the last token read from it
-    /// is kept, and with none the attempt fails), else `token`. Blank is none. Nothing here is
+    /// is kept, and with none the attempt fails; likewise an empty file after a good read; an empty file
+    /// at startup is no token), else `token`. Blank is none. Nothing here is
     /// logged except the path and the I/O error, which never carry file content.
     fn resolve_token(&self) -> Result<(), Status> {
         let resolved = match &self.settings.token_file {
             Some(path) => match crate::security::read_token_file(path) {
-                Ok(token) => token,
+                Ok(Some(token)) => {
+                    self.empty_file_warned.store(false, Ordering::Relaxed);
+                    Some(token)
+                }
+                // An empty file after a good read is a non-atomic rotation caught between the
+                // truncate and the write: like a failed read, keep the last token. At startup it
+                // is no token.
+                Ok(None) => {
+                    let last = self.token.lock().unwrap().clone();
+                    if last.is_some() && !self.empty_file_warned.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(service = %self.service_name, path = %path.display(), "hub token file is empty (a rotation in progress?); keeping the last token");
+                    }
+                    last
+                }
                 Err(e) => {
                     let last = self.token.lock().unwrap().clone();
                     if last.is_none() {

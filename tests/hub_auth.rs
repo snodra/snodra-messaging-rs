@@ -292,6 +292,114 @@ async fn an_unreadable_token_file_keeps_the_last_token() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+fn token_of(register: &proto::Register) -> Option<String> {
+    match register.credentials.clone().and_then(|c| c.kind) {
+        Some(proto::credentials::Kind::Token(t)) => Some(t),
+        _ => None,
+    }
+}
+
+async fn wait_for_registers(hub: &FakeHub, n: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while hub.registers().await.len() < n {
+        assert!(tokio::time::Instant::now() < deadline, "no stream #{n}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn an_empty_token_file_during_a_rotation_keeps_the_last_token() {
+    let old = random_token();
+    let new = random_token();
+    let hub = FakeHub::start().await;
+    hub.set_auth(
+        AuthMode::Enforce,
+        &[
+            (&old, Acl::new("svc", &["*"], &["*"])),
+            (&new, Acl::new("svc", &["*"], &["*"])),
+        ],
+    );
+    let captured = Captured::default();
+    let _logs = captured.install();
+    let (dir, file) = temp_file(&format!("{old}\n"));
+    let conn = connection(
+        HubSettings {
+            token_file: Some(file.clone()),
+            ..settings(hub.address(), None)
+        },
+        "svc",
+    );
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    // A non-atomic rotation truncates the file before writing the new secret: the reconnect that
+    // lands in between must not drop the credentials.
+    std::fs::write(&file, "").unwrap();
+    hub.drop_streams();
+    wait_for_registers(&hub, 2).await;
+    assert!(hub.rejections().is_empty(), "{:?}", hub.rejections());
+    assert_eq!(
+        token_of(&hub.registers().await[1]).as_deref(),
+        Some(old.as_str())
+    );
+    let warns: Vec<String> = captured
+        .lines()
+        .into_iter()
+        .filter(|l| l.contains(" WARN ") && l.contains("token file"))
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:#?}");
+    for line in captured.lines() {
+        assert!(!line.contains(&old), "token leaked: {line}");
+    }
+
+    // The new secret lands: the next stream carries it.
+    std::fs::write(&file, format!("{new}\n")).unwrap();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    hub.drop_streams();
+    wait_for_registers(&hub, 3).await;
+    assert_eq!(
+        token_of(&hub.registers().await[2]).as_deref(),
+        Some(new.as_str())
+    );
+    assert!(hub.rejections().is_empty());
+    conn.shutdown().await;
+    hub.stop();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn an_empty_token_file_at_startup_is_no_token() {
+    let token = random_token();
+    let hub = FakeHub::start().await;
+    hub.set_auth(
+        AuthMode::Enforce,
+        &[(&token, Acl::new("svc", &["*"], &["*"]))],
+    );
+    let (dir, file) = temp_file("\n");
+    let conn = connection(
+        HubSettings {
+            token_file: Some(file),
+            ..settings(hub.address(), Some(&token))
+        },
+        "svc",
+    );
+    conn.start();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while hub.rejections().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "no attempt");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(hub.rejections()[0].token, None);
+    assert!(
+        conn.last_rejection()
+            .is_some_and(|r| r.contains("missing token")),
+        "{:?}",
+        conn.last_rejection()
+    );
+    conn.shutdown().await;
+    hub.stop();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A refusal, as a rejection: reported, retried at the backoff cap (80-100 % of 300 ms), logged at
 /// `error` once per distinct message and then at `debug`, never with the token.
 async fn rejected(
