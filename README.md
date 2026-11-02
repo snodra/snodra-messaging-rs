@@ -551,6 +551,10 @@ while let Some(update) = updates.next().await { let tick = update?; /* in the hu
   send it with Sender::subscribe"), a subscription request to a type whose handler is unary or
   streaming ends with `INVALID_REQUEST` ("`<type>` is not a subscription query handler (it
   answers mode ...)"): the caller used the wrong mode, which no retry fixes.
+  The initial request is recognised by the `#0` suffix of its id alone, which collides with
+  scatter-gather (its targets are numbered from `#0` too): a gather of a subscription type sent
+  by a raw client would have its target `<id>#0` answered with the initial result. Only raw
+  clients can hit it, because the typed APIs never gather a subscription type.
 - **Emitting.** `emit` sends one `ReplyPart` (the update serialized with the crate's codec,
   `seq` from 1 per subscription) to every open subscription of `Q` on this instance whose query
   passes the filter, in call order; `complete` a clean `ReplyEnd` and removes it;
