@@ -566,6 +566,42 @@ async fn the_end_of_a_subscription_counts_the_parts_it_sent() {
     a.shutdown().await;
 }
 
+/// A shutdown half-closes the hub stream and waits for the hub to finish it, instead of
+/// resetting it: the updates and the `ReplyEnd` the pumps queued just before it reach the hub even
+/// when the hub has not read them yet (its HTTP/2 window is full), so the subscriber gets a clean
+/// end rather than HANDLER_DISCONNECTED.
+#[tokio::test]
+async fn a_shutdown_delivers_what_the_subscriptions_queued_before_closing_the_stream() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let a = owner(&hub.address(), "svc-a", "a1", &probe).await;
+    hub.send_to_clients(subscribed("s1#1", &prices("acme")))
+        .await;
+    eventually("registered", async || a.emitter.open_subscriptions() == 1).await;
+    // The hub stops reading: its HTTP/2 stream window (hyper's 2 MiB) fills with the first two
+    // updates, the rest and the end wait in the client.
+    hub.set_stall_reads(true);
+    let big = "x".repeat(1_000_000);
+    for price in 0..4 {
+        a.emitter.emit::<Prices>(|_| true, &tick(&big, price));
+    }
+    for pump in a.dispatcher.end_subscriptions() {
+        pump.await.unwrap();
+    }
+    tokio::join!(a.shutdown(), async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        hub.set_stall_reads(false);
+    });
+    eventually("the end reached the hub", async || {
+        hub.ends().iter().any(|(_, e)| e.request_id == "s1#1")
+    })
+    .await;
+    assert_eq!(hub.parts().len(), 4, "every update came before the end");
+    let ends = hub.ends();
+    assert_eq!(ends.len(), 1);
+    assert_eq!((end_code(&ends[0].1), ends[0].1.parts), (None, 4));
+}
+
 /// The user's filter runs outside the subscriptions' lock: one that panics skips its
 /// subscription (the others still get the update) and leaves the instance serving: a later hub
 /// `Cancel` and a lost stream are still processed.

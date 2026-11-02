@@ -102,6 +102,8 @@ pub const CLIENT_VERSION: &str = concat!("kraken-messaging-rs/", env!("CARGO_PKG
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// How long a PING may stay unanswered before the channel is dropped.
 pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long [`HubConnection::shutdown`] waits for the hub to finish a stream it half-closed.
+pub const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Identifies one stream (one connect attempt); strictly increasing and unique in the process, so
 /// streams of different hubs never share an id.
@@ -894,7 +896,8 @@ impl HubConnection {
         }
     }
 
-    /// Stops the loop and closes the stream (the hub then drops this instance immediately).
+    /// Stops the loop and closes the stream (the hub then drops this instance immediately), after
+    /// what was queued for it has been written: see [`close_stream`](Self::close_stream).
     pub async fn shutdown(&self) {
         self.cancel.cancel();
         let handle = self.task.lock().unwrap().take();
@@ -1057,7 +1060,10 @@ impl HubConnection {
         let mut handshake: Option<Handshake> = None;
         loop {
             tokio::select! {
-                _ = self.cancel.cancelled() => return Ok(()),
+                _ = self.cancel.cancelled() => {
+                    self.close_stream(tx, &mut stream).await;
+                    return Ok(());
+                }
                 _ = tokio::time::sleep_until(handshake_deadline), if handshake.is_none() => {
                     return Err(Status::deadline_exceeded("registration not confirmed in time"));
                 }
@@ -1124,6 +1130,30 @@ impl HubConnection {
                     },
                 },
             }
+        }
+    }
+
+    /// Closes the stream on a shutdown without losing what is still on its way to the hub (a
+    /// subscription's last updates and `ReplyEnd`): the request side is half-closed once the
+    /// transport has taken everything queued, and the hub finishing its side is awaited (bounded).
+    /// Dropping the response stream at once would reset the RPC, discarding whatever the
+    /// transport had not written yet, and a hub that never saw a subscription target's end would
+    /// fail the subscription with HANDLER_DISCONNECTED.
+    async fn close_stream(
+        &self,
+        tx: mpsc::Sender<ClientMessage>,
+        stream: &mut tonic::Streaming<proto::ServerMessage>,
+    ) {
+        // The senders are the live stream's and ours: with none left the buffer ends after the
+        // messages still in it, and the transport ends the request.
+        *self.live.lock().unwrap() = None;
+        drop(tx);
+        let finished = tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, async {
+            while let Ok(Some(_)) = stream.message().await {}
+        })
+        .await;
+        if finished.is_err() {
+            tracing::warn!(service = %self.service_name, address = %self.settings.address, "the hub did not finish the stream in time, closing it anyway");
         }
     }
 
