@@ -26,6 +26,9 @@
 //! - P4b (ADR 0017): the new hub shares `streaming`. Against `kraken-hub:p4a-hub`
 //!   (`KRAKEN_HUB_P4A_IMAGE`) a streaming query fails with `UnsupportedByHub` (nothing is sent)
 //!   while a unary query and a scatter-gather keep working.
+//! - P4c (ADR 0017): the new hub shares `subscription`. Against `kraken-hub:p4b-hub`
+//!   (`KRAKEN_HUB_P4B_IMAGE`) a subscription fails with `UnsupportedByHub` (nothing is sent)
+//!   while a unary query, a scatter-gather and a streaming query keep working.
 //!
 //! A missing image fails the test with the command that builds it. No Kafka or MongoDB: the
 //! participants are a `HubConnection` and a `Sender` each; a pass-through (`PermitTap`) records the
@@ -38,11 +41,15 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use kraken_messaging::hub::{
-    CLIENT_VERSION, Handshake, HubConnection, HubPool, HubSettings, Inbound, PERMIT_FLUSH_AFTER,
-    RegisteredTypes, ScatterOptions, SendOptions, Sender, SenderSettings, StreamOptions,
+    CLIENT_VERSION, Dispatcher, HandlerRegistry, Handshake, HubConnection, HubPool, HubSettings,
+    Inbound, PERMIT_FLUSH_AFTER, RegisteredTypes, ScatterOptions, SendOptions, Sender,
+    SenderSettings, StreamOptions, SubscriptionOptions,
 };
+use kraken_messaging::identity::IdentityResolver;
 use kraken_messaging::proto::{self, ClientMessage, client_message, reply};
-use kraken_messaging::{Command, MessagingError, Query, RetryPolicy, StreamingQuery, message_type};
+use kraken_messaging::{
+    Command, MessagingError, Query, RetryPolicy, StreamingQuery, SubscriptionQuery, message_type,
+};
 use serde::{Deserialize, Serialize};
 use support::containers::{HubContainer, HubImage, HubOptions, free_port, hub_with};
 use tokio::sync::mpsc;
@@ -224,7 +231,8 @@ async fn new_hub_acks_with_its_configured_values_and_applies_type_overrides() {
             "flow-control",
             "instance-status",
             "scatter-gather",
-            "streaming"
+            "streaming",
+            "subscription"
         ],
         "the hub shares what we declared"
     );
@@ -1358,4 +1366,138 @@ async fn p4a_hub_streaming_is_unsupported_by_hub_and_unary_and_gathers_still_wor
     assert_eq!(a.sender.in_flight(), 0);
     a.shutdown().await;
     owner.shutdown().await;
+}
+
+/// `compat.Rows`: a streaming query a P4b hub serves (two items).
+#[derive(Serialize, Deserialize)]
+struct Rows {}
+message_type!(Rows, "compat.Rows");
+impl StreamingQuery for Rows {
+    type Item = ();
+}
+
+/// `compat.Feed`: a subscription query, which only a P4c hub routes.
+#[derive(Serialize, Deserialize)]
+struct Feed {}
+message_type!(Feed, "compat.Feed");
+impl SubscriptionQuery for Feed {
+    type Initial = ();
+    type Update = ();
+}
+
+/// The handlers of the owner: `compat.Lookup` (unary), `compat.Rows` (streaming) and
+/// `compat.Feed` (subscription).
+fn owner_registry() -> HandlerRegistry {
+    let mut registry = HandlerRegistry::new();
+    registry.shared_query::<Lookup, _, _>(|_, _| async move { Ok(()) });
+    registry.streaming_query::<Rows, _, _, _>(|_, _| async move {
+        Ok(tokio_stream::iter(vec![Ok(()), Ok(())]))
+    });
+    registry.subscription_query::<Feed, _, _>(|_, _| async move { Ok(()) });
+    registry
+}
+
+/// An instance of `service` served by the library's own dispatcher with `registry`.
+async fn library_node(
+    address: &str,
+    service: &str,
+    registry: HandlerRegistry,
+) -> (Arc<HubPool>, Arc<Sender>) {
+    let (tx, mut rx) = mpsc::channel::<Inbound>(64);
+    let pool = HubPool::new(
+        HubSettings {
+            address: address.to_string(),
+            backoff_min: Duration::from_millis(500),
+            backoff_max: Duration::from_secs(5),
+            ..HubSettings::default()
+        },
+        service.to_string(),
+        uuid::Uuid::new_v4().to_string(),
+        tx,
+    )
+    .unwrap();
+    pool.set_registered_types(registry.registered_types());
+    let sender = Sender::with_pool(Arc::clone(&pool), SenderSettings::default());
+    let dispatcher = Arc::new(Dispatcher::new(
+        Arc::new(registry),
+        Arc::new(IdentityResolver::new(None)),
+        8,
+    ));
+    let forward = Arc::clone(&sender);
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                Inbound::Request { request, reply_to } => {
+                    tokio::spawn(dispatcher.serve(request, reply_to));
+                }
+                Inbound::Flow(f) => dispatcher.flow(&f.request_id, f.credits),
+                Inbound::Cancel(c) => dispatcher.cancel(&c.request_id, &c.reason),
+                Inbound::Disconnected { stream, .. } => {
+                    dispatcher.stream_lost(stream);
+                    forward.on_inbound(msg);
+                }
+                other => forward.on_inbound(other),
+            }
+        }
+    });
+    pool.start();
+    assert!(
+        pool.await_all_registered(Duration::from_secs(15)).await,
+        "{service} did not register"
+    );
+    (pool, sender)
+}
+
+/// A P4b hub (ADR 0017, P4c): it shares `streaming` but not `subscription`, so a subscription
+/// fails with `UnsupportedByHub` before anything is sent, while a unary query, a scatter-gather
+/// and a streaming query to the same owner work as before.
+#[tokio::test]
+async fn p4b_hub_subscription_is_unsupported_by_hub_and_unary_gathers_and_streams_still_work() {
+    require_docker!();
+    let hub = hub_with(HubOptions::new(HubImage::P4b)).await;
+    let (owner_pool, _) = library_node(&hub.address, "compat-owner", owner_registry()).await;
+    let (second_pool, _) = library_node(&hub.address, "compat-owner-2", {
+        // A second owner of the shared `compat.Lookup`, so the gather has two parts.
+        let mut r = HandlerRegistry::new();
+        r.shared_query::<Lookup, _, _>(|_, _| async move { Ok(()) });
+        r
+    })
+    .await;
+    let (caller_pool, caller) =
+        library_node(&hub.address, "compat-caller", HandlerRegistry::new()).await;
+    let handshake = caller_pool.handshake_for("").unwrap();
+    assert!(handshake.streaming(), "{handshake:?}");
+    assert!(!handshake.subscription(), "{handshake:?}");
+
+    let e = caller
+        .subscribe(&Feed {}, SubscriptionOptions::default())
+        .await
+        .err()
+        .expect("unsupported by a P4b hub");
+    assert!(
+        matches!(e, MessagingError::UnsupportedByHub(ref m) if m.contains("subscription")),
+        "{e:?}"
+    );
+    assert_eq!(caller.in_flight(), 0);
+    caller
+        .send_query(&Lookup {}, SendOptions::default())
+        .await
+        .expect("unary query on a P4b hub");
+    let gathered = caller
+        .scatter_gather(&Lookup {}, ScatterOptions::default())
+        .await
+        .expect("scatter-gather on a P4b hub");
+    assert_eq!(gathered.parts.len(), 2, "both owners answer");
+    let items: Vec<_> = caller
+        .stream(&Rows {}, StreamOptions::default())
+        .await
+        .expect("streaming query on a P4b hub")
+        .collect()
+        .await;
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().all(Result::is_ok), "{items:?}");
+    assert_eq!(caller.in_flight(), 0);
+    caller_pool.shutdown().await;
+    second_pool.shutdown().await;
+    owner_pool.shutdown().await;
 }
