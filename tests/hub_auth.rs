@@ -186,6 +186,45 @@ fn debug_output_never_shows_the_token() {
     }
 }
 
+#[test]
+fn a_debug_print_of_a_register_never_shows_the_token() {
+    let token = random_token();
+    for kind in [
+        proto::credentials::Kind::Token(token.clone()),
+        proto::credentials::Kind::Jwt(token.clone()),
+    ] {
+        let register = proto::Register {
+            service_name: "svc".into(),
+            credentials: Some(proto::Credentials {
+                kind: Some(kind.clone()),
+            }),
+            ..Default::default()
+        };
+        for printed in [
+            format!("{register:?}"),
+            format!("{register:#?}"),
+            format!("{:?}", register.credentials),
+            format!("{kind:?}"),
+            format!(
+                "{:?}",
+                proto::ClientMessage {
+                    message: Some(proto::client_message::Message::Register(register.clone()))
+                }
+            ),
+        ] {
+            assert!(!printed.contains(&token), "token leaked: {printed}");
+            assert!(printed.contains("\"***\""), "{printed}");
+        }
+    }
+    let printed = format!(
+        "{:?}",
+        proto::Credentials {
+            kind: Some(proto::credentials::Kind::Token("x".into()))
+        }
+    );
+    assert!(printed.contains("Token"), "the kind is shown: {printed}");
+}
+
 #[tokio::test]
 async fn the_token_file_is_reread_on_reconnect_and_a_fixed_token_registers() {
     support::init_tracing();
