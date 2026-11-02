@@ -43,6 +43,7 @@ indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
 - [Scatter-gather](#scatter-gather)
 - [Streaming queries](#streaming-queries)
 - [Subscription queries](#subscription-queries)
+- [Security](#security)
 - [Upgrading](#upgrading)
 - [Build and test](#build-and-test)
 - [Example](#example)
@@ -125,6 +126,11 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 | `KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS`, `_MULTIPLIER`, `_MAX_BACKOFF_MS` | 100, 2, 2000 | wait before the second attempt, growth factor (a finite number >= 1, else rejected at startup), cap of one wait; each wait is jittered by ±20 % and never above the cap (at the cap: 80-100 % of it), like the reconnect backoff |
 | `KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS` | 600000 | how long a streaming query handler waits for credit before it ends its stream with `TIMEOUT` "no credit within <d>" and releases its permits (see [Streaming queries](#streaming-queries)); the default is the hub's default `KRAKEN_HUB_MAX_STREAM_DURATION` (10 min); at least 1 (`0` is rejected at startup, also when set in code) |
 | `KRAKEN_HUB_MAX_SUBSCRIPTIONS` | 1024 | the most subscription queries this instance serves at once (see [Subscription queries](#subscription-queries)): a subscription request beyond it is refused with `ReplyEnd{error = RESOURCE_EXHAUSTED}` `subscription limit (N) reached`, which the subscriber sees as `HandlerBusy`; subscriptions hold no handler permit, so this is their only bound here; the hub has its own per-instance limit (`KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE`, 1024); at least 1 (`0` is rejected at startup, also when set in code) |
+| `KRAKEN_HUB_TOKEN` | none | the static access token sent in `Register.credentials.token` on every hub stream (`Config.hub_token`, a `SecretString` whose `Debug` prints `"***"`); needed when the hub runs `KRAKEN_HUB_AUTH_MODE=enforce`, ignored by a hub in `off` mode and by older hubs; an empty value is no token; never logged (see [Security](#security)) |
+| `KRAKEN_HUB_TOKEN_FILE` | none | a file holding the token, for container secrets (`Config.hub_token_file`); read at startup (an unreadable file is a startup error) and again before every reconnect, so a rotated secret needs no restart; **wins over `KRAKEN_HUB_TOKEN` when both are set**; surrounding whitespace is trimmed, an empty file is no token |
+| `KRAKEN_HUB_TLS` | `false` | `true` makes every hub channel TLS (`Config.hub_tls = Some(HubTls { .. })`), for a static list and for `dns:///`; needed when the hub sets `KRAKEN_HUB_TLS_CERT`. An `https://` address turns TLS on by itself (system roots) |
+| `KRAKEN_HUB_TLS_CA` | none (system roots) | PEM file with the CA that signs the hub's certificate (`HubTls.ca_file`), re-read on every connect; needs `KRAKEN_HUB_TLS=true` |
+| `KRAKEN_HUB_TLS_SERVER_NAME` | the host of the address | the name the hub's certificate must carry, also sent as SNI (`HubTls.server_name`); needs `KRAKEN_HUB_TLS=true` |
 | `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS` | true, 5 | consumer starts only when event handlers are registered |
 | `KRAKEN_OUTBOX_ENABLED`, `KRAKEN_OUTBOX_POLL_INTERVAL_MS`, `KRAKEN_OUTBOX_BATCH_SIZE`, `KRAKEN_OUTBOX_MAX_ATTEMPTS` | true, 200, 100, 10 | |
 | `KRAKEN_FORWARD_JWT` | true | |
@@ -619,10 +625,94 @@ while let Some(update) = updates.next().await { let tick = update?; /* in the hu
   (`tests/hub_compat.rs`); the P4c hub serves it (`tests/e2e_subscription.rs`, image
   `kraken-hub:p4c-hub`, `KRAKEN_HUB_P4C_IMAGE`).
 
+## Security
+
+Access control and TLS for the hub connection (roadmap P5a, hub ADR 0018). Everything here is opt-in
+and the hub decides: against a hub in `KRAKEN_HUB_AUTH_MODE=off` (the default) or an older hub the
+token is ignored and nothing changes.
+
+**Token.** Set `KRAKEN_HUB_TOKEN` (or `Config.hub_token`) to the service's static token. It is sent in
+`Register.credentials.token` of every stream to every hub, and nowhere else. It is never logged:
+`Config`'s and `HubSettings`' `Debug` print `"***"`, and the error and log lines about it carry the
+path or the code, not the value. An empty token is no token. Generate one per service with
+`openssl rand -hex 32`; the hub's ACL holds only its SHA-256 (`kraken-hub acl hash -`).
+
+**Token file.** `KRAKEN_HUB_TOKEN_FILE` (or `Config.hub_token_file`) names a file with the token, the
+way container secrets arrive (`/run/secrets/...`). It is read at startup (unreadable is a startup
+error, `Config::validate`) and **again before every reconnect**: rotate the secret, and the next
+attempt uses it, no restart. If both settings are set **the file wins**. If the file cannot be read
+later (a secret mid-swap) the last token read from it is kept and a warning logged.
+
+**Rejections.** In `enforce` mode the hub closes the stream of a service it refuses: `UNAUTHENTICATED`
+(no token, an unknown token) or `PERMISSION_DENIED` (the token is for another service name, or the
+`Register` lists a command, query or shared query type outside the token's `handle` patterns, which
+the message names). Like `ALREADY_EXISTS` and `INVALID_ARGUMENT` before, these are registration
+rejections, not outages:
+
+- `HubConnection::last_rejection()` holds the hub's message (until a stream registers, which clears
+  it); `await_hub` / `await_all_hubs` keep returning `false` while the hub refuses, as for the
+  other rejections.
+- The reconnect waits the **backoff cap** (`reconnect_backoff_max`, 80-100 % of it), not the floor:
+  no tight loop against a hub that will keep saying no.
+- The log line `hub rejected the registration` is at `error` once per distinct (code, message),
+  then at `debug` (it resets once a stream registers). Fix the token or the ACL; the next attempt
+  succeeds on its own.
+
+**Access denied.** A request whose type is outside the token's `send` patterns is answered by the hub
+with `Error{PERMISSION_DENIED}` before anything is routed, in every mode. It surfaces as
+`MessagingError::AccessDenied(message)` from `send_command`, `send_query`, `scatter_gather`,
+`stream` and `subscribe`, and is **never retried** (`Config.hub_retry` does not apply). `AccessDenied`
+is the existing variant; a handler that returns it replies `PERMISSION_DENIED` as before.
+
+**TLS.** `KRAKEN_HUB_TLS=true` (`Config.hub_tls`) makes the channel TLS: rustls through tonic, the
+`ring` provider like the hub, TLS 1.2 and 1.3, for every address form (a static list, `dns:///`; an
+`https://` address turns it on by itself). Without `KRAKEN_HUB_TLS_CA` the platform's root certificates
+are trusted; with it, that PEM file's CA is (re-read on every connect, so a CA rotation needs no
+restart). `KRAKEN_HUB_TLS_SERVER_NAME` sets the name the certificate must carry and the SNI, for a
+hub reached by an address that is not in its certificate. If the application installs its own
+process-wide rustls provider, tonic uses that one. Client certificates (mTLS) are P5c: the channel
+setup has a named hook for them (`client_identity` in `src/hub/tls.rs`), not implemented.
+
+A mismatch is a clear log line, not a hang: plain text to a TLS hub (which drops anything that is not
+a TLS handshake) logs `hub stream closed; reconnecting ... set hub_tls / KRAKEN_HUB_TLS=true`, and TLS
+to a plain-text hub or a certificate the CA does not vouch for logs `TLS to the hub failed: does it
+serve TLS, and does its certificate match hub_tls ca_file and server_name?` with the cause.
+
+```bash
+KRAKEN_HUB_TOKEN_FILE=/run/secrets/orders-hub-token \
+KRAKEN_HUB_TLS=true KRAKEN_HUB_TLS_CA=/etc/kraken/ca.pem KRAKEN_HUB_TLS_SERVER_NAME=kraken-hub
+```
+
+**Rollout: permissive first.** Hubs, services and the ACL are released independently, so go in this
+order: (1) roll the hub out with `KRAKEN_HUB_AUTH_MODE=permissive` and the ACL; it logs and counts
+every violation (`kraken_hub_auth_violations_total`) and refuses nothing; (2) roll the services out
+with their token (and TLS, once the hub has a certificate); (3) when the hub's log and metric show no
+violation, switch it to `enforce`. A service without a token against an `enforce` hub is refused
+and shows up as the `UNAUTHENTICATED` rejection above.
+
+Tested in `tests/hub_auth.rs` and `tests/hub_tls.rs` against the in-process fake hub (which implements
+the hub's modes and codes), in `tests/e2e_auth.rs` against `kraken-hub:p5a-hub`
+(`KRAKEN_HUB_P5A_IMAGE`) running `enforce` with an ACL file and a TLS certificate generated at test
+time, and for a token against the P4c hub in `tests/hub_compat.rs`.
+
 ## Upgrading
 
-What changes for a service moving to this version (P4c, then P4b):
+What changes for a service moving to this version (P5a, then P4c, then P4b):
 
+- **Access control and TLS (P5a).** `Config` gained `hub_token: Option<SecretString>`,
+  `hub_token_file: Option<PathBuf>` and `hub_tls: Option<HubTls>` (`KRAKEN_HUB_TOKEN`,
+  `KRAKEN_HUB_TOKEN_FILE`, `KRAKEN_HUB_TLS`, `KRAKEN_HUB_TLS_CA`, `KRAKEN_HUB_TLS_SERVER_NAME`).
+  Code that builds `Config` as a struct literal needs the three fields (`Config::new` sets them to
+  `None`); `HubSettings` gained `token`, `token_file` and `tls` likewise (`..HubSettings::default()`
+  keeps compiling). Nothing changes until a token or TLS is configured. See [Security](#security).
+- **`UNAUTHENTICATED` and `PERMISSION_DENIED` are registration rejections now.** A stream the hub
+  closes with either (an `enforce` hub refusing the token, the service name or a handled type) used
+  to be an ordinary closure retried from the backoff floor with a `warn`; it is now kept in
+  `last_rejection`, retried at the backoff cap and logged at `error` once per distinct message, like
+  `ALREADY_EXISTS` and `INVALID_ARGUMENT`. The `error` log for those two is now once per distinct
+  message as well (it was every attempt). A registered stream clears `last_rejection`, which used to
+  keep the last rejection for good. A request the hub refuses with `PERMISSION_DENIED` is
+  `MessagingError::AccessDenied` and is not retried (it already mapped so; nothing to change).
 - **`Config.hub_max_subscriptions`** (`KRAKEN_HUB_MAX_SUBSCRIPTIONS`, default 1024, at least 1)
   is new. Code that builds `Config` as a struct literal needs the field (`Config::new` sets the
   default). `RegisteredTypes` gained `subscription_queries` too, for code that builds one as a
@@ -675,7 +765,9 @@ previous hub releases: `kraken-hub:p0` (protocol v2 without flow control, overri
 prove the client behaves as before against them. `tests/e2e_multi_hub.rs` and the P3 compat test
 run two or one `kraken-hub:p3-hub` (override with `KRAKEN_HUB_P3_IMAGE`); `tests/e2e_stream.rs` and the P4a compat test run `kraken-hub:p4b-hub` and
 `kraken-hub:p4a-hub` (`KRAKEN_HUB_P4B_IMAGE`, `KRAKEN_HUB_P4A_IMAGE`) and `tests/e2e_subscription.rs`
-two `kraken-hub:p4c-hub` (`KRAKEN_HUB_P4C_IMAGE`); `tests/hub_pool.rs` runs
+two `kraken-hub:p4c-hub` (`KRAKEN_HUB_P4C_IMAGE`); `tests/e2e_auth.rs` runs `kraken-hub:p5a-hub`
+(`KRAKEN_HUB_P5A_IMAGE`) with an ACL file and TLS certificate generated at test time (they are written under
+`target/tmp` and bind-mounted into the container); `tests/hub_pool.rs` runs
 the multi-hub rules against in-process fake hubs. Without Docker the integration tests print a notice and skip; with Docker but no hub
 image they fail with the build command. On Rancher Desktop export
 `DOCKER_HOST=unix://$HOME/.rd/docker.sock` first. A unit test and `scripts/check-proto-sync.sh` (CI

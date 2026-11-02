@@ -73,21 +73,7 @@ impl KrakenMessaging {
             .ok_or_else(|| MessagingError::Storage("mongodb_uri must name a database".into()))?;
         let events = EventBus::new(db.clone());
         let (tx, inbound) = mpsc::channel::<Inbound>(1024);
-        let settings = HubSettings {
-            address: config.hub_address.clone(),
-            heartbeat_interval: config.heartbeat_interval,
-            backoff_min: config.reconnect_backoff_min,
-            backoff_max: config.reconnect_backoff_max,
-            handshake_timeout: Duration::from_secs(10),
-            max_concurrent_handlers: config.max_concurrent_handlers,
-            load_factor: config.hub_load_factor,
-            tags: config.hub_tags.clone(),
-            status_interval: config.hub_status_interval,
-            dns_refresh: crate::hub::DNS_REFRESH,
-            token: config.hub_token.clone(),
-            token_file: config.hub_token_file.clone(),
-            tls: config.hub_tls.clone(),
-        };
+        let settings = hub_settings(&config);
         let hubs = HubPool::new(
             settings,
             config.service_name.clone(),
@@ -467,5 +453,53 @@ impl KrakenMessagingBuilder {
             tasks,
             handlers,
         })
+    }
+}
+
+/// The hub connection settings a [`Config`] describes, access control included.
+fn hub_settings(config: &Config) -> HubSettings {
+    HubSettings {
+        address: config.hub_address.clone(),
+        heartbeat_interval: config.heartbeat_interval,
+        backoff_min: config.reconnect_backoff_min,
+        backoff_max: config.reconnect_backoff_max,
+        handshake_timeout: Duration::from_secs(10),
+        max_concurrent_handlers: config.max_concurrent_handlers,
+        load_factor: config.hub_load_factor,
+        tags: config.hub_tags.clone(),
+        status_interval: config.hub_status_interval,
+        dns_refresh: crate::hub::DNS_REFRESH,
+        token: config.hub_token.clone(),
+        token_file: config.hub_token_file.clone(),
+        tls: config.hub_tls.clone(),
+    }
+}
+
+#[cfg(test)]
+mod hub_settings_tests {
+    use super::*;
+    use crate::security::{HubTls, SecretString};
+
+    #[test]
+    fn the_config_reaches_the_hub_settings() {
+        let mut config = Config::new("svc", "static://hub:7000", "kafka:19092", "mongodb://m/db");
+        assert!(hub_settings(&config).token.is_none());
+        assert!(hub_settings(&config).tls.is_none());
+        config.hub_token = Some(SecretString::new("tok"));
+        config.hub_token_file = Some("/run/secrets/hub-token".into());
+        config.hub_tls = Some(HubTls {
+            server_name: Some("kraken-hub".into()),
+            ..HubTls::default()
+        });
+        let settings = hub_settings(&config);
+        assert_eq!(
+            settings.token.as_ref().map(SecretString::expose),
+            Some("tok")
+        );
+        assert_eq!(
+            settings.token_file.as_deref(),
+            Some(std::path::Path::new("/run/secrets/hub-token"))
+        );
+        assert_eq!(settings.tls, config.hub_tls);
     }
 }
