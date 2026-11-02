@@ -76,6 +76,18 @@
 //! was the last (`HANDLER_DISCONNECTED`). `set_subscription_max_duration(Some(d))` ends one open
 //! longer with `CANCELLED "max subscription duration (<d>) exceeded"`. No idle timeout.
 
+//! Access control like kraken-hub (ADR 0018, P5a): `set_auth(mode, &[(token, Acl)])`. In `Enforce`
+//! the first `Register` of a stream must carry a token the table knows (else the stream is closed
+//! with `UNAUTHENTICATED`), the service name must be the entry's (else `PERMISSION_DENIED`) and
+//! every command, query and shared query type must match its `handle` patterns (else
+//! `PERMISSION_DENIED`, naming the type); a later `Register` is judged for its types against the
+//! session's own token. A `Request` whose type is outside the entry's `send` patterns is answered
+//! with an immediate `Error{PERMISSION_DENIED}` in every request mode and never routed. In
+//! `Permissive` every violation is recorded ([`FakeHub::violations`]) and allowed; in `Off`
+//! (default) nothing is checked. A refused `Register` is not in [`FakeHub::registers`]; it is in
+//! [`FakeHub::rejections`] with the token it carried and when it arrived. A session without a
+//! valid token (permissive) is not judged per request. Patterns: exact, `prefix.*`, `*`.
+
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -217,7 +229,67 @@ async fn deliver(msgs: Vec<(Outbound, ServerMessage)>) {
     }
 }
 
+/// `KRAKEN_HUB_AUTH_MODE` of the fake hub.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthMode {
+    Off,
+    Permissive,
+    Enforce,
+}
+
+/// What a token may do: the one service name, the types it may handle and the types it may send.
+#[derive(Clone, Debug)]
+pub struct Acl {
+    pub service: String,
+    pub handle: Vec<String>,
+    pub send: Vec<String>,
+}
+
+impl Acl {
+    pub fn new(service: &str, handle: &[&str], send: &[&str]) -> Acl {
+        Acl {
+            service: service.to_string(),
+            handle: handle.iter().map(|p| p.to_string()).collect(),
+            send: send.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+}
+
+fn pattern_matches(pattern: &str, ty: &str) -> bool {
+    match pattern.strip_suffix(".*") {
+        _ if pattern == "*" => true,
+        Some(prefix) => ty.starts_with(&format!("{prefix}.")),
+        None => pattern == ty,
+    }
+}
+
+fn allowed(patterns: &[String], ty: &str) -> bool {
+    patterns.iter().any(|p| pattern_matches(p, ty))
+}
+
+#[derive(Default)]
+struct Auth {
+    mode: Option<AuthMode>,
+    tokens: HashMap<String, Acl>,
+}
+
+/// A refused `Register`: the status it was closed with, the token it carried, when.
+#[derive(Clone, Debug)]
+pub struct Rejection {
+    pub code: tonic::Code,
+    pub message: String,
+    pub token: Option<String>,
+    pub at: std::time::Instant,
+}
+
+/// The identity of a stream, fixed by its first `Register`: `None` until then, `Some(None)` for a
+/// session without a valid token (only possible in permissive mode).
+type Principal = Option<Option<Acl>>;
+
 pub struct State {
+    auth: StdMutex<Auth>,
+    rejections: StdMutex<Vec<Rejection>>,
+    violations: StdMutex<Vec<String>>,
     pub registers: Mutex<Vec<proto::Register>>,
     /// Replies with the number of the stream (1-based, in accept order) they arrived on.
     pub replies: Mutex<Vec<(usize, proto::Reply)>>,
@@ -279,6 +351,94 @@ pub struct State {
     ends: StdMutex<Vec<(usize, proto::ReplyEnd)>>,
     flows: StdMutex<Vec<(usize, proto::Flow)>>,
     cancels: StdMutex<Vec<(usize, proto::Cancel)>>,
+}
+
+impl State {
+    fn mode(&self) -> AuthMode {
+        self.auth.lock().unwrap().mode.unwrap_or(AuthMode::Off)
+    }
+
+    /// Judges a `Register`: `Err` closes the stream (enforce); violations of a permissive hub are
+    /// recorded and allowed.
+    fn admit(&self, r: &proto::Register, principal: &mut Principal) -> Result<(), tonic::Status> {
+        let mode = self.mode();
+        if mode == AuthMode::Off {
+            return Ok(());
+        }
+        let mut found: Option<tonic::Status> = None;
+        if principal.is_none() {
+            let token = match r.credentials.as_ref().and_then(|c| c.kind.as_ref()) {
+                Some(proto::credentials::Kind::Token(t)) if !t.is_empty() => Some(t.clone()),
+                _ => None,
+            };
+            let acl = token
+                .as_ref()
+                .and_then(|t| self.auth.lock().unwrap().tokens.get(t).cloned());
+            if acl.is_none() {
+                found = Some(tonic::Status::unauthenticated(if token.is_none() {
+                    "missing token"
+                } else {
+                    "unknown token"
+                }));
+            }
+            *principal = Some(acl);
+        }
+        if found.is_none()
+            && let Some(Some(acl)) = principal
+        {
+            if acl.service != r.service_name {
+                found = Some(tonic::Status::permission_denied(format!(
+                    "token is not valid for service '{}'",
+                    r.service_name
+                )));
+            } else if let Some(ty) = r
+                .command_types
+                .iter()
+                .chain(&r.query_types)
+                .chain(&r.shared_query_types)
+                .find(|t| !allowed(&acl.handle, t))
+            {
+                found = Some(tonic::Status::permission_denied(format!(
+                    "type '{ty}' is not allowed to be handled"
+                )));
+            }
+        }
+        match found {
+            Some(status) if mode == AuthMode::Enforce => Err(status),
+            Some(status) => {
+                self.violations.lock().unwrap().push(format!(
+                    "{:?}: {}",
+                    status.code(),
+                    status.message()
+                ));
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// An immediate `Error{PERMISSION_DENIED}` for a request outside the session's `send`.
+    fn check_send(&self, principal: &Principal, req: &proto::Request) -> Option<ServerMessage> {
+        let mode = self.mode();
+        let Some(Some(acl)) = principal else {
+            return None;
+        };
+        if mode == AuthMode::Off || allowed(&acl.send, &req.r#type) {
+            return None;
+        }
+        if mode == AuthMode::Permissive {
+            self.violations
+                .lock()
+                .unwrap()
+                .push(format!("send {}", req.r#type));
+            return None;
+        }
+        Some(hub_error(
+            &req.id,
+            proto::ErrorCode::PermissionDenied,
+            &format!("type '{}' is not allowed to be sent", req.r#type),
+        ))
+    }
 }
 
 /// What happened on the fake hub, in order.
@@ -1480,6 +1640,7 @@ impl Hub for Service {
         let cancel = CancellationToken::new();
         tokio::spawn(async move {
             let mut instance: Option<String> = None;
+            let mut principal: Principal = None;
             // Dropped with every other stream (a hub restart): nothing more is delivered.
             let mut dropped = false;
             loop {
@@ -1495,6 +1656,20 @@ impl Hub for Service {
                         None | Some(Err(_)) => break,
                         Some(Ok(ClientMessage { message: Some(m) })) => match m {
                             client_message::Message::Register(r) => {
+                                if let Err(status) = state.admit(&r, &mut principal) {
+                                    state.rejections.lock().unwrap().push(Rejection {
+                                        code: status.code(),
+                                        message: status.message().to_string(),
+                                        token: match r.credentials.as_ref().and_then(|c| c.kind.as_ref()) {
+                                            Some(proto::credentials::Kind::Token(t)) => Some(t.clone()),
+                                            _ => None,
+                                        },
+                                        at: std::time::Instant::now(),
+                                    });
+                                    // Like the hub: the stream ends with the status, nothing of the registration stays.
+                                    let _ = tx.send(Err(status)).await;
+                                    break;
+                                }
                                 let v2 = r.protocol_version >= 2;
                                 let wants_flow = r.capabilities.iter().any(|c| c == "flow-control");
                                 let wants_status = r.capabilities.iter().any(|c| c == "instance-status");
@@ -1588,6 +1763,10 @@ impl Hub for Service {
                             client_message::Message::Status(st) => state.statuses.lock().unwrap().push((stream_no, st)),
                             client_message::Message::Request(req) => {
                                 state.requests.lock().await.push(req.clone());
+                                if let Some(denied) = state.check_send(&principal, &req) {
+                                    if tx.send(Ok(denied)).await.is_err() { break; }
+                                    continue;
+                                }
                                 let scattered = req.mode == proto::RequestMode::ScatterGather as i32
                                     && state.scatter(stream_no, &req, &tx).await;
                                 let streamed = req.mode == proto::RequestMode::Streaming as i32
@@ -1669,6 +1848,9 @@ impl FakeHub {
     pub async fn start() -> FakeHub {
         let (drop_tx, _) = broadcast::channel(8);
         let state = Arc::new(State {
+            auth: StdMutex::new(Auth::default()),
+            rejections: StdMutex::new(vec![]),
+            violations: StdMutex::new(vec![]),
             registers: Mutex::new(vec![]),
             replies: Mutex::new(vec![]),
             requests: Mutex::new(vec![]),
@@ -1957,6 +2139,27 @@ impl FakeHub {
     /// Fails every open stream with UNAVAILABLE, as a hub restart would.
     pub fn drop_streams(&self) {
         let _ = self.state.drop_tx.send(());
+    }
+
+    /// Access control (see the module docs): the mode and the token table (token to ACL), replacing
+    /// both. Streams already open keep the identity they registered with.
+    pub fn set_auth(&self, mode: AuthMode, tokens: &[(&str, Acl)]) {
+        let mut auth = self.state.auth.lock().unwrap();
+        auth.mode = Some(mode);
+        auth.tokens = tokens
+            .iter()
+            .map(|(t, a)| (t.to_string(), a.clone()))
+            .collect();
+    }
+
+    /// The refused `Register`s so far, in order.
+    pub fn rejections(&self) -> Vec<Rejection> {
+        self.state.rejections.lock().unwrap().clone()
+    }
+
+    /// What a permissive hub would have refused.
+    pub fn violations(&self) -> Vec<String> {
+        self.state.violations.lock().unwrap().clone()
     }
 
     pub fn reject_next_with_already_exists(&self) {

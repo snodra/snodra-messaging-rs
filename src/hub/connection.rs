@@ -16,8 +16,15 @@
 //! Any failure closes the stream, notifies the owner with [`Inbound::Disconnected`] (carrying the
 //! stream id and the requests still in its outbound buffer, never written) and reconnects with exponential backoff (`backoff_min` doubling up to `backoff_max`,
 //! each wait jittered by ±20 % and clamped to `backoff_max`; at the cap 80-100 % of it), reset to `backoff_min` once an attempt
-//! reached the handshake. An `ALREADY_EXISTS` or `INVALID_ARGUMENT` rejection is kept in
-//! [`HubConnection::last_rejection`] and retried at `backoff_max`.
+//! reached the handshake. A stream the hub closes with `ALREADY_EXISTS`, `INVALID_ARGUMENT`,
+//! `UNAUTHENTICATED` or `PERMISSION_DENIED` is a registration rejection (the last two are the hub's
+//! access control, ADR 0018): it is kept in [`HubConnection::last_rejection`] (until a stream
+//! registers), retried at `backoff_max` and logged at `error` once per distinct message, then at
+//! `debug`.
+//!
+//! Access control (P5a): the static token, from `HubSettings::token` or, winning over it, read from
+//! `HubSettings::token_file` before every connect, goes in `Register.credentials.token` of every
+//! stream; it is never logged. `HubSettings::tls` (or an `https://` address) makes the channel TLS.
 //!
 //! Flow control (capability `flow-control`): the `Register` offers `max_concurrent_handlers`
 //! permits; a hub whose ack shares the capability forwards only that many requests and queues the
@@ -35,6 +42,7 @@
 //! one-way partition is noticed by the transport too, not only by the missing heartbeat echoes.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -51,6 +59,9 @@ use crate::proto::{
     self, ClientMessage, Heartbeat, Permits, Register, RegisterAck, client_message, server_message,
 };
 use crate::retry::{jittered, random_unit};
+use crate::security::{HubTls, SecretString};
+
+use super::tls;
 
 /// The hub protocol version this client speaks (`Register.protocol_version`).
 pub const PROTOCOL_VERSION: u32 = 2;
@@ -122,6 +133,14 @@ pub struct HubSettings {
     pub status_interval: Duration,
     /// [`super::HubPool`] only: how often a `dns:///` address is resolved again.
     pub dns_refresh: Duration,
+    /// The static token for `Register.credentials.token` (`Config.hub_token`); blank is none.
+    /// Replaced by `token_file` when that is set.
+    pub token: Option<SecretString>,
+    /// A file holding the token, read before every connect (`Config.hub_token_file`); wins over
+    /// `token`. When it cannot be read the last token read from it is kept.
+    pub token_file: Option<PathBuf>,
+    /// TLS to the hub (`Config.hub_tls`); `None` is plain text unless the address is `https://`.
+    pub tls: Option<HubTls>,
 }
 
 impl Default for HubSettings {
@@ -137,6 +156,9 @@ impl Default for HubSettings {
             tags: HashMap::new(),
             status_interval: Duration::from_secs(5),
             dns_refresh: super::targets::DNS_REFRESH,
+            token: None,
+            token_file: None,
+            tls: None,
         }
     }
 }
@@ -566,6 +588,9 @@ pub struct HubConnection {
     connected: AtomicBool,
     handshake: watch::Sender<Option<Handshake>>,
     last_rejection: Mutex<Option<String>>,
+    /// The token resolved for the stream being opened (the last one read from `token_file`); what
+    /// every `Register` of the stream carries.
+    token: Mutex<Option<SecretString>>,
     /// A stream of this connection failed or ended at least once.
     failed_once: AtomicBool,
     /// Requests that arrived on this connection's streams and are not finished yet.
@@ -627,6 +652,7 @@ impl HubConnection {
             connected: AtomicBool::new(false),
             handshake,
             last_rejection: Mutex::new(None),
+            token: Mutex::new(None),
             failed_once: AtomicBool::new(false),
             in_flight: Arc::new(AtomicUsize::new(0)),
             hooks: OnceLock::new(),
@@ -879,6 +905,8 @@ impl HubConnection {
     async fn connect_loop(self: Arc<Self>) {
         let mut backoff = self.settings.backoff_min;
         let mut failures: u32 = 0;
+        // The rejection logged at `error` last, so a repeat goes to `debug`.
+        let mut logged_rejection: Option<(Code, String)> = None;
         while !self.cancel.is_cancelled() {
             let stream = NEXT_STREAM.fetch_add(1, Ordering::SeqCst);
             let outcome = self.run_stream(stream).await;
@@ -909,13 +937,20 @@ impl HubConnection {
             if reached_handshake {
                 backoff = self.settings.backoff_min;
                 failures = 0;
+                logged_rejection = None;
             }
             failures += 1;
             let max = self.settings.backoff_max;
-            let wait = if matches!(status.code(), Code::AlreadyExists | Code::InvalidArgument) {
+            let wait = if is_rejection(status.code()) {
                 *self.last_rejection.lock().unwrap() = Some(status.message().to_string());
                 let wait = jittered(max, max, random_unit());
-                tracing::error!(service = %self.service_name, instance = %self.instance_id, address = %self.settings.address, reason = status.message(), retry_in = ?wait, "hub rejected the registration");
+                let key = (status.code(), status.message().to_string());
+                if logged_rejection.as_ref() == Some(&key) {
+                    tracing::debug!(service = %self.service_name, instance = %self.instance_id, address = %self.settings.address, code = ?status.code(), reason = status.message(), retry_in = ?wait, "hub rejected the registration");
+                } else {
+                    tracing::error!(service = %self.service_name, instance = %self.instance_id, address = %self.settings.address, code = ?status.code(), reason = status.message(), retry_in = ?wait, "hub rejected the registration");
+                    logged_rejection = Some(key);
+                }
                 wait
             } else {
                 let wait = jittered(backoff, max, random_unit());
@@ -936,16 +971,26 @@ impl HubConnection {
 
     /// One stream from connect to failure. `Ok(())` when the hub ended it or we were cancelled.
     async fn run_stream(&self, stream_id: StreamId) -> Result<(), Status> {
-        let endpoint = Endpoint::from_shared(grpc_target(&self.settings.address))
+        self.resolve_token()?;
+        let tls = tls::effective(self.settings.tls.as_ref(), &self.settings.address);
+        let mut endpoint = Endpoint::from_shared(grpc_target(&self.settings.address))
             .map_err(|e| Status::invalid_argument(format!("bad hub address: {e}")))?
             .connect_timeout(self.settings.handshake_timeout)
             .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
             .keep_alive_timeout(KEEPALIVE_TIMEOUT)
             .keep_alive_while_idle(true);
-        let channel = endpoint
-            .connect()
-            .await
-            .map_err(|e| Status::unavailable(e.to_string()))?;
+        if let Some(tls) = &tls {
+            endpoint = tls::configure(endpoint, tls).map_err(Status::failed_precondition)?;
+        }
+        let plain = tls.is_none();
+        let channel = endpoint.connect().await.map_err(|e| {
+            let cause = tls::chain(&e);
+            Status::unavailable(if plain {
+                cause
+            } else {
+                format!("{cause} (TLS to the hub failed: does it serve TLS, and does its certificate match hub_tls ca_file and server_name?)")
+            })
+        })?;
         let mut client = HubClient::new(channel);
         let (tx, rx) = mpsc::channel::<ClientMessage>(256);
         let rx = Arc::new(Mutex::new(rx));
@@ -956,9 +1001,8 @@ impl HubConnection {
             client.connect(Outbound(rx)),
         )
         .await
-        .map_err(|_| {
-            Status::deadline_exceeded("hub did not answer the connect handshake in time")
-        })??
+        .map_err(|_| Status::deadline_exceeded("hub did not answer the connect handshake in time"))?
+        .map_err(|s| plain_text_hint(plain, s))?
         .into_inner();
 
         // The Register is the first message of every stream; the ack or the echo of the heartbeat
@@ -1001,7 +1045,7 @@ impl HubConnection {
                     }
                     tx.send(heartbeat()).await.map_err(|_| Status::unavailable("stream closed"))?;
                 }
-                msg = stream.message() => match msg? {
+                msg = stream.message() => match msg.map_err(|s| if handshake.is_none() { plain_text_hint(plain, s) } else { s })? {
                     None => return Ok(()),
                     Some(proto::ServerMessage { message: None }) => {}
                     Some(proto::ServerMessage { message: Some(m) }) => match m {
@@ -1078,6 +1122,32 @@ impl HubConnection {
         unsent
     }
 
+    /// Fixes the token the stream about to open registers with: the one in `token_file` (read now,
+    /// so a rotated secret is picked up; when the file cannot be read the last token read from it
+    /// is kept, and with none the attempt fails), else `token`. Blank is none. Nothing here is
+    /// logged except the path and the I/O error, which never carry file content.
+    fn resolve_token(&self) -> Result<(), Status> {
+        let resolved = match &self.settings.token_file {
+            Some(path) => match crate::security::read_token_file(path) {
+                Ok(token) => token,
+                Err(e) => {
+                    let last = self.token.lock().unwrap().clone();
+                    if last.is_none() {
+                        return Err(Status::failed_precondition(format!(
+                            "hub token file '{}' cannot be read: {e}",
+                            path.display()
+                        )));
+                    }
+                    tracing::warn!(service = %self.service_name, path = %path.display(), error = %e, "hub token file cannot be read; keeping the last token");
+                    last
+                }
+            },
+            None => self.settings.token.clone().filter(|t| !t.is_blank()),
+        };
+        *self.token.lock().unwrap() = resolved;
+        Ok(())
+    }
+
     /// The `Register` of this instance with the types set now.
     fn register(&self, initial_permits: u32) -> ClientMessage {
         let types = self.types.lock().unwrap().clone();
@@ -1088,7 +1158,14 @@ impl HubConnection {
             query_types: types.exclusive_query_types(),
             protocol_version: PROTOCOL_VERSION,
             capabilities: CAPABILITIES.iter().map(|c| c.to_string()).collect(),
-            credentials: None,
+            credentials: self
+                .token
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|t| proto::Credentials {
+                    kind: Some(proto::credentials::Kind::Token(t.expose().to_string())),
+                }),
             client_version: CLIENT_VERSION.to_string(),
             initial_permits,
             load_factor: self.settings.load_factor,
@@ -1113,6 +1190,8 @@ impl HubConnection {
             handshake: handshake.clone(),
             grants: Arc::clone(grants),
         });
+        // A registered stream is the end of any earlier rejection.
+        *self.last_rejection.lock().unwrap() = None;
         let first = self
             .handshake
             .send_replace(Some(handshake.clone()))
@@ -1154,6 +1233,39 @@ pub(crate) fn grpc_target(address: &str) -> String {
         stripped.to_string()
     } else {
         format!("http://{stripped}")
+    }
+}
+
+/// The status codes with which a hub closes a stream to refuse the registration: the hub's
+/// existing refusals and its access control (ADR 0018).
+fn is_rejection(code: Code) -> bool {
+    matches!(
+        code,
+        Code::AlreadyExists
+            | Code::InvalidArgument
+            | Code::Unauthenticated
+            | Code::PermissionDenied
+    )
+}
+
+/// A plain-text connection that the peer drops before the handshake is most likely one to a hub
+/// that serves TLS only (it drops anything that is not a TLS handshake): say so.
+fn plain_text_hint(plain: bool, status: Status) -> Status {
+    if plain
+        && matches!(
+            status.code(),
+            Code::Unavailable | Code::Unknown | Code::Internal
+        )
+    {
+        Status::new(
+            status.code(),
+            format!(
+                "{} (the connection was dropped before the registration; a hub that serves TLS does that to plain text: set hub_tls / KRAKEN_HUB_TLS=true)",
+                status.message()
+            ),
+        )
+    } else {
+        status
     }
 }
 

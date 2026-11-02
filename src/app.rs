@@ -84,6 +84,9 @@ impl KrakenMessaging {
             tags: config.hub_tags.clone(),
             status_interval: config.hub_status_interval,
             dns_refresh: crate::hub::DNS_REFRESH,
+            token: config.hub_token.clone(),
+            token_file: config.hub_token_file.clone(),
+            tls: config.hub_tls.clone(),
         };
         let hubs = HubPool::new(
             settings,
