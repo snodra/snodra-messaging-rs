@@ -5,13 +5,13 @@
 //! the reverse, fails with a log line that says what to check, not with a hang.
 mod support;
 
-use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kraken_messaging::HubTls;
 use kraken_messaging::hub::{HubConnection, HubPool, HubSettings, Inbound};
 use support::fake_hub::FakeHub;
+use support::logs::Captured;
 use support::pki::{Pki, TempDir};
 use tokio::sync::mpsc;
 
@@ -48,36 +48,6 @@ async fn tls_hub(pki: &Pki) -> FakeHub {
 /// `static://127.0.0.1:port` as the TLS hub's address.
 fn address(hub: &FakeHub) -> String {
     hub.address()
-}
-
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
-
-impl Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Captured {
-    fn install(&self) -> tracing::subscriber::DefaultGuard {
-        let sink = self.clone();
-        tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::DEBUG)
-                .with_ansi(false)
-                .with_writer(move || sink.clone())
-                .finish(),
-        )
-    }
-
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-    }
 }
 
 #[tokio::test]

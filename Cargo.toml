@@ -48,6 +48,7 @@ wiremock = "0.6.5"
 # Test certificates are generated at test time; nothing is checked in.
 # The fake hub's TLS listener (tonic's server side takes the process-wide provider): ring, like the hub.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+sha2 = "0.10.9" # SHA-256 of the test tokens for the e2e ACL file (the hub stores digests only)
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
 tokio-stream = { version = "0.1", features = ["net"] } # TcpListenerStream for the in-process fake hub
 testcontainers = "0.27"

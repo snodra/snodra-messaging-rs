@@ -1403,12 +1403,23 @@ async fn library_node(
     service: &str,
     registry: HandlerRegistry,
 ) -> (Arc<HubPool>, Arc<Sender>) {
+    library_node_with_token(address, service, registry, None).await
+}
+
+/// [`library_node`] configured with the hub token `token` (P5a).
+async fn library_node_with_token(
+    address: &str,
+    service: &str,
+    registry: HandlerRegistry,
+    token: Option<&str>,
+) -> (Arc<HubPool>, Arc<Sender>) {
     let (tx, mut rx) = mpsc::channel::<Inbound>(64);
     let pool = HubPool::new(
         HubSettings {
             address: address.to_string(),
             backoff_min: Duration::from_millis(500),
             backoff_max: Duration::from_secs(5),
+            token: token.map(kraken_messaging::SecretString::new),
             ..HubSettings::default()
         },
         service.to_string(),
@@ -1499,5 +1510,46 @@ async fn p4b_hub_subscription_is_unsupported_by_hub_and_unary_gathers_and_stream
     assert_eq!(caller.in_flight(), 0);
     caller_pool.shutdown().await;
     second_pool.shutdown().await;
+    owner_pool.shutdown().await;
+}
+
+/// A P4c hub predates access control (P5a): it ignores `Register.credentials`, so a configured
+/// token is harmless. Every request mode works as before, and the hub never needs the token.
+#[tokio::test]
+async fn p4c_hub_ignores_a_configured_token() {
+    require_docker!();
+    let hub = hub_with(HubOptions::new(HubImage::P4c)).await;
+    let token = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let (owner_pool, _) =
+        library_node_with_token(&hub.address, "compat-owner", owner_registry(), Some(&token)).await;
+    let (caller_pool, caller) = library_node_with_token(
+        &hub.address,
+        "compat-caller",
+        HandlerRegistry::new(),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(caller_pool.connections()[0].last_rejection(), None);
+    caller
+        .send_query(&Lookup {}, SendOptions::default())
+        .await
+        .expect("unary query with a token configured");
+    let items: Vec<_> = caller
+        .stream(&Rows {}, StreamOptions::default())
+        .await
+        .expect("streaming query with a token configured")
+        .collect()
+        .await;
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().all(Result::is_ok), "{items:?}");
+    caller
+        .subscribe(&Feed {}, SubscriptionOptions::default())
+        .await
+        .expect("subscription with a token configured");
+    caller_pool.shutdown().await;
     owner_pool.shutdown().await;
 }

@@ -1,7 +1,7 @@
 //! Testcontainers for the integration tests: Kafka (apache image), MongoDB replica set, kraken-hub.
 #![allow(dead_code)]
 
-use testcontainers::core::{IntoContainerPort, WaitFor};
+use testcontainers::core::{AccessMode, IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use testcontainers_modules::kafka::apache::{self, Kafka};
@@ -67,6 +67,9 @@ pub enum HubImage {
     P4b,
     /// The P4c hub (subscription queries): `KRAKEN_HUB_P4C_IMAGE`, default `kraken-hub:p4c-hub`.
     P4c,
+    /// The P5a hub (access control: static tokens, ACL, TLS): `KRAKEN_HUB_P5A_IMAGE`, default
+    /// `kraken-hub:p5a-hub`.
+    P5a,
 }
 
 impl HubImage {
@@ -91,6 +94,8 @@ impl HubImage {
                 .unwrap_or_else(|_| "kraken-hub:p4b-hub".to_string()),
             HubImage::P4c => std::env::var("KRAKEN_HUB_P4C_IMAGE")
                 .unwrap_or_else(|_| "kraken-hub:p4c-hub".to_string()),
+            HubImage::P5a => std::env::var("KRAKEN_HUB_P5A_IMAGE")
+                .unwrap_or_else(|_| "kraken-hub:p5a-hub".to_string()),
         }
     }
 
@@ -119,6 +124,9 @@ impl HubImage {
             }
             HubImage::P4c => {
                 "build the P4c hub and tag it `kraken-hub:p4c-hub` (or set KRAKEN_HUB_P4C_IMAGE)"
+            }
+            HubImage::P5a => {
+                "build the P5a hub and tag it `kraken-hub:p5a-hub` (or set KRAKEN_HUB_P5A_IMAGE)"
             }
         }
     }
@@ -165,6 +173,8 @@ pub struct HubOptions {
     pub port: Option<u16>,
     /// Extra `KRAKEN_HUB_*` variables, for example `KRAKEN_HUB_TIMEOUT_OVERRIDES`.
     pub env: Vec<(String, String)>,
+    /// Host directories bind-mounted read-only: (host path, container path).
+    pub mounts: Vec<(String, String)>,
 }
 
 impl HubOptions {
@@ -173,6 +183,7 @@ impl HubOptions {
             image,
             port: None,
             env: vec![],
+            mounts: vec![],
         }
     }
 
@@ -183,6 +194,14 @@ impl HubOptions {
 
     pub fn env(mut self, name: &str, value: &str) -> HubOptions {
         self.env.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    /// Bind-mounts the host directory `host` at `container` (read-only), for an ACL file or a
+    /// certificate and key.
+    pub fn mount(mut self, host: &std::path::Path, container: &str) -> HubOptions {
+        self.mounts
+            .push((host.display().to_string(), container.to_string()));
         self
     }
 }
@@ -198,6 +217,13 @@ pub async fn hub_with(options: HubOptions) -> HubContainer {
         .with_env_var("KRAKEN_HUB_LOG", "info");
     for (k, v) in &options.env {
         image = image.with_env_var(k.clone(), v.clone());
+    }
+    let mut image = image;
+    for (host, container) in &options.mounts {
+        image = image.with_mount(
+            Mount::bind_mount(host.clone(), container.clone())
+                .with_access_mode(AccessMode::ReadOnly),
+        );
     }
     let container = match options.port {
         Some(port) => {

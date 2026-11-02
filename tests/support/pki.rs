@@ -48,7 +48,10 @@ pub struct TempDir(PathBuf);
 
 impl TempDir {
     pub fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("kraken-test-{}", uuid::Uuid::new_v4()));
+        // Under `target/` (inside the checkout) rather than the system temp dir: container runtimes
+        // that run in a VM share the home directory, not necessarily `/var/folders`.
+        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("kraken-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)
     }

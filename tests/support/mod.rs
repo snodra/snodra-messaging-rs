@@ -80,6 +80,7 @@ pub fn token_without_realm_access(subject: &str) -> String {
 }
 
 pub mod fake_hub;
+pub mod logs;
 pub mod pki;
 
 /// Opt-in logging for debugging a test: `RUST_LOG=debug cargo test -- --nocapture`.
