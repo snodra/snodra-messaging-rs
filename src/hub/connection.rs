@@ -973,7 +973,14 @@ impl HubConnection {
     async fn run_stream(&self, stream_id: StreamId) -> Result<(), Status> {
         self.resolve_token()?;
         let tls = tls::effective(self.settings.tls.as_ref(), &self.settings.address);
-        let mut endpoint = Endpoint::from_shared(grpc_target(&self.settings.address))
+        let mut target = grpc_target(&self.settings.address);
+        if tls.is_some() {
+            // tonic speaks TLS only to an `https` URI, whatever the endpoint's TLS config says.
+            if let Some(rest) = target.strip_prefix("http://") {
+                target = format!("https://{rest}");
+            }
+        }
+        let mut endpoint = Endpoint::from_shared(target)
             .map_err(|e| Status::invalid_argument(format!("bad hub address: {e}")))?
             .connect_timeout(self.settings.handshake_timeout)
             .http2_keep_alive_interval(KEEPALIVE_INTERVAL)

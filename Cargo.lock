@@ -1899,6 +1899,7 @@ dependencies = [
  "rcgen",
  "rdkafka",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "testcontainers",

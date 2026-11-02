@@ -1846,6 +1846,20 @@ pub struct FakeHub {
 
 impl FakeHub {
     pub async fn start() -> FakeHub {
+        Self::start_with(None).await
+    }
+
+    /// A hub that serves TLS only, with the given certificate and key (PEM): a plain-text client
+    /// is dropped at the handshake, like the real hub's TLS listener does.
+    pub async fn start_tls(cert_pem: &str, key_pem: &str) -> FakeHub {
+        Self::start_with(Some((cert_pem.to_string(), key_pem.to_string()))).await
+    }
+
+    async fn start_with(tls: Option<(String, String)>) -> FakeHub {
+        if tls.is_some() {
+            // tonic's server side builds its rustls config from the process-wide provider.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        }
         let (drop_tx, _) = broadcast::channel(8);
         let state = Arc::new(State {
             auth: StdMutex::new(Auth::default()),
@@ -1903,7 +1917,16 @@ impl FakeHub {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let svc = Service(state.clone());
         tokio::spawn(async move {
-            tonic::transport::Server::builder()
+            let mut builder = tonic::transport::Server::builder();
+            if let Some((cert, key)) = tls {
+                builder = builder
+                    .tls_config(
+                        tonic::transport::ServerTlsConfig::new()
+                            .identity(tonic::transport::Identity::from_pem(cert, key)),
+                    )
+                    .unwrap();
+            }
+            builder
                 .add_service(HubServer::new(svc))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                     shutdown_rx.await.ok();

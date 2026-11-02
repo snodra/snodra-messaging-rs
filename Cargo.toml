@@ -46,6 +46,8 @@ tokio = { version = "1.54.1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wiremock = "0.6.5"
 # Test certificates are generated at test time; nothing is checked in.
+# The fake hub's TLS listener (tonic's server side takes the process-wide provider): ring, like the hub.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
 tokio-stream = { version = "0.1", features = ["net"] } # TcpListenerStream for the in-process fake hub
 testcontainers = "0.27"
