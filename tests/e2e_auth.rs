@@ -337,20 +337,18 @@ async fn plain_text_against_the_tls_hub_fails_cleanly() {
     let _logs = captured.install();
     let plain = peer(&f, "billing", &f.billing_token, None, billing_types());
     let started = Instant::now();
-    // Not a hang: the failure is logged within a few seconds, with what to do about it.
-    while !captured.text().contains("hub stream closed") {
+    // Not a hang: the hint is logged within a few seconds. The first failure can be a refused
+    // connect (the host-mapped port not forwarding yet) that carries no hint, so wait for the
+    // hint itself, not for the first "hub stream closed".
+    while !captured.text().contains("KRAKEN_HUB_TLS=true") {
         assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "no failure logged: {}",
+            started.elapsed() < Duration::from_secs(15),
+            "no hint logged: {}",
             captured.text()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(
-        captured.text().contains("KRAKEN_HUB_TLS=true"),
-        "{}",
-        captured.text()
-    );
+    assert!(captured.text().contains("hub stream closed"));
     assert!(plain.conn.handshake().is_none());
     assert!(!captured.text().contains(&f.billing_token));
     plain.shutdown().await;

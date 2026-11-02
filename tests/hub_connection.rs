@@ -678,3 +678,27 @@ async fn permits_go_only_to_the_arrival_stream() {
     conn.shutdown().await;
     hub.stop();
 }
+
+// ---- Test support: the container readiness probe ----
+
+#[tokio::test]
+async fn wait_for_tcp_returns_once_the_port_accepts_and_gives_up_otherwise() {
+    // Nothing listens: it gives up at the deadline.
+    let free = support::containers::free_port();
+    let addr = format!("127.0.0.1:{free}");
+    assert!(!support::containers::wait_for_tcp(&addr, Duration::from_millis(300)).await);
+
+    // A listener that only comes up after a while (a forward that is not ready at once).
+    let late = tokio::spawn(async move {
+        sleep(Duration::from_millis(400)).await;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", free))
+            .await
+            .unwrap();
+        sleep(Duration::from_secs(3)).await;
+        drop(listener);
+    });
+    let started = Instant::now();
+    assert!(support::containers::wait_for_tcp(&addr, Duration::from_secs(5)).await);
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    late.abort();
+}

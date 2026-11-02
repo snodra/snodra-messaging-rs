@@ -206,6 +206,32 @@ impl HubOptions {
     }
 }
 
+/// Retries a TCP connect to `addr` (`host:port`) until it is accepted or `within` has passed;
+/// `true` when it was. The hub prints "hub listening" before the runtime's host-mapped port
+/// forwards (Rancher Desktop), so a client that connects right away can be refused.
+pub async fn wait_for_tcp(addr: &str, within: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let attempt = tokio::net::TcpStream::connect(addr);
+        if let Ok(Ok(_)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), attempt).await
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+async fn probe_or_fail(addr: &str) {
+    assert!(
+        wait_for_tcp(addr, std::time::Duration::from_secs(30)).await,
+        "the hub's mapped port {addr} never accepted a connection"
+    );
+}
+
 pub async fn hub_with(options: HubOptions) -> HubContainer {
     let (name, tag) = image_or_fail(options.image);
     let mut image = GenericImage::new(name, tag)
@@ -234,6 +260,8 @@ pub async fn hub_with(options: HubOptions) -> HubContainer {
                 .start()
                 .await
                 .expect("hub container");
+            probe_or_fail(&format!("127.0.0.1:{port}")).await;
+            probe_or_fail(&format!("127.0.0.1:{http_port}")).await;
             return HubContainer {
                 container,
                 address: format!("static://127.0.0.1:{port}"),
@@ -250,6 +278,8 @@ pub async fn hub_with(options: HubOptions) -> HubContainer {
         .get_host_port_ipv4(7001.tcp())
         .await
         .expect("hub http port");
+    probe_or_fail(&format!("127.0.0.1:{grpc}")).await;
+    probe_or_fail(&format!("127.0.0.1:{http}")).await;
     HubContainer {
         container,
         address: format!("static://127.0.0.1:{grpc}"),
