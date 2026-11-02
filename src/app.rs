@@ -407,8 +407,9 @@ impl KrakenMessagingBuilder {
                     msg = inbound.recv() => match msg { Some(m) => m, None => break },
                 };
                 match msg {
-                    // Served on the stream it arrived on; registered before the spawn so that a
-                    // Flow or Cancel right behind it finds it.
+                    // Served on the stream it arrived on. `serve` registers the request (a
+                    // running request, or a subscription pending its admission) synchronously,
+                    // before the spawn, so that a Flow or Cancel right behind it finds it.
                     Inbound::Request { request, reply_to } => {
                         loop_handlers.spawn(loop_dispatcher.serve(request, reply_to));
                     }

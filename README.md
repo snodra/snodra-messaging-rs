@@ -541,7 +541,10 @@ while let Some(update) = updates.next().await { let tick = update?; /* in the hu
   (it holds a handler permit and is bounded by the timeout). Every capable instance gets
   `Request{id = <id>#n, mode = SUBSCRIPTION}`, which registers a subscription on it (the decoded
   query, the request id and the arrival stream; no handler runs, no permit is held here or at
-  the hub). The sender gets the initial result as `ReplyPart{seq = 1}` and then the updates as
+  the hub). It is registered as soon as the request is read, before its identity and guard are
+  checked: a hub `Cancel` or a lost stream right behind it removes it (nothing is sent), updates
+  emitted meanwhile are held and delivered, in order, once it is admitted (dropped when it is
+  refused). The sender gets the initial result as `ReplyPart{seq = 1}` and then the updates as
   `ReplyPart{seq = 2, 3, ...}` in the hub's arrival order (the hub renumbers: per-source order
   is kept, there is no order between sources). A unary query to a subscription type (an id
   without the `#0` suffix) is answered `INVALID_REQUEST` ("`<type>` is a subscription query:

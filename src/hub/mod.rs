@@ -16,7 +16,7 @@ pub use connection::{
     INSTANCE_STATUS, Inbound, PERMIT_BATCH, PERMIT_FLUSH_AFTER, PROTOCOL_VERSION, RegisteredTypes,
     ReplyTo, SCATTER_GATHER, STREAMING, SUBSCRIPTION, StreamId,
 };
-pub use dispatcher::Dispatcher;
+pub use dispatcher::{AdmissionHook, Dispatcher};
 pub use pool::{DRAIN_LIMIT, HubPool, Resolver};
 pub use registry::{EventContext, HandlerRegistry};
 pub use sender::{

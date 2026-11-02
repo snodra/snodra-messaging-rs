@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -23,8 +24,11 @@ use crate::proto::{
 };
 
 use super::connection::{ReplyTo, StreamId};
+use super::registry::SubscriptionHandler;
 use super::registry::{HandlerRegistry, Invocation, ItemStream};
-use super::subscriptions::{DEFAULT_MAX_SUBSCRIPTIONS, QueryUpdateEmitter, Subscriptions};
+use super::subscriptions::{
+    Admission, DEFAULT_MAX_SUBSCRIPTIONS, QueryUpdateEmitter, Subscriptions,
+};
 
 /// How the hub reaches a running request: its cancel token and, for a stream, its credits.
 struct Control {
@@ -72,9 +76,16 @@ pub struct Dispatcher {
     stream_credit_timeout: Duration,
     /// The subscriptions served here (P4c), shared with the [`QueryUpdateEmitter`]s.
     subscriptions: Arc<Subscriptions>,
+    /// Awaited by a subscription request before its identity is resolved (tests: a slow
+    /// identity check, to hold requests in admission).
+    admission_hook: Option<AdmissionHook>,
 }
 
-/// Why a subscription request was not registered.
+/// What a test runs at the start of a subscription's admission, with the request id.
+#[doc(hidden)]
+pub type AdmissionHook = Arc<dyn Fn(&str) -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// Why a subscription request is refused.
 enum Rejected {
     /// The instance already serves that many subscriptions.
     Limit(usize),
@@ -85,6 +96,24 @@ impl From<MessagingError> for Rejected {
     fn from(e: MessagingError) -> Self {
         Rejected::Error(e)
     }
+}
+
+/// A subscription request as [`Dispatcher::serve`] read it, before its admission: registered
+/// (pending) when it could be, else what is wrong with it. The flaws are reported in the order
+/// the admission always checked: lookup, then the guard, then the decode, then the limit.
+struct Prepared {
+    admission: Option<Admission>,
+    flaw: Flaw,
+}
+
+enum Flaw {
+    None,
+    /// No handler of this mode for the type, or not a query.
+    Lookup(MessagingError),
+    /// The query does not decode.
+    Decode(MessagingError),
+    /// The instance serves its limit already.
+    Limit(usize),
 }
 
 impl Dispatcher {
@@ -100,6 +129,7 @@ impl Dispatcher {
             running: Mutex::new(HashMap::new()),
             stream_credit_timeout: crate::config::DEFAULT_STREAM_CREDIT_TIMEOUT,
             subscriptions: Arc::new(Subscriptions::new(DEFAULT_MAX_SUBSCRIPTIONS)),
+            admission_hook: None,
         }
     }
 
@@ -116,6 +146,14 @@ impl Dispatcher {
     /// handlers could capture it) instead of its own; its limit is kept.
     pub fn with_emitter(mut self, emitter: QueryUpdateEmitter) -> Dispatcher {
         self.subscriptions = Arc::clone(emitter.inner());
+        self
+    }
+
+    /// Test hook: `hook(request_id)` is awaited by every subscription request before its
+    /// identity is resolved, standing in for a slow identity check.
+    #[doc(hidden)]
+    pub fn admission_hook(mut self, hook: AdmissionHook) -> Dispatcher {
+        self.admission_hook = Some(hook);
         self
     }
 
@@ -228,8 +266,9 @@ impl Dispatcher {
     /// `Cancel` for its id that follows it at once still finds it. A unary request gets its
     /// `Reply`; a streaming one (`mode = STREAMING`) its parts under the credits and its end.
     /// One permit goes back to the hub at the end, whatever the end. A subscription request
-    /// (`mode = SUBSCRIPTION`, P4c) registers a subscription instead: it is passive (no running
-    /// handler, no permit here or at the hub) and gets a `ReplyEnd{error}` only when refused.
+    /// (`mode = SUBSCRIPTION`, P4c) registers a subscription instead, also before the returned
+    /// future runs, pending its admission: it is passive (no running handler, no permit here or
+    /// at the hub) and gets a `ReplyEnd{error}` only when refused.
     pub fn serve(
         self: &Arc<Self>,
         request: proto::Request,
@@ -239,11 +278,17 @@ impl Dispatcher {
         let subscription = request.mode == RequestMode::Subscription as i32;
         let accepted =
             (!subscription).then(|| self.accept(&request.id, reply_to.stream(), streaming));
+        // Registered here, before the spawn, like a running request: a hub `Cancel` or a lost
+        // stream that follows the request finds it, whatever the admission is doing.
+        let prepared = subscription.then(|| self.register_subscription(&request, &reply_to));
         let me = Arc::clone(self);
         async move {
             let request_id = request.id.clone();
+            if let Some(prepared) = prepared {
+                me.subscribe(request, &reply_to, prepared).await;
+                return;
+            }
             let Some((running, credits)) = accepted else {
-                me.subscribe(request, &reply_to).await;
                 return;
             };
             if streaming {
@@ -344,6 +389,12 @@ impl Dispatcher {
                 }
                 // A subscription's initial result is the unary request `<id>#0` (P4c): the
                 // subscription handler answers it; any other unary request used the wrong mode.
+                //
+                // Recognised by the id's `#0` suffix alone, which collides with scatter-gather:
+                // its targets are numbered from `#0` too, so a gather of a subscription type
+                // sent by a raw client would have its target `<id>#0` answered with the initial
+                // result. Only raw clients can hit it: the typed APIs never gather a
+                // subscription type.
                 None => match self.registry.subscription_handler(&req.r#type) {
                     Some(handler) if req.id.ends_with("#0") => Some(handler.initial.clone()),
                     Some(_) => {
@@ -426,16 +477,84 @@ impl Dispatcher {
         Ok((ctx, req.payload))
     }
 
-    /// A subscription request (`<id>#n`, `mode = SUBSCRIPTION`): registered with the
-    /// subscriptions the emitter feeds, or refused with a `ReplyEnd{error}`: `INVALID_REQUEST`
-    /// when the type's handler answers another mode (a unary or streaming handler: the sender
-    /// used the wrong call), `NO_HANDLER` for a type not served here, `RESOURCE_EXHAUSTED`
-    /// `subscription limit (N) reached` beyond `max_subscriptions`, the guard's code, or
-    /// `INVALID_REQUEST` for a query that does not decode.
-    async fn subscribe(&self, req: proto::Request, reply_to: &ReplyTo) {
+    /// Registers a subscription request (`<id>#n`, `mode = SUBSCRIPTION`) as pending, as far
+    /// as it can be before its identity is known: its handler is looked up and its query decoded
+    /// (the guard decides later whether either matters). What stops it is kept to be reported by
+    /// [`subscribe`](Self::subscribe) in the order its admission always reported it.
+    fn register_subscription(&self, req: &proto::Request, reply_to: &ReplyTo) -> Prepared {
+        let flawed = |flaw| Prepared {
+            admission: None,
+            flaw,
+        };
+        let handler = match self.subscription_handler(req) {
+            Ok(handler) => handler,
+            Err(e) => return flawed(Flaw::Lookup(e)),
+        };
+        let query = match (handler.decode)(&req.payload) {
+            Ok(query) => query,
+            Err(e) => return flawed(Flaw::Decode(invocation_error(&req.r#type, e))),
+        };
+        match self.subscriptions.register(
+            &req.id,
+            &req.r#type,
+            query,
+            req.payload.clone(),
+            reply_to.clone(),
+        ) {
+            Ok(admission) => Prepared {
+                admission: Some(admission),
+                flaw: Flaw::None,
+            },
+            Err(max) => flawed(Flaw::Limit(max)),
+        }
+    }
+
+    /// The handler of a subscription request: `INVALID_REQUEST` when the type's handler answers
+    /// another mode (a unary or streaming handler: the sender used the wrong call, which no
+    /// retry fixes), `NO_HANDLER` for a type not served here.
+    fn subscription_handler(
+        &self,
+        req: &proto::Request,
+    ) -> Result<SubscriptionHandler, MessagingError> {
+        match kind(req)? {
+            RequestKind::Query => match self.registry.subscription_handler(&req.r#type) {
+                Some(handler) => Ok(handler.clone()),
+                None if self.registry.query_handler(&req.r#type).is_some() => {
+                    Err(MessagingError::InvalidMessage(format!(
+                        "{} is not a subscription query handler (it answers mode UNARY)",
+                        req.r#type
+                    )))
+                }
+                None if self.registry.stream_handler(&req.r#type).is_some() => {
+                    Err(MessagingError::InvalidMessage(format!(
+                        "{} is not a subscription query handler (it answers mode STREAMING)",
+                        req.r#type
+                    )))
+                }
+                None => Err(MessagingError::NoHandler(req.r#type.clone())),
+            },
+            _ => Err(MessagingError::NoHandler(req.r#type.clone())),
+        }
+    }
+
+    /// The admission of a subscription request (`<id>#n`, `mode = SUBSCRIPTION`) that
+    /// [`register_subscription`](Self::register_subscription) read: admitted, so what emits
+    /// matched meanwhile is delivered, or refused with a `ReplyEnd{error}`: `INVALID_REQUEST`
+    /// when the type's handler answers another mode, `NO_HANDLER` for a type not served here,
+    /// `RESOURCE_EXHAUSTED` `subscription limit (N) reached` beyond `max_subscriptions`, the
+    /// guard's code, or `INVALID_REQUEST` for a query that does not decode. A hub `Cancel` or a
+    /// lost stream meanwhile removed it: the outcome is dropped and nothing is sent.
+    async fn subscribe(&self, req: proto::Request, reply_to: &ReplyTo, prepared: Prepared) {
         let request_id = req.id.clone();
-        let error = match self.open_subscription(req, reply_to).await {
-            Ok(()) => return,
+        let Prepared { admission, flaw } = prepared;
+        let error = match self.vet_subscription(req, flaw).await {
+            Ok(()) => {
+                if let Some(admission) = admission {
+                    admission.admit();
+                    tracing::debug!(request = %request_id, stream = reply_to.stream(), "subscription registered");
+                }
+                return;
+            }
             Err(Rejected::Limit(max)) => proto::Error {
                 request_id: request_id.clone(),
                 code: ErrorCode::ResourceExhausted as i32,
@@ -445,51 +564,29 @@ impl Dispatcher {
             Err(Rejected::Error(e)) => hub_error(&request_id, &e),
         };
         tracing::debug!(request = %request_id, code = error.code, "subscription refused: {}", error.message);
-        send_end(reply_to, &request_id, Some(error)).await;
+        match admission {
+            // Registered: its pump writes the refusal (unless the hub cancelled it).
+            Some(admission) => admission.refuse(error),
+            None => send_end(reply_to, &request_id, Some(error)).await,
+        }
     }
 
-    async fn open_subscription(
-        &self,
-        req: proto::Request,
-        reply_to: &ReplyTo,
-    ) -> Result<(), Rejected> {
-        let identity = self.identity(&req).await?;
-        let handler = match kind(&req)? {
-            RequestKind::Query => match self.registry.subscription_handler(&req.r#type) {
-                Some(handler) => Some(handler.clone()),
-                // The caller used the wrong mode: not retryable, unlike NO_HANDLER.
-                None if self.registry.query_handler(&req.r#type).is_some() => {
-                    return Err(MessagingError::InvalidMessage(format!(
-                        "{} is not a subscription query handler (it answers mode UNARY)",
-                        req.r#type
-                    ))
-                    .into());
-                }
-                None if self.registry.stream_handler(&req.r#type).is_some() => {
-                    return Err(MessagingError::InvalidMessage(format!(
-                        "{} is not a subscription query handler (it answers mode STREAMING)",
-                        req.r#type
-                    ))
-                    .into());
-                }
-                None => None,
-            },
-            _ => None,
+    /// Identity, then what `register_subscription` found wrong with the request, then the guard
+    /// (before the decode's verdict: anonymous callers cannot probe payload shapes).
+    async fn vet_subscription(&self, req: proto::Request, flaw: Flaw) -> Result<(), Rejected> {
+        if let Some(hook) = &self.admission_hook {
+            hook(&req.id).await;
         }
-        .ok_or_else(|| MessagingError::NoHandler(req.r#type.clone()))?;
-        let (ctx, payload) = self.context(req, identity)?;
-        let query = (handler.decode)(&payload).map_err(|e| invocation_error(&ctx.type_name, e))?;
-        self.subscriptions
-            .open(
-                &ctx.message_id,
-                &ctx.type_name,
-                query,
-                payload,
-                reply_to.clone(),
-            )
-            .map_err(Rejected::Limit)?;
-        tracing::debug!(request = %ctx.message_id, r#type = %ctx.type_name, stream = reply_to.stream(), "subscription registered");
-        Ok(())
+        let identity = self.identity(&req).await?;
+        if let Flaw::Lookup(e) = flaw {
+            return Err(e.into());
+        }
+        let (_ctx, _payload) = self.context(req, identity)?;
+        match flaw {
+            Flaw::Decode(e) => Err(e.into()),
+            Flaw::Limit(max) => Err(Rejected::Limit(max)),
+            Flaw::Lookup(_) | Flaw::None => Ok(()),
+        }
     }
 
     /// A streaming request: its parts under the credits (`initial_credit` plus every `Flow`;

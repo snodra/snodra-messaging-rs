@@ -4,14 +4,19 @@
 //! `ReplyPart` on that stream (`seq` from 1 per subscription; the hub renumbers), `complete` and
 //! `complete_exceptionally` a `ReplyEnd`. Each subscription has a pump task that writes its
 //! messages in call order, so an emitter call never blocks on the hub stream's buffer.
+//!
+//! A subscription is registered when its request is read (see [`Subscriptions::register`]),
+//! before its admission (identity, guard, limit) completes: a hub `Cancel` or a lost stream that
+//! follows finds it, so none outlives the hub's own forgetting. Until admitted, its pump holds
+//! back what matching emits queued; a refused admission drops them.
 
 use std::any::Any;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -41,6 +46,8 @@ enum Outgoing {
 
 /// One open subscription.
 struct Open {
+    /// Tells this entry from another registered under the same id later.
+    serial: u64,
     type_name: String,
     /// The decoded query, as the registered handler's type, for the emitter's filters (shared
     /// with the filters' snapshot, which runs them outside the lock).
@@ -61,6 +68,7 @@ struct Open {
 /// What an emit reads of an open subscription under the lock, to run the filter on it outside.
 struct Candidate {
     id: String,
+    serial: u64,
     query: Arc<dyn Any + Send + Sync>,
     payload: Arc<Vec<u8>>,
 }
@@ -80,6 +88,7 @@ impl Candidate {
 /// The subscriptions open on this instance, by their handler-side request id (`<id>#n`).
 pub(crate) struct Subscriptions {
     max: AtomicUsize,
+    serials: AtomicU64,
     open: Mutex<HashMap<String, Open>>,
 }
 
@@ -87,6 +96,7 @@ impl Subscriptions {
     pub(crate) fn new(max: usize) -> Subscriptions {
         Subscriptions {
             max: AtomicUsize::new(max.max(1)),
+            serials: AtomicU64::new(0),
             open: Mutex::new(HashMap::new()),
         }
     }
@@ -111,28 +121,47 @@ impl Subscriptions {
     }
 
     /// Registers subscription `id` of `type_name` with its decoded `query`, its parts and end to
-    /// go to `reply_to`. `Err(max)` when the instance already serves `max` subscriptions
-    /// (nothing registered). A second registration of the same id replaces (and stops) the
-    /// first.
-    pub(crate) fn open(
-        &self,
+    /// go to `reply_to`, pending its admission. `Err(max)` when the instance already serves
+    /// `max` subscriptions (nothing registered). A second registration of the same id replaces
+    /// (and stops) the first.
+    ///
+    /// The pump is started at once but writes nothing until the [`Admission`] is decided: what
+    /// matching emits send meanwhile is queued, in order, and goes out first once it is
+    /// [`admit`](Admission::admit)ted; [`refuse`](Admission::refuse) drops it and writes the
+    /// refusal instead. A hub `Cancel` or a lost stream in between removes the entry, and
+    /// nothing is written at all.
+    pub(crate) fn register(
+        self: &Arc<Self>,
         id: &str,
         type_name: &str,
         query: Box<dyn Any + Send + Sync>,
         payload: Vec<u8>,
         reply_to: ReplyTo,
-    ) -> Result<(), usize> {
+    ) -> Result<Admission, usize> {
         let mut open = self.lock();
         let max = self.max();
         if open.len() >= max && !open.contains_key(id) {
             return Err(max);
         }
+        let serial = self.serials.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
+        let (gate, verdict) = oneshot::channel();
         let cancel = CancellationToken::new();
-        let pump = tokio::spawn(pump(id.to_string(), reply_to.clone(), rx, cancel.clone()));
+        let pump = tokio::spawn(pump(
+            Pump {
+                id: id.to_string(),
+                serial,
+                subscriptions: Arc::downgrade(self),
+                reply_to: reply_to.clone(),
+                cancel: cancel.clone(),
+            },
+            rx,
+            verdict,
+        ));
         let replaced = open.insert(
             id.to_string(),
             Open {
+                serial,
                 type_name: type_name.to_string(),
                 query: Arc::from(query),
                 payload: Arc::new(payload),
@@ -150,7 +179,22 @@ impl Subscriptions {
             );
             old.cancel.cancel();
         }
-        Ok(())
+        Ok(Admission {
+            subscriptions: Arc::clone(self),
+            id: id.to_string(),
+            serial,
+            gate,
+        })
+    }
+
+    /// Removes the entry `id` if it is still the one registered as `serial`, without stopping
+    /// its pump.
+    fn remove_entry(&self, id: &str, serial: u64) -> Option<Open> {
+        let mut open = self.lock();
+        match open.get(id) {
+            Some(o) if o.serial == serial => open.remove(id),
+            _ => None,
+        }
     }
 
     /// Removes subscription `id` (a hub `Cancel`): nothing more is sent for it. False when there
@@ -216,6 +260,7 @@ impl Subscriptions {
             .filter(|(_, o)| o.type_name == Q::TYPE)
             .map(|(id, o)| Candidate {
                 id: id.clone(),
+                serial: o.serial,
                 query: Arc::clone(&o.query),
                 payload: Arc::clone(&o.payload),
             })
@@ -243,7 +288,7 @@ impl Subscriptions {
             let Some(o) = open.get(&candidate.id) else {
                 continue;
             };
-            if !Arc::ptr_eq(&o.query, &candidate.query) {
+            if o.serial != candidate.serial {
                 continue;
             }
             sent += 1;
@@ -260,22 +305,98 @@ impl Subscriptions {
     }
 }
 
-/// Writes subscription `id`'s parts and end to its arrival stream in order, until the end, the
-/// cancel, or a write that fails (the stream is gone).
-async fn pump(
+/// How a pending subscription's admission ended: `Err` is the refusal to write.
+type Verdict = Result<(), proto::Error>;
+
+/// The decision on a registered, pending subscription. Dropped undecided (its task was aborted),
+/// the subscription is removed: it must not wait for ever.
+pub(crate) struct Admission {
+    subscriptions: Arc<Subscriptions>,
     id: String,
+    serial: u64,
+    gate: oneshot::Sender<Verdict>,
+}
+
+impl Admission {
+    /// The subscription is admitted: what was queued meanwhile goes out, then later emits.
+    pub(crate) fn admit(self) {
+        let _ = self.gate.send(Ok(()));
+    }
+
+    /// The subscription is refused: it is removed, what was queued is dropped and `error` is
+    /// the only thing written (nothing, if the hub cancelled it meanwhile).
+    pub(crate) fn refuse(self, error: proto::Error) {
+        self.subscriptions.remove_entry(&self.id, self.serial);
+        let _ = self.gate.send(Err(error));
+    }
+}
+
+/// What one subscription's pump knows of its subscription.
+struct Pump {
+    id: String,
+    serial: u64,
+    subscriptions: Weak<Subscriptions>,
     reply_to: ReplyTo,
-    mut rx: mpsc::UnboundedReceiver<Outgoing>,
     cancel: CancellationToken,
+}
+
+impl Pump {
+    /// This subscription is over without anyone having removed it (its stream is gone, or its
+    /// admission was abandoned): it must not hold its slot.
+    fn abandon(&self) {
+        if let Some(subscriptions) = self.subscriptions.upgrade() {
+            subscriptions.remove_entry(&self.id, self.serial);
+        }
+    }
+}
+
+/// Writes subscription `id`'s parts and end to its arrival stream in order, once admitted, until
+/// the end, the cancel, or a write that fails (the stream is gone: the entry is removed).
+async fn pump(
+    pump: Pump,
+    mut rx: mpsc::UnboundedReceiver<Outgoing>,
+    verdict: oneshot::Receiver<Verdict>,
 ) {
+    let Pump {
+        id,
+        reply_to,
+        cancel,
+        ..
+    } = &pump;
+    let mut refusal = None;
+    let verdict = tokio::select! {
+        _ = cancel.cancelled() => return,
+        verdict = verdict => verdict,
+    };
+    match verdict {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            // What was queued is not sent: the subscription never started.
+            rx.close();
+            refusal = Some(Outgoing::End {
+                error: Some(error),
+                parts: 0,
+            });
+        }
+        Err(_) => {
+            pump.abandon();
+            return;
+        }
+    }
     loop {
-        let next = tokio::select! {
-            _ = cancel.cancelled() => return,
-            next = rx.recv() => next,
+        let next = match refusal.take() {
+            Some(end) => Some(end),
+            None => tokio::select! {
+                _ = cancel.cancelled() => return,
+                next = rx.recv() => next,
+            },
         };
         let Some(outgoing) = next else {
             return;
         };
+        if cancel.is_cancelled() {
+            return;
+        }
         let (message, last) = match outgoing {
             Outgoing::Part { payload, seq } => (
                 client_message::Message::Part(proto::ReplyPart {
@@ -304,6 +425,7 @@ async fn pump(
         };
         if let Err(e) = reply_to.send(msg).await {
             tracing::debug!(request = %id, stream = reply_to.stream(), "subscription message dropped, subscription abandoned: {e}");
+            pump.abandon();
             return;
         }
         if last {

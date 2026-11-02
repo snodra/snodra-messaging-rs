@@ -219,6 +219,75 @@ async fn node_with(
     sender_settings: SenderSettings,
     max_subscriptions: Option<usize>,
 ) -> Node {
+    node_wired(
+        address,
+        service,
+        instance,
+        registry,
+        max_handlers,
+        sender_settings,
+        max_subscriptions,
+        Wiring::default(),
+    )
+    .await
+}
+
+/// What a test changes in how a node is wired.
+struct Wiring {
+    /// Awaited by every subscription request before its identity check (a slow identity).
+    admission_hook: Option<kraken_messaging::hub::AdmissionHook>,
+    /// Whether a lost hub stream reaches `Dispatcher::stream_lost` (as `KrakenMessaging` does).
+    stream_lost: bool,
+}
+
+impl Default for Wiring {
+    fn default() -> Wiring {
+        Wiring {
+            admission_hook: None,
+            stream_lost: true,
+        }
+    }
+}
+
+/// A door the subscription requests wait at, until it is opened: a slow identity check.
+struct Gate(tokio::sync::watch::Sender<bool>);
+
+impl Gate {
+    fn closed() -> Gate {
+        Gate(tokio::sync::watch::channel(false).0)
+    }
+
+    fn open(&self) {
+        self.0.send_replace(true);
+    }
+
+    /// The hook that holds the requests whose id ends with `#1` (the update targets, not the
+    /// `#0` initial request) until the gate opens.
+    fn hook(&self) -> kraken_messaging::hub::AdmissionHook {
+        let tx = self.0.clone();
+        Arc::new(move |id| {
+            let mut rx = tx.subscribe();
+            let held = id.ends_with("#1");
+            Box::pin(async move {
+                if held {
+                    let _ = rx.wait_for(|open| *open).await;
+                }
+            })
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn node_wired(
+    address: &str,
+    service: &str,
+    instance: &str,
+    registry: HandlerRegistry,
+    max_handlers: usize,
+    sender_settings: SenderSettings,
+    max_subscriptions: Option<usize>,
+    wiring: Wiring,
+) -> Node {
     let (tx, mut rx) = mpsc::channel::<Inbound>(64);
     let pool = HubPool::new(
         settings(address, max_handlers),
@@ -237,6 +306,9 @@ async fn node_with(
     if let Some(max) = max_subscriptions {
         dispatcher = dispatcher.max_subscriptions(max);
     }
+    if let Some(hook) = wiring.admission_hook {
+        dispatcher = dispatcher.admission_hook(hook);
+    }
     let dispatcher = Arc::new(dispatcher);
     let emitter = dispatcher.emitter();
     pool.start();
@@ -250,7 +322,9 @@ async fn node_with(
                 Inbound::Flow(f) => serve.flow(&f.request_id, f.credits),
                 Inbound::Cancel(c) => serve.cancel(&c.request_id, &c.reason),
                 Inbound::Disconnected { stream, .. } => {
-                    serve.stream_lost(stream);
+                    if wiring.stream_lost {
+                        serve.stream_lost(stream);
+                    }
                     forward.on_inbound(msg);
                 }
                 other => forward.on_inbound(other),
@@ -756,6 +830,186 @@ async fn the_per_instance_limit_refuses_new_subscriptions_with_resource_exhauste
         .await;
     eventually("the fourth registered", async || {
         a.emitter.open_subscriptions() == 1
+    })
+    .await;
+    a.shutdown().await;
+}
+
+/// A node whose subscription requests wait at `gate` before their identity check.
+async fn gated_owner(hub: &FakeHub, gate: &Gate, max_subscriptions: Option<usize>) -> Node {
+    node_wired(
+        &hub.address(),
+        "svc-a",
+        "a1",
+        registry("a1", &Arc::new(Probe::default())),
+        4,
+        SenderSettings::default(),
+        max_subscriptions,
+        Wiring {
+            admission_hook: Some(gate.hook()),
+            ..Wiring::default()
+        },
+    )
+    .await
+}
+
+/// The subscription is registered when its request is read, before its admission (identity,
+/// guard) completes: a hub `Cancel` that follows at once finds it, so nothing leaks, no slot is
+/// held and nothing is sent.
+#[tokio::test]
+async fn a_cancel_before_admission_completes_leaves_nothing_open_and_sends_nothing() {
+    let hub = FakeHub::start().await;
+    let gate = Gate::closed();
+    let a = gated_owner(&hub, &gate, Some(1)).await;
+    hub.send_to_clients(subscribed("s1#1", &prices("acme")))
+        .await;
+    eventually("registered while pending", async || {
+        a.emitter.open_subscriptions() == 1
+    })
+    .await;
+    hub.send_to_clients(cancel("s1#1", "max results")).await;
+    eventually("removed by the cancel", async || {
+        a.emitter.open_subscriptions() == 0
+    })
+    .await;
+    gate.open();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(a.emitter.open_subscriptions(), 0, "not registered late");
+    a.emitter.emit::<Prices>(|_| true, &tick("acme", 1));
+    assert!(hub.parts().is_empty() && hub.ends().is_empty());
+    // No slot is held (the limit is 1): another subscription registers.
+    hub.send_to_clients(subscribed("s2#1", &prices("acme")))
+        .await;
+    eventually("the next one registered", async || {
+        a.emitter.open_subscriptions() == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(hub.ends().is_empty(), "not refused for a leaked slot");
+    a.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_lost_stream_during_admission_leaves_nothing_open() {
+    let hub = FakeHub::start().await;
+    let gate = Gate::closed();
+    let a = gated_owner(&hub, &gate, None).await;
+    hub.send_to_clients(subscribed("s1#1", &prices("acme")))
+        .await;
+    eventually("registered while pending", async || {
+        a.emitter.open_subscriptions() == 1
+    })
+    .await;
+    hub.drop_streams();
+    eventually("removed with the stream", async || {
+        a.emitter.open_subscriptions() == 0
+    })
+    .await;
+    gate.open();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(a.emitter.open_subscriptions(), 0, "not registered late");
+    assert!(hub.parts().is_empty() && hub.ends().is_empty());
+    a.shutdown().await;
+}
+
+/// The hub writes `<id>#n` before `<id>#0` to the same instance: an update emitted after the
+/// initial result was answered, while the subscription is still being admitted, is held and
+/// delivered once it is, after the initial result and in order.
+#[tokio::test]
+async fn an_update_emitted_during_admission_is_delivered_after_the_initial_result() {
+    let hub = FakeHub::start().await;
+    let gate = Gate::closed();
+    let a = gated_owner(&hub, &gate, None).await;
+    let payload = serde_json::to_vec(&prices("acme")).unwrap();
+    hub.send_to_clients(subscribed("s1#1", &prices("acme")))
+        .await;
+    hub.send_to_clients(forwarded("s1#0", "t.Prices", &payload, false))
+        .await;
+    eventually("the initial result answered", async || {
+        hub.replies().await.len() == 1
+    })
+    .await;
+    a.emitter.emit::<Prices>(|_| true, &tick("acme", 1));
+    a.emitter.emit::<Prices>(|_| true, &tick("acme", 2));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(hub.parts().is_empty(), "held while the admission runs");
+    gate.open();
+    eventually("both delivered", async || hub.parts().len() == 2).await;
+    let parts = hub.parts();
+    for (n, (_, part)) in parts.iter().enumerate() {
+        assert_eq!((part.request_id.as_str(), part.seq), ("s1#1", n as u64 + 1));
+        let update: Tick = serde_json::from_slice(&part.payload).unwrap();
+        assert_eq!(update.price, n as u32 + 1, "in emit order");
+    }
+    // Later emits follow.
+    a.emitter.emit::<Prices>(|_| true, &tick("acme", 3));
+    eventually("the later one", async || hub.parts().len() == 3).await;
+    assert_eq!(hub.parts()[2].1.seq, 3);
+    a.shutdown().await;
+}
+
+/// A refused admission drops what was held: the subscriber gets the refusal only.
+#[tokio::test]
+async fn a_refused_admission_drops_the_held_updates_and_sends_the_refusal_only() {
+    let hub = FakeHub::start().await;
+    let gate = Gate::closed();
+    let a = gated_owner(&hub, &gate, None).await;
+    let mut request = subscribed("s1#1", &prices("acme"));
+    if let Some(server_message::Message::Request(r)) = &mut request.message {
+        r.headers
+            .insert("authorization".into(), "not a bearer token".into());
+    }
+    hub.send_to_clients(request).await;
+    eventually("registered while pending", async || {
+        a.emitter.open_subscriptions() == 1
+    })
+    .await;
+    a.emitter.emit::<Prices>(|_| true, &tick("acme", 1));
+    gate.open();
+    eventually("the refusal", async || hub.ends().len() == 1).await;
+    let (_, end) = &hub.ends()[0];
+    assert_eq!(end.request_id, "s1#1");
+    assert_eq!(end_code(end), Some(ErrorCode::Unauthenticated));
+    assert_eq!(end.parts, 0);
+    assert_eq!(a.emitter.open_subscriptions(), 0);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(hub.parts().is_empty(), "the held update was dropped");
+    a.shutdown().await;
+}
+
+/// A pump whose write fails (its stream is gone and nobody told the dispatcher) removes its own
+/// entry: it would otherwise hold its slot for ever.
+#[tokio::test]
+async fn a_pump_whose_write_fails_removes_its_entry() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let a = node_wired(
+        &hub.address(),
+        "svc-a",
+        "a1",
+        registry("a1", &probe),
+        4,
+        SenderSettings::default(),
+        None,
+        Wiring {
+            stream_lost: false,
+            ..Wiring::default()
+        },
+    )
+    .await;
+    hub.send_to_clients(subscribed("s1#1", &prices("acme")))
+        .await;
+    eventually("registered", async || a.emitter.open_subscriptions() == 1).await;
+    hub.drop_streams();
+    eventually("reconnected", async || hub.registers().await.len() == 2).await;
+    assert_eq!(
+        a.emitter.open_subscriptions(),
+        1,
+        "nothing removed it with the stream"
+    );
+    eventually("the failed write removed it", async || {
+        a.emitter.emit::<Prices>(|_| true, &tick("acme", 1));
+        a.emitter.open_subscriptions() == 0
     })
     .await;
     a.shutdown().await;
