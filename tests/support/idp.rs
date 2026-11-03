@@ -233,7 +233,8 @@ impl Idp {
         self.shared.jwks.clone()
     }
 
-    /// Token lifetime in seconds (`exp - iat` and `expires_in`).
+    /// Token lifetime in seconds: `expires_in`, and `exp` is that long after issue. `iat` is set
+    /// 10 s before issue (see the claims above), so `exp - iat` is this plus 10.
     pub fn set_lifetime(&self, seconds: u64) {
         self.shared.config.lock().unwrap().lifetime = seconds;
     }

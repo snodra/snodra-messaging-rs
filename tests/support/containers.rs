@@ -367,7 +367,7 @@ pub async fn wait_until_reachable(address: &str) {
     }
 }
 
-/// A container serving one static file over plain HTTP (busybox `httpd`, from Rancher's public mirror of the busybox image), for what a hub fetches
+/// A container serving one static file over plain HTTP (busybox `httpd`, from the official `busybox` image), for what a hub fetches
 /// from a server of the test: the JWKS. Reached by other containers on the default bridge at
 /// [`ip`](Self::ip) port 8080, so it needs nothing from the host's network.
 pub struct StaticServer {
@@ -388,7 +388,7 @@ pub async fn static_server(root: &std::path::Path, name: &str, content: &str) ->
     let file = dir.join(name);
     std::fs::write(&file, content).unwrap();
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let image = GenericImage::new("rancher/mirrored-library-busybox", "1.36.1")
+    let image = GenericImage::new("busybox", "1.36.1")
         .with_exposed_port(STATIC_SERVER_PORT.tcp())
         .with_wait_for(WaitFor::seconds(1))
         .with_mount(
