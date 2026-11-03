@@ -9,7 +9,7 @@ mod dispatcher;
 mod mtls;
 mod pool;
 mod registry;
-mod sender;
+pub(crate) mod sender;
 mod subscriptions;
 mod targets;
 mod tls;
@@ -23,6 +23,7 @@ pub use connection::{
     HubSettings, INSTANCE_STATUS, Inbound, PERMIT_BATCH, PERMIT_FLUSH_AFTER, PROTOCOL_VERSION,
     RegisteredTypes, ReplyTo, SCATTER_GATHER, STREAMING, SUBSCRIPTION, StreamId,
 };
+pub(crate) use dispatcher::{AbortOnDrop, invocation_error};
 pub use dispatcher::{AdmissionHook, Dispatcher};
 pub(crate) use mtls::{LoadError, check_valid_at, load as load_client_certificate};
 pub use pool::{DRAIN_LIMIT, HubPool, ROLL_IDLE_LIMIT, ROLL_RECONNECT_LIMIT, Resolver};

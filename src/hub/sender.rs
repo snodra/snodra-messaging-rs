@@ -50,6 +50,7 @@ use crate::proto::{
     self, ClientMessage, ErrorCode, RequestKind, RequestMode, client_message, reply,
 };
 use crate::retry::{self, RetryPolicy};
+use crate::saga::{RawOutcome, classify_failure};
 use crate::types::{Command, Query, StreamingQuery, SubscriptionQuery};
 
 use super::connection::{
@@ -135,6 +136,30 @@ pub(crate) fn chosen_timeout(
     set(per_call).or(set(default))
 }
 
+/// The request headers the library sets itself: [`SendOptions::headers`] may not carry them.
+const RESERVED_HEADERS: [&str; 5] = [
+    "authorization",
+    "traceparent",
+    "tracestate",
+    "correlation-id",
+    "correlationid",
+];
+
+/// Refuses a header the library sets itself (compared ignoring case) with `InvalidMessage`.
+pub(crate) fn reject_reserved_headers(
+    headers: &HashMap<String, String>,
+) -> Result<(), MessagingError> {
+    match headers
+        .keys()
+        .find(|k| RESERVED_HEADERS.contains(&k.to_lowercase().as_str()))
+    {
+        Some(name) => Err(MessagingError::InvalidMessage(format!(
+            "Header '{name}' is set by the library and cannot be given in SendOptions.headers"
+        ))),
+        None => Ok(()),
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SendOptions {
     /// Same key, same owning instance (consistent hashing on the hub); typically the aggregate id.
@@ -152,6 +177,12 @@ pub struct SendOptions {
     /// configured policy off). Without one, `Config.hub_retry` applies (no retry unless set). A
     /// policy with `max_attempts == 0` fails the call with `InvalidMessage` before anything is sent.
     pub retry: Option<RetryPolicy>,
+    /// Extra request headers, delivered to the handler's `MessageContext.headers` (sent in
+    /// `Request.headers`). The library's own headers (`authorization`, `traceparent`,
+    /// `tracestate`, `correlation-id`, `correlationId`; compared ignoring case) cannot be given
+    /// here: the send fails with `InvalidMessage` before anything is sent. The saga relay uses
+    /// it for `idempotency-key` and `saga-id`.
+    pub headers: HashMap<String, String>,
 }
 
 /// What a [`Sender`] applies to every call unless [`SendOptions`] says otherwise.
@@ -997,8 +1028,23 @@ impl Sender {
         payload: Vec<u8>,
         opts: SendOptions,
     ) -> Result<Vec<u8>, MessagingError> {
+        reject_reserved_headers(&opts.headers)?;
+        let mut headers = self.headers(opts.authorization.clone());
+        headers.extend(opts.headers.clone());
+        self.request_with(kind, type_name, payload, opts, headers)
+            .await
+    }
+
+    /// [`request`](Self::request) with the headers already built.
+    async fn request_with(
+        &self,
+        kind: RequestKind,
+        type_name: &str,
+        payload: Vec<u8>,
+        opts: SendOptions,
+        headers: HashMap<String, String>,
+    ) -> Result<Vec<u8>, MessagingError> {
         let policy = opts.retry.or_else(|| self.retry.clone());
-        let headers = self.headers(opts.authorization.clone());
         let priority = self.priority(type_name, opts.priority);
         let chosen = chosen_timeout(opts.timeout, self.default_timeout);
         let routing_key = opts.routing_key.unwrap_or_default();
@@ -1013,6 +1059,42 @@ impl Sender {
             self.attempt(&call, &payload, timeout)
         })
         .await
+    }
+
+    /// Sends a command known only by its wire type name and JSON bytes, through the hub, for the
+    /// saga relay (ADR 0021 ruling 8): the reply is not decoded and a failure is returned
+    /// classified ([`classify_failure`]), except that the hub's `NO_HANDLER` is transient here (a
+    /// rolling redeploy of the target service looks the same as a mistake, ruling 34).
+    ///
+    /// The send carries **no caller**: no bearer token, whoever's handler it runs in (a saga's
+    /// triggering event is not a caller, ruling 14); the correlation id and trace parent of the
+    /// current handler context do travel. `options.headers` are sent; `options.authorization` is
+    /// ignored. **No retry**, whatever `Config.hub_retry` says and `options.retry` asks: the relay
+    /// owns the backoff and the attempt limit (ruling 29), a retry here would multiply them.
+    pub async fn send_raw(
+        &self,
+        type_name: &str,
+        payload: Vec<u8>,
+        options: SendOptions,
+    ) -> RawOutcome {
+        if let Err(e) = reject_reserved_headers(&options.headers) {
+            return classify_failure(&e);
+        }
+        let mut headers = self.headers_with(None, false);
+        headers.extend(options.headers.clone());
+        let options = SendOptions {
+            retry: Some(RetryPolicy::NONE),
+            authorization: None,
+            ..options
+        };
+        match self
+            .request_with(RequestKind::Command, type_name, payload, options, headers)
+            .await
+        {
+            Ok(_) => RawOutcome::Success,
+            Err(e @ MessagingError::NoHandler(_)) => RawOutcome::Transient(e.to_string()),
+            Err(e) => classify_failure(&e),
+        }
     }
 
     /// `priority` for this call, else `Config.hub_priorities` for the type, else 0.
@@ -1629,6 +1711,16 @@ impl Sender {
 
     /// Correlation id, forwarded bearer token and trace parent, shared by every attempt.
     fn headers(&self, authorization: Option<String>) -> HashMap<String, String> {
+        self.headers_with(authorization, self.forward_jwt)
+    }
+
+    /// [`headers`](Self::headers) with the forwarding of the current handler's bearer token chosen
+    /// by the caller: the saga relay sends no token, whoever's handler it happens to run in.
+    fn headers_with(
+        &self,
+        authorization: Option<String>,
+        forward_jwt: bool,
+    ) -> HashMap<String, String> {
         let current = MessageContext::current();
         let mut headers = HashMap::new();
         headers.insert(
@@ -1640,7 +1732,7 @@ impl Sender {
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         );
         let authorization = authorization.or_else(|| {
-            if self.forward_jwt {
+            if forward_jwt {
                 current.as_ref().and_then(|c| c.authorization.clone())
             } else {
                 None

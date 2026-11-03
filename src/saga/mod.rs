@@ -13,12 +13,17 @@ mod context;
 mod definition;
 mod failed;
 mod indexes;
+mod raw;
 pub mod store;
 
 pub use context::SagaContext;
 pub use definition::SagaDefinition;
 pub use failed::{FailureReason, SagaCommandFailed};
 pub use indexes::{ensure_external_call_indexes, ensure_saga_indexes};
+pub use raw::{
+    LocalFirstSender, LocalRawCommandSender, RETRYABLE_MARKER, RawCommandSender, RawOutcome,
+    UNKNOWN_OUTCOME_MARKER, classify_failure,
+};
 
 pub(crate) use context::{AssociationChange, DeadlineOp, Effects, RecordedDispatch};
 pub(crate) use definition::{

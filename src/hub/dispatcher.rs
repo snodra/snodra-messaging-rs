@@ -54,7 +54,7 @@ impl Drop for Running {
 }
 
 /// Aborts the task when dropped (a cancelled request must not leave its handler running).
-struct AbortOnDrop<T>(JoinHandle<T>);
+pub(crate) struct AbortOnDrop<T>(pub(crate) JoinHandle<T>);
 
 impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
@@ -749,7 +749,7 @@ fn kind(req: &proto::Request) -> Result<RequestKind, MessagingError> {
 /// Why an erased handler did not produce its payload (or an item), as this handler's error.
 /// Only authorization outcomes keep their code; anything else a handler returns (including a
 /// nested call's NoHandler or a decode error of its own) is this handler's error.
-fn invocation_error(type_name: &str, invocation: Invocation) -> MessagingError {
+pub(crate) fn invocation_error(type_name: &str, invocation: Invocation) -> MessagingError {
     let handler_error = |message: String| MessagingError::RemoteHandler {
         type_name: type_name.to_string(),
         message,
