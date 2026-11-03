@@ -76,15 +76,24 @@ pub(crate) struct ErasedDeadlineHandler {
 /// registration order, the order they run in), its deadline handlers by deadline name, the
 /// handler of [`SagaCommandFailed`] (routed by `sagaId`, ruling 27, so it is not in `handlers`) and
 /// a fresh instance's state text.
-pub(crate) struct SagaType {
-    pub name: &'static str,
-    pub handlers: HashMap<&'static str, Vec<ErasedHandler>>,
-    pub deadlines: HashMap<&'static str, ErasedDeadlineHandler>,
-    pub command_failed: Option<ErasedHandler>,
-    pub new_state: fn() -> String,
+///
+/// Opaque outside the crate: build one with [`SagaDefinition::build`] and hand it to
+/// [`SagaRuntime::new`](super::SagaRuntime::new) (the builder does so for the sagas registered on
+/// it; tests and the test fixture build their own).
+pub struct SagaType {
+    pub(crate) name: &'static str,
+    pub(crate) handlers: HashMap<&'static str, Vec<ErasedHandler>>,
+    pub(crate) deadlines: HashMap<&'static str, ErasedDeadlineHandler>,
+    pub(crate) command_failed: Option<ErasedHandler>,
+    pub(crate) new_state: fn() -> String,
 }
 
 impl SagaType {
+    /// The saga's wire name (`sagas.type`).
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
     /// Whether any handler of this type reacts to events of `type_name`.
     pub(crate) fn interested_in(&self, type_name: &str) -> bool {
         self.handlers.contains_key(type_name)
@@ -342,7 +351,7 @@ impl<S: Serialize + DeserializeOwned + Default + Send + 'static> SagaDefinition<
     }
 
     /// The startup checks (S2-R2), then the erased type; the error names the saga and the handler.
-    pub(crate) fn build(self) -> Result<SagaType, MessagingError> {
+    pub fn build(self) -> Result<SagaType, MessagingError> {
         let name = self.name;
         let invalid = |message: String| Err(MessagingError::InvalidMessage(message));
         if name.trim().is_empty() {

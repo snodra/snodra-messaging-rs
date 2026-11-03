@@ -145,7 +145,7 @@ impl SagaContext {
         let recorded = self.effects.dispatches.len();
         if recorded >= (SEQ_STRIDE - 1) as usize {
             return Err(MessagingError::InvalidMessage(format!(
-                "a saga handling may send and publish at most {} messages, '{type_name}' would be                  number {}",
+                "a saga handling may send and publish at most {} messages, '{type_name}' would be number {}",
                 SEQ_STRIDE - 1,
                 recorded + 1
             )));
