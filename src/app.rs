@@ -32,8 +32,8 @@ use crate::context::MessageContext;
 use crate::error::MessagingError;
 use crate::external::kafka::{SourceRegistration, validate_source};
 use crate::external::{
-    ExternalCallSettings, ExternalCalls, ExternalCallsHandle, ExternalEventIngress,
-    ExternalKafkaSources, ExternalSource, IdempotencyKey, TranslatedEvent,
+    ExternalCalls, ExternalCallsHandle, ExternalEventIngress, ExternalKafkaSources, ExternalSource,
+    IdempotencyKey, TranslatedEvent,
 };
 use crate::hub::{
     Dispatcher, EventContext, HandlerRegistry, HubPool, HubSettings, Inbound, QueryUpdateEmitter,
@@ -41,10 +41,13 @@ use crate::hub::{
 };
 use crate::identity::{Guard, IdentityResolver, JwksVerifier};
 use crate::kafka::{
-    EventBus, EventConsumer, LocalEventDispatcher, NoSagas, OutboxPublisher, ensure_indexes,
+    EventBus, EventConsumer, LocalEventDispatcher, NoSagas, OUTBOX_COLLECTION, OutboxPublisher,
+    PROCESSED_EVENTS_COLLECTION, SagaStage, ensure_indexes,
 };
 use crate::saga::{
-    Clock, SagaDefinition, SagaStats, SagaType, ensure_external_call_indexes,
+    Clock, DeadlineScheduler, LocalFirstSender, RawCommandSender, SagaDefinition,
+    SagaDispatchRelay, SagaFailures, SagaPorts, SagaRetry, SagaRuntime, SagaStats, SagaType,
+    ensure_external_call_indexes, ensure_saga_indexes, stats::SAMPLE_INTERVAL,
     validate_registrations,
 };
 use crate::types::{Command, Event, MessageType, Query, StreamingQuery, SubscriptionQuery};
@@ -70,6 +73,8 @@ pub struct KrakenMessagingBuilder {
     sources: Vec<SourceRegistration>,
     /// What the runtime, relay, scheduler and idempotent handlers report to.
     stats: SagaStats,
+    /// "Now" for the saga runtime, relay, scheduler, idempotent handlers and ingress.
+    clock: Clock,
 }
 
 pub struct KrakenMessaging {
@@ -85,6 +90,12 @@ pub struct KrakenMessaging {
     handlers: TaskTracker,
     ingress: ExternalEventIngress,
     stats: SagaStats,
+    /// The saga runtime, when a saga is registered (and enabled).
+    runtime: Option<Arc<SagaRuntime>>,
+    /// Stops the relay, the deadline scheduler and the gauge sampler.
+    saga_cancel: CancellationToken,
+    saga_tasks: Vec<JoinHandle<()>>,
+    clock: Clock,
 }
 
 impl KrakenMessaging {
@@ -126,6 +137,7 @@ impl KrakenMessaging {
             external_calls: ExternalCallsHandle::new(),
             sources: Vec::new(),
             stats: SagaStats::new(),
+            clock: Clock::system(),
             config,
         })
     }
@@ -176,6 +188,22 @@ impl KrakenMessaging {
     /// ```
     pub fn ingress(&self) -> ExternalEventIngress {
         self.ingress.clone()
+    }
+
+    /// The admin API over the parked saga events (`saga_failures`, ADR 0021 rulings 3, 36): list,
+    /// retry and discard. In a service without sagas it lists what the collection holds and a
+    /// retry fails (no saga type handles the event).
+    pub fn saga_failures(&self) -> SagaFailures {
+        let runtime = self.runtime.clone().unwrap_or_else(|| {
+            Arc::new(SagaRuntime::new(
+                Vec::new(),
+                SagaPorts::mongo(self.client.clone(), self.db.clone()),
+                self.clock.clone(),
+                SagaRetry::default(),
+                Arc::new(self.stats.clone()),
+            ))
+        });
+        SagaFailures::new(runtime)
     }
 
     /// The saga, deadline, dispatch and external-call statistics (S2-R7): the Kotlin meters'
@@ -234,11 +262,24 @@ impl KrakenMessaging {
         self.hubs.await_all_registered(timeout).await
     }
 
-    /// Drains in-flight handlers (bounded), completes the subscriptions served here with a
+    /// Stops the saga relay (its sends in flight finish, bounded), the deadline scheduler and the
+    /// gauge sampler, then drains in-flight handlers (bounded), completes the subscriptions served here with a
     /// `ReplyEnd` (best effort, bounded), closes every hub stream (each hub drops this instance
     /// at once), stops the outbox publisher and the consumer. Pending outgoing requests fail
     /// with `HubConnectionLost`.
     pub async fn shutdown(self) {
+        // The saga relay and the deadline scheduler first, while the hub and the consumer still
+        // run: the relay's sends in flight finish (or are abandoned after 15 s, their leases
+        // expire and another instance takes the sagas over).
+        self.saga_cancel.cancel();
+        for t in self.saga_tasks {
+            if tokio::time::timeout(Duration::from_secs(20), t)
+                .await
+                .is_err()
+            {
+                tracing::warn!("a saga task did not stop in 20 s");
+            }
+        }
         self.handlers.close();
         if tokio::time::timeout(Duration::from_secs(10), self.handlers.wait())
             .await
@@ -402,7 +443,9 @@ impl KrakenMessagingBuilder {
     ///     })
     ///     .on::<ChargeSucceeded>("paymentRef", |e| Some(e.payment_ref.clone()), |s, e, ctx| Ok(()))
     ///     .ending()
-    ///     .on_deadline::<()>("charge-timeout", |s, _, ctx| { ctx.end(); Ok(()) })
+    ///     // A deadline without a payload, or one whose payload the handler ignores, reads it as
+    ///     // `IgnoredAny` (`()` cannot read a payload that is present).
+    ///     .on_deadline::<serde::de::IgnoredAny>("charge-timeout", |s, _, ctx| { ctx.end(); Ok(()) })
     /// })
     /// ```
     pub fn saga<S>(
@@ -510,6 +553,14 @@ impl KrakenMessagingBuilder {
         self
     }
 
+    /// The clock of the saga runtime, the relay, the deadline scheduler, the idempotent handlers
+    /// and the webhook ingress (default [`Clock::system`]): what "now" is for deadlines, leases
+    /// and backoffs. Tests move a [`ManualClock`](crate::saga::ManualClock).
+    pub fn clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
+    }
+
     /// Opt-in authorization for a command or query registered before this call.
     pub fn requires<M: MessageType>(mut self, guard: Guard) -> Self {
         self.registry.requires::<M>(guard);
@@ -560,23 +611,70 @@ impl KrakenMessagingBuilder {
             external_calls,
             sources,
             stats,
+            clock,
         } = self;
         // Definition errors first: nothing is connected or created for a saga that cannot run.
-        let _sagas = validate_registrations(sagas)?;
+        let saga_types = validate_registrations(sagas)?;
         for source in &sources {
             validate_source(&source.name, &source.source)?;
         }
+        if !config.sagas_enabled && !saga_types.is_empty() {
+            tracing::warn!(sagas = ?saga_types.iter().map(SagaType::name).collect::<Vec<_>>(), "sagas are registered but KRAKEN_SAGAS_ENABLED=false: they do not run");
+        }
+        let saga_types = if config.sagas_enabled {
+            saga_types
+        } else {
+            Vec::new()
+        };
         ensure_indexes(&db, config.outbox_retention, config.idempotency_retention).await?;
         if !registry.idempotent_handlers().is_empty() {
-            ensure_external_call_indexes(&db, Duration::from_secs(30 * 86_400)).await?;
+            ensure_external_call_indexes(&db, config.external_calls_retention).await?;
             external_calls.bind(ExternalCalls::new(
                 db.clone(),
-                Clock::system(),
-                ExternalCallSettings::default(),
+                clock.clone(),
+                config.external_call_settings(),
                 Arc::new(stats.clone()),
             )?);
         }
         let registry = Arc::new(registry);
+        // The saga runtime only when a saga is registered (and enabled); it is the second stage of
+        // every local dispatch.
+        let runtime = if saga_types.is_empty() {
+            None
+        } else {
+            ensure_saga_indexes(
+                &db,
+                config.sagas_ended_retention,
+                config.sagas_dispatch_retention,
+                config.deadlines_retention,
+            )
+            .await?;
+            // Transactions do not create collections on older servers.
+            for name in [PROCESSED_EVENTS_COLLECTION, OUTBOX_COLLECTION] {
+                let _ = db.create_collection(name).await;
+            }
+            stats.register_saga_types(saga_types.iter().map(SagaType::name));
+            Some(Arc::new(SagaRuntime::new(
+                saga_types,
+                SagaPorts::mongo(client.clone(), db.clone()),
+                clock.clone(),
+                config.saga_retry(),
+                Arc::new(stats.clone()),
+            )))
+        };
+        let stage: Arc<dyn SagaStage> = match &runtime {
+            Some(runtime) => runtime.clone(),
+            None => Arc::new(NoSagas),
+        };
+        // One local dispatch for every entry point: the Kafka consumer, the partner topics, the
+        // webhook ingress and the relay's failure notices (the ordinary handlers, then the sagas).
+        let local = Arc::new(LocalEventDispatcher::new(
+            client.clone(),
+            db.clone(),
+            Arc::clone(&registry),
+            stage,
+        ));
+        let ingress = ExternalEventIngress::new(Arc::clone(&local), db.clone(), clock.clone());
         let verifier = match (&config.jwks_url, &config.issuer) {
             (Some(url), Some(issuer)) => Some(JwksVerifier::new(url.clone(), issuer.clone())),
             _ => None,
@@ -638,28 +736,48 @@ impl KrakenMessagingBuilder {
             )?;
             tasks.push(publisher.start(cancel.clone()));
         }
-        if config.consumer_enabled && !registry.event_types().is_empty() {
-            let consumer = EventConsumer::new(
+        // The consumer also runs for a service whose events only sagas handle.
+        if config.consumer_enabled && (!registry.event_types().is_empty() || runtime.is_some()) {
+            let consumer = EventConsumer::with_dispatcher(
                 &config.kafka_bootstrap,
                 &config.service_name,
                 &config.kafka_topic,
-                client.clone(),
-                db.clone(),
-                Arc::clone(&registry),
+                Arc::clone(&local),
                 config.consumer_max_attempts,
                 Duration::from_secs(1),
             )?;
             tasks.push(consumer.start(cancel.clone()));
         }
-        // The local dispatch of partner records and webhook events: the ordinary handlers, then
-        // the sagas.
-        let local = Arc::new(LocalEventDispatcher::new(
-            client.clone(),
-            db.clone(),
-            Arc::clone(&registry),
-            Arc::new(NoSagas),
-        ));
-        let ingress = ExternalEventIngress::new(Arc::clone(&local), db.clone(), Clock::system());
+        // The relay, the deadline scheduler and the gauge sampler stop on their own token, before
+        // the consumer and the hub streams (`shutdown`).
+        let saga_cancel = CancellationToken::new();
+        let mut saga_tasks = Vec::new();
+        if let Some(runtime) = &runtime {
+            let commands: Arc<dyn RawCommandSender> = Arc::new(LocalFirstSender::new(
+                Arc::clone(&registry),
+                Arc::clone(&sender),
+            ));
+            let relay = SagaDispatchRelay::new(
+                client.clone(),
+                db.clone(),
+                commands,
+                events.clone(),
+                Arc::clone(&local),
+                clock.clone(),
+                config.relay_settings(),
+                Arc::new(stats.clone()),
+            )?;
+            saga_tasks.push(relay.start(saga_cancel.clone()));
+            let scheduler = DeadlineScheduler::new(
+                db.clone(),
+                Arc::clone(runtime),
+                clock.clone(),
+                config.deadline_settings(),
+                Arc::new(stats.clone()),
+            )?;
+            saga_tasks.push(scheduler.start(saga_cancel.clone()));
+            saga_tasks.push(stats.start_sampler(db.clone(), SAMPLE_INTERVAL, saga_cancel.clone()));
+        }
         if !sources.is_empty() {
             let sources = ExternalKafkaSources::new(
                 sources,
@@ -671,7 +789,7 @@ impl KrakenMessagingBuilder {
             )?;
             tasks.push(sources.start(cancel.clone()));
         }
-        tracing::info!(service = %config.service_name, instance = %hubs.instance_id(), hubs = ?hubs.targets(), commands = ?registry.command_types(), queries = ?registry.exclusive_query_types(), shared_queries = ?registry.shared_query_types(), streaming_queries = ?registry.streaming_query_types(), subscription_queries = ?registry.subscription_query_types(), events = ?registry.event_types(), "kraken messaging started");
+        tracing::info!(service = %config.service_name, instance = %hubs.instance_id(), hubs = ?hubs.targets(), commands = ?registry.command_types(), queries = ?registry.exclusive_query_types(), shared_queries = ?registry.shared_query_types(), streaming_queries = ?registry.streaming_query_types(), subscription_queries = ?registry.subscription_query_types(), events = ?registry.event_types(), sagas = ?runtime.as_ref().map(|r| r.saga_types()).unwrap_or_default(), idempotent = ?registry.idempotent_handlers(), "kraken messaging started");
         Ok(KrakenMessaging {
             hubs,
             sender,
@@ -685,6 +803,10 @@ impl KrakenMessagingBuilder {
             handlers,
             ingress,
             stats,
+            runtime,
+            saga_cancel,
+            saga_tasks,
+            clock,
         })
     }
 }

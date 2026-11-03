@@ -78,7 +78,7 @@ pub fn classify_with(
 
 pub struct EventConsumer {
     consumer: StreamConsumer,
-    dispatcher: LocalEventDispatcher,
+    dispatcher: Arc<LocalEventDispatcher>,
     topic: String,
     max_attempts: u32,
     backoff: Duration,
@@ -125,6 +125,26 @@ impl EventConsumer {
         max_attempts: u32,
         backoff: Duration,
     ) -> Result<Arc<EventConsumer>, MessagingError> {
+        Self::with_dispatcher(
+            bootstrap_servers,
+            group_id,
+            topic,
+            Arc::new(LocalEventDispatcher::new(client, db, registry, stage)),
+            max_attempts,
+            backoff,
+        )
+    }
+
+    /// A consumer that dispatches through `dispatcher`, shared with the other local entry points
+    /// (the partner topics, the webhook ingress, the saga relay's failure notices).
+    pub fn with_dispatcher(
+        bootstrap_servers: &str,
+        group_id: &str,
+        topic: &str,
+        dispatcher: Arc<LocalEventDispatcher>,
+        max_attempts: u32,
+        backoff: Duration,
+    ) -> Result<Arc<EventConsumer>, MessagingError> {
         let consumer: StreamConsumer = ClientConfig::new()
             .set("bootstrap.servers", bootstrap_servers)
             .set("group.id", group_id)
@@ -134,7 +154,7 @@ impl EventConsumer {
             .create()?;
         Ok(Arc::new(EventConsumer {
             consumer,
-            dispatcher: LocalEventDispatcher::new(client, db, registry, stage),
+            dispatcher,
             topic: topic.to_string(),
             max_attempts: max_attempts.max(1),
             backoff,

@@ -290,8 +290,9 @@ impl<S: Serialize + DeserializeOwned + Default + Send + 'static> SagaDefinition<
     }
 
     /// The handler of the deadlines named `name` that this instance scheduled; `payload` is
-    /// `None` when it was scheduled without one (`on_deadline::<()>` for a deadline that never
-    /// carries any).
+    /// `None` when it was scheduled without one. A handler that ignores the payload (or whose
+    /// deadline never carries one) takes `on_deadline::<serde::de::IgnoredAny>`: `()` reads only
+    /// a JSON `null`, so a deadline scheduled with a payload would fail to decode.
     pub fn on_deadline<P: DeserializeOwned + 'static>(
         mut self,
         name: &'static str,

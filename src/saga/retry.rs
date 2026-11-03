@@ -43,14 +43,22 @@ impl SagaRetry {
     }
 }
 
-impl Default for SagaRetry {
-    /// 5 attempts, 200 ms doubling up to 5 s.
-    fn default() -> Self {
-        SagaRetry::new(RetryPolicy {
+impl SagaRetry {
+    /// The default policy: 5 attempts, 200 ms doubling up to 5 s (ruling 16: only the attempts
+    /// are configurable, `KRAKEN_SAGAS_MAX_ATTEMPTS`).
+    pub fn default_policy() -> RetryPolicy {
+        RetryPolicy {
             max_attempts: 5,
             initial_backoff: Duration::from_millis(200),
             multiplier: 2.0,
             max_backoff: Duration::from_secs(5),
-        })
+        }
+    }
+}
+
+impl Default for SagaRetry {
+    /// 5 attempts, 200 ms doubling up to 5 s.
+    fn default() -> Self {
+        SagaRetry::new(SagaRetry::default_policy())
     }
 }

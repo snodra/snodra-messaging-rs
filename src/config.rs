@@ -103,6 +103,41 @@ pub struct Config {
     pub issuer: Option<String>,
     /// Forward the current handler's bearer token on outgoing requests.
     pub forward_jwt: bool,
+    /// Sagas (ADR 0021; `KRAKEN_SAGAS_ENABLED`, default true): with `false` a service that
+    /// registers sagas starts without their runtime, relay and scheduler (logged at warn).
+    pub sagas_enabled: bool,
+    /// Attempts of one (event, saga type) before the event is parked in `saga_failures`
+    /// (`KRAKEN_SAGAS_MAX_ATTEMPTS`, default 5; 200 ms doubling to 5 s between them).
+    pub sagas_max_attempts: u32,
+    /// How long an ended saga instance is kept (`KRAKEN_SAGAS_ENDED_RETENTION_MS`, default 30 d).
+    pub sagas_ended_retention: Duration,
+    /// How long a dispatched `saga_dispatch` entry is kept (`KRAKEN_SAGAS_DISPATCH_RETENTION_MS`,
+    /// default 7 d; an entry that failed for good stays).
+    pub sagas_dispatch_retention: Duration,
+    /// `KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS`, default 500 ms.
+    pub sagas_relay_poll_interval: Duration,
+    /// How long a saga's dispatch lease holds (`KRAKEN_SAGAS_RELAY_LEASE_MS`, default 30 s).
+    pub sagas_relay_lease: Duration,
+    /// Attempts of a saga command in all before `EXHAUSTED` (`KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS`,
+    /// default 10).
+    pub sagas_relay_max_attempts: u32,
+    /// `KRAKEN_SAGAS_RELAY_INITIAL_BACKOFF_MS`, default 1 s (doubling).
+    pub sagas_relay_initial_backoff: Duration,
+    /// `KRAKEN_SAGAS_RELAY_MAX_BACKOFF_MS`, default 5 min.
+    pub sagas_relay_max_backoff: Duration,
+    /// `KRAKEN_DEADLINES_POLL_INTERVAL_MS`, default 1 s.
+    pub deadlines_poll_interval: Duration,
+    /// How long a claimed deadline stays reserved (`KRAKEN_DEADLINES_LEASE_MS`, default 30 s).
+    pub deadlines_lease: Duration,
+    /// How long a fired or cancelled deadline is kept (`KRAKEN_DEADLINES_RETENTION_MS`, default
+    /// 7 d).
+    pub deadlines_retention: Duration,
+    /// How long an idempotent call may take before its outcome counts as unknown
+    /// (`KRAKEN_EXTERNAL_CALLS_LEASE_MS`, default 5 min).
+    pub external_calls_lease: Duration,
+    /// How long an `external_calls` record is kept (`KRAKEN_EXTERNAL_CALLS_RETENTION_MS`,
+    /// default 30 d).
+    pub external_calls_retention: Duration,
 }
 
 impl Config {
@@ -145,6 +180,57 @@ impl Config {
             jwks_url: None,
             issuer: None,
             forward_jwt: true,
+            sagas_enabled: true,
+            sagas_max_attempts: 5,
+            sagas_ended_retention: Duration::from_secs(30 * 86_400),
+            sagas_dispatch_retention: Duration::from_secs(7 * 86_400),
+            sagas_relay_poll_interval: Duration::from_millis(500),
+            sagas_relay_lease: Duration::from_secs(30),
+            sagas_relay_max_attempts: 10,
+            sagas_relay_initial_backoff: Duration::from_secs(1),
+            sagas_relay_max_backoff: Duration::from_secs(300),
+            deadlines_poll_interval: Duration::from_secs(1),
+            deadlines_lease: Duration::from_secs(30),
+            deadlines_retention: Duration::from_secs(7 * 86_400),
+            external_calls_lease: Duration::from_secs(300),
+            external_calls_retention: Duration::from_secs(30 * 86_400),
+        }
+    }
+
+    /// The dispatch relay's settings: the `sagas_relay_*` fields, with the constants of ruling
+    /// 16 (multiplier 2, parallelism 4, batch size 100).
+    pub fn relay_settings(&self) -> crate::saga::RelaySettings {
+        crate::saga::RelaySettings {
+            poll_interval: self.sagas_relay_poll_interval,
+            lease: self.sagas_relay_lease,
+            max_attempts: self.sagas_relay_max_attempts,
+            initial_backoff: self.sagas_relay_initial_backoff,
+            max_backoff: self.sagas_relay_max_backoff,
+            ..crate::saga::RelaySettings::default()
+        }
+    }
+
+    /// The deadline scheduler's settings: the `deadlines_*` fields (batch size 100).
+    pub fn deadline_settings(&self) -> crate::saga::DeadlineSettings {
+        crate::saga::DeadlineSettings {
+            poll_interval: self.deadlines_poll_interval,
+            lease: self.deadlines_lease,
+            ..crate::saga::DeadlineSettings::default()
+        }
+    }
+
+    /// The saga runtime's retry: `sagas_max_attempts`, 200 ms doubling to 5 s (ruling 16).
+    pub fn saga_retry(&self) -> crate::saga::SagaRetry {
+        crate::saga::SagaRetry::new(RetryPolicy {
+            max_attempts: self.sagas_max_attempts,
+            ..crate::saga::SagaRetry::default_policy()
+        })
+    }
+
+    /// The idempotent handlers' settings.
+    pub fn external_call_settings(&self) -> crate::external::ExternalCallSettings {
+        crate::external::ExternalCallSettings {
+            lease: self.external_calls_lease,
         }
     }
 
@@ -166,7 +252,14 @@ impl Config {
     /// `KRAKEN_HUB_MAX_SUBSCRIPTIONS`, `KRAKEN_HUB_OAUTH2_TOKEN_URI` (turns JWT authentication on;
     /// then `KRAKEN_HUB_OAUTH2_CLIENT_SECRET` or `KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE` is needed,
     /// and `KRAKEN_HUB_OAUTH2_CLIENT_ID` defaults to the service name), `KRAKEN_HUB_OAUTH2_SCOPE`,
-    /// `KRAKEN_HUB_OAUTH2_CA`.
+    /// `KRAKEN_HUB_OAUTH2_CA`; the saga settings (ADR 0021) `KRAKEN_SAGAS_ENABLED`,
+    /// `KRAKEN_SAGAS_MAX_ATTEMPTS`, `KRAKEN_SAGAS_ENDED_RETENTION_MS`,
+    /// `KRAKEN_SAGAS_DISPATCH_RETENTION_MS`, `KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS`,
+    /// `KRAKEN_SAGAS_RELAY_LEASE_MS`, `KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS`,
+    /// `KRAKEN_SAGAS_RELAY_INITIAL_BACKOFF_MS`, `KRAKEN_SAGAS_RELAY_MAX_BACKOFF_MS`,
+    /// `KRAKEN_DEADLINES_POLL_INTERVAL_MS`, `KRAKEN_DEADLINES_LEASE_MS`,
+    /// `KRAKEN_DEADLINES_RETENTION_MS`, `KRAKEN_EXTERNAL_CALLS_LEASE_MS`,
+    /// `KRAKEN_EXTERNAL_CALLS_RETENTION_MS`.
     /// `KRAKEN_HUB_RETRY_ENABLED=true` sets `hub_retry` to the
     /// policy the other `KRAKEN_HUB_RETRY_*` variables describe (defaults: 3 attempts, 100 ms
     /// doubling to 2 s); those are validated whether or not retry is enabled.
@@ -343,6 +436,56 @@ impl Config {
         if let Some(v) = optional("KRAKEN_FORWARD_JWT") {
             c.forward_jwt = flag("KRAKEN_FORWARD_JWT", &v)?;
         }
+        if let Some(v) = optional("KRAKEN_SAGAS_ENABLED") {
+            c.sagas_enabled = flag("KRAKEN_SAGAS_ENABLED", &v)?;
+        }
+        if let Some(v) = optional("KRAKEN_SAGAS_MAX_ATTEMPTS") {
+            c.sagas_max_attempts = small_number("KRAKEN_SAGAS_MAX_ATTEMPTS", &v)?;
+        }
+        if let Some(v) = optional("KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS") {
+            c.sagas_relay_max_attempts = small_number("KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS", &v)?;
+        }
+        for (name, field) in [
+            (
+                "KRAKEN_SAGAS_ENDED_RETENTION_MS",
+                &mut c.sagas_ended_retention,
+            ),
+            (
+                "KRAKEN_SAGAS_DISPATCH_RETENTION_MS",
+                &mut c.sagas_dispatch_retention,
+            ),
+            (
+                "KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS",
+                &mut c.sagas_relay_poll_interval,
+            ),
+            ("KRAKEN_SAGAS_RELAY_LEASE_MS", &mut c.sagas_relay_lease),
+            (
+                "KRAKEN_SAGAS_RELAY_INITIAL_BACKOFF_MS",
+                &mut c.sagas_relay_initial_backoff,
+            ),
+            (
+                "KRAKEN_SAGAS_RELAY_MAX_BACKOFF_MS",
+                &mut c.sagas_relay_max_backoff,
+            ),
+            (
+                "KRAKEN_DEADLINES_POLL_INTERVAL_MS",
+                &mut c.deadlines_poll_interval,
+            ),
+            ("KRAKEN_DEADLINES_LEASE_MS", &mut c.deadlines_lease),
+            ("KRAKEN_DEADLINES_RETENTION_MS", &mut c.deadlines_retention),
+            (
+                "KRAKEN_EXTERNAL_CALLS_LEASE_MS",
+                &mut c.external_calls_lease,
+            ),
+            (
+                "KRAKEN_EXTERNAL_CALLS_RETENTION_MS",
+                &mut c.external_calls_retention,
+            ),
+        ] {
+            if let Some(v) = optional(name) {
+                *field = millis(name, &v)?;
+            }
+        }
         c.validate()?;
         Ok(c)
     }
@@ -423,6 +566,7 @@ impl Config {
                 ))
             })?;
         }
+        self.validate_sagas()?;
         if let Some(oauth2) = &self.hub_oauth2 {
             self.validate_oauth2(oauth2)?;
         }
@@ -449,6 +593,108 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// The saga, deadline and external-call settings (ADR 0021 ruling 16): attempts at least 1,
+    /// intervals, leases and backoffs at least 1 ms, the relay's initial backoff not above its
+    /// maximum, retentions at least 1 s (a TTL index counts in seconds). Checked whether or not
+    /// sagas are registered, so a typo is found before the first saga is.
+    fn validate_sagas(&self) -> Result<(), MessagingError> {
+        let invalid = |m: String| Err(MessagingError::InvalidMessage(m));
+        for (field, env, value) in [
+            (
+                "sagas_max_attempts",
+                "KRAKEN_SAGAS_MAX_ATTEMPTS",
+                self.sagas_max_attempts,
+            ),
+            (
+                "sagas_relay_max_attempts",
+                "KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS",
+                self.sagas_relay_max_attempts,
+            ),
+        ] {
+            if value == 0 {
+                return invalid(format!("{field} ({env}) must be at least 1"));
+            }
+        }
+        for (field, env, value) in [
+            (
+                "sagas_relay_poll_interval",
+                "KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS",
+                self.sagas_relay_poll_interval,
+            ),
+            (
+                "sagas_relay_lease",
+                "KRAKEN_SAGAS_RELAY_LEASE_MS",
+                self.sagas_relay_lease,
+            ),
+            (
+                "sagas_relay_initial_backoff",
+                "KRAKEN_SAGAS_RELAY_INITIAL_BACKOFF_MS",
+                self.sagas_relay_initial_backoff,
+            ),
+            (
+                "sagas_relay_max_backoff",
+                "KRAKEN_SAGAS_RELAY_MAX_BACKOFF_MS",
+                self.sagas_relay_max_backoff,
+            ),
+            (
+                "deadlines_poll_interval",
+                "KRAKEN_DEADLINES_POLL_INTERVAL_MS",
+                self.deadlines_poll_interval,
+            ),
+            (
+                "deadlines_lease",
+                "KRAKEN_DEADLINES_LEASE_MS",
+                self.deadlines_lease,
+            ),
+            (
+                "external_calls_lease",
+                "KRAKEN_EXTERNAL_CALLS_LEASE_MS",
+                self.external_calls_lease,
+            ),
+        ] {
+            if value.is_zero() {
+                return invalid(format!("{field} ({env}) must be at least 1 ms"));
+            }
+        }
+        for (field, env, value) in [
+            (
+                "sagas_ended_retention",
+                "KRAKEN_SAGAS_ENDED_RETENTION_MS",
+                self.sagas_ended_retention,
+            ),
+            (
+                "sagas_dispatch_retention",
+                "KRAKEN_SAGAS_DISPATCH_RETENTION_MS",
+                self.sagas_dispatch_retention,
+            ),
+            (
+                "deadlines_retention",
+                "KRAKEN_DEADLINES_RETENTION_MS",
+                self.deadlines_retention,
+            ),
+            (
+                "external_calls_retention",
+                "KRAKEN_EXTERNAL_CALLS_RETENTION_MS",
+                self.external_calls_retention,
+            ),
+        ] {
+            if value < Duration::from_secs(1) {
+                return invalid(format!(
+                    "{field} ({env}) must be at least 1000 ms (a TTL index counts in seconds)"
+                ));
+            }
+        }
+        if self.sagas_relay_initial_backoff > self.sagas_relay_max_backoff {
+            return invalid(format!(
+                "sagas_relay_initial_backoff (KRAKEN_SAGAS_RELAY_INITIAL_BACKOFF_MS, {:?}) must not exceed sagas_relay_max_backoff (KRAKEN_SAGAS_RELAY_MAX_BACKOFF_MS, {:?})",
+                self.sagas_relay_initial_backoff, self.sagas_relay_max_backoff
+            ));
+        }
+        self.relay_settings().validate()?;
+        self.deadline_settings().validate()?;
+        self.external_call_settings().validate()
     }
 
     /// The client certificate (mTLS, ADR 0020): both files, no other credential, and a pair the
@@ -530,6 +776,12 @@ fn number(name: &str, v: &str) -> Result<u64, MessagingError> {
     v.trim().parse::<u64>().map_err(|_| {
         MessagingError::InvalidMessage(format!("{name} must be a non-negative integer, got '{v}'"))
     })
+}
+
+/// A count that fits a `u32` (attempts).
+fn small_number(name: &str, v: &str) -> Result<u32, MessagingError> {
+    u32::try_from(number(name, v)?)
+        .map_err(|_| MessagingError::InvalidMessage(format!("{name} is too large, got '{v}'")))
 }
 
 fn millis(name: &str, v: &str) -> Result<Duration, MessagingError> {
@@ -1348,5 +1600,107 @@ mod tests {
             dir.write("k4.pem", &expired.key_pem),
         );
         mentions(vars(&c, &k), &["expired"]);
+    }
+    #[test]
+    fn saga_settings_default_as_kotlin() {
+        let c = code_config();
+        assert!(c.sagas_enabled);
+        assert_eq!(c.sagas_max_attempts, 5);
+        assert_eq!(c.sagas_ended_retention, Duration::from_secs(30 * 86_400));
+        assert_eq!(c.sagas_dispatch_retention, Duration::from_secs(7 * 86_400));
+        assert_eq!(c.sagas_relay_poll_interval, Duration::from_millis(500));
+        assert_eq!(c.sagas_relay_lease, Duration::from_secs(30));
+        assert_eq!(c.sagas_relay_max_attempts, 10);
+        assert_eq!(c.sagas_relay_initial_backoff, Duration::from_secs(1));
+        assert_eq!(c.sagas_relay_max_backoff, Duration::from_secs(300));
+        assert_eq!(c.deadlines_poll_interval, Duration::from_secs(1));
+        assert_eq!(c.deadlines_lease, Duration::from_secs(30));
+        assert_eq!(c.deadlines_retention, Duration::from_secs(7 * 86_400));
+        assert_eq!(c.external_calls_lease, Duration::from_secs(300));
+        assert_eq!(c.external_calls_retention, Duration::from_secs(30 * 86_400));
+        let relay = c.relay_settings();
+        assert_eq!(
+            (relay.multiplier, relay.parallelism, relay.batch_size),
+            (2.0, 4, 100)
+        );
+        assert_eq!(c.deadline_settings().batch_size, 100);
+        assert_eq!(c.saga_retry().max_attempts(), 5);
+        assert_eq!(
+            from(&[]).sagas_relay_max_attempts,
+            10,
+            "the environment's defaults too"
+        );
+    }
+
+    #[test]
+    fn every_saga_variable_is_read() {
+        let c = from(&[
+            ("KRAKEN_SAGAS_ENABLED", "false"),
+            ("KRAKEN_SAGAS_MAX_ATTEMPTS", "7"),
+            ("KRAKEN_SAGAS_ENDED_RETENTION_MS", "86400000"),
+            ("KRAKEN_SAGAS_DISPATCH_RETENTION_MS", "3600000"),
+            ("KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS", "250"),
+            ("KRAKEN_SAGAS_RELAY_LEASE_MS", "10000"),
+            ("KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS", "4"),
+            ("KRAKEN_SAGAS_RELAY_INITIAL_BACKOFF_MS", "100"),
+            ("KRAKEN_SAGAS_RELAY_MAX_BACKOFF_MS", "2000"),
+            ("KRAKEN_DEADLINES_POLL_INTERVAL_MS", "300"),
+            ("KRAKEN_DEADLINES_LEASE_MS", "6000"),
+            ("KRAKEN_DEADLINES_RETENTION_MS", "7200000"),
+            ("KRAKEN_EXTERNAL_CALLS_LEASE_MS", "60000"),
+            ("KRAKEN_EXTERNAL_CALLS_RETENTION_MS", "1000"),
+        ]);
+        assert!(!c.sagas_enabled);
+        assert_eq!(c.sagas_max_attempts, 7);
+        assert_eq!(c.saga_retry().max_attempts(), 7);
+        assert_eq!(c.sagas_ended_retention, Duration::from_secs(86_400));
+        assert_eq!(c.sagas_dispatch_retention, Duration::from_secs(3600));
+        let relay = c.relay_settings();
+        assert_eq!(relay.poll_interval, Duration::from_millis(250));
+        assert_eq!(relay.lease, Duration::from_secs(10));
+        assert_eq!(relay.max_attempts, 4);
+        assert_eq!(relay.initial_backoff, Duration::from_millis(100));
+        assert_eq!(relay.max_backoff, Duration::from_secs(2));
+        let deadlines = c.deadline_settings();
+        assert_eq!(deadlines.poll_interval, Duration::from_millis(300));
+        assert_eq!(deadlines.lease, Duration::from_secs(6));
+        assert_eq!(c.deadlines_retention, Duration::from_secs(7200));
+        assert_eq!(c.external_call_settings().lease, Duration::from_secs(60));
+        assert_eq!(c.external_calls_retention, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn invalid_saga_settings_are_rejected_naming_the_variable() {
+        for (name, value) in [
+            ("KRAKEN_SAGAS_ENABLED", "maybe"),
+            ("KRAKEN_SAGAS_MAX_ATTEMPTS", "0"),
+            ("KRAKEN_SAGAS_MAX_ATTEMPTS", "five"),
+            ("KRAKEN_SAGAS_MAX_ATTEMPTS", "99999999999"),
+            ("KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS", "0"),
+            ("KRAKEN_SAGAS_ENDED_RETENTION_MS", "999"),
+            ("KRAKEN_SAGAS_DISPATCH_RETENTION_MS", "0"),
+            ("KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS", "0"),
+            ("KRAKEN_SAGAS_RELAY_LEASE_MS", "0"),
+            ("KRAKEN_SAGAS_RELAY_INITIAL_BACKOFF_MS", "0"),
+            ("KRAKEN_SAGAS_RELAY_INITIAL_BACKOFF_MS", "600000"),
+            ("KRAKEN_SAGAS_RELAY_MAX_BACKOFF_MS", "-1"),
+            ("KRAKEN_DEADLINES_POLL_INTERVAL_MS", "0"),
+            ("KRAKEN_DEADLINES_LEASE_MS", "0"),
+            ("KRAKEN_DEADLINES_RETENTION_MS", "10"),
+            ("KRAKEN_EXTERNAL_CALLS_LEASE_MS", "0"),
+            ("KRAKEN_EXTERNAL_CALLS_RETENTION_MS", "soon"),
+        ] {
+            let e = try_from(&[(name, value)]).unwrap_err().to_string();
+            assert!(e.contains(name), "{name}={value}: {e}");
+        }
+        // Set in code, validate() checks them as well.
+        let mut c = code_config();
+        c.deadlines_lease = Duration::ZERO;
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("deadlines_lease")
+        );
     }
 }
