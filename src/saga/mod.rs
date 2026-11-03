@@ -21,6 +21,9 @@ mod retry;
 mod runtime;
 pub mod stats;
 pub mod store;
+/// [`SagaTestFixture`](testing::SagaTestFixture) and the in-memory ports (feature `testing`).
+#[cfg(feature = "testing")]
+pub mod testing;
 
 pub use clock::{Clock, ManualClock};
 pub use context::SagaContext;
