@@ -784,7 +784,10 @@ KRAKEN_HUB_TLS_CA=/etc/kraken/ca.pem            # the CA of the hub's certificat
 
 (`Config.hub_tls = Some(HubTls { client_cert_file, client_key_file, .. })` in code.) Setting them turns
 TLS on, as `KRAKEN_HUB_TLS=true` does. The key is PKCS#8 PEM (`BEGIN PRIVATE KEY`, what `openssl req
--newkey` writes); EC (`BEGIN EC PRIVATE KEY`) and RSA PEM keys work as well, without a promise.
+-newkey` writes); EC (`BEGIN EC PRIVATE KEY`) and RSA PEM keys work as well, without a promise. A PKCS#8
+EC key that lacks its public key (some tools write it that way) is refused at startup with the
+conversion to run: `openssl pkcs8 -topk8 -nocrypt -in key.pem -out key.pkcs8.pem`, or generate a new
+key with openssl.
 
 **The SAN rule.** The leaf must carry **exactly one URI SAN `kraken://service/<name>`**, `<name>` being
 the service name (`KRAKEN_SERVICE_NAME`; 1 to 128 characters of `[A-Za-z0-9._-]`), and, if it has an
@@ -801,31 +804,45 @@ static token or OAuth2 together would be refused by the hub (a stale credential 
 certificate), so the client sends **no credentials** with a certificate and refuses the combination.
 Before every connect the pair is read again and checked the same way, so a renewed pair is used by the
 next reconnect with no restart; files caught half way through a replacement (unreadable, empty)
-keep the last good pair, with one warning. A pair for another service, or an expired one, fails the
-attempt before a stream opens (a registration rejection: `last_rejection()`, one `error` line per
+keep the last good pair, with one warning, and so does every other problem with the files while that
+pair has not expired (another service's pair, an expired one, one that is not valid yet): one `warn`
+per problem. Without a good pair to fall back on, a pair for another service or an expired one fails
+the attempt before a stream opens (a registration rejection: `last_rejection()`, one `error` line per
 distinct message, retried at the backoff cap).
 
-**Rotation without a reconnect gap.** The pool reads the files once per heartbeat period
-(`heartbeat_interval`, 10 s by default). When they hold a valid pair that a live connection is not
-presenting, it rolls the hubs over **one at a time**, in the order of `hub_address`:
+**Rotation.** The pool reads the files every 3 s (`HubSettings::certificate_check_interval`, as the
+Kotlin client does, whatever the heartbeat period). When they hold a valid pair (not expired, and
+past its `notBefore`: a pair that is not valid yet is waited for, never rolled to) that a live
+connection is not presenting, it first waits a **random delay**, uniform in `[0, min(30 s, 10 % of the
+presented certificate's remaining validity)]` (0 once it has expired; `certificate_roll_delay_max`
+sets the 30 s, 0 switches the delay off), once per renewed pair, so that the replicas which see the
+same renewal in the same tick do not all leave the routing together; it then reads the files again
+(the roll goes to what they hold after the delay) and rolls the hubs over **one at a time**, in the
+order of `hub_address`:
 
 1. the hub is told the instance is stopping (a `Register` with no types, as the shutdown path does),
    so it routes new work to other instances; a hub that has another live hub is also taken out of
    this instance's own routing, so new requests go to the other hubs (the only hub is taken out once
    its handlers have finished);
 2. it waits, at most 10 s, for the requests written to that hub and the handlers of its requests to
-   finish;
-3. it closes the stream gracefully (half-close, up to 2 s for the hub to finish its side);
+   finish. **The streaming queries and subscriptions this instance itself consumes are not waited
+   for**: they end when their owners decide, not when work is done, so the roll cuts them (as
+   it always did) and their consumer sees the loss (`HubConnectionLost`); resubscribe on that. A
+   handler that outlives the 10 s is cut too;
+3. it closes the stream gracefully (half-close, up to 2 s for the hub to finish its side; what the hub
+   sends meanwhile, a late reply included, still reaches its caller);
 4. the connection reconnects at once with the new pair, and only when it is registered again (at most
    30 s) is the next hub rolled.
 
-Requests that were still unsent when the stream closed follow the rules of any lost stream (they may
-go to another hub). **A deployment with a single hub has a short gap**: while the stream is closed and
-re-opened (milliseconds to a second) a send fails with `HubUnavailable` (never written, so `hub_retry`
-covers it, commands included); only a deployment with several hubs rolls over with no request failing
-at all. If the new pair does not
-load (a rotation caught half way, a key that is not the certificate's, a certificate for another
-service, an expired one) every connection keeps what it presents and the problem is logged at
+**A deployment with a single hub has a short gap**: the only hub is out of the routing from the end of
+step 2 until its new stream is registered (milliseconds to a few seconds). A send in that window
+**waits for the new stream** within its own deadline (the call's timeout; 30 s at most when it has
+none) instead of failing, whatever the retry policy; if the deadline passes first it fails with
+`HubUnavailable`. Requests already written to the hub when its stream closes (the 10 s ran out) fail
+like on any lost stream (`HubConnectionLost`); `hub_retry` covers them for idempotent calls. Only a
+deployment with several hubs rolls over with no request failing or waiting at all. If the new pair
+does not load (a rotation caught half way, a key that is not the certificate's, a certificate for
+another service, an expired one) every connection keeps what it presents and the problem is logged at
 `error`, once per distinct problem, once it is still there a period later. A hub that does not take
 the new pair back in time stops the rollover (logged at `error`; the other hubs keep their old pair
 until the files change again). Replace the key and the certificate together, and prefer an atomic
@@ -833,9 +850,10 @@ swap (write new files, rename them over the old ones).
 
 **Expiry.** The hub closes a certificate session at the certificate's `notAfter` with `UNAUTHENTICATED`
 "certificate expired" and no grace, a TLS session being fixed. A client that renews the files ahead
-of `notAfter` never meets it (the rollover above). One that did not reconnects after the close with
-whatever the files hold: a renewed pair registers; the expired one is not offered (`expired at ...`,
-logged at `error` once) and the attempts back off. When the certificate in use has less than a tenth
+of `notAfter` never meets it (the rollover above). One that did not reconnects after the close (a normal
+reconnect at the normal backoff, one `info` line, no rejection) with whatever the files hold: a renewed
+pair registers; the expired one is not offered (`expired at ...`, logged at `error` once) and the
+attempts back off. When the certificate in use has less than a tenth
 of its lifetime (or 24 h, whichever is smaller) left and the files hold no other, one `warn` per
 certificate says so.
 
