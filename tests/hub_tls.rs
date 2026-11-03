@@ -37,6 +37,7 @@ fn ca(dir: &TempDir, pki: &Pki) -> HubTls {
     HubTls {
         ca_file: Some(dir.write("ca.pem", &pki.ca_pem)),
         server_name: None,
+        ..HubTls::default()
     }
 }
 

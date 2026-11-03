@@ -8,6 +8,7 @@ use std::path::Path;
 
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 
+use super::mtls::ClientIdentity;
 use crate::security::HubTls;
 
 /// The PEM bytes of a CA file. An error (as text, for the config message and the log) when it
@@ -34,14 +35,13 @@ pub(crate) fn effective(configured: Option<&HubTls>, address: &str) -> Option<Hu
     }
 }
 
-/// P5c hook: the client certificate of a mutual-TLS setup. Nothing yet (client certificates are
-/// not built); P5c returns the identity here and the channel setup picks it up unchanged.
-pub(crate) fn client_identity(_tls: &HubTls) -> Option<tonic::transport::Identity> {
-    None
-}
-
-/// Adds TLS to `endpoint`. The CA file is read now, so a rotated CA applies at the next connect.
-pub(crate) fn configure(endpoint: Endpoint, tls: &HubTls) -> Result<Endpoint, String> {
+/// Adds TLS to `endpoint`, presenting `identity` (mutual TLS, P5c) when there is one. The CA file
+/// is read now, so a rotated CA applies at the next connect.
+pub(crate) fn configure(
+    endpoint: Endpoint,
+    tls: &HubTls,
+    identity: Option<&ClientIdentity>,
+) -> Result<Endpoint, String> {
     let mut config = ClientTlsConfig::new();
     match &tls.ca_file {
         Some(path) => {
@@ -59,8 +59,8 @@ pub(crate) fn configure(endpoint: Endpoint, tls: &HubTls) -> Result<Endpoint, St
     {
         config = config.domain_name(name);
     }
-    if let Some(identity) = client_identity(tls) {
-        config = config.identity(identity);
+    if let Some(identity) = identity {
+        config = config.identity(identity.tonic_identity());
     }
     endpoint
         .tls_config(config)

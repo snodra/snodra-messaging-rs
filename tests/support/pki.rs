@@ -59,6 +59,102 @@ impl Pki {
     }
 }
 
+/// What a client certificate carries: its SANs and its validity period.
+pub struct ClientSpec {
+    pub uris: Vec<String>,
+    pub dns: Vec<String>,
+    pub not_before: time::OffsetDateTime,
+    pub not_after: time::OffsetDateTime,
+}
+
+impl ClientSpec {
+    /// The certificate of `name`: one `kraken://service/<name>` URI SAN, valid for a week.
+    pub fn service(name: &str) -> Self {
+        let now = time::OffsetDateTime::now_utc();
+        ClientSpec {
+            uris: vec![format!("kraken://service/{name}")],
+            dns: vec![],
+            not_before: now - time::Duration::hours(1),
+            not_after: now + time::Duration::days(7),
+        }
+    }
+
+    /// Valid from an hour ago for `lifetime` from now.
+    pub fn living(mut self, lifetime: std::time::Duration) -> Self {
+        self.not_after = time::OffsetDateTime::now_utc() + lifetime;
+        self
+    }
+}
+
+impl Pki {
+    /// `(certificate PEM, private key PEM)` of a client with the `clientAuth` usage.
+    pub fn client(&self, spec: &ClientSpec) -> (String, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(spec.dns.clone()).unwrap();
+        for uri in &spec.uris {
+            params
+                .subject_alt_names
+                .push(rcgen::SanType::URI(uri.clone().try_into().unwrap()));
+        }
+        params.not_before = spec.not_before;
+        params.not_after = spec.not_after;
+        params
+            .extended_key_usages
+            .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
+        let issuer = rcgen::Issuer::from_params(&self.ca_params, &self.ca_key);
+        let cert = params.signed_by(&key, &issuer).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
+    /// The client certificate of service `name`.
+    pub fn client_for(&self, name: &str) -> (String, String) {
+        self.client(&ClientSpec::service(name))
+    }
+
+    /// A server certificate that also carries the `clientAuth` usage, as a platform CA issues the
+    /// hub's own pair when it must pass the hub's own `required` health check.
+    pub fn server_and_client(&self, names: &[&str]) -> (String, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut sans = vec!["localhost".to_string()];
+        sans.extend(names.iter().map(|n| n.to_string()));
+        let mut params = rcgen::CertificateParams::new(sans).unwrap();
+        params.subject_alt_names.push(rcgen::SanType::IpAddress(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+        ));
+        params.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let issuer = rcgen::Issuer::from_params(&self.ca_params, &self.ca_key);
+        let cert = params.signed_by(&key, &issuer).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+}
+
+/// The first 8 hex characters of the SHA-256 of the first certificate in `pem`: how the library and
+/// the hub show a certificate.
+pub fn fingerprint_of_pem(pem: &str) -> String {
+    let der = pem
+        .lines()
+        .skip_while(|l| !l.starts_with("-----BEGIN CERTIFICATE"))
+        .skip(1)
+        .take_while(|l| !l.starts_with("-----END"))
+        .collect::<String>();
+    use base64::Engine;
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(der)
+        .unwrap();
+    fingerprint_of_der(&der)
+}
+
+pub fn fingerprint_of_der(der: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(der)[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// A temporary directory removed on drop.
 pub struct TempDir(PathBuf);
 

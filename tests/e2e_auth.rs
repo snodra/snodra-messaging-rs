@@ -95,6 +95,7 @@ impl Fixture {
         Some(HubTls {
             ca_file: Some(self.ca.clone()),
             server_name: None,
+            ..HubTls::default()
         })
     }
 }

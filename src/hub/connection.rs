@@ -71,7 +71,10 @@ use crate::proto::{
 use crate::retry::{jittered, random_unit};
 use crate::security::{HubTls, SecretString};
 
-use super::auth::{AccessToken, AuthKind, AuthStatus, TokenProvider, TokenStats};
+use super::auth::{
+    AccessToken, AuthKind, AuthStatus, CertificateStatus, TokenProvider, TokenStats,
+};
+use super::mtls::{self, ClientIdentity, LoadError};
 use super::tls;
 
 /// The hub protocol version this client speaks (`Register.protocol_version`).
@@ -629,6 +632,13 @@ pub struct HubConnection {
     presented: Mutex<Option<SecretString>>,
     /// `ClientMessage.credentials` written on this connection's streams.
     refreshes_sent: AtomicU64,
+    /// The client certificate pair last read and found good (mTLS): what a connect falls back to
+    /// while the files cannot be read or are half way through a rotation.
+    identity: Mutex<Option<ClientIdentity>>,
+    /// The client certificate the last handshaken stream presented.
+    certificate: Mutex<Option<Presented>>,
+    /// The `credentials` problem logged for the files last, so a repeat goes to `debug`.
+    logged_identity_problem: Mutex<Option<String>>,
     /// The empty-token-file warning was logged and no good read has followed it.
     empty_file_warned: AtomicBool,
     /// A stream of this connection failed or ended at least once.
@@ -644,6 +654,13 @@ pub struct HubConnection {
 }
 
 type OutboundBuffer = Arc<Mutex<mpsc::Receiver<ClientMessage>>>;
+
+/// The client certificate a handshaken stream presented.
+struct Presented {
+    status: CertificateStatus,
+    /// Digest of the pair's files ([`ClientIdentity::digest`]).
+    digest: [u8; 32],
+}
 
 /// Why a stream attempt ended.
 enum StreamError {
@@ -706,6 +723,19 @@ impl HubConnection {
         inbound: mpsc::Sender<Inbound>,
     ) -> Arc<HubConnection> {
         let (handshake, _) = watch::channel(None);
+        let mut settings = settings;
+        if settings
+            .tls
+            .as_ref()
+            .is_some_and(HubTls::has_client_certificate)
+        {
+            // One credential kind per service: the certificate is the identity, and a token next to
+            // it would be refused by the hub ([`crate::Config::validate`] refuses the combination;
+            // this keeps settings built in code to the same rule).
+            settings.token = None;
+            settings.token_file = None;
+            settings.token_provider = None;
+        }
         Arc::new(HubConnection {
             settings,
             service_name,
@@ -720,6 +750,9 @@ impl HubConnection {
             jwt: Mutex::new(None),
             presented: Mutex::new(None),
             refreshes_sent: AtomicU64::new(0),
+            identity: Mutex::new(None),
+            certificate: Mutex::new(None),
+            logged_identity_problem: Mutex::new(None),
             empty_file_warned: AtomicBool::new(false),
             failed_once: AtomicBool::new(false),
             in_flight: Arc::new(AtomicUsize::new(0)),
@@ -830,14 +863,37 @@ impl HubConnection {
         self.last_rejection.lock().unwrap().clone()
     }
 
-    /// How this connection authenticates: the kind, and for a JWT the expiry of the current
-    /// access token, the last token fetch error and the fetch counts.
+    /// How this connection authenticates: the kind, for a JWT the expiry of the current access
+    /// token, the last token fetch error and the fetch counts, for a client certificate the one
+    /// the current stream presented (its fingerprint, `notAfter`, rotations).
     pub fn auth(&self) -> AuthStatus {
-        Self::auth_of(&self.settings)
+        let mut status = Self::auth_of(&self.settings);
+        if status.kind == AuthKind::Certificate {
+            status.certificate = self
+                .certificate
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|p| p.status.clone());
+        }
+        status
     }
 
     /// [`auth`](Self::auth) of connections made with `settings`.
     pub(crate) fn auth_of(settings: &HubSettings) -> AuthStatus {
+        if settings
+            .tls
+            .as_ref()
+            .is_some_and(HubTls::has_client_certificate)
+        {
+            return AuthStatus {
+                kind: AuthKind::Certificate,
+                token_expires_at: None,
+                last_error: None,
+                token_fetches: TokenStats::default(),
+                certificate: None,
+            };
+        }
         if let Some(provider) = &settings.token_provider {
             return provider.status();
         }
@@ -852,6 +908,7 @@ impl HubConnection {
             token_expires_at: None,
             last_error: None,
             token_fetches: TokenStats::default(),
+            certificate: None,
         }
     }
 
@@ -1158,6 +1215,10 @@ impl HubConnection {
                 target = format!("https://{rest}");
             }
         }
+        let identity = match tls.as_ref().filter(|t| t.has_client_certificate()) {
+            Some(t) => Some(self.load_identity(t)?),
+            None => None,
+        };
         let mut endpoint = Endpoint::from_shared(target)
             .map_err(|e| Status::invalid_argument(format!("bad hub address: {e}")))?
             .connect_timeout(self.settings.handshake_timeout)
@@ -1165,15 +1226,22 @@ impl HubConnection {
             .keep_alive_timeout(KEEPALIVE_TIMEOUT)
             .keep_alive_while_idle(true);
         if let Some(tls) = &tls {
-            endpoint = tls::configure(endpoint, tls).map_err(Status::failed_precondition)?;
+            endpoint = tls::configure(endpoint, tls, identity.as_ref())
+                .map_err(Status::failed_precondition)?;
         }
         let plain = tls.is_none();
+        let hint = Hint {
+            plain,
+            client_certificate: identity.is_some(),
+        };
         let channel = endpoint.connect().await.map_err(|e| {
             let cause = tls::chain(&e);
             Status::unavailable(if plain {
                 cause
+            } else if identity.is_some() {
+                format!("{cause} (TLS to the hub failed: does it serve TLS, does its certificate match hub_tls ca_file and server_name, and does it trust the CA of the client certificate?)")
             } else {
-                format!("{cause} (TLS to the hub failed: does it serve TLS, and does its certificate match hub_tls ca_file and server_name?)")
+                format!("{cause} (TLS to the hub failed: does it serve TLS, does its certificate match hub_tls ca_file and server_name, and does it require a client certificate?)")
             })
         })?;
         let mut client = HubClient::new(channel);
@@ -1187,7 +1255,7 @@ impl HubConnection {
         )
         .await
         .map_err(|_| Status::deadline_exceeded("hub did not answer the connect handshake in time"))?
-        .map_err(|s| plain_text_hint(plain, s))?
+        .map_err(|s| hint.apply(s))?
         .into_inner();
 
         // The Register is the first message of every stream; the ack or the echo of the heartbeat
@@ -1246,7 +1314,7 @@ impl HubConnection {
                         following = None;
                     }
                 }
-                msg = stream.message() => match msg.map_err(|s| if handshake.is_none() { plain_text_hint(plain, s) } else { s })? {
+                msg = stream.message() => match msg.map_err(|s| if handshake.is_none() { hint.apply(s) } else { s })? {
                     None => return Ok(()),
                     Some(proto::ServerMessage { message: None }) => {}
                     Some(proto::ServerMessage { message: Some(m) }) => match m {
@@ -1263,7 +1331,7 @@ impl HubConnection {
                                 grants.decide(h.flow_control()).await;
                                 let ack = h.ack().expect("v2");
                                 tracing::info!(service = %self.service_name, instance = %self.instance_id, hub = %ack.hub_id, address = %self.settings.address, protocol = ack.protocol_version, heartbeat = ?interval, flow_control = h.flow_control(), "registered with the hub");
-                                self.go_live(stream_id, &tx, &h, &grants);
+                                self.go_live(stream_id, &tx, &h, &grants, identity.as_ref());
                                 handshake = Some(h);
                                 // A token published since the Register went out.
                                 self.follow_token(&tx, handshake.as_ref(), following.as_mut()).await?;
@@ -1271,7 +1339,7 @@ impl HubConnection {
                             // Every later Register is acked too; the values do not change.
                             Some(Handshake::V2(_)) => {
                                 let h = Handshake::V2(ack);
-                                self.go_live(stream_id, &tx, &h, &grants);
+                                self.go_live(stream_id, &tx, &h, &grants, identity.as_ref());
                                 handshake = Some(h);
                             }
                             Some(Handshake::Legacy) => {
@@ -1287,7 +1355,7 @@ impl HubConnection {
                                     return Ok(());
                                 }
                                 grants.decide(false).await;
-                                self.go_live(stream_id, &tx, &h, &grants);
+                                self.go_live(stream_id, &tx, &h, &grants, identity.as_ref());
                                 handshake = Some(h);
                             }
                         }
@@ -1518,13 +1586,97 @@ impl HubConnection {
         }
     }
 
+    /// The client certificate pair for the stream about to open: read from the files now (a
+    /// renewal applies at the next connect), and checked: it parses, the key is the leaf's, the
+    /// leaf names this service, it has not expired. A pair that cannot be read or parsed (a
+    /// rotation caught half way) falls back to the last good one while that has not expired;
+    /// otherwise, or for a pair that names another service or has expired, the attempt fails
+    /// before a stream is opened: [`Code::PermissionDenied`] / [`Code::Unauthenticated`] (a
+    /// registration rejection, logged at `error` once per distinct message), else
+    /// `FailedPrecondition`.
+    fn load_identity(&self, tls: &HubTls) -> Result<ClientIdentity, Status> {
+        let (Some(cert), Some(key)) = (&tls.client_cert_file, &tls.client_key_file) else {
+            return Err(Status::failed_precondition(
+                "hub_tls needs both client_cert_file and client_key_file",
+            ));
+        };
+        let now = SystemTime::now();
+        let loaded = mtls::load(cert, key, &self.service_name).and_then(|identity| {
+            mtls::check_not_expired(&identity, now)?;
+            Ok(identity)
+        });
+        match loaded {
+            Ok(identity) => {
+                *self.logged_identity_problem.lock().unwrap() = None;
+                *self.identity.lock().unwrap() = Some(identity.clone());
+                Ok(identity)
+            }
+            Err(LoadError::Unusable(message)) => {
+                let last = self
+                    .identity
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .filter(|i| now < i.not_after);
+                let Some(last) = last else {
+                    return Err(Status::failed_precondition(message));
+                };
+                let first = self
+                    .logged_identity_problem
+                    .lock()
+                    .unwrap()
+                    .replace(message.clone())
+                    .as_deref()
+                    != Some(message.as_str());
+                if first {
+                    tracing::warn!(service = %self.service_name, reason = %message, fingerprint = %last.fingerprint, "client certificate files cannot be used; keeping the last good pair");
+                }
+                Ok(last)
+            }
+            Err(LoadError::WrongService(message)) => Err(Status::permission_denied(message)),
+            Err(LoadError::Expired(message)) => Err(Status::unauthenticated(message)),
+        }
+    }
+
+    /// Records the client certificate the stream going live presents; a different one than the
+    /// last stream's counts as a rotation.
+    fn presented_certificate(&self, identity: &ClientIdentity) {
+        let mut presented = self.certificate.lock().unwrap();
+        let rotations = match presented.as_ref() {
+            Some(p) if p.status.fingerprint == identity.fingerprint => p.status.rotations,
+            Some(p) => p.status.rotations + 1,
+            None => 0,
+        };
+        let changed = presented
+            .as_ref()
+            .is_some_and(|p| p.status.fingerprint != identity.fingerprint);
+        if changed {
+            tracing::info!(service = %self.service_name, address = %self.settings.address, fingerprint = %identity.fingerprint, not_after = ?identity.not_after, "presenting a renewed client certificate");
+        } else if presented.is_none() {
+            tracing::info!(service = %self.service_name, address = %self.settings.address, fingerprint = %identity.fingerprint, not_after = ?identity.not_after, "presenting the client certificate");
+        }
+        *presented = Some(Presented {
+            status: CertificateStatus {
+                service: identity.service.clone(),
+                fingerprint: identity.fingerprint.clone(),
+                not_after: identity.not_after,
+                rotations,
+            },
+            digest: identity.digest,
+        });
+    }
+
     fn go_live(
         &self,
         stream: StreamId,
         tx: &mpsc::Sender<ClientMessage>,
         handshake: &Handshake,
         grants: &Arc<Grants>,
+        identity: Option<&ClientIdentity>,
     ) {
+        if let Some(identity) = identity {
+            self.presented_certificate(identity);
+        }
         *self.live.lock().unwrap() = Some(Live {
             stream,
             tx: tx.clone(),
@@ -1591,21 +1743,37 @@ fn is_rejection(code: Code) -> bool {
 
 const PLAIN_TEXT_HINT: &str = "the connection was dropped before the registration; a hub that serves TLS does that to plain text: set hub_tls / KRAKEN_HUB_TLS=true";
 
-/// A plain-text connection that the peer drops before the handshake is most likely one to a hub
-/// that serves TLS only (it drops anything that is not a TLS handshake): say so.
-fn plain_text_hint(plain: bool, status: Status) -> Status {
-    if plain
-        && matches!(
+const CLIENT_CERT_HINT: &str = "the connection was dropped before the registration; a hub that requires client certificates does that to a client that presents none: set hub_tls client_cert_file and client_key_file / KRAKEN_HUB_TLS_CLIENT_CERT and KRAKEN_HUB_TLS_CLIENT_KEY";
+
+/// What a connection that the peer drops before the registration most likely means.
+#[derive(Clone, Copy)]
+struct Hint {
+    /// No TLS: the hub probably serves TLS only (it drops anything that is not a TLS handshake).
+    plain: bool,
+    /// TLS with a client certificate presented.
+    client_certificate: bool,
+}
+
+impl Hint {
+    /// Says so on an `Unavailable`, `Unknown` or `Internal` status: over plain text the hub most
+    /// likely serves TLS only; over TLS without a client certificate it may require one (TLS 1.3
+    /// shows a refused client certificate only when the stream opens, as a transport error).
+    fn apply(self, status: Status) -> Status {
+        let hint = if self.plain {
+            PLAIN_TEXT_HINT
+        } else if !self.client_certificate {
+            CLIENT_CERT_HINT
+        } else {
+            return status;
+        };
+        if matches!(
             status.code(),
             Code::Unavailable | Code::Unknown | Code::Internal
-        )
-    {
-        Status::new(
-            status.code(),
-            format!("{} ({PLAIN_TEXT_HINT})", status.message()),
-        )
-    } else {
-        status
+        ) {
+            Status::new(status.code(), format!("{} ({hint})", status.message()))
+        } else {
+            status
+        }
     }
 }
 

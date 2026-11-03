@@ -6,6 +6,7 @@
 mod auth;
 mod connection;
 mod dispatcher;
+mod mtls;
 mod pool;
 mod registry;
 mod sender;
@@ -14,8 +15,8 @@ mod targets;
 mod tls;
 
 pub use auth::{
-    AccessToken, AuthKind, AuthStatus, FetchResult, TokenError, TokenProvider, TokenStats,
-    WAKE_INTERVAL, WallClock, refresh_margin,
+    AccessToken, AuthKind, AuthStatus, CertificateStatus, FetchResult, TokenError, TokenProvider,
+    TokenStats, WAKE_INTERVAL, WallClock, refresh_margin,
 };
 pub use connection::{
     CAPABILITIES, CLIENT_VERSION, CREDENTIALS_REFRESH, FLOW_CONTROL, Handshake, HubConnection,
@@ -23,6 +24,9 @@ pub use connection::{
     RegisteredTypes, ReplyTo, SCATTER_GATHER, STREAMING, SUBSCRIPTION, StreamId,
 };
 pub use dispatcher::{AdmissionHook, Dispatcher};
+pub(crate) use mtls::{
+    ClientIdentity, LoadError, check_not_expired, load as load_client_certificate,
+};
 pub use pool::{DRAIN_LIMIT, HubPool, Resolver};
 pub use registry::{EventContext, HandlerRegistry};
 pub use sender::{
@@ -35,3 +39,6 @@ pub use targets::{
     DNS_REFRESH, HubTargets, permit_share, rendezvous_score, resolved_targets, target_id,
 };
 pub use tls::read_ca_file;
+
+#[cfg(test)]
+pub(crate) use mtls::test_pki;

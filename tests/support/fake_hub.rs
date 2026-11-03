@@ -420,6 +420,8 @@ pub struct State {
     credentials_refresh: AtomicBool,
     /// `ClientMessage.credentials` (P5b): (stream number, the new credential).
     refreshes: StdMutex<Vec<(usize, proto::Credentials)>>,
+    /// The leaf certificate each stream presented in the TLS handshake (DER), mutual TLS only.
+    peers: StdMutex<Vec<(usize, Vec<u8>)>>,
 }
 
 impl State {
@@ -1815,8 +1817,14 @@ impl Hub for Service {
         if state.reject_invalid_next.swap(false, Ordering::SeqCst) {
             return Err(Status::invalid_argument("service_name must not be empty"));
         }
+        let peer = request
+            .peer_certs()
+            .and_then(|c| c.first().map(|d| d.to_vec()));
         let mut inbound = request.into_inner();
         let stream_no = state.streams.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(der) = peer {
+            state.peers.lock().unwrap().push((stream_no, der));
+        }
         let (tx, rx) = mpsc::channel::<Result<ServerMessage, Status>>(64);
         state.clients.lock().await.push((stream_no, tx.clone()));
         let mut drop_rx = state.drop_tx.subscribe();
@@ -2043,6 +2051,24 @@ impl Hub for Service {
     }
 }
 
+/// The TLS side of a fake hub.
+struct Tls {
+    cert: String,
+    key: String,
+    /// The CA that signs client certificates and whether one is required.
+    client_ca: Option<(String, bool)>,
+}
+
+impl Tls {
+    fn server(cert: &str, key: &str) -> Tls {
+        Tls {
+            cert: cert.to_string(),
+            key: key.to_string(),
+            client_ca: None,
+        }
+    }
+}
+
 pub struct FakeHub {
     pub addr: SocketAddr,
     pub state: Arc<State>,
@@ -2054,19 +2080,44 @@ impl FakeHub {
         Self::start_with(None, 0).await
     }
 
+    /// A hub that serves mutual TLS: the client certificate is verified against `client_ca_pem`
+    /// (`required`: a client without one fails the handshake; else a client may present none, but
+    /// one that does must present a valid one), and the leaf each stream presented is recorded
+    /// ([`peer_fingerprints`](Self::peer_fingerprints)).
+    pub async fn start_mtls(
+        cert_pem: &str,
+        key_pem: &str,
+        client_ca_pem: &str,
+        required: bool,
+    ) -> FakeHub {
+        Self::start_with_tls(
+            Some(Tls {
+                cert: cert_pem.to_string(),
+                key: key_pem.to_string(),
+                client_ca: Some((client_ca_pem.to_string(), required)),
+            }),
+            0,
+        )
+        .await
+    }
+
     /// A hub that serves TLS only, with the given certificate and key (PEM): a plain-text client
     /// is dropped at the handshake, like the real hub's TLS listener does.
     pub async fn start_tls(cert_pem: &str, key_pem: &str) -> FakeHub {
-        Self::start_with(Some((cert_pem.to_string(), key_pem.to_string())), 0).await
+        Self::start_with(Some(Tls::server(cert_pem, key_pem)), 0).await
     }
 
     /// Like [`start_tls`](Self::start_tls), on a given port (a hub that comes up where nothing
     /// listened a moment ago).
     pub async fn start_tls_on(port: u16, cert_pem: &str, key_pem: &str) -> FakeHub {
-        Self::start_with(Some((cert_pem.to_string(), key_pem.to_string())), port).await
+        Self::start_with(Some(Tls::server(cert_pem, key_pem)), port).await
     }
 
-    async fn start_with(tls: Option<(String, String)>, port: u16) -> FakeHub {
+    async fn start_with(tls: Option<Tls>, port: u16) -> FakeHub {
+        Self::start_with_tls(tls, port).await
+    }
+
+    async fn start_with_tls(tls: Option<Tls>, port: u16) -> FakeHub {
         if tls.is_some() {
             // tonic's server side builds its rustls config from the process-wide provider.
             let _ = rustls::crypto::ring::default_provider().install_default();
@@ -2128,6 +2179,7 @@ impl FakeHub {
             jwt_refusal: StdMutex::new(None),
             close_with: StdMutex::new(None),
             credentials_refresh: AtomicBool::new(false),
+            peers: StdMutex::new(vec![]),
         });
         let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2135,13 +2187,15 @@ impl FakeHub {
         let svc = Service(state.clone());
         tokio::spawn(async move {
             let mut builder = tonic::transport::Server::builder();
-            if let Some((cert, key)) = tls {
-                builder = builder
-                    .tls_config(
-                        tonic::transport::ServerTlsConfig::new()
-                            .identity(tonic::transport::Identity::from_pem(cert, key)),
-                    )
-                    .unwrap();
+            if let Some(tls) = tls {
+                let mut config = tonic::transport::ServerTlsConfig::new()
+                    .identity(tonic::transport::Identity::from_pem(tls.cert, tls.key));
+                if let Some((ca, required)) = tls.client_ca {
+                    config = config
+                        .client_ca_root(tonic::transport::Certificate::from_pem(ca))
+                        .client_auth_optional(!required);
+                }
+                builder = builder.tls_config(config).unwrap();
             }
             builder
                 .add_service(HubServer::new(svc))
@@ -2431,6 +2485,18 @@ impl FakeHub {
     /// Offer the `credentials-refresh` capability to clients that declare it.
     pub fn set_credentials_refresh(&self, on: bool) {
         self.state.credentials_refresh.store(on, Ordering::SeqCst);
+    }
+
+    /// The leaf certificate each stream presented in the TLS handshake, as its fingerprint (the
+    /// first 8 hex characters of the SHA-256 of its DER), with the stream number; mutual TLS only.
+    pub fn peer_fingerprints(&self) -> Vec<(usize, String)> {
+        self.state
+            .peers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(stream, der)| (*stream, super::pki::fingerprint_of_der(der)))
+            .collect()
     }
 
     /// The refused `Register`s so far, in order.

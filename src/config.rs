@@ -161,6 +161,8 @@ impl Config {
     /// `KRAKEN_HUB_RETRY_MAX_BACKOFF_MS`, `KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS`,
     /// `KRAKEN_HUB_TOKEN`, `KRAKEN_HUB_TOKEN_FILE`, `KRAKEN_HUB_TLS` (`true` turns TLS on),
     /// `KRAKEN_HUB_TLS_CA`, `KRAKEN_HUB_TLS_SERVER_NAME` (both need `KRAKEN_HUB_TLS=true`),
+    /// `KRAKEN_HUB_TLS_CLIENT_CERT` and `KRAKEN_HUB_TLS_CLIENT_KEY` (a client certificate for
+    /// mutual TLS, both or neither; they turn TLS on and exclude a hub token and OAuth2),
     /// `KRAKEN_HUB_MAX_SUBSCRIPTIONS`, `KRAKEN_HUB_OAUTH2_TOKEN_URI` (turns JWT authentication on;
     /// then `KRAKEN_HUB_OAUTH2_CLIENT_SECRET` or `KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE` is needed,
     /// and `KRAKEN_HUB_OAUTH2_CLIENT_ID` defaults to the service name), `KRAKEN_HUB_OAUTH2_SCOPE`,
@@ -263,16 +265,27 @@ impl Config {
         }
         c.hub_token = optional("KRAKEN_HUB_TOKEN").map(|v| SecretString::new(v.trim()));
         c.hub_token_file = optional("KRAKEN_HUB_TOKEN_FILE").map(|v| PathBuf::from(v.trim()));
-        let tls_on = match optional("KRAKEN_HUB_TLS") {
-            Some(v) => flag("KRAKEN_HUB_TLS", &v)?,
-            None => false,
+        let tls_flag = match optional("KRAKEN_HUB_TLS") {
+            Some(v) => Some(flag("KRAKEN_HUB_TLS", &v)?),
+            None => None,
         };
         let tls_ca = optional("KRAKEN_HUB_TLS_CA").map(|v| PathBuf::from(v.trim()));
         let tls_name = optional("KRAKEN_HUB_TLS_SERVER_NAME").map(|v| v.trim().to_string());
-        if tls_on {
+        let client_cert = optional("KRAKEN_HUB_TLS_CLIENT_CERT").map(|v| PathBuf::from(v.trim()));
+        let client_key = optional("KRAKEN_HUB_TLS_CLIENT_KEY").map(|v| PathBuf::from(v.trim()));
+        let client_certificate = client_cert.is_some() || client_key.is_some();
+        if client_certificate && tls_flag == Some(false) {
+            return Err(MessagingError::InvalidMessage(
+                "KRAKEN_HUB_TLS_CLIENT_CERT and KRAKEN_HUB_TLS_CLIENT_KEY need TLS, but KRAKEN_HUB_TLS=false".into(),
+            ));
+        }
+        // A client certificate implies TLS, as KRAKEN_HUB_TLS=true does.
+        if tls_flag.unwrap_or(false) || client_certificate {
             c.hub_tls = Some(HubTls {
                 ca_file: tls_ca,
                 server_name: tls_name,
+                client_cert_file: client_cert,
+                client_key_file: client_key,
             });
         } else if tls_ca.is_some() || tls_name.is_some() {
             return Err(MessagingError::InvalidMessage(
@@ -340,7 +353,11 @@ impl Config {
     /// `hub_stream_credit_timeout`, a zero `hub_max_subscriptions`, a `hub_token_file` that cannot
     /// be read, a `hub_tls` CA file that cannot be read or holds no certificate, an empty
     /// `hub_tls` server name, `hub_oauth2` together with a static hub token, without a token URI
-    /// that is `http(s)://`, without a secret or with an unreadable secret file or CA file.
+    /// that is `http(s)://`, without a secret or with an unreadable secret file or CA file, a
+    /// `hub_tls` client certificate without its key (or the reverse), together with a static hub
+    /// token or `hub_oauth2`, or one the hub would refuse (unreadable files, a key that is not the
+    /// certificate's, a leaf that does not carry exactly one `kraken://service/<service_name>`
+    /// URI SAN, an expired one).
     /// Called by `from_env` and by `KrakenMessaging::builder`; error
     /// messages never carry the token.
     pub fn validate(&self) -> Result<(), MessagingError> {
@@ -427,8 +444,35 @@ impl Config {
                     ))
                 })?;
             }
+            if tls.has_client_certificate() {
+                self.validate_client_certificate(tls)?;
+            }
         }
         Ok(())
+    }
+
+    /// The client certificate (mTLS, ADR 0020): both files, no other credential, and a pair the
+    /// hub would accept (it parses, the key is the certificate's, the leaf names this service, it
+    /// has not expired).
+    fn validate_client_certificate(&self, tls: &HubTls) -> Result<(), MessagingError> {
+        let invalid = |m: String| Err(MessagingError::InvalidMessage(m));
+        let (Some(cert), Some(key)) = (&tls.client_cert_file, &tls.client_key_file) else {
+            return invalid(if tls.client_cert_file.is_none() {
+                "hub_tls.client_key_file (KRAKEN_HUB_TLS_CLIENT_KEY) is set without hub_tls.client_cert_file (KRAKEN_HUB_TLS_CLIENT_CERT): set both or neither".into()
+            } else {
+                "hub_tls.client_cert_file (KRAKEN_HUB_TLS_CLIENT_CERT) is set without hub_tls.client_key_file (KRAKEN_HUB_TLS_CLIENT_KEY): set both or neither".into()
+            });
+        };
+        if self.hub_token.as_ref().is_some_and(|t| !t.is_blank()) || self.hub_token_file.is_some() {
+            return invalid("a client certificate (hub_tls.client_cert_file, KRAKEN_HUB_TLS_CLIENT_CERT) and a static hub token (hub_token / hub_token_file, KRAKEN_HUB_TOKEN / KRAKEN_HUB_TOKEN_FILE) are both set: use one credential".into());
+        }
+        if self.hub_oauth2.is_some() {
+            return invalid("a client certificate (hub_tls.client_cert_file, KRAKEN_HUB_TLS_CLIENT_CERT) and hub_oauth2 (KRAKEN_HUB_OAUTH2_TOKEN_URI) are both set: use one credential".into());
+        }
+        let invalid = |e: crate::hub::LoadError| MessagingError::InvalidMessage(e.to_string());
+        let identity =
+            crate::hub::load_client_certificate(cert, key, &self.service_name).map_err(invalid)?;
+        crate::hub::check_not_expired(&identity, std::time::SystemTime::now()).map_err(invalid)
     }
 
     fn validate_oauth2(&self, oauth2: &HubOAuth2) -> Result<(), MessagingError> {
@@ -949,7 +993,8 @@ mod tests {
             c.hub_tls,
             Some(HubTls {
                 ca_file: Some(ca.clone()),
-                server_name: Some("kraken-hub".into())
+                server_name: Some("kraken-hub".into()),
+                ..HubTls::default()
             })
         );
         for vars in [
@@ -1131,5 +1176,177 @@ mod tests {
         c.hub_token = Some(SecretString::new("static"));
         assert!(c.validate().is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A certificate pair for service `name` in a fresh directory.
+    fn cert_pair(name: &str) -> (crate::hub::test_pki::Dir, String, String) {
+        let dir = crate::hub::test_pki::Dir::new();
+        let (cert, key) = dir.pair(&crate::hub::test_pki::issue(
+            &crate::hub::test_pki::Spec::service(name),
+        ));
+        let (cert, key) = (
+            cert.to_str().unwrap().to_string(),
+            key.to_str().unwrap().to_string(),
+        );
+        (dir, cert, key)
+    }
+
+    #[test]
+    fn a_client_certificate_turns_tls_on_and_needs_both_files() {
+        let (_dir, cert, key) = cert_pair("svc");
+        let c = from(&[
+            ("KRAKEN_HUB_TLS_CLIENT_CERT", &cert),
+            ("KRAKEN_HUB_TLS_CLIENT_KEY", &key),
+        ]);
+        assert_eq!(
+            c.hub_tls,
+            Some(HubTls {
+                client_cert_file: Some(cert.clone().into()),
+                client_key_file: Some(key.clone().into()),
+                ..HubTls::default()
+            })
+        );
+        // The other TLS settings stay as they were.
+        let c = from(&[
+            ("KRAKEN_HUB_TLS", "true"),
+            ("KRAKEN_HUB_TLS_SERVER_NAME", "kraken-hub"),
+            ("KRAKEN_HUB_TLS_CLIENT_CERT", &cert),
+            ("KRAKEN_HUB_TLS_CLIENT_KEY", &key),
+        ]);
+        let tls = c.hub_tls.unwrap();
+        assert_eq!(tls.server_name.as_deref(), Some("kraken-hub"));
+        assert!(tls.client_cert_file.is_some() && tls.client_key_file.is_some());
+        // One alone names the one that is missing.
+        for (vars, missing) in [
+            (
+                vec![("KRAKEN_HUB_TLS_CLIENT_CERT", cert.as_str())],
+                "KRAKEN_HUB_TLS_CLIENT_KEY",
+            ),
+            (
+                vec![("KRAKEN_HUB_TLS_CLIENT_KEY", key.as_str())],
+                "KRAKEN_HUB_TLS_CLIENT_CERT",
+            ),
+        ] {
+            let r = try_from(&vars);
+            assert!(
+                matches!(r, Err(MessagingError::InvalidMessage(ref m)) if m.contains(missing)),
+                "{vars:?}: {r:?}"
+            );
+        }
+        // Explicitly off while a certificate is set contradicts itself.
+        let r = try_from(&[
+            ("KRAKEN_HUB_TLS", "false"),
+            ("KRAKEN_HUB_TLS_CLIENT_CERT", &cert),
+            ("KRAKEN_HUB_TLS_CLIENT_KEY", &key),
+        ]);
+        assert!(matches!(r, Err(MessagingError::InvalidMessage(_))), "{r:?}");
+        // Set in code, one file alone is the same error.
+        let in_code = Config {
+            hub_tls: Some(HubTls {
+                client_cert_file: Some(cert.into()),
+                ..HubTls::default()
+            }),
+            ..code_config()
+        };
+        assert!(in_code.validate().is_err());
+    }
+
+    #[test]
+    fn a_client_certificate_and_a_token_or_oauth2_together_are_a_startup_error_naming_both() {
+        let (dir, cert, key) = cert_pair("svc");
+        let token_file = dir.write("token", "tok\n");
+        let token_file = token_file.to_str().unwrap().to_string();
+        let certificate = [
+            ("KRAKEN_HUB_TLS_CLIENT_CERT", cert.as_str()),
+            ("KRAKEN_HUB_TLS_CLIENT_KEY", key.as_str()),
+        ];
+        assert!(try_from(&certificate).is_ok());
+        for extra in [
+            vec![("KRAKEN_HUB_TOKEN", "a-static-token")],
+            vec![("KRAKEN_HUB_TOKEN_FILE", token_file.as_str())],
+            vec![
+                ("KRAKEN_HUB_OAUTH2_TOKEN_URI", "http://keycloak:8080/token"),
+                ("KRAKEN_HUB_OAUTH2_CLIENT_SECRET", "x"),
+            ],
+        ] {
+            let mut vars = certificate.to_vec();
+            vars.extend(extra.iter().copied());
+            let r = try_from(&vars);
+            assert!(
+                matches!(r, Err(MessagingError::InvalidMessage(ref m))
+                    if m.contains("KRAKEN_HUB_TLS_CLIENT_CERT") && m.contains(extra[0].0)),
+                "{extra:?}: {r:?}"
+            );
+        }
+        // A blank static token is no token.
+        let mut vars = certificate.to_vec();
+        vars.push(("KRAKEN_HUB_TOKEN", " "));
+        assert!(try_from(&vars).is_ok());
+        // Set in code, the same.
+        let mut c = from(&certificate);
+        c.hub_token = Some(SecretString::new("static"));
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn the_client_certificate_files_are_checked_at_startup() {
+        let dir = crate::hub::test_pki::Dir::new();
+        use crate::hub::test_pki::{Spec, issue};
+        let vars = |cert: &std::path::Path, key: &std::path::Path| {
+            try_from(&[
+                ("KRAKEN_HUB_TLS_CLIENT_CERT", cert.to_str().unwrap()),
+                ("KRAKEN_HUB_TLS_CLIENT_KEY", key.to_str().unwrap()),
+            ])
+        };
+        let mentions = |r: Result<Config, MessagingError>, parts: &[&str]| {
+            let Err(MessagingError::InvalidMessage(m)) = r else {
+                panic!("accepted");
+            };
+            for p in parts {
+                assert!(m.contains(p), "{p} not in {m}");
+            }
+        };
+        let good = issue(&Spec::service("svc"));
+        let (cert, key) = dir.pair(&good);
+        assert!(vars(&cert, &key).is_ok());
+        // Unreadable, empty.
+        mentions(
+            vars(&dir.0.join("absent.pem"), &key),
+            &["absent.pem", "cannot be read"],
+        );
+        let empty = dir.write("empty.pem", "");
+        mentions(vars(&cert, &empty), &["empty.pem", "no PEM private key"]);
+        // A key that is not the certificate's.
+        let other = dir.write("other.pem", &issue(&Spec::service("svc")).key_pem);
+        mentions(vars(&cert, &other), &["does not match"]);
+        // No service SAN, or another service's.
+        let dns_only = issue(&Spec {
+            uris: vec![],
+            dns: vec!["svc".into()],
+            ..Spec::service("x")
+        });
+        let (c, k) = (
+            dir.write("c2.pem", &dns_only.cert_pem),
+            dir.write("k2.pem", &dns_only.key_pem),
+        );
+        mentions(vars(&c, &k), &["kraken://service/"]);
+        let orders = issue(&Spec::service("orders"));
+        let (c, k) = (
+            dir.write("c3.pem", &orders.cert_pem),
+            dir.write("k3.pem", &orders.key_pem),
+        );
+        mentions(vars(&c, &k), &["orders", "svc"]);
+        // Already expired: the hub would refuse it at the handshake.
+        let now = time::OffsetDateTime::now_utc();
+        let expired = issue(&Spec {
+            not_before: now - std::time::Duration::from_secs(7200),
+            not_after: now - std::time::Duration::from_secs(60),
+            ..Spec::service("svc")
+        });
+        let (c, k) = (
+            dir.write("c4.pem", &expired.cert_pem),
+            dir.write("k4.pem", &expired.key_pem),
+        );
+        mentions(vars(&c, &k), &["expired"]);
     }
 }

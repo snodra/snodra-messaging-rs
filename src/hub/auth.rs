@@ -227,6 +227,8 @@ pub enum AuthKind {
     Token,
     /// A Keycloak client-credentials access token (`hub_oauth2`).
     Jwt,
+    /// A client certificate (`hub_tls.client_cert_file`, mutual TLS, ADR 0020).
+    Certificate,
 }
 
 impl AuthKind {
@@ -235,6 +237,7 @@ impl AuthKind {
             AuthKind::None => "none",
             AuthKind::Token => "token",
             AuthKind::Jwt => "jwt",
+            AuthKind::Certificate => "certificate",
         }
     }
 }
@@ -250,6 +253,24 @@ pub struct AuthStatus {
     /// Token fetches so far by result (`Jwt` only; all zero otherwise): the library's counterpart
     /// of `kraken_messaging_hub_token_fetches_total{result}`.
     pub token_fetches: TokenStats,
+    /// The client certificate the hub streams present (`Certificate` only; `None` until a stream
+    /// registered with it).
+    pub certificate: Option<CertificateStatus>,
+}
+
+/// The client certificate in use (hub ADR 0020). The certificate itself is never shown, only the
+/// first 8 hex characters of the SHA-256 of its DER, as the hub shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CertificateStatus {
+    /// The service the leaf names (`kraken://service/<name>`).
+    pub service: String,
+    /// The first 8 hex characters of the SHA-256 fingerprint of the leaf presented.
+    pub fingerprint: String,
+    /// The leaf's `notAfter`: the hub closes the session then.
+    pub not_after: SystemTime,
+    /// How many times the presented certificate changed after the first one (a renewed pair
+    /// rolled over, or picked up by a reconnect).
+    pub rotations: u64,
 }
 
 /// The wall clock the provider reads (replaceable in tests).
@@ -440,6 +461,7 @@ impl TokenProvider {
             token_expires_at: self.cached().map(|t| t.expires_at),
             last_error: self.last_error.lock().unwrap().clone(),
             token_fetches: self.stats(),
+            certificate: None,
         }
     }
 

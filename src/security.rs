@@ -45,8 +45,9 @@ impl From<&str> for SecretString {
 
 /// TLS towards the hubs (`KRAKEN_HUB_TLS=true`), rustls with the platform's root certificates
 /// unless `ca_file` names the CA to trust instead. Applies to every address form (a static list,
-/// `dns:///`). Client certificates (mTLS) are roadmap P5c: build `HubTls` with
-/// `..HubTls::default()` so the fields added then do not break you.
+/// `dns:///`). With `client_cert_file` and `client_key_file` the service also presents a client
+/// certificate (mutual TLS, roadmap P5c, hub ADR 0020). Build `HubTls` with `..HubTls::default()`
+/// so the fields added later do not break you.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HubTls {
     /// PEM file with the CA certificate(s) that sign the hub's certificate (`KRAKEN_HUB_TLS_CA`).
@@ -55,6 +56,23 @@ pub struct HubTls {
     /// The name the hub's certificate must carry and the SNI sent (`KRAKEN_HUB_TLS_SERVER_NAME`).
     /// `None`: the host of the address (for `dns:///name:port`, `name`, not the resolved IP).
     pub server_name: Option<String>,
+    /// PEM file with the client certificate chain, leaf first (`KRAKEN_HUB_TLS_CLIENT_CERT`). The
+    /// leaf carries exactly one URI SAN `kraken://service/<name>`, `<name>` being the service name.
+    /// Both this and `client_key_file`, or neither. Re-read on every (re)connect and checked for
+    /// a renewal once per heartbeat period, see [`crate::hub::HubPool`]. Excludes a static hub
+    /// token and OAuth2 ([`crate::Config::validate`]).
+    pub client_cert_file: Option<PathBuf>,
+    /// PEM file with the private key of the client certificate (`KRAKEN_HUB_TLS_CLIENT_KEY`),
+    /// PKCS#8 (`BEGIN PRIVATE KEY`); EC and RSA PEM keys work as well without a promise.
+    pub client_key_file: Option<PathBuf>,
+}
+
+impl HubTls {
+    /// True when a client certificate is configured (either file; [`crate::Config::validate`]
+    /// insists on both).
+    pub fn has_client_certificate(&self) -> bool {
+        self.client_cert_file.is_some() || self.client_key_file.is_some()
+    }
 }
 
 /// The OAuth2 client-credentials setup that authenticates this service to the hubs with a Keycloak

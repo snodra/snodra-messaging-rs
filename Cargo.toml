@@ -34,6 +34,13 @@ uuid = { version = "1", features = ["v4", "serde"] }
 jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 base64 = "0.23"
+# Client certificate (mTLS, P5c): the URI SAN, notAfter and public key of the leaf (pure Rust, as in
+# the hub; no C toolchain), the SHA-256 fingerprint, and rustls' own key parsing to check the key
+# belongs to the certificate.
+x509-parser = { version = "0.18", default-features = false }
+sha2 = "0.10.9"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = { version = "1", features = ["std"] }
 tracing = "0.1.44"
 thiserror = "2"
 
@@ -46,10 +53,8 @@ tokio = { version = "1.54.1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wiremock = "0.6.5"
 # Test certificates are generated at test time; nothing is checked in.
-# The fake hub's TLS listener (tonic's server side takes the process-wide provider): ring, like the hub.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-sha2 = "0.10.9" # SHA-256 of the test tokens for the e2e ACL file (the hub stores digests only)
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+time = "0.3" # validity periods of the test certificates
 tokio-stream = { version = "0.1", features = ["net"] } # TcpListenerStream for the in-process fake hub
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15.0", features = ["kafka", "mongo"] }

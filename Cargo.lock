@@ -1900,12 +1900,14 @@ dependencies = [
  "rdkafka",
  "reqwest",
  "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "testcontainers",
  "testcontainers-modules",
  "thiserror",
+ "time",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -1916,6 +1918,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wiremock",
+ "x509-parser",
 ]
 
 [[package]]
