@@ -3,5 +3,7 @@
 //! signature verifier ([`ingress`], [`webhook`]). The Rust form of the Kotlin `external` package.
 
 pub mod calls;
+pub mod kafka;
 
 pub use calls::{ExternalCallSettings, ExternalCalls, ExternalCallsHandle, IdempotencyKey};
+pub use kafka::{ExternalKafkaSources, ExternalSource, TranslatedEvent};

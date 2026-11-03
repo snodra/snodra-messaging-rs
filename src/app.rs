@@ -19,6 +19,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rdkafka::message::BorrowedMessage;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
@@ -29,13 +30,19 @@ use tokio_util::task::TaskTracker;
 use crate::config::Config;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
-use crate::external::{ExternalCallSettings, ExternalCalls, ExternalCallsHandle, IdempotencyKey};
+use crate::external::kafka::{SourceRegistration, validate_source};
+use crate::external::{
+    ExternalCallSettings, ExternalCalls, ExternalCallsHandle, ExternalKafkaSources, ExternalSource,
+    IdempotencyKey, TranslatedEvent,
+};
 use crate::hub::{
     Dispatcher, EventContext, HandlerRegistry, HubPool, HubSettings, Inbound, QueryUpdateEmitter,
     Sender, SenderSettings, TokenProvider,
 };
 use crate::identity::{Guard, IdentityResolver, JwksVerifier};
-use crate::kafka::{EventBus, EventConsumer, OutboxPublisher, ensure_indexes};
+use crate::kafka::{
+    EventBus, EventConsumer, LocalEventDispatcher, NoSagas, OutboxPublisher, ensure_indexes,
+};
 use crate::saga::{
     Clock, NoopSagaMetrics, SagaDefinition, SagaType, ensure_external_call_indexes,
     validate_registrations,
@@ -59,6 +66,8 @@ pub struct KrakenMessagingBuilder {
     sagas: Vec<Result<SagaType, MessagingError>>,
     /// What the idempotent handlers record their calls in, bound by `start()`.
     external_calls: ExternalCallsHandle,
+    /// The partner topics, consumed from `start()`.
+    sources: Vec<SourceRegistration>,
 }
 
 pub struct KrakenMessaging {
@@ -111,6 +120,7 @@ impl KrakenMessaging {
             emitter: QueryUpdateEmitter::new(config.hub_max_subscriptions),
             sagas: Vec::new(),
             external_calls: ExternalCallsHandle::new(),
+            sources: Vec::new(),
             config,
         })
     }
@@ -439,6 +449,36 @@ impl KrakenMessagingBuilder {
         self
     }
 
+    /// A partner's Kafka topic whose records become local kraken events (ADR 0021 ruling 20,
+    /// spec "Inbound 1"): `translator` turns each record into an event (`Ok(None)` ignores it, an
+    /// error retries it up to `KRAKEN_CONSUMER_MAX_ATTEMPTS` times and then skips it), which is
+    /// dispatched locally to this service's event handlers and sagas, never published to
+    /// `kraken.events`. The dedupe id is `<name>:<partition>:<offset>`, or `<name>:<dedupeKey>`
+    /// when the translation carries one. A `properties` entry for a key the library fixes, an
+    /// empty topic or two sources of one name fail [`start`](Self::start). See
+    /// [`crate::external::kafka`].
+    ///
+    /// ```ignore
+    /// builder.external_source("printer-banner", ExternalSource::new("partner.printer.banner"), |record| {
+    ///     let reply: PrinterReply = serde_json::from_slice(record.payload().unwrap_or_default())?;
+    ///     Ok(Some(TranslatedEvent::new(&BannerPrinted { job_id: reply.job_id }, Some(reply.event_id))?))
+    /// })
+    /// ```
+    pub fn external_source<T>(mut self, name: &str, source: ExternalSource, translator: T) -> Self
+    where
+        T: Fn(&BorrowedMessage<'_>) -> Result<Option<TranslatedEvent>, MessagingError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.sources.push(SourceRegistration {
+            name: name.to_string(),
+            source,
+            translator: Arc::new(translator),
+        });
+        self
+    }
+
     /// Opt-in authorization for a command or query registered before this call.
     pub fn requires<M: MessageType>(mut self, guard: Guard) -> Self {
         self.registry.requires::<M>(guard);
@@ -487,9 +527,13 @@ impl KrakenMessagingBuilder {
             emitter,
             sagas,
             external_calls,
+            sources,
         } = self;
         // Definition errors first: nothing is connected or created for a saga that cannot run.
         let _sagas = validate_registrations(sagas)?;
+        for source in &sources {
+            validate_source(&source.name, &source.source)?;
+        }
         ensure_indexes(&db, config.outbox_retention, config.idempotency_retention).await?;
         if !registry.idempotent_handlers().is_empty() {
             ensure_external_call_indexes(&db, Duration::from_secs(30 * 86_400)).await?;
@@ -574,6 +618,23 @@ impl KrakenMessagingBuilder {
                 Duration::from_secs(1),
             )?;
             tasks.push(consumer.start(cancel.clone()));
+        }
+        if !sources.is_empty() {
+            let dispatcher = Arc::new(LocalEventDispatcher::new(
+                client.clone(),
+                db.clone(),
+                Arc::clone(&registry),
+                Arc::new(NoSagas),
+            ));
+            let sources = ExternalKafkaSources::new(
+                sources,
+                dispatcher,
+                &config.service_name,
+                &config.kafka_bootstrap,
+                config.consumer_max_attempts,
+                Duration::from_secs(1),
+            )?;
+            tasks.push(sources.start(cancel.clone()));
         }
         tracing::info!(service = %config.service_name, instance = %hubs.instance_id(), hubs = ?hubs.targets(), commands = ?registry.command_types(), queries = ?registry.exclusive_query_types(), shared_queries = ?registry.shared_query_types(), streaming_queries = ?registry.streaming_query_types(), subscription_queries = ?registry.subscription_query_types(), events = ?registry.event_types(), "kraken messaging started");
         Ok(KrakenMessaging {
