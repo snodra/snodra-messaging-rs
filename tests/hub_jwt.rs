@@ -278,6 +278,51 @@ async fn the_token_type_is_compared_without_case() {
 }
 
 #[tokio::test]
+async fn an_endpoint_that_echoes_the_credentials_back_does_not_leak_them_in_the_error() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let secret = "p@ss w/rd:42";
+    let encoded_secret = "p%40ss+w%2Frd%3A42";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(move |request: &wiremock::Request| {
+            let authorization = request.headers["authorization"].to_str().unwrap().to_string();
+            let basic = authorization.trim_start_matches("Basic ").to_string();
+            ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": "invalid_client",
+                "error_description": format!(
+                    "rejected '{authorization}' (basic {basic}); secret {secret} / {encoded_secret}; credentials svc:{encoded_secret}"
+                ),
+            }))
+        })
+        .mount(&server)
+        .await;
+    let provider = TokenProvider::new(HubOAuth2 {
+        token_uri: format!("{}/token", server.uri()),
+        client_id: "svc".into(),
+        client_secret: Some(SecretString::new(secret)),
+        ..HubOAuth2::default()
+    })
+    .unwrap();
+    let basic = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(format!("svc:{encoded_secret}"))
+    };
+
+    let error = provider.refresh().await.expect_err("401").to_string();
+    assert_eq!(
+        provider.status().last_error.as_deref(),
+        Some(error.as_str())
+    );
+    assert!(error.contains("invalid_client"), "{error}");
+    assert!(error.contains("***"), "masked, not just cut: {error}");
+    for leaked in [secret, encoded_secret, basic.as_str(), "Basic "] {
+        assert!(!error.contains(leaked), "'{leaked}' leaked: {error}");
+    }
+}
+
+#[tokio::test]
 async fn the_secret_file_is_reread_on_every_fetch_and_wins_over_the_inline_secret() {
     let dir = temp_dir();
     let file = dir.join("client-secret");

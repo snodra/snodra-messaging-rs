@@ -508,15 +508,22 @@ impl TokenProvider {
             form_encode(&self.settings.client_id),
             form_encode(secret.expose())
         );
-        let mut authorization =
-            HeaderValue::from_str(&format!("Basic {}", STANDARD.encode(credentials))).map_err(
-                |_| {
-                    TokenError::new(
-                        FetchResult::IoError,
-                        "the client credentials cannot be sent",
-                    )
-                },
-            )?;
+        let basic = STANDARD.encode(&credentials);
+        // What an endpoint might echo back in an error text: masked before the text is clipped
+        // (a clipped secret could no longer be recognised).
+        let masker = Masker(vec![
+            format!("Basic {basic}"),
+            basic.clone(),
+            credentials.clone(),
+            form_encode(secret.expose()),
+            secret.expose().to_string(),
+        ]);
+        let mut authorization = HeaderValue::from_str(&format!("Basic {basic}")).map_err(|_| {
+            TokenError::new(
+                FetchResult::IoError,
+                "the client credentials cannot be sent",
+            )
+        })?;
         authorization.set_sensitive(true);
         let mut body = String::from("grant_type=client_credentials");
         if let Some(scope) = self
@@ -530,7 +537,7 @@ impl TokenProvider {
         }
         let io = |e: reqwest::Error| {
             let e = e.without_url();
-            TokenError::new(
+            masker.error(
                 FetchResult::IoError,
                 format!("OAuth2 token endpoint: {}", super::tls::chain(&e)),
             )
@@ -549,7 +556,7 @@ impl TokenProvider {
         let mut bytes: Vec<u8> = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(io)? {
             if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
-                return Err(TokenError::new(
+                return Err(masker.error(
                     FetchResult::BadResponse,
                     format!(
                         "OAuth2 token endpoint answered with more than {MAX_RESPONSE_BYTES} bytes"
@@ -560,10 +567,10 @@ impl TokenProvider {
         }
         let json: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
         if !status.is_success() {
-            return Err(refusal(status, json.as_ref()));
+            return Err(refusal(status, json.as_ref(), &masker));
         }
         let bad = |what: &str| {
-            TokenError::new(
+            masker.error(
                 FetchResult::BadResponse,
                 format!("OAuth2 token endpoint response {what}"),
             )
@@ -610,29 +617,54 @@ impl TokenProvider {
     }
 }
 
+/// Hides the client credentials in a text an endpoint sent back (some echo the request).
+struct Masker(Vec<String>);
+
+impl Masker {
+    /// `text` with every secret form replaced by `***`, longest first.
+    fn apply(&self, text: &str) -> String {
+        let mut out = text.to_string();
+        for needle in &self.0 {
+            // A secret shorter than this would turn any text into asterisks.
+            if needle.len() >= 3 {
+                out = out.replace(needle.as_str(), "***");
+            }
+        }
+        out
+    }
+
+    fn error(&self, result: FetchResult, text: impl AsRef<str>) -> TokenError {
+        TokenError::new(result, self.apply(text.as_ref()))
+    }
+}
+
 /// A non-success answer: the OAuth2 error body when there is one, else the status.
-fn refusal(status: reqwest::StatusCode, body: Option<&serde_json::Value>) -> TokenError {
+fn refusal(
+    status: reqwest::StatusCode,
+    body: Option<&serde_json::Value>,
+    masker: &Masker,
+) -> TokenError {
     let field = |name: &str| {
         body.and_then(|b| b.get(name))
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
     };
     match (field("error"), field("error_description")) {
-        (Some(error), Some(description)) => TokenError::new(
+        (Some(error), Some(description)) => masker.error(
             FetchResult::OauthError,
             format!(
                 "OAuth2 token endpoint refused (HTTP {}): {error}: {description}",
                 status.as_u16()
             ),
         ),
-        (Some(error), None) => TokenError::new(
+        (Some(error), None) => masker.error(
             FetchResult::OauthError,
             format!(
                 "OAuth2 token endpoint refused (HTTP {}): {error}",
                 status.as_u16()
             ),
         ),
-        _ => TokenError::new(
+        _ => masker.error(
             FetchResult::HttpError,
             format!("OAuth2 token endpoint answered HTTP {status}"),
         ),
