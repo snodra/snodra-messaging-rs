@@ -19,6 +19,8 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -33,6 +35,7 @@ use crate::hub::{
 };
 use crate::identity::{Guard, IdentityResolver, JwksVerifier};
 use crate::kafka::{EventBus, EventConsumer, OutboxPublisher, ensure_indexes};
+use crate::saga::{SagaDefinition, SagaType, validate_registrations};
 use crate::types::{Command, Event, MessageType, Query, StreamingQuery, SubscriptionQuery};
 
 /// How long a shutdown waits for the subscriptions' `ReplyEnd`s to be written.
@@ -48,6 +51,8 @@ pub struct KrakenMessagingBuilder {
     inbound: mpsc::Receiver<Inbound>,
     sender: Arc<Sender>,
     emitter: QueryUpdateEmitter,
+    /// The saga registrations, checked by `start()`.
+    sagas: Vec<Result<SagaType, MessagingError>>,
 }
 
 pub struct KrakenMessaging {
@@ -98,6 +103,7 @@ impl KrakenMessaging {
             inbound,
             sender,
             emitter: QueryUpdateEmitter::new(config.hub_max_subscriptions),
+            sagas: Vec::new(),
             config,
         })
     }
@@ -332,6 +338,38 @@ impl KrakenMessagingBuilder {
         self
     }
 
+    /// Registers a saga (ADR 0021): `name` is its wire type name in `sagas.type`, `S` its state
+    /// (stored as JSON text, so it must be `Serialize + Deserialize` and round-trip from its
+    /// `Default`), `define` its handlers. A definition error (no start handler, two sagas of one
+    /// name, a state that does not round-trip, `ending()` before any handler) is returned by
+    /// [`start`](Self::start), naming the saga and the handler.
+    ///
+    /// ```ignore
+    /// builder.saga::<PaymentState>("payment", |d| {
+    ///     d.start_on::<OrderPlaced>("orderId", |e| Some(e.order_id.clone()), |s, e, ctx| {
+    ///         s.order_id = Some(e.order_id.clone());
+    ///         ctx.associate_with("paymentRef", &format!("pay-{}", e.order_id));
+    ///         ctx.send(&RequestCharge { amount: e.amount }, None)?; // dispatched after commit
+    ///         Ok(())
+    ///     })
+    ///     .on::<ChargeSucceeded>("paymentRef", |e| Some(e.payment_ref.clone()), |s, e, ctx| Ok(()))
+    ///     .ending()
+    ///     .on_deadline::<()>("charge-timeout", |s, _, ctx| { ctx.end(); Ok(()) })
+    /// })
+    /// ```
+    pub fn saga<S>(
+        mut self,
+        name: &'static str,
+        define: impl FnOnce(SagaDefinition<S>) -> SagaDefinition<S>,
+    ) -> Self
+    where
+        S: Serialize + DeserializeOwned + Default + Send + 'static,
+    {
+        self.sagas
+            .push(define(SagaDefinition::<S>::new(name)).build());
+        self
+    }
+
     /// Opt-in authorization for a command or query registered before this call.
     pub fn requires<M: MessageType>(mut self, guard: Guard) -> Self {
         self.registry.requires::<M>(guard);
@@ -378,7 +416,10 @@ impl KrakenMessagingBuilder {
             mut inbound,
             sender,
             emitter,
+            sagas,
         } = self;
+        // Definition errors first: nothing is connected or created for a saga that cannot run.
+        let _sagas = validate_registrations(sagas)?;
         ensure_indexes(&db, config.outbox_retention, config.idempotency_retention).await?;
         let registry = Arc::new(registry);
         let verifier = match (&config.jwks_url, &config.issuer) {
