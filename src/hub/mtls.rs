@@ -145,7 +145,7 @@ fn load_pair(cert_file: &Path, key_file: &Path) -> Result<ClientIdentity, String
     })?;
     let signing = rustls::crypto::ring::sign::any_supported_type(&key).map_err(|_| {
         format!(
-            "client key file '{}' holds a private key of a type that is not supported",
+            "client key file '{}' holds a private key this client cannot use: it must be an RSA, ECDSA (P-256 or P-384) or Ed25519 key in PKCS#8 PEM, and an EC key must carry its public key (OpenSSL writes it; some tools leave it out). Convert it with `openssl pkcs8 -topk8 -nocrypt -in <key> -out <key>.pkcs8.pem` (a key that still fails: generate a new one with openssl, e.g. `openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256`)",
             key_file.display()
         )
     })?;
@@ -533,6 +533,36 @@ mod tests {
         let id = load(&cert, &key, "orders").unwrap();
         assert!(!format!("{id:?}").contains(probe));
         assert!(!format!("{id:#?}").contains(probe));
+    }
+
+    /// A PKCS#8 P-256 key whose `ECPrivateKey` carries no public key: ring refuses it.
+    fn ec_key_without_public_key_pem() -> String {
+        use base64::Engine;
+        let mut der = vec![0x30, 0x4d, 0x02, 0x01, 0x00];
+        der.extend([
+            0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+        ]);
+        der.extend([0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]);
+        der.extend([0x04, 0x33, 0x30, 0x31, 0x02, 0x01, 0x01, 0x04, 0x20]);
+        der.extend((1..=32u8).collect::<Vec<_>>());
+        der.extend([
+            0xa0, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
+        ]);
+        let body = base64::engine::general_purpose::STANDARD.encode(der);
+        format!("-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----\n")
+    }
+
+    #[test]
+    fn a_key_that_ring_refuses_says_what_is_wrong_and_how_to_convert_it() {
+        let dir = Dir::new();
+        let (cert, _) = dir.pair(&issue(&Spec::service("billing")));
+        let key = dir.write("odd-key.pem", &ec_key_without_public_key_pem());
+        let err = load(&cert, &key, "billing").unwrap_err().to_string();
+        assert!(err.contains("odd-key.pem"), "{err}");
+        assert!(!err.contains("not supported"), "{err}");
+        assert!(err.contains("public key"), "{err}");
+        assert!(err.contains("openssl pkcs8 -topk8 -nocrypt"), "{err}");
+        assert!(err.contains("PKCS#8"), "{err}");
     }
 
     #[test]
