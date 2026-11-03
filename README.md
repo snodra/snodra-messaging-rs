@@ -814,10 +814,12 @@ distinct message, retried at the backoff cap).
 Kotlin client does, whatever the heartbeat period). When they hold a valid pair (not expired, and
 past its `notBefore`: a pair that is not valid yet is waited for, never rolled to) that a live
 connection is not presenting, it first waits a **random delay**, uniform in `[0, min(30 s, 10 % of the
-presented certificate's remaining validity)]` (0 once it has expired; `certificate_roll_delay_max`
-sets the 30 s, 0 switches the delay off), once per renewed pair, so that the replicas which see the
+shortest remaining validity among the connections that still present an older pair)]` (0 once that
+certificate has ended; `certificate_roll_delay_max` sets the 30 s, 0 switches the delay off), drawn once
+per renewed pair (not per hub), so that the replicas which see the
 same renewal in the same tick do not all leave the routing together; it then reads the files again
-(the roll goes to what they hold after the delay) and rolls the hubs over **one at a time**, in the
+(the roll goes to whatever pair is current then, with no second delay, and is skipped if no
+connection is stale any more) and rolls the hubs over **one at a time**, in the
 order of `hub_address`:
 
 1. the hub is told the instance is stopping (a `Register` with no types, as the shutdown path does),
