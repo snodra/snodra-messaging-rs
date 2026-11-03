@@ -17,6 +17,7 @@ mod indexes;
 mod metrics;
 pub mod ports;
 mod raw;
+mod relay;
 mod retry;
 mod runtime;
 pub mod store;
@@ -33,6 +34,7 @@ pub use raw::{
     UNKNOWN_OUTCOME_MARKER, classify_failure,
 };
 
+pub use relay::{RelaySettings, SagaDispatchRelay};
 pub use retry::SagaRetry;
 pub use runtime::SagaRuntime;
 

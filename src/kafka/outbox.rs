@@ -119,6 +119,56 @@ impl EventBus {
         Ok(())
     }
 
+    /// The outbox document of an event known only by its wire type name and its JSON payload text
+    /// (what the saga relay holds for an `EVENT` entry of `saga_dispatch`): the headers carry
+    /// `correlation_id` and no user, as an event published outside any handler.
+    pub fn raw_document(
+        &self,
+        type_name: &str,
+        key: Option<&str>,
+        payload_json: &str,
+        correlation_id: &str,
+    ) -> Result<OutboxDocument, MessagingError> {
+        let json: serde_json::Value = serde_json::from_str(payload_json)?;
+        let payload: Document = mongodb::bson::to_document(&json).map_err(|e| {
+            MessagingError::Serialization(serde_json::Error::io(std::io::Error::other(
+                e.to_string(),
+            )))
+        })?;
+        let mut hdrs = HashMap::new();
+        hdrs.insert(
+            headers::CORRELATION_ID.to_string(),
+            correlation_id.to_string(),
+        );
+        hdrs.insert(headers::USER_ID.to_string(), String::new());
+        Ok(OutboxDocument {
+            id: uuid::Uuid::new_v4().to_string(),
+            type_name: type_name.to_string(),
+            key: key.map(str::to_string),
+            headers: hdrs,
+            payload,
+            created_at: DateTime::now(),
+            seq: self.seq.fetch_add(1, Ordering::SeqCst) + 1,
+            sent_at: None,
+            attempts: 0,
+            failed_at: None,
+        })
+    }
+
+    /// Inserts a document built by [`raw_document`](Self::raw_document) inside `session`.
+    pub async fn publish_raw_in(
+        &self,
+        doc: OutboxDocument,
+        session: &mut ClientSession,
+    ) -> Result<(), MessagingError> {
+        self.db
+            .collection::<OutboxDocument>(OUTBOX_COLLECTION)
+            .insert_one(doc)
+            .session(session)
+            .await?;
+        Ok(())
+    }
+
     pub fn document<E: Event>(
         &self,
         event: &E,
