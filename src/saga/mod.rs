@@ -11,6 +11,7 @@ mod context;
 mod deadlines;
 mod definition;
 mod failed;
+mod failures;
 mod indexes;
 mod metrics;
 pub mod ports;
@@ -33,6 +34,7 @@ pub use raw::{
 };
 
 pub use deadlines::{DeadlineScheduler, DeadlineSettings};
+pub use failures::SagaFailures;
 pub use relay::{RelaySettings, SagaDispatchRelay};
 pub use retry::SagaRetry;
 pub use runtime::SagaRuntime;
