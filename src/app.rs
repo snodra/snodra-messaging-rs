@@ -32,8 +32,8 @@ use crate::context::MessageContext;
 use crate::error::MessagingError;
 use crate::external::kafka::{SourceRegistration, validate_source};
 use crate::external::{
-    ExternalCallSettings, ExternalCalls, ExternalCallsHandle, ExternalKafkaSources, ExternalSource,
-    IdempotencyKey, TranslatedEvent,
+    ExternalCallSettings, ExternalCalls, ExternalCallsHandle, ExternalEventIngress,
+    ExternalKafkaSources, ExternalSource, IdempotencyKey, TranslatedEvent,
 };
 use crate::hub::{
     Dispatcher, EventContext, HandlerRegistry, HubPool, HubSettings, Inbound, QueryUpdateEmitter,
@@ -81,6 +81,7 @@ pub struct KrakenMessaging {
     cancel: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
     handlers: TaskTracker,
+    ingress: ExternalEventIngress,
 }
 
 impl KrakenMessaging {
@@ -152,6 +153,25 @@ impl KrakenMessaging {
     /// [`QueryUpdateEmitter`].
     pub fn emitter(&self) -> QueryUpdateEmitter {
         self.emitter.clone()
+    }
+
+    /// The webhook ingress (ADR 0021 ruling 18): a service's webhook endpoint verifies the
+    /// request ([`webhook::verify`](crate::external::webhook::verify)), turns the body into an
+    /// event and hands it to [`ExternalEventIngress::accept`], which dispatches it locally (the
+    /// event handlers, then the sagas) before returning.
+    ///
+    /// ```ignore
+    /// async fn webhook(app: &KrakenMessaging, headers: &HashMap<String, String>, body: &[u8]) -> u16 {
+    ///     if !webhook::verify(&secret, None, headers, body) { return 401; }
+    ///     let reply: PrinterReply = match serde_json::from_slice(body) { Ok(r) => r, Err(_) => return 400 };
+    ///     match app.ingress().accept("printer-banner", &reply.event_id, &BannerPrinted::from(reply), headers).await {
+    ///         Ok(_) => 202,  // Accepted or Duplicate
+    ///         Err(_) => 500, // the partner retries
+    ///     }
+    /// }
+    /// ```
+    pub fn ingress(&self) -> ExternalEventIngress {
+        self.ingress.clone()
     }
 
     pub fn instance_id(&self) -> &str {
@@ -619,16 +639,19 @@ impl KrakenMessagingBuilder {
             )?;
             tasks.push(consumer.start(cancel.clone()));
         }
+        // The local dispatch of partner records and webhook events: the ordinary handlers, then
+        // the sagas.
+        let local = Arc::new(LocalEventDispatcher::new(
+            client.clone(),
+            db.clone(),
+            Arc::clone(&registry),
+            Arc::new(NoSagas),
+        ));
+        let ingress = ExternalEventIngress::new(Arc::clone(&local), db.clone(), Clock::system());
         if !sources.is_empty() {
-            let dispatcher = Arc::new(LocalEventDispatcher::new(
-                client.clone(),
-                db.clone(),
-                Arc::clone(&registry),
-                Arc::new(NoSagas),
-            ));
             let sources = ExternalKafkaSources::new(
                 sources,
-                dispatcher,
+                Arc::clone(&local),
                 &config.service_name,
                 &config.kafka_bootstrap,
                 config.consumer_max_attempts,
@@ -648,6 +671,7 @@ impl KrakenMessagingBuilder {
             cancel,
             tasks,
             handlers,
+            ingress,
         })
     }
 }
