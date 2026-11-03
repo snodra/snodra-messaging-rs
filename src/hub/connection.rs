@@ -1557,9 +1557,10 @@ impl HubConnection {
         Ok(())
     }
 
-    /// Closes the stream on a shutdown without losing what is still on its way to the hub (a
-    /// subscription's last updates and `ReplyEnd`): the request side is half-closed once the
-    /// transport has taken everything queued, and the hub finishing its side is awaited (bounded).
+    /// Closes the stream (on a shutdown or a certificate rollover) without losing what is still on
+    /// its way to the hub (a subscription's last updates and `ReplyEnd`): the request side is
+    /// half-closed once the transport has taken everything queued, and the hub finishing its side
+    /// is awaited (bounded), handling what it sends meanwhile (late replies to our requests).
     /// Dropping the response stream at once would reset the RPC, discarding whatever the
     /// transport had not written yet, and a hub that never saw a subscription target's end would
     /// fail the subscription with HANDLER_DISCONNECTED.
@@ -1572,8 +1573,30 @@ impl HubConnection {
         // messages still in it, and the transport ends the request.
         *self.live.lock().unwrap() = None;
         drop(tx);
+        // What the hub still sends meanwhile is handled as on a live stream: the replies, errors
+        // and parts of our own requests reach their callers (a request the drain gave up waiting
+        // for is answered late, not failed). A request pushed to us now cannot be answered any
+        // more (our side is closed); the hub fails it when the stream ends.
         let finished = tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, async {
-            while let Ok(Some(_)) = stream.message().await {}
+            while let Ok(Some(msg)) = stream.message().await {
+                let Some(msg) = msg.message else { continue };
+                let inbound = match msg {
+                    server_message::Message::Reply(r) => Inbound::Reply(r),
+                    server_message::Message::Error(e) => Inbound::Error(e),
+                    server_message::Message::Part(p) => Inbound::Part(p),
+                    server_message::Message::End(e) => Inbound::End(e),
+                    server_message::Message::Flow(x) => Inbound::Flow(x),
+                    server_message::Message::Cancel(c) => Inbound::Cancel(c),
+                    server_message::Message::Request(_) => {
+                        tracing::debug!(service = %self.service_name, address = %self.settings.address, "a request arrived while the stream was closing; the hub fails it when the stream ends");
+                        continue;
+                    }
+                    server_message::Message::RegisterAck(_) | server_message::Message::Heartbeat(_) => continue,
+                };
+                if self.forward(inbound).await.is_err() {
+                    break;
+                }
+            }
         })
         .await;
         if finished.is_err() {

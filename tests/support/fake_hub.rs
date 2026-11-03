@@ -120,6 +120,12 @@ use tonic::{Request, Response, Status, Streaming};
 
 type Responder = Box<dyn Fn(proto::Request) -> Option<ServerMessage> + Send + Sync>;
 type Outbound = mpsc::Sender<Result<ServerMessage, Status>>;
+/// What the hub says to a client that half-closed its stream, and how long it then keeps its own
+/// side open.
+type HalfClose = (
+    std::time::Duration,
+    Arc<dyn Fn() -> Vec<ServerMessage> + Send + Sync>,
+);
 /// A subscription target: (stream number, service, instance, outbound).
 type Target = (usize, String, String, Outbound);
 
@@ -375,6 +381,7 @@ pub struct State {
     down: AtomicBool,
     replace_sessions: AtomicBool,
     stall_reads: AtomicBool,
+    half_close: StdMutex<Option<HalfClose>>,
     /// instance id → (stream number, that stream's cancel token).
     sessions: StdMutex<HashMap<String, (usize, CancellationToken)>>,
     evictions: AtomicUsize,
@@ -1848,7 +1855,18 @@ impl Hub for Service {
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(10)), if state.stall_reads.load(Ordering::SeqCst) => {}
                     msg = inbound.next(), if !state.stall_reads.load(Ordering::SeqCst) => match msg {
-                        None | Some(Err(_)) => break,
+                        None => {
+                            // The client half-closed: like a hub that still has things to say.
+                            let half_close = state.half_close.lock().unwrap().clone();
+                            if let Some((linger, farewell)) = half_close {
+                                for msg in farewell() {
+                                    let _ = tx.send(Ok(msg)).await;
+                                }
+                                tokio::time::sleep(linger).await;
+                            }
+                            break;
+                        }
+                        Some(Err(_)) => break,
                         Some(Ok(ClientMessage { message: Some(m) })) => match m {
                             client_message::Message::Register(r) => {
                                 if let Err(status) = state.admit(stream_no, &r, &mut principal) {
@@ -2150,6 +2168,7 @@ impl FakeHub {
             down: AtomicBool::new(false),
             replace_sessions: AtomicBool::new(true),
             stall_reads: AtomicBool::new(false),
+            half_close: StdMutex::new(None),
             sessions: StdMutex::new(HashMap::new()),
             evictions: AtomicUsize::new(0),
             events: StdMutex::new(vec![]),
@@ -2562,6 +2581,16 @@ impl FakeHub {
     /// messages stay in its own outbound buffer, never written.
     pub fn set_stall_reads(&self, on: bool) {
         self.state.stall_reads.store(on, Ordering::SeqCst);
+    }
+
+    /// When a client half-closes its stream the hub sends `farewell()` at once and keeps its own
+    /// side open for `linger` before it ends the stream (a hub still finishing its work).
+    pub fn set_half_close(
+        &self,
+        linger: Duration,
+        farewell: impl Fn() -> Vec<ServerMessage> + Send + Sync + 'static,
+    ) {
+        *self.state.half_close.lock().unwrap() = Some((linger, Arc::new(farewell)));
     }
 
     /// Sessions replaced by a newer stream of the same instance id so far.

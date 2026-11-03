@@ -990,3 +990,61 @@ async fn a_renewed_pair_is_not_rolled_to_before_its_not_before() {
     c.shutdown().await;
     w.hub.stop();
 }
+
+#[tokio::test]
+async fn a_reply_that_arrives_while_the_stream_is_closing_for_the_roll_reaches_its_caller() {
+    let w = world(true).await;
+    // The hub keeps the request unanswered; once the instance half-closes the stream (the drain
+    // ran out) it sends the late reply, and then takes its time to end the stream.
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let recorded = Arc::clone(&seen);
+    w.hub
+        .set_responder(move |req| {
+            recorded.lock().unwrap().push(req.id);
+            None
+        })
+        .await;
+    let late = Arc::clone(&seen);
+    w.hub.set_half_close(Duration::from_millis(500), move || {
+        late.lock()
+            .unwrap()
+            .iter()
+            .map(|id| {
+                ok_reply(&proto::Request {
+                    id: id.clone(),
+                    ..Default::default()
+                })
+            })
+            .collect()
+    });
+    let (tls, first) = w.issue("svc", &ClientSpec::service("svc"));
+    let c = client(settings(w.hub.address(), tls.clone())).await;
+    assert!(c.pool.await_all_registered(Duration::from_secs(5)).await);
+    c.presenting(&first).await;
+    let sender = Arc::clone(&c.sender);
+    let call = tokio::spawn(async move {
+        sender
+            .send_command(
+                &Ping {},
+                SendOptions {
+                    timeout: Some(Duration::from_secs(30)),
+                    ..SendOptions::default()
+                },
+            )
+            .await
+    });
+    eventually("the hub has the request", || {
+        !seen.lock().unwrap().is_empty()
+    })
+    .await;
+    let second = w.renew(&tls, &ClientSpec::service("svc"));
+    // The roll waits 10 s for the request, then closes the stream; the late reply arrives then.
+    c.presenting_within(&second, Duration::from_secs(20)).await;
+    let outcome = call.await.unwrap();
+    assert!(
+        outcome.is_ok(),
+        "the late reply was lost with the close: {outcome:?}"
+    );
+    c.shutdown().await;
+    w.hub.stop();
+}
