@@ -1211,6 +1211,9 @@ impl Sender {
     /// Dropping it before the end cancels
     /// the stream at the hub (the handler is told) and forgets the request.
     ///
+    /// A client certificate rollover (mTLS) cuts it: the roll does not wait for the streams and
+    /// subscriptions this instance consumes, so the last item is `HubConnectionLost`.
+    ///
     /// The stream borrows this sender (`BoxStream<'a>`): it cannot outlive the borrow, so it
     /// cannot be returned as an HTTP streaming body or moved into a spawned task. For that use
     /// [`stream_owned`](Self::stream_owned), which shares the `Arc<Sender>` instead.
@@ -1332,6 +1335,10 @@ impl Sender {
     /// The subscription is owned (`'static`): it holds a clone of this `Arc<Sender>` and can be
     /// moved into a task or returned. Dropping it, or its `updates`, before the end cancels it
     /// at the hub (every owner instance is told) and forgets the request.
+    ///
+    /// A client certificate rollover (mTLS) cuts the subscription: the roll does not wait for the
+    /// streams and subscriptions this instance consumes (they end when their owners decide), so
+    /// its last item is `HubConnectionLost` and the consumer resubscribes.
     pub async fn subscribe<Q: SubscriptionQuery>(
         self: &Arc<Self>,
         query: &Q,

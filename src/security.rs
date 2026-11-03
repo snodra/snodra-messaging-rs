@@ -59,7 +59,7 @@ pub struct HubTls {
     /// PEM file with the client certificate chain, leaf first (`KRAKEN_HUB_TLS_CLIENT_CERT`). The
     /// leaf carries exactly one URI SAN `kraken://service/<name>`, `<name>` being the service name.
     /// Both this and `client_key_file`, or neither. Re-read on every (re)connect and checked for
-    /// a renewal once per heartbeat period, see [`crate::hub::HubPool`]. Excludes a static hub
+    /// a renewal every `certificate_check_interval` (3 s), see [`crate::hub::HubPool`]. Excludes a static hub
     /// token and OAuth2 ([`crate::Config::validate`]).
     pub client_cert_file: Option<PathBuf>,
     /// PEM file with the private key of the client certificate (`KRAKEN_HUB_TLS_CLIENT_KEY`),
