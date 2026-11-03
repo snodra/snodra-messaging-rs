@@ -454,7 +454,8 @@ async fn rotation(rotated: Rotated) {
     let billing = HubPool::new(
         HubSettings {
             address: both.clone(),
-            heartbeat_interval: Duration::from_millis(300),
+            certificate_check_interval: Duration::from_millis(300),
+            certificate_roll_delay_max: Duration::ZERO,
             backoff_min: Duration::from_millis(100),
             backoff_max: Duration::from_secs(1),
             tls: Some(billing_tls),
@@ -475,7 +476,8 @@ async fn rotation(rotated: Rotated) {
     let orders = HubPool::new(
         HubSettings {
             address: both,
-            heartbeat_interval: Duration::from_millis(300),
+            certificate_check_interval: Duration::from_millis(300),
+            certificate_roll_delay_max: Duration::ZERO,
             backoff_min: Duration::from_millis(100),
             backoff_max: Duration::from_secs(1),
             tls: Some(orders_tls.clone()),

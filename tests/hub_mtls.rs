@@ -74,6 +74,7 @@ fn settings(address: String, tls: HubTls) -> HubSettings {
         tls: Some(tls),
         // No delay before a roll, unless a test is about it.
         certificate_roll_delay_max: Duration::ZERO,
+        certificate_check_interval: Duration::from_millis(200),
         ..HubSettings::default()
     }
 }
@@ -874,7 +875,7 @@ async fn no_warning_while_a_renewed_file_is_waiting_to_be_picked_up() {
     let _logs = captured.install();
     // A slow tick: the renewal is on disk before the first one looks.
     let c = client(HubSettings {
-        heartbeat_interval: Duration::from_secs(1),
+        certificate_check_interval: Duration::from_secs(1),
         ..settings(w.hub.address(), tls.clone())
     })
     .await;
@@ -1347,6 +1348,33 @@ async fn the_pair_is_checked_again_after_the_delay() {
         [first, third],
         "the superseded pair was presented"
     );
+    c.shutdown().await;
+    w.hub.stop();
+}
+
+#[test]
+fn the_files_are_looked_at_every_three_seconds_by_default_like_kotlin() {
+    assert_eq!(
+        HubSettings::default().certificate_check_interval,
+        Duration::from_secs(3)
+    );
+}
+
+#[tokio::test]
+async fn the_files_are_checked_on_their_own_interval_not_the_heartbeat_period() {
+    let w = world(true).await;
+    let (tls, first) = w.issue("svc", &ClientSpec::service("svc"));
+    // A heartbeat period of a minute: a check tied to it would not see the renewal in time.
+    let c = client(HubSettings {
+        heartbeat_interval: Duration::from_secs(60),
+        certificate_check_interval: Duration::from_millis(200),
+        ..settings(w.hub.address(), tls.clone())
+    })
+    .await;
+    assert!(c.pool.await_all_registered(Duration::from_secs(5)).await);
+    c.presenting(&first).await;
+    let second = w.renew(&tls, &ClientSpec::service("svc"));
+    c.presenting_within(&second, Duration::from_secs(3)).await;
     c.shutdown().await;
     w.hub.stop();
 }

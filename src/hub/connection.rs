@@ -177,6 +177,9 @@ pub struct HubSettings {
     /// the presented certificate's remaining validity)]`, so replicas that see the same renewal
     /// within one tick do not all deregister at once. Zero: no delay.
     pub certificate_roll_delay_max: Duration,
+    /// [`super::HubPool`] with a client certificate only: how often the certificate files are
+    /// looked at for a renewal (3 s, as in the Kotlin client, whatever the heartbeat period).
+    pub certificate_check_interval: Duration,
 }
 
 impl Default for HubSettings {
@@ -197,6 +200,7 @@ impl Default for HubSettings {
             tls: None,
             token_provider: None,
             certificate_roll_delay_max: Duration::from_secs(30),
+            certificate_check_interval: Duration::from_secs(3),
         }
     }
 }

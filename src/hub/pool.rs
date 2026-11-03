@@ -34,7 +34,7 @@
 //!   of ours written to it unanswered, no handler of its requests running), at most
 //!   [`DRAIN_LIMIT`] later. A failed or empty resolution keeps the current hubs.
 //! - **Client certificate rotation** (mutual TLS, P5c). With `hub_tls.client_cert_file` the pool
-//!   reads the files once per heartbeat period (`HubSettings::heartbeat_interval`). When they hold
+//!   reads the files every `HubSettings::certificate_check_interval` (3 s, as the Kotlin client does). When they hold
 //!   a valid pair that a live connection is not presenting (the content changed), the
 //!   connections are rolled over to it one hub at a time, in target order: the hub is told the
 //!   instance is stopping (a `Register` with no types; a hub that has another live hub is
@@ -929,12 +929,13 @@ impl HubPool {
         tasks.push(task);
     }
 
-    /// Once per heartbeat period: look at the client certificate files (see the module docs).
+    /// Once per `certificate_check_interval`: look at the client certificate files (see the module docs).
     async fn certificate_loop(self: Arc<Self>) {
-        let mut ticker = tokio::time::interval_at(
-            tokio::time::Instant::now() + self.settings.heartbeat_interval,
-            self.settings.heartbeat_interval,
-        );
+        let period = self
+            .settings
+            .certificate_check_interval
+            .max(Duration::from_millis(1));
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
