@@ -379,6 +379,62 @@ async fn files_caught_half_way_through_a_rotation_keep_the_last_good_pair() {
 }
 
 #[tokio::test]
+async fn at_connect_every_problem_with_the_files_falls_back_to_the_last_good_pair() {
+    let w = world(true).await;
+    let (tls, first) = w.issue("svc", &ClientSpec::service("svc"));
+    let captured = Captured::default();
+    let _logs = captured.install();
+    let conn = connection(settings(w.hub.address(), tls.clone()), "svc");
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    let now = time::OffsetDateTime::now_utc();
+    let problems = [
+        // Another service's pair (a wrong one copied over).
+        ClientSpec::service("orders"),
+        // Expired.
+        ClientSpec {
+            not_before: now - time::Duration::hours(2),
+            not_after: now - time::Duration::seconds(30),
+            ..ClientSpec::service("svc")
+        },
+        // Not valid yet.
+        ClientSpec::service("svc").starting_in(Duration::from_secs(3600)),
+    ];
+    let mut streams = 1;
+    for (n, problem) in problems.iter().enumerate() {
+        w.renew(&tls, problem);
+        // The same problem on two reconnects: one warning.
+        for _ in 0..2 {
+            w.hub.drop_streams();
+            streams += 1;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while w.hub.peer_fingerprints().len() < streams {
+                assert!(Instant::now() < deadline, "problem {n}: no reconnect");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(conn.await_registered(Duration::from_secs(5)).await);
+            assert_eq!(
+                w.hub.peer_fingerprints().last().unwrap().1,
+                first,
+                "problem {n}: not the last good pair"
+            );
+        }
+    }
+    assert_eq!(conn.last_rejection(), None);
+    let warnings: Vec<String> = captured
+        .lines()
+        .into_iter()
+        .filter(|l| l.contains("WARN") && l.contains("keeping the last good pair"))
+        .collect();
+    assert_eq!(warnings.len(), 3, "one per problem: {warnings:#?}");
+    assert!(warnings[0].contains("orders"), "{}", warnings[0]);
+    assert!(warnings[1].contains("expired"), "{}", warnings[1]);
+    assert!(warnings[2].contains("not valid before"), "{}", warnings[2]);
+    conn.shutdown().await;
+    w.hub.stop();
+}
+
+#[tokio::test]
 async fn without_a_good_pair_to_fall_back_on_the_attempt_fails_and_nothing_is_offered() {
     let w = world(true).await;
     let (tls, _) = w.issue("svc", &ClientSpec::service("svc"));

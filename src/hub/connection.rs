@@ -1686,12 +1686,12 @@ impl HubConnection {
 
     /// The client certificate pair for the stream about to open: read from the files now (a
     /// renewal applies at the next connect), and checked: it parses, the key is the leaf's, the
-    /// leaf names this service, it has not expired. A pair that cannot be read or parsed (a
-    /// rotation caught half way) falls back to the last good one while that has not expired;
-    /// otherwise, or for a pair that names another service or has expired, the attempt fails
-    /// before a stream is opened: [`Code::PermissionDenied`] / [`Code::Unauthenticated`] (a
-    /// registration rejection, logged at `error` once per distinct message), else
-    /// `FailedPrecondition`.
+    /// leaf names this service, it is valid now. Any problem with the files (a rotation caught
+    /// half way, another service's pair, an expired or not yet valid one) falls back to the last
+    /// good pair while that has not expired (one `warn` per distinct problem); without one the
+    /// attempt fails before a stream is opened: [`Code::PermissionDenied`] (another service) /
+    /// [`Code::Unauthenticated`] (expired) (a registration rejection, logged at `error` once per
+    /// distinct message), else `FailedPrecondition`.
     fn load_identity(&self, tls: &HubTls) -> Result<ClientIdentity, Status> {
         let (Some(cert), Some(key)) = (&tls.client_cert_file, &tls.client_key_file) else {
             return Err(Status::failed_precondition(
@@ -1709,7 +1709,10 @@ impl HubConnection {
                 *self.identity.lock().unwrap() = Some(identity.clone());
                 Ok(identity)
             }
-            Err(LoadError::Unusable(message) | LoadError::NotYetValid(message)) => {
+            Err(problem) => {
+                // The last good pair, while it has not expired, serves every problem with the
+                // files (a rotation caught half way, another service's pair, an expired or a
+                // not yet valid one): the next reconnect or rollover reads them again.
                 let last = self
                     .identity
                     .lock()
@@ -1717,8 +1720,15 @@ impl HubConnection {
                     .clone()
                     .filter(|i| now < i.not_after);
                 let Some(last) = last else {
-                    return Err(Status::failed_precondition(message));
+                    return Err(match problem {
+                        LoadError::Unusable(m) | LoadError::NotYetValid(m) => {
+                            Status::failed_precondition(m)
+                        }
+                        LoadError::WrongService(m) => Status::permission_denied(m),
+                        LoadError::Expired(m) => Status::unauthenticated(m),
+                    });
                 };
+                let message = problem.message().to_string();
                 let first = self
                     .logged_identity_problem
                     .lock()
@@ -1731,8 +1741,6 @@ impl HubConnection {
                 }
                 Ok(last)
             }
-            Err(LoadError::WrongService(message)) => Err(Status::permission_denied(message)),
-            Err(LoadError::Expired(message)) => Err(Status::unauthenticated(message)),
         }
     }
 
