@@ -3,6 +3,7 @@
 //! sends. Protocol in `proto/hub.proto`, behaviour mirrors the Kotlin
 //! `HubConnection`/`HubBus`.
 
+mod auth;
 mod connection;
 mod dispatcher;
 mod pool;
@@ -12,6 +13,10 @@ mod subscriptions;
 mod targets;
 mod tls;
 
+pub use auth::{
+    AccessToken, AuthKind, AuthStatus, FetchResult, TokenError, TokenProvider, TokenStats,
+    refresh_margin,
+};
 pub use connection::{
     CAPABILITIES, CLIENT_VERSION, FLOW_CONTROL, Handshake, HubConnection, HubSettings,
     INSTANCE_STATUS, Inbound, PERMIT_BATCH, PERMIT_FLUSH_AFTER, PROTOCOL_VERSION, RegisteredTypes,
