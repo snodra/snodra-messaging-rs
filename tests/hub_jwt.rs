@@ -818,6 +818,97 @@ async fn a_token_endpoint_that_refuses_opens_no_stream_logs_one_error_and_recove
 }
 
 #[tokio::test]
+async fn an_unauthenticated_refusal_of_the_register_makes_the_next_stream_fetch_a_new_token() {
+    let idp = Idp::start("svc", SECRET).await;
+    idp.set_lifetime(300); // fresh by every clock: only the refusal can retire it
+    let hub = FakeHub::start().await;
+    jwt_hub_acl(&hub);
+    hub.refuse_jwts_with(Some((tonic::Code::Unauthenticated, "token expired")));
+    let provider = provider(&idp);
+    let conn = connection(jwt_settings(hub.address(), &provider), "svc");
+    conn.start();
+    until("a refusal", Duration::from_secs(5), || {
+        !hub.rejections().is_empty()
+    })
+    .await;
+    hub.refuse_jwts_with(None);
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+
+    let refused = hub.rejections();
+    let accepted = jwt_of(&hub.registers().await[0]).unwrap();
+    assert!(
+        refused
+            .iter()
+            .all(|r| r.token.as_deref() != Some(&accepted)),
+        "the token the hub refused as unauthenticated was not offered again"
+    );
+    assert_eq!(
+        idp.issued() as usize,
+        refused.len() + 1,
+        "one token per refused attempt, one for the accepted one"
+    );
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn an_unauthenticated_close_of_a_live_stream_makes_the_next_stream_fetch_a_new_token() {
+    let idp = Idp::start("svc", SECRET).await;
+    idp.set_lifetime(300);
+    let hub = FakeHub::start().await;
+    jwt_hub_acl(&hub);
+    let provider = provider(&idp);
+    let conn = connection(jwt_settings(hub.address(), &provider), "svc");
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    let first = jwt_of(&hub.registers().await[0]).unwrap();
+    assert_eq!(idp.issued(), 1);
+
+    hub.close_streams_with(tonic::Code::Unauthenticated, "credentials expired");
+    wait_for_registers(&hub, 2).await;
+    let second = jwt_of(&hub.registers().await[1]).unwrap();
+    assert_ne!(first, second, "a new token, not the one the hub gave up on");
+    assert_eq!(idp.issued(), 2);
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn a_permission_denied_refusal_keeps_the_token_because_a_new_one_would_not_help() {
+    let idp = Idp::start("svc", SECRET).await;
+    idp.set_lifetime(300);
+    let hub = FakeHub::start().await;
+    jwt_hub_acl(&hub);
+    hub.refuse_jwts_with(Some((
+        tonic::Code::PermissionDenied,
+        "no ACL entry for service",
+    )));
+    let provider = provider(&idp);
+    let conn = connection(jwt_settings(hub.address(), &provider), "svc");
+    conn.start();
+    until("two refusals", Duration::from_secs(5), || {
+        hub.rejections().len() >= 2
+    })
+    .await;
+    hub.refuse_jwts_with(None);
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+
+    let tokens: Vec<_> = hub
+        .rejections()
+        .into_iter()
+        .filter_map(|r| r.token)
+        .collect();
+    let accepted = jwt_of(&hub.registers().await[0]).unwrap();
+    assert!(
+        tokens.iter().all(|t| *t == accepted),
+        "the same token every time"
+    );
+    assert_eq!(idp.issued(), 1, "the IdP was not asked again");
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
 async fn jwks_not_loaded_yet_is_a_retry_not_a_logged_rejection() {
     let captured = Captured::default();
     let _logs = captured.install();

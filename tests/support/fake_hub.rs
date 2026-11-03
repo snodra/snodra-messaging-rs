@@ -409,6 +409,11 @@ pub struct State {
     cancels: StdMutex<Vec<(usize, proto::Cancel)>>,
     /// The JWKS is loaded: JWT `Register`s are judged (else `UNAVAILABLE`).
     jwks_loaded: AtomicBool,
+    /// While set, every JWT `Register` and refresh is refused with this status (the hub judging the
+    /// token: "token expired", "unknown signing key", ...).
+    jwt_refusal: StdMutex<Option<(tonic::Code, String)>>,
+    /// The status the next [`FakeHub::close_streams_with`] ends the open streams with.
+    close_with: StdMutex<Option<(tonic::Code, String)>>,
     /// Offer `credentials-refresh` to clients that declare it.
     credentials_refresh: AtomicBool,
     /// `ClientMessage.credentials` (P5b): (stream number, the new credential).
@@ -501,6 +506,9 @@ impl State {
             Some(proto::credentials::Kind::Jwt(jwt)) if !jwt.is_empty() => {
                 if !self.jwks_loaded.load(Ordering::SeqCst) {
                     return Err(tonic::Status::unavailable("jwks not loaded yet"));
+                }
+                if let Some((code, message)) = self.jwt_refusal.lock().unwrap().clone() {
+                    return Err(tonic::Status::new(code, message));
                 }
                 let azp = jwt_claims(jwt)
                     .and_then(|c| c["azp"].as_str().map(str::to_string))
@@ -1821,7 +1829,11 @@ impl Hub for Service {
                     _ = cancel.cancelled() => break,
                     _ = drop_rx.recv() => {
                         dropped = true;
-                        let _ = tx.send(Err(Status::unavailable("dropped by test"))).await;
+                        let status = match state.close_with.lock().unwrap().clone() {
+                            Some((code, message)) => Status::new(code, message),
+                            None => Status::unavailable("dropped by test"),
+                        };
+                        let _ = tx.send(Err(status)).await;
                         break;
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(10)), if state.stall_reads.load(Ordering::SeqCst) => {}
@@ -2106,6 +2118,8 @@ impl FakeHub {
             cancels: StdMutex::new(vec![]),
             refreshes: StdMutex::new(vec![]),
             jwks_loaded: AtomicBool::new(true),
+            jwt_refusal: StdMutex::new(None),
+            close_with: StdMutex::new(None),
             credentials_refresh: AtomicBool::new(false),
         });
         let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
@@ -2357,7 +2371,21 @@ impl FakeHub {
 
     /// Fails every open stream with UNAVAILABLE, as a hub restart would.
     pub fn drop_streams(&self) {
+        *self.state.close_with.lock().unwrap() = None;
         let _ = self.state.drop_tx.send(());
+    }
+
+    /// Ends every open stream with `code` and `message` (a hub closing a session: "credentials
+    /// expired", ...), as [`drop_streams`](Self::drop_streams) does with UNAVAILABLE.
+    pub fn close_streams_with(&self, code: tonic::Code, message: &str) {
+        *self.state.close_with.lock().unwrap() = Some((code, message.to_string()));
+        let _ = self.state.drop_tx.send(());
+    }
+
+    /// While `Some`, every JWT `Register` and refresh is refused with this status (the hub judging
+    /// the token); `None` judges them normally again.
+    pub fn refuse_jwts_with(&self, refusal: Option<(tonic::Code, &str)>) {
+        *self.state.jwt_refusal.lock().unwrap() = refusal.map(|(c, m)| (c, m.to_string()));
     }
 
     /// Access control (see the module docs): the mode and the token table (token to ACL), replacing

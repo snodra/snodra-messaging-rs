@@ -392,6 +392,17 @@ impl TokenProvider {
         flight.await
     }
 
+    /// The hub turned `token` down as unauthenticated (expired, unknown signing key, ...): it is not
+    /// handed out again, so the next stream fetches a new one. A token that has been replaced since
+    /// is left alone. Not for `PERMISSION_DENIED`: that is about the service, and a new token
+    /// would not help (nor should the IdP be hit for it).
+    pub fn invalidate(&self, token: &SecretString) {
+        let mut current = self.current.lock().unwrap();
+        if current.as_ref().is_some_and(|t| t.value() == token) {
+            *current = None;
+        }
+    }
+
     /// The tokens as they are fetched: every live hub stream follows this to send
     /// `ClientMessage.credentials`. Holds `None` until the first fetch.
     pub fn subscribe(&self) -> watch::Receiver<Option<Arc<AccessToken>>> {

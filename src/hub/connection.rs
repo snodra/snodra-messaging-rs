@@ -1029,7 +1029,10 @@ impl HubConnection {
             }
             let (status, no_token) = match outcome {
                 Ok(()) => (Status::unavailable("hub closed the stream"), false),
-                Err(StreamError::Hub(s)) => (s, false),
+                Err(StreamError::Hub(s)) => {
+                    self.retire_refused_token(&s);
+                    (s, false)
+                }
                 // Distinguishable from a hub refusal: the hub was never asked.
                 Err(StreamError::Token(message)) => (
                     Status::unauthenticated(format!(
@@ -1099,6 +1102,23 @@ impl HubConnection {
                 _ = self.cancel.cancelled() => break,
             }
         }
+    }
+
+    /// The hub ended the stream with `UNAUTHENTICATED` (a Register or refresh refused, "token
+    /// expired", "unknown signing key", "credentials expired" ...): the access token it was given is
+    /// not offered again, the next stream gets a new one. `PERMISSION_DENIED` (wrong `azp`, no ACL
+    /// entry) leaves it: a new token would not help and the IdP is not to be hammered.
+    fn retire_refused_token(&self, status: &Status) {
+        if status.code() != Code::Unauthenticated {
+            return;
+        }
+        let (Some(provider), Some(jwt)) = (
+            &self.settings.token_provider,
+            self.jwt.lock().unwrap().clone(),
+        ) else {
+            return;
+        };
+        provider.invalidate(&jwt);
     }
 
     /// One stream from connect to failure. `Ok(())` when the hub ended it or we were cancelled.
