@@ -24,10 +24,8 @@ pub use connection::{
     RegisteredTypes, ReplyTo, SCATTER_GATHER, STREAMING, SUBSCRIPTION, StreamId,
 };
 pub use dispatcher::{AdmissionHook, Dispatcher};
-pub(crate) use mtls::{
-    ClientIdentity, LoadError, check_not_expired, load as load_client_certificate,
-};
-pub use pool::{DRAIN_LIMIT, HubPool, Resolver};
+pub(crate) use mtls::{LoadError, check_not_expired, load as load_client_certificate};
+pub use pool::{DRAIN_LIMIT, HubPool, ROLL_IDLE_LIMIT, ROLL_RECONNECT_LIMIT, Resolver};
 pub use registry::{EventContext, HandlerRegistry};
 pub use sender::{
     DEFAULT_CREDIT, LEGACY_REQUEST_TIMEOUT, LOCAL_GUARD_MARGIN, RETRY_MIN_REMAINING, RemoteError,

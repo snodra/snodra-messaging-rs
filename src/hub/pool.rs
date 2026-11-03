@@ -33,6 +33,23 @@
 //!   `Register` (the hub stops routing to the instance there) and is closed once idle (no request
 //!   of ours written to it unanswered, no handler of its requests running), at most
 //!   [`DRAIN_LIMIT`] later. A failed or empty resolution keeps the current hubs.
+//! - **Client certificate rotation** (mutual TLS, P5c). With `hub_tls.client_cert_file` the pool
+//!   reads the files once per heartbeat period (`HubSettings::heartbeat_interval`). When they hold
+//!   a valid pair that a live connection is not presenting (the content changed), the
+//!   connections are rolled over to it one hub at a time, in target order: the hub is told the
+//!   instance is stopping (a `Register` with no types, and a hub that has another live hub is
+//!   left out of the routing), the pool waits (at most [`ROLL_IDLE_LIMIT`]) for the requests
+//!   written to it and the handlers of its requests to finish, closes the stream gracefully
+//!   (half-close, the hub gets [`SHUTDOWN_CLOSE_TIMEOUT`](super::connection::SHUTDOWN_CLOSE_TIMEOUT)
+//!   to finish), and the connection reconnects with the new pair; only when it is registered again
+//!   (at most [`ROLL_RECONNECT_LIMIT`]) is the next hub rolled. A pair that does not load (a
+//!   rotation caught half way, a key that is not the certificate's, a certificate for another
+//!   service, an expired one) leaves every connection as it is and is logged at `error` once per
+//!   distinct problem (when it persists for a second period). A hub that does not take the new
+//!   pair back in time stops the rollover (logged at `error`, the other hubs keep what they
+//!   have). A pool with one hub has a short gap: requests written then fail like on any lost
+//!   stream. A certificate with less than a tenth of its lifetime (at most 24 h) left, and no
+//!   renewed file, is warned about once.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -40,7 +57,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -48,15 +65,26 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::MessagingError;
 use crate::proto::{ClientMessage, InstanceStatus, client_message};
+use crate::security::HubTls;
 
 use super::auth::AuthStatus;
 use super::connection::{
     Handshake, Hooks, HubConnection, HubSettings, Inbound, RegisteredTypes, StreamId,
 };
+use super::mtls::{self, ClientIdentity};
 use super::targets::{HubTargets, permit_share, rank_keyed, rank_round_robin, resolved_targets};
 
 /// The longest a vanished DNS address stays open to finish its requests.
 pub const DRAIN_LIMIT: Duration = Duration::from_secs(65);
+/// The longest a certificate rollover waits for the requests of a hub's stream to finish before
+/// closing it.
+pub const ROLL_IDLE_LIMIT: Duration = Duration::from_secs(10);
+/// The longest a certificate rollover waits for a hub's connection to register again with the new
+/// pair before it gives up on the remaining hubs.
+pub const ROLL_RECONNECT_LIMIT: Duration = Duration::from_secs(30);
+/// A request a sender had already routed to a hub when it was taken out of the routing is written
+/// within this; the rollover looks for unanswered requests only after it.
+const ROLL_SETTLE: Duration = Duration::from_millis(50);
 /// How long one `InstanceStatus` write may wait for room on a stream.
 const STATUS_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 const DRAIN_POLL: Duration = Duration::from_millis(100);
@@ -78,6 +106,9 @@ enum Role {
     Duplicate,
     /// Its address vanished from DNS; out of the routing, closed once idle.
     Draining,
+    /// Being rolled over to a renewed client certificate (another hub serves meanwhile); out of
+    /// the routing until its stream is back.
+    Rolling,
 }
 
 struct Member {
@@ -94,6 +125,17 @@ impl Member {
         *self.role.lock().unwrap() = role;
     }
 
+    /// Sets `to` only while the role is `from`; true when it was.
+    fn change_role(&self, from: Role, to: Role) -> bool {
+        let mut role = self.role.lock().unwrap();
+        if *role == from {
+            *role = to;
+            true
+        } else {
+            false
+        }
+    }
+
     fn address(&self) -> &str {
         self.conn.address()
     }
@@ -104,6 +146,17 @@ struct Live {
     conn: Arc<HubConnection>,
     hub_id: String,
     handshake: Handshake,
+}
+
+/// What the certificate watch has seen and said (see the module docs).
+#[derive(Default)]
+struct CertificateWatch {
+    /// The problem with the files seen on the last period, and whether it was logged.
+    problem: Option<(String, bool)>,
+    /// The certificate (fingerprint) warned about as near its end.
+    warned: Option<String>,
+    /// The digest of the pair a hub did not take back in time: not tried again until it changes.
+    refused: Option<[u8; 32]>,
 }
 
 pub struct HubPool {
@@ -121,6 +174,8 @@ pub struct HubPool {
     /// Credential refreshes written to any hub (monotonic: members come and go).
     refreshes_sent: Arc<AtomicU64>,
     changes: watch::Sender<u64>,
+    /// The client certificate watch (mTLS only).
+    certificate: Mutex<CertificateWatch>,
     probes: Mutex<Vec<PendingProbe>>,
     resolver: Mutex<Resolver>,
     /// Built around one connection the caller owns ([`HubPool::of`]): no tasks of its own.
@@ -200,6 +255,7 @@ impl HubPool {
             in_flight: Arc::new(AtomicUsize::new(0)),
             refreshes_sent: Arc::new(AtomicU64::new(0)),
             changes,
+            certificate: Mutex::new(CertificateWatch::default()),
             probes: Mutex::new(vec![]),
             resolver: Mutex::new(Arc::new(|host, port| {
                 Box::pin(async move {
@@ -264,6 +320,15 @@ impl HubPool {
                 async move { me.resolve_loop(host, port).await },
             ));
         }
+        if self
+            .settings
+            .tls
+            .as_ref()
+            .is_some_and(HubTls::has_client_certificate)
+        {
+            let me = Arc::clone(self);
+            tasks.push(tokio::spawn(async move { me.certificate_loop().await }));
+        }
     }
 
     /// True once at least one hub confirmed the registration (the client can send); see
@@ -307,9 +372,12 @@ impl HubPool {
         let active: Vec<_> = self
             .members()
             .into_iter()
-            .filter(|m| m.role() == Role::Active)
+            .filter(|m| matches!(m.role(), Role::Active | Role::Rolling))
             .collect();
-        !active.is_empty() && active.iter().all(|m| m.conn.handshake().is_some())
+        !active.is_empty()
+            && active
+                .iter()
+                .all(|m| m.role() == Role::Active && m.conn.handshake().is_some())
     }
 
     /// The ids of the hubs live now (handshaken streams), in target order; a hub without an id
@@ -771,6 +839,176 @@ impl HubPool {
         let mut tasks = self.tasks.lock().unwrap();
         tasks.retain(|t| !t.is_finished());
         tasks.push(task);
+    }
+
+    /// Once per heartbeat period: look at the client certificate files (see the module docs).
+    async fn certificate_loop(self: Arc<Self>) {
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + self.settings.heartbeat_interval,
+            self.settings.heartbeat_interval,
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = self.cancel.cancelled() => return,
+                _ = ticker.tick() => {}
+            }
+            self.check_certificate().await;
+        }
+    }
+
+    async fn check_certificate(self: &Arc<Self>) {
+        let Some(tls) = &self.settings.tls else {
+            return;
+        };
+        let (Some(cert_file), Some(key_file)) = (&tls.client_cert_file, &tls.client_key_file)
+        else {
+            return;
+        };
+        let now = SystemTime::now();
+        let disk = mtls::load(cert_file, key_file, &self.service_name).and_then(|identity| {
+            mtls::check_not_expired(&identity, now)?;
+            Ok(identity)
+        });
+        let disk = match disk {
+            Ok(identity) => {
+                self.certificate.lock().unwrap().problem = None;
+                Some(identity)
+            }
+            Err(e) => {
+                self.note_certificate_problem(e.message());
+                None
+            }
+        };
+        let live = self.live();
+        self.warn_near_expiry(&live, disk.as_ref(), cert_file, now);
+        let Some(disk) = disk else {
+            return;
+        };
+        {
+            let mut watch = self.certificate.lock().unwrap();
+            if watch.refused.is_some_and(|d| d != disk.digest) {
+                watch.refused = None;
+            }
+            if watch.refused == Some(disk.digest) {
+                return;
+            }
+        }
+        for member in self.members() {
+            if self.cancel.is_cancelled() {
+                return;
+            }
+            let stale = member.role() == Role::Active
+                && member.conn.handshake().is_some()
+                && member
+                    .conn
+                    .presented_certificate()
+                    .is_some_and(|p| p.digest != disk.digest);
+            if stale && !self.roll_over(&member, &disk.fingerprint).await {
+                self.certificate.lock().unwrap().refused = Some(disk.digest);
+                tracing::error!(service = %self.service_name, address = %member.address(), fingerprint = %disk.fingerprint, "the hub did not register again with the renewed client certificate in time; the other hubs keep the certificate they have until the files change again");
+                return;
+            }
+        }
+    }
+
+    /// A problem with the files is logged at `error` once, when it is still there a period later
+    /// (a pair replaced in two writes is caught half way for a moment); the same problem again
+    /// goes to `debug`.
+    fn note_certificate_problem(&self, message: &str) {
+        let mut watch = self.certificate.lock().unwrap();
+        match &mut watch.problem {
+            Some((seen, logged)) if seen == message => {
+                if !*logged {
+                    *logged = true;
+                    tracing::error!(service = %self.service_name, reason = message, "the client certificate files cannot be used; the connections keep the certificate they present");
+                }
+            }
+            problem => {
+                tracing::debug!(service = %self.service_name, reason = message, "the client certificate files cannot be used right now");
+                *problem = Some((message.to_string(), false));
+            }
+        }
+    }
+
+    /// Warns once per certificate when the one in use is in the last tenth of its life (at most
+    /// the last 24 h) and the files hold no other one.
+    fn warn_near_expiry(
+        &self,
+        live: &[Live],
+        disk: Option<&ClientIdentity>,
+        cert_file: &std::path::Path,
+        now: SystemTime,
+    ) {
+        let Some(presented) = live.iter().find_map(|l| l.conn.presented_certificate()) else {
+            return;
+        };
+        if disk.is_some_and(|d| d.digest != presented.digest) {
+            return; // a renewal is on disk and about to be rolled over
+        }
+        let status = &presented.status;
+        if !mtls::expiry_warning_due(presented.not_before, status.not_after, now) {
+            return;
+        }
+        let mut watch = self.certificate.lock().unwrap();
+        if watch.warned.as_deref() == Some(status.fingerprint.as_str()) {
+            return;
+        }
+        watch.warned = Some(status.fingerprint.clone());
+        let left = status.not_after.duration_since(now).unwrap_or_default();
+        tracing::warn!(service = %self.service_name, fingerprint = %status.fingerprint, not_after = ?status.not_after, left = ?left, file = %cert_file.display(), "the client certificate expires soon and the file holds no renewed one; the hub closes the session at notAfter");
+    }
+
+    /// Rolls the connection of `member` over to the pair now on disk, see the module docs; true
+    /// when it is registered again with it (or there was nothing to roll).
+    async fn roll_over(&self, member: &Arc<Member>, fingerprint: &str) -> bool {
+        let conn = &member.conn;
+        let Some(stream) = conn.current_stream() else {
+            return true;
+        };
+        // Another live hub serves meanwhile; the only hub keeps taking requests until the end.
+        let others = self.members().iter().any(|m| {
+            !Arc::ptr_eq(m, member) && m.role() == Role::Active && m.conn.handshake().is_some()
+        });
+        if others {
+            member.change_role(Role::Active, Role::Rolling);
+        }
+        tracing::info!(service = %self.service_name, address = %member.address(), fingerprint, "rolling the hub connection over to the renewed client certificate");
+        if let Err(e) = conn.deregister().await {
+            tracing::debug!(address = %member.address(), "no stream to deregister on: {e}");
+        }
+        let deadline = tokio::time::Instant::now() + ROLL_IDLE_LIMIT;
+        tokio::select! {
+            _ = self.cancel.cancelled() => return true,
+            _ = tokio::time::sleep(ROLL_SETTLE) => {}
+        }
+        while !self.idle(conn) {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(service = %self.service_name, address = %member.address(), "requests still running after {ROLL_IDLE_LIMIT:?}, closing the hub stream for the certificate rollover anyway");
+                break;
+            }
+            tokio::select! {
+                _ = self.cancel.cancelled() => return true,
+                _ = tokio::time::sleep(DRAIN_POLL) => {}
+            }
+        }
+        conn.roll_over(stream);
+        let deadline = tokio::time::Instant::now() + ROLL_RECONNECT_LIMIT;
+        let back = loop {
+            if conn.current_stream().is_some_and(|s| s != stream) {
+                break true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::select! {
+                _ = self.cancel.cancelled() => return true,
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        };
+        member.change_role(Role::Rolling, Role::Active);
+        self.changes.send_modify(|n| *n += 1);
+        back
     }
 
     /// No handler of its requests running and none of our requests written to it unanswered.

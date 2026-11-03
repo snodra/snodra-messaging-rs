@@ -639,6 +639,10 @@ pub struct HubConnection {
     certificate: Mutex<Option<Presented>>,
     /// The `credentials` problem logged for the files last, so a repeat goes to `debug`.
     logged_identity_problem: Mutex<Option<String>>,
+    /// The stream to close gracefully and reconnect (a client certificate rollover); 0 is none.
+    roll: watch::Sender<u64>,
+    /// The stream that just ended did so for a rollover: reconnect at once, no backoff.
+    rolling: AtomicBool,
     /// The empty-token-file warning was logged and no good read has followed it.
     empty_file_warned: AtomicBool,
     /// A stream of this connection failed or ended at least once.
@@ -658,8 +662,19 @@ type OutboundBuffer = Arc<Mutex<mpsc::Receiver<ClientMessage>>>;
 /// The client certificate a handshaken stream presented.
 struct Presented {
     status: CertificateStatus,
+    not_before: SystemTime,
     /// Digest of the pair's files ([`ClientIdentity::digest`]).
     digest: [u8; 32],
+}
+
+/// The client certificate the last handshaken stream presented, as the pool judges it.
+#[derive(Clone, Debug)]
+pub(crate) struct PresentedCertificate {
+    pub status: CertificateStatus,
+    pub not_before: SystemTime,
+    /// Digest of the pair's files ([`ClientIdentity::digest`]): equal to the one on disk while
+    /// no renewal has appeared.
+    pub digest: [u8; 32],
 }
 
 /// Why a stream attempt ended.
@@ -753,6 +768,8 @@ impl HubConnection {
             identity: Mutex::new(None),
             certificate: Mutex::new(None),
             logged_identity_problem: Mutex::new(None),
+            roll: watch::channel(0).0,
+            rolling: AtomicBool::new(false),
             empty_file_warned: AtomicBool::new(false),
             failed_once: AtomicBool::new(false),
             in_flight: Arc::new(AtomicUsize::new(0)),
@@ -1018,6 +1035,45 @@ impl HubConnection {
             .map_err(|_| MessagingError::HubUnavailable("hub stream closed".into()))
     }
 
+    /// Writes a `Register` with no types to the current handshaken stream, without changing the
+    /// types later streams register with: the hub stops routing to this instance on this stream
+    /// and hands its queue to other instances, while replies to requests it already forwarded
+    /// still go through. The first step of a certificate rollover. `HubUnavailable` when there is
+    /// no handshaken stream.
+    pub(crate) async fn deregister(&self) -> Result<(), MessagingError> {
+        let _order = self.reregistering.lock().await;
+        let (tx, initial) = {
+            let live = self.live.lock().unwrap();
+            let live = live
+                .as_ref()
+                .ok_or_else(|| MessagingError::HubUnavailable("not connected to the hub".into()))?;
+            (live.tx.clone(), live.grants.initial())
+        };
+        tx.send(self.register_with(RegisteredTypes::default(), initial))
+            .await
+            .map_err(|_| MessagingError::HubUnavailable("hub stream closed".into()))
+    }
+
+    /// Closes stream `stream` gracefully (half-close, then waiting for the hub, bounded) and
+    /// reconnects at once, reading the certificate files again: the third and fourth steps of a
+    /// certificate rollover. Does nothing when `stream` is not the one being served.
+    pub(crate) fn roll_over(&self, stream: StreamId) {
+        self.roll.send_replace(stream);
+    }
+
+    /// The client certificate the last handshaken stream presented (mTLS only).
+    pub(crate) fn presented_certificate(&self) -> Option<PresentedCertificate> {
+        self.certificate
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|p| PresentedCertificate {
+                status: p.status.clone(),
+                not_before: p.not_before,
+                digest: p.digest,
+            })
+    }
+
     /// Waits (at most `timeout`) until everything queued for the current stream has been taken by
     /// the transport, so closing it does not drop a last reply or `Register`.
     pub(crate) async fn flushed(&self, timeout: Duration) {
@@ -1088,6 +1144,12 @@ impl HubConnection {
             }
             if self.cancel.is_cancelled() {
                 break;
+            }
+            if self.rolling.swap(false, Ordering::SeqCst) {
+                // A certificate rollover closed the stream on purpose: back at once with the new pair.
+                backoff = self.settings.backoff_min;
+                failures = 0;
+                continue;
             }
             let (status, no_token) = match outcome {
                 Ok(()) => (Status::unavailable("hub closed the stream"), false),
@@ -1280,6 +1342,7 @@ impl HubConnection {
             grants: Arc::clone(&grants),
         };
 
+        let mut roll = self.roll.subscribe();
         let mut interval = self.settings.heartbeat_interval;
         let mut ticker = ticker(interval);
         let mut last_echo = tokio::time::Instant::now();
@@ -1290,6 +1353,22 @@ impl HubConnection {
                 _ = self.cancel.cancelled() => {
                     self.close_stream(tx, &mut stream).await;
                     return Ok(());
+                }
+                rolled = async {
+                    loop {
+                        if roll.changed().await.is_err() {
+                            return false;
+                        }
+                        if *roll.borrow_and_update() == stream_id {
+                            return true;
+                        }
+                    }
+                } => {
+                    if rolled {
+                        self.rolling.store(true, Ordering::SeqCst);
+                        self.close_stream(tx, &mut stream).await;
+                        return Ok(());
+                    }
                 }
                 _ = tokio::time::sleep_until(handshake_deadline), if handshake.is_none() => {
                     return Err(Status::deadline_exceeded("registration not confirmed in time").into());
@@ -1567,6 +1646,10 @@ impl HubConnection {
     /// The `Register` of this instance with the types set now.
     fn register(&self, initial_permits: u32) -> ClientMessage {
         let types = self.types.lock().unwrap().clone();
+        self.register_with(types, initial_permits)
+    }
+
+    fn register_with(&self, types: RegisteredTypes, initial_permits: u32) -> ClientMessage {
         let register = Register {
             service_name: self.service_name.clone(),
             instance_id: self.instance_id.clone(),
@@ -1640,7 +1723,7 @@ impl HubConnection {
 
     /// Records the client certificate the stream going live presents; a different one than the
     /// last stream's counts as a rotation.
-    fn presented_certificate(&self, identity: &ClientIdentity) {
+    fn record_presented(&self, identity: &ClientIdentity) {
         let mut presented = self.certificate.lock().unwrap();
         let rotations = match presented.as_ref() {
             Some(p) if p.status.fingerprint == identity.fingerprint => p.status.rotations,
@@ -1662,6 +1745,7 @@ impl HubConnection {
                 not_after: identity.not_after,
                 rotations,
             },
+            not_before: identity.not_before,
             digest: identity.digest,
         });
     }
@@ -1675,7 +1759,7 @@ impl HubConnection {
         identity: Option<&ClientIdentity>,
     ) {
         if let Some(identity) = identity {
-            self.presented_certificate(identity);
+            self.record_presented(identity);
         }
         *self.live.lock().unwrap() = Some(Live {
             stream,
