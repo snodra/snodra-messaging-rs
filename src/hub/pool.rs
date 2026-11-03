@@ -65,6 +65,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::MessagingError;
 use crate::proto::{ClientMessage, InstanceStatus, client_message};
+use crate::retry::random_unit;
 use crate::security::HubTls;
 
 use super::auth::AuthStatus;
@@ -95,6 +96,9 @@ pub type Resolver = Arc<
         + Send
         + Sync,
 >;
+
+/// Picks the random delay before a rollover from the bound it may not exceed (tests replace it).
+pub type RollDelaySource = Arc<dyn Fn(Duration) -> Duration + Send + Sync>;
 
 /// Tells whether requests written to a stream are still unanswered (registered by a [`super::Sender`]).
 type PendingProbe = Box<dyn Fn(StreamId, Consumers) -> bool + Send + Sync>;
@@ -168,6 +172,8 @@ struct CertificateWatch {
     refused: Option<[u8; 32]>,
     /// The digest of the pair that is not valid yet (logged once).
     waiting: Option<[u8; 32]>,
+    /// The digest of the pair the random delay before a roll was waited for.
+    delayed: Option<[u8; 32]>,
 }
 
 pub struct HubPool {
@@ -189,6 +195,7 @@ pub struct HubPool {
     certificate: Mutex<CertificateWatch>,
     probes: Mutex<Vec<PendingProbe>>,
     resolver: Mutex<Resolver>,
+    roll_delay: Mutex<RollDelaySource>,
     /// Built around one connection the caller owns ([`HubPool::of`]): no tasks of its own.
     external: bool,
     started: AtomicBool,
@@ -275,6 +282,7 @@ impl HubPool {
                         .map(|addrs| addrs.collect())
                 })
             })),
+            roll_delay: Mutex::new(Arc::new(|bound| roll_delay(bound, random_unit()))),
             external,
             started: AtomicBool::new(false),
             cancel: CancellationToken::new(),
@@ -312,6 +320,13 @@ impl HubPool {
     #[doc(hidden)]
     pub fn set_resolver(&self, resolver: Resolver) {
         *self.resolver.lock().unwrap() = resolver;
+    }
+
+    /// Replaces how the random delay before a certificate rollover is picked from its bound
+    /// (tests); set before [`start`](Self::start).
+    #[doc(hidden)]
+    pub fn set_roll_delay_source(&self, source: RollDelaySource) {
+        *self.roll_delay.lock().unwrap() = source;
     }
 
     /// Starts every connection, the status reports and (for `dns:///`) the resolution loop.
@@ -975,6 +990,11 @@ impl HubPool {
                 return;
             }
         }
+        // The replicas of a service all see a renewal within one tick; rolled together they would
+        // all be out of the routing at once. Each waits its own random time first, once per pair.
+        if !self.wait_before_rolling(&disk, cert_file, key_file).await {
+            return;
+        }
         for member in self.members() {
             if self.cancel.is_cancelled() {
                 return;
@@ -991,6 +1011,51 @@ impl HubPool {
                 return;
             }
         }
+    }
+
+    /// Before the first roll to `disk`: waits a random time, uniform in `[0, min(the setting,
+    /// 10 % of what the presented certificate has left)]` (nothing when it has expired already),
+    /// and looks at the files again. False when the roll is not to go on: the pool is shutting
+    /// down, or the files no longer hold `disk` (the next tick decides about what they hold).
+    async fn wait_before_rolling(
+        &self,
+        disk: &ClientIdentity,
+        cert_file: &std::path::Path,
+        key_file: &std::path::Path,
+    ) -> bool {
+        let remaining = {
+            let mut watch = self.certificate.lock().unwrap();
+            if watch.delayed == Some(disk.digest) {
+                return true;
+            }
+            let stale = self.members().into_iter().find_map(|m| {
+                m.conn
+                    .presented_certificate()
+                    .filter(|p| p.digest != disk.digest)
+            });
+            let Some(presented) = stale else {
+                return true; // nothing to roll
+            };
+            watch.delayed = Some(disk.digest);
+            presented
+                .status
+                .not_after
+                .duration_since(SystemTime::now())
+                .unwrap_or_default()
+        };
+        let bound = roll_delay_bound(self.settings.certificate_roll_delay_max, remaining);
+        let source = self.roll_delay.lock().unwrap().clone();
+        let delay = source(bound).min(bound);
+        if delay.is_zero() {
+            return true;
+        }
+        tracing::info!(service = %self.service_name, fingerprint = %disk.fingerprint, delay = ?delay, "a renewed client certificate is in the files; rolling the hub connections over to it after a random delay");
+        tokio::select! {
+            _ = self.cancel.cancelled() => return false,
+            _ = tokio::time::sleep(delay) => {}
+        }
+        mtls::load(cert_file, key_file, &self.service_name)
+            .is_ok_and(|now| now.digest == disk.digest)
     }
 
     /// A renewed pair that is not valid yet is waited for: logged at `info` once per pair.
@@ -1136,6 +1201,17 @@ impl HubPool {
     }
 }
 
+/// The upper bound of the random delay before a rollover starts: `max`, or a tenth of what the
+/// presented certificate has left, whichever is smaller (zero when it has expired).
+pub(crate) fn roll_delay_bound(max: Duration, remaining: Duration) -> Duration {
+    max.min(remaining / 10)
+}
+
+/// The delay for a uniform `unit` in `[0, 1)`: that share of `bound`.
+pub(crate) fn roll_delay(bound: Duration, unit: f64) -> Duration {
+    bound.mul_f64(unit.clamp(0.0, 1.0))
+}
+
 /// `(to add, to remove)`: resolved addresses without a connection, and connected ones no longer
 /// resolved; both in input order.
 pub(crate) fn plan(current: &[String], resolved: &[String]) -> (Vec<String>, Vec<String>) {
@@ -1171,6 +1247,27 @@ mod tests {
 
     fn strings(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_roll_delay_is_bounded_by_the_setting_and_a_tenth_of_what_is_left() {
+        let (max, day) = (Duration::from_secs(30), Duration::from_secs(86_400));
+        assert_eq!(roll_delay_bound(max, 7 * day), max);
+        assert_eq!(
+            roll_delay_bound(max, Duration::from_secs(100)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(roll_delay_bound(max, Duration::ZERO), Duration::ZERO);
+        assert_eq!(roll_delay_bound(Duration::ZERO, 7 * day), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_roll_delay_is_uniform_over_zero_to_the_bound() {
+        let bound = Duration::from_secs(30);
+        assert_eq!(roll_delay(bound, 0.0), Duration::ZERO);
+        assert_eq!(roll_delay(bound, 0.5), Duration::from_secs(15));
+        assert!(roll_delay(bound, 0.999_999) < bound);
+        assert_eq!(roll_delay(Duration::ZERO, 0.7), Duration::ZERO);
     }
 
     #[test]

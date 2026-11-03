@@ -496,6 +496,7 @@ fn hub_settings(config: &Config) -> Result<HubSettings, MessagingError> {
         token_file: config.hub_token_file.clone(),
         tls: config.hub_tls.clone(),
         token_provider,
+        ..HubSettings::default()
     })
 }
 

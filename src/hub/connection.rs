@@ -172,6 +172,11 @@ pub struct HubSettings {
     /// of the process (a [`super::HubPool`] clones these settings for each of its hubs). Wins over
     /// `token` and `token_file`, which [`crate::Config::validate`] refuses to combine with it.
     pub token_provider: Option<Arc<TokenProvider>>,
+    /// [`super::HubPool`] with a client certificate only: the bound of the random delay before a
+    /// rollover to a renewed certificate starts. The delay is uniform in `[0, min(this, 10 % of
+    /// the presented certificate's remaining validity)]`, so replicas that see the same renewal
+    /// within one tick do not all deregister at once. Zero: no delay.
+    pub certificate_roll_delay_max: Duration,
 }
 
 impl Default for HubSettings {
@@ -191,6 +196,7 @@ impl Default for HubSettings {
             token_file: None,
             tls: None,
             token_provider: None,
+            certificate_roll_delay_max: Duration::from_secs(30),
         }
     }
 }

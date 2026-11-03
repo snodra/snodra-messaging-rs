@@ -72,6 +72,8 @@ fn settings(address: String, tls: HubTls) -> HubSettings {
         backoff_max: Duration::from_millis(200),
         handshake_timeout: Duration::from_secs(3),
         tls: Some(tls),
+        // No delay before a roll, unless a test is about it.
+        certificate_roll_delay_max: Duration::ZERO,
         ..HubSettings::default()
     }
 }
@@ -1214,5 +1216,137 @@ async fn the_drain_does_not_wait_for_the_subscriptions_this_instance_consumes() 
     assert!(matches!(last, Some(Err(_))), "{last:?}");
     c.shutdown().await;
     owner.shutdown().await;
+    w.hub.stop();
+}
+
+/// A pool on the hub(s) of `address` whose rollover delay is picked by `source` from its bound.
+async fn client_delayed(
+    settings: HubSettings,
+    source: impl Fn(Duration) -> Duration + Send + Sync + 'static,
+) -> Client {
+    let (tx, mut rx) = mpsc::channel::<Inbound>(64);
+    let pool = HubPool::new(settings, "svc".into(), uuid::Uuid::new_v4().to_string(), tx)
+        .expect("valid hub address");
+    pool.set_types(vec!["t.Handled".into()], vec![]);
+    pool.set_roll_delay_source(Arc::new(source));
+    let sender = Sender::with_pool(Arc::clone(&pool), SenderSettings::default());
+    let forward = Arc::clone(&sender);
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            forward.on_inbound(msg);
+        }
+    });
+    pool.start();
+    Client {
+        pool,
+        sender,
+        held: Arc::new(Mutex::new(Vec::new())),
+    }
+}
+
+#[tokio::test]
+async fn replicas_that_see_the_same_renewal_do_not_deregister_at_the_same_instant() {
+    let w = world(true).await;
+    let (tls, first) = w.issue("svc", &ClientSpec::service("svc"));
+    let bounded = HubSettings {
+        certificate_roll_delay_max: Duration::from_secs(2),
+        ..settings(w.hub.address(), tls.clone())
+    };
+    // Two replicas sharing the files; their delays are 0 and half the bound.
+    let a = client_delayed(bounded.clone(), |_| Duration::ZERO).await;
+    let b = client_delayed(bounded, |bound| bound / 2).await;
+    for c in [&a, &b] {
+        assert!(c.pool.await_all_registered(Duration::from_secs(5)).await);
+        c.presenting(&first).await;
+    }
+    let second = w.renew(&tls, &ClientSpec::service("svc"));
+    for c in [&a, &b] {
+        c.presenting(&second).await;
+    }
+    let deregistered: Vec<Instant> = w
+        .hub
+        .events_timed()
+        .into_iter()
+        .filter(|(e, _)| matches!(e, Event::Register { types: 0, .. }))
+        .map(|(_, at)| at)
+        .collect();
+    assert_eq!(deregistered.len(), 2, "{:?}", w.hub.events());
+    let apart = deregistered[1].duration_since(deregistered[0]);
+    assert!(
+        apart >= Duration::from_millis(800),
+        "both deregistered within {apart:?}"
+    );
+    a.shutdown().await;
+    b.shutdown().await;
+    w.hub.stop();
+}
+
+#[tokio::test]
+async fn the_delay_never_exceeds_its_bound_and_is_capped_by_a_tenth_of_the_remaining_validity() {
+    let w = world(true).await;
+    // 100 s left: a tenth is 10 s, below the 30 s setting.
+    let (tls, first) = w.issue(
+        "svc",
+        &ClientSpec::service("svc").living(Duration::from_secs(100)),
+    );
+    let bounds = Arc::new(Mutex::new(Vec::<Duration>::new()));
+    let seen = Arc::clone(&bounds);
+    let c = client_delayed(
+        HubSettings {
+            certificate_roll_delay_max: Duration::from_secs(30),
+            ..settings(w.hub.address(), tls.clone())
+        },
+        move |bound| {
+            seen.lock().unwrap().push(bound);
+            Duration::ZERO
+        },
+    )
+    .await;
+    assert!(c.pool.await_all_registered(Duration::from_secs(5)).await);
+    c.presenting(&first).await;
+    let second = w.renew(&tls, &ClientSpec::service("svc"));
+    c.presenting(&second).await;
+    let bounds = bounds.lock().unwrap().clone();
+    assert_eq!(bounds.len(), 1, "one delay per renewed pair: {bounds:?}");
+    assert!(
+        bounds[0] <= Duration::from_secs(10) && bounds[0] > Duration::from_millis(9_000),
+        "{:?}",
+        bounds[0]
+    );
+    c.shutdown().await;
+    w.hub.stop();
+}
+
+#[tokio::test]
+async fn the_pair_is_checked_again_after_the_delay() {
+    let w = world(true).await;
+    let (tls, first) = w.issue("svc", &ClientSpec::service("svc"));
+    let c = client_delayed(
+        HubSettings {
+            certificate_roll_delay_max: Duration::from_secs(1),
+            ..settings(w.hub.address(), tls.clone())
+        },
+        |bound| bound,
+    )
+    .await;
+    assert!(c.pool.await_all_registered(Duration::from_secs(5)).await);
+    c.presenting(&first).await;
+    let _superseded = w.renew(&tls, &ClientSpec::service("svc"));
+    // Within the delay the files change again: the roll goes to what is there after it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let third = w.renew(&tls, &ClientSpec::service("svc"));
+    c.presenting(&third).await;
+    let presented: Vec<String> = w
+        .hub
+        .peer_fingerprints()
+        .into_iter()
+        .map(|(_, f)| f)
+        .collect();
+    assert_eq!(
+        presented,
+        [first, third],
+        "the superseded pair was presented"
+    );
+    c.shutdown().await;
     w.hub.stop();
 }
