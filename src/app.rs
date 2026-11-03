@@ -29,7 +29,7 @@ use crate::context::MessageContext;
 use crate::error::MessagingError;
 use crate::hub::{
     Dispatcher, EventContext, HandlerRegistry, HubPool, HubSettings, Inbound, QueryUpdateEmitter,
-    Sender, SenderSettings,
+    Sender, SenderSettings, TokenProvider,
 };
 use crate::identity::{Guard, IdentityResolver, JwksVerifier};
 use crate::kafka::{EventBus, EventConsumer, OutboxPublisher, ensure_indexes};
@@ -73,7 +73,7 @@ impl KrakenMessaging {
             .ok_or_else(|| MessagingError::Storage("mongodb_uri must name a database".into()))?;
         let events = EventBus::new(db.clone());
         let (tx, inbound) = mpsc::channel::<Inbound>(1024);
-        let settings = hub_settings(&config);
+        let settings = hub_settings(&config)?;
         let hubs = HubPool::new(
             settings,
             config.service_name.clone(),
@@ -138,6 +138,19 @@ impl KrakenMessaging {
     /// The ids of the hubs this instance is registered on now (a legacy hub by its address).
     pub fn hub_ids(&self) -> Vec<String> {
         self.hubs.hub_ids()
+    }
+
+    /// How this instance authenticates to the hubs: `none`, a static `token` or a `jwt`
+    /// (Keycloak client credentials, ADR 0019), the current access token's expiry and the last
+    /// token fetch error.
+    pub fn hub_auth(&self) -> crate::hub::AuthStatus {
+        self.hubs.auth()
+    }
+
+    /// The credential refreshes sent to the hubs so far
+    /// (`kraken_messaging_hub_credentials_refreshes_sent_total`).
+    pub fn hub_credentials_refreshes_sent(&self) -> u64 {
+        self.hubs.credentials_refreshes_sent()
     }
 
     /// The crate's Mongo client; sessions for `events().publish_in` must come from this client.
@@ -457,8 +470,16 @@ impl KrakenMessagingBuilder {
 }
 
 /// The hub connection settings a [`Config`] describes, access control included.
-fn hub_settings(config: &Config) -> HubSettings {
-    HubSettings {
+///
+/// With `hub_oauth2` this is where the one token provider of the process is made; it is shared by
+/// every hub connection through the settings.
+fn hub_settings(config: &Config) -> Result<HubSettings, MessagingError> {
+    let token_provider = config
+        .hub_oauth2
+        .clone()
+        .map(TokenProvider::new)
+        .transpose()?;
+    Ok(HubSettings {
         address: config.hub_address.clone(),
         heartbeat_interval: config.heartbeat_interval,
         backoff_min: config.reconnect_backoff_min,
@@ -472,7 +493,8 @@ fn hub_settings(config: &Config) -> HubSettings {
         token: config.hub_token.clone(),
         token_file: config.hub_token_file.clone(),
         tls: config.hub_tls.clone(),
-    }
+        token_provider,
+    })
 }
 
 #[cfg(test)]
@@ -483,15 +505,16 @@ mod hub_settings_tests {
     #[test]
     fn the_config_reaches_the_hub_settings() {
         let mut config = Config::new("svc", "static://hub:7000", "kafka:19092", "mongodb://m/db");
-        assert!(hub_settings(&config).token.is_none());
-        assert!(hub_settings(&config).tls.is_none());
+        assert!(hub_settings(&config).unwrap().token.is_none());
+        assert!(hub_settings(&config).unwrap().tls.is_none());
+        assert!(hub_settings(&config).unwrap().token_provider.is_none());
         config.hub_token = Some(SecretString::new("tok"));
         config.hub_token_file = Some("/run/secrets/hub-token".into());
         config.hub_tls = Some(HubTls {
             server_name: Some("kraken-hub".into()),
             ..HubTls::default()
         });
-        let settings = hub_settings(&config);
+        let settings = hub_settings(&config).unwrap();
         assert_eq!(
             settings.token.as_ref().map(SecretString::expose),
             Some("tok")
@@ -501,5 +524,26 @@ mod hub_settings_tests {
             Some(std::path::Path::new("/run/secrets/hub-token"))
         );
         assert_eq!(settings.tls, config.hub_tls);
+    }
+
+    #[test]
+    fn oauth2_in_the_config_becomes_one_token_provider_for_the_settings() {
+        let mut config = Config::new("svc", "a:7000,b:7000", "kafka:19092", "mongodb://m/db");
+        config.hub_oauth2 = Some(crate::security::HubOAuth2 {
+            token_uri: "http://keycloak:8080/token".into(),
+            client_id: "svc".into(),
+            client_secret: Some(SecretString::new("s3cr3t")),
+            ..Default::default()
+        });
+        let settings = hub_settings(&config).unwrap();
+        let provider = settings.token_provider.as_ref().expect("a provider");
+        // The pool clones the settings for each hub: they all share the provider.
+        assert!(Arc::ptr_eq(
+            provider,
+            settings.clone().token_provider.as_ref().unwrap()
+        ));
+        assert!(!format!("{settings:?}").contains("s3cr3t"));
+        config.hub_oauth2.as_mut().unwrap().token_uri = "ftp://nope".into();
+        assert!(hub_settings(&config).is_err());
     }
 }

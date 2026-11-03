@@ -26,6 +26,16 @@
 //! `HubSettings::token_file` before every connect, goes in `Register.credentials.token` of every
 //! stream; it is never logged. `HubSettings::tls` (or an `https://` address) makes the channel TLS.
 //!
+//! JWT authentication (P5b, ADR 0019): with `HubSettings::token_provider` every new stream asks the
+//! provider for an access token before it connects and registers with it in
+//! `Register.credentials.jwt`; if the provider cannot get one the stream is not opened, the attempt
+//! fails locally with the endpoint's error (kept in [`HubConnection::last_rejection`], logged at
+//! `error` once per distinct message, then `debug`) and is retried with the normal backoff. Every
+//! `Register` declares `credentials-refresh`; when the hub's ack lists it, each token the provider
+//! publishes later is sent on the live stream as `ClientMessage.credentials`, so the session
+//! outlives the token (a hub closes it at `exp` plus its grace otherwise). A static token session
+//! whose `token_file` changes does the same.
+//!
 //! Flow control (capability `flow-control`): the `Register` offers `max_concurrent_handlers`
 //! permits; a hub whose ack shares the capability forwards only that many requests and queues the
 //! rest. Each completed inbound request gives one permit back ([`ReplyTo::grant`]), on the stream
@@ -61,6 +71,7 @@ use crate::proto::{
 use crate::retry::{jittered, random_unit};
 use crate::security::{HubTls, SecretString};
 
+use super::auth::{AccessToken, AuthKind, AuthStatus, TokenProvider};
 use super::tls;
 
 /// The hub protocol version this client speaks (`Register.protocol_version`).
@@ -82,6 +93,10 @@ pub const STREAMING: &str = "streaming";
 /// and `Cancel` both ways. Declared by senders and by handlers alike: the hub subscribes only
 /// instances that negotiated it.
 pub const SUBSCRIPTION: &str = "subscription";
+/// The credential refresh capability (ADR 0019, P5b): `ClientMessage.credentials` replaces the
+/// session's credential before a JWT expires; sent only to a hub whose ack lists it. Declared by
+/// every `Register`, token sessions included.
+pub const CREDENTIALS_REFRESH: &str = "credentials-refresh";
 /// Optional protocol features this client declares (`Register.capabilities`).
 pub const CAPABILITIES: &[&str] = &[
     FLOW_CONTROL,
@@ -89,6 +104,7 @@ pub const CAPABILITIES: &[&str] = &[
     SCATTER_GATHER,
     STREAMING,
     SUBSCRIPTION,
+    CREDENTIALS_REFRESH,
 ];
 /// A `Permits` message is sent as soon as this many grants are pending, or as soon as the hub holds
 /// no more than `min(PERMIT_BATCH, initial_permits / 2)` permits for the stream (the low-water mark)...
@@ -144,6 +160,12 @@ pub struct HubSettings {
     pub token_file: Option<PathBuf>,
     /// TLS to the hub (`Config.hub_tls`); `None` is plain text unless the address is `https://`.
     pub tls: Option<HubTls>,
+    /// The OAuth2 client-credentials token provider (`Config.hub_oauth2`, ADR 0019): every stream
+    /// registers with a JWT from it in `Register.credentials.jwt`, and the tokens it refreshes go
+    /// to the hubs that offer `credentials-refresh`. Share one provider between every connection
+    /// of the process (a [`super::HubPool`] clones these settings for each of its hubs). Wins over
+    /// `token` and `token_file`, which [`crate::Config::validate`] refuses to combine with it.
+    pub token_provider: Option<Arc<TokenProvider>>,
 }
 
 impl Default for HubSettings {
@@ -162,6 +184,7 @@ impl Default for HubSettings {
             token: None,
             token_file: None,
             tls: None,
+            token_provider: None,
         }
     }
 }
@@ -222,6 +245,11 @@ impl Handshake {
     /// owner instance, relays their updates under the sender's credit and sends `Cancel`.
     pub fn subscription(&self) -> bool {
         self.shares(SUBSCRIPTION)
+    }
+
+    /// True when the hub shares `credentials-refresh`: it takes `ClientMessage.credentials`.
+    pub fn credentials_refresh(&self) -> bool {
+        self.shares(CREDENTIALS_REFRESH)
     }
 
     pub(crate) fn shares(&self, capability: &str) -> bool {
@@ -594,6 +622,10 @@ pub struct HubConnection {
     /// The token resolved for the stream being opened (the last one read from `token_file`); what
     /// every `Register` of the stream carries.
     token: Mutex<Option<SecretString>>,
+    /// The access token the current (and next) stream registers with: the provider's latest.
+    jwt: Mutex<Option<SecretString>>,
+    /// `ClientMessage.credentials` written on this connection's streams.
+    refreshes_sent: AtomicU64,
     /// The empty-token-file warning was logged and no good read has followed it.
     empty_file_warned: AtomicBool,
     /// A stream of this connection failed or ended at least once.
@@ -609,6 +641,28 @@ pub struct HubConnection {
 }
 
 type OutboundBuffer = Arc<Mutex<mpsc::Receiver<ClientMessage>>>;
+
+/// Why a stream attempt ended.
+enum StreamError {
+    /// The stream failed, or the hub closed it with this status.
+    Hub(Status),
+    /// No stream was opened: the token provider could not give an access token (what the token
+    /// endpoint said).
+    Token(String),
+}
+
+impl From<Status> for StreamError {
+    fn from(status: Status) -> Self {
+        StreamError::Hub(status)
+    }
+}
+
+/// A stream following the token provider: the tokens it publishes, and the generation of the one
+/// this stream registered or refreshed with last.
+struct Following {
+    tokens: watch::Receiver<Option<Arc<AccessToken>>>,
+    sent: u64,
+}
 
 /// The request body of a stream: the messages of its outbound buffer, taken one at a time by the
 /// transport. The buffer is shared so that, once the stream is lost, what the transport never
@@ -637,6 +691,8 @@ pub(crate) struct Hooks {
     pub changed: Box<dyn Fn() + Send + Sync>,
     /// Also counts requests that arrived and are not finished (all connections of the pool).
     pub in_flight: Arc<AtomicUsize>,
+    /// Also counts the credential refreshes written (all connections of the pool).
+    pub refreshes_sent: Arc<AtomicU64>,
 }
 
 impl HubConnection {
@@ -658,6 +714,8 @@ impl HubConnection {
             handshake,
             last_rejection: Mutex::new(None),
             token: Mutex::new(None),
+            jwt: Mutex::new(None),
+            refreshes_sent: AtomicU64::new(0),
             empty_file_warned: AtomicBool::new(false),
             failed_once: AtomicBool::new(false),
             in_flight: Arc::new(AtomicUsize::new(0)),
@@ -766,6 +824,36 @@ impl HubConnection {
 
     pub fn last_rejection(&self) -> Option<String> {
         self.last_rejection.lock().unwrap().clone()
+    }
+
+    /// How this connection authenticates: the kind, and for a JWT the expiry of the current
+    /// access token and the last token fetch error.
+    pub fn auth(&self) -> AuthStatus {
+        Self::auth_of(&self.settings)
+    }
+
+    /// [`auth`](Self::auth) of connections made with `settings`.
+    pub(crate) fn auth_of(settings: &HubSettings) -> AuthStatus {
+        if let Some(provider) = &settings.token_provider {
+            return provider.status();
+        }
+        let token =
+            settings.token_file.is_some() || settings.token.as_ref().is_some_and(|t| !t.is_blank());
+        AuthStatus {
+            kind: if token {
+                AuthKind::Token
+            } else {
+                AuthKind::None
+            },
+            token_expires_at: None,
+            last_error: None,
+        }
+    }
+
+    /// The credential refreshes (`ClientMessage.credentials`) written to hubs so far
+    /// (`kraken_messaging_hub_credentials_refreshes_sent_total`).
+    pub fn credentials_refreshes_sent(&self) -> u64 {
+        self.refreshes_sent.load(Ordering::Relaxed)
     }
 
     /// Writes to the current handshaken stream and returns its id; `HubUnavailable` when there is
@@ -914,6 +1002,8 @@ impl HubConnection {
         let mut failures: u32 = 0;
         // The rejection logged at `error` last, so a repeat goes to `debug`.
         let mut logged_rejection: Option<(Code, String)> = None;
+        // The same for a failure to get an access token.
+        let mut logged_token_error: Option<String> = None;
         // The plain-text/TLS hint went to `warn` already (once, whatever the attempt number).
         let mut logged_hint = false;
         while !self.cancel.is_cancelled() {
@@ -937,9 +1027,10 @@ impl HubConnection {
             if self.cancel.is_cancelled() {
                 break;
             }
-            let status = match outcome {
-                Ok(()) => Status::unavailable("hub closed the stream"),
-                Err(s) => s,
+            let (status, no_token) = match outcome {
+                Ok(()) => (Status::unavailable("hub closed the stream"), false),
+                Err(StreamError::Hub(s)) => (s, false),
+                Err(StreamError::Token(message)) => (Status::unavailable(message), true),
             };
             // A hub that answered the Register (ack or echo) is healthy: come back quickly. One that
             // accepts the stream and then rejects it never reaches the handshake.
@@ -947,11 +1038,26 @@ impl HubConnection {
                 backoff = self.settings.backoff_min;
                 failures = 0;
                 logged_rejection = None;
+                logged_token_error = None;
                 logged_hint = false;
             }
             failures += 1;
             let max = self.settings.backoff_max;
-            let wait = if is_rejection(status.code()) {
+            let wait = if no_token {
+                // No stream was opened: the token endpoint refused or could not be reached. Surfaced
+                // like a rejection, retried with the normal backoff (a recovered endpoint is used at
+                // once).
+                *self.last_rejection.lock().unwrap() = Some(status.message().to_string());
+                let wait = jittered(backoff, max, random_unit());
+                if logged_token_error.as_deref() == Some(status.message()) {
+                    tracing::debug!(service = %self.service_name, instance = %self.instance_id, address = %self.settings.address, reason = status.message(), retry_in = ?wait, "could not get an access token for the hub");
+                } else {
+                    tracing::error!(service = %self.service_name, instance = %self.instance_id, address = %self.settings.address, reason = status.message(), retry_in = ?wait, "could not get an access token for the hub; no stream opened");
+                    logged_token_error = Some(status.message().to_string());
+                }
+                backoff = (backoff * 2).min(max);
+                wait
+            } else if is_rejection(status.code()) {
                 *self.last_rejection.lock().unwrap() = Some(status.message().to_string());
                 let wait = jittered(max, max, random_unit());
                 let key = (status.code(), status.message().to_string());
@@ -989,8 +1095,26 @@ impl HubConnection {
     }
 
     /// One stream from connect to failure. `Ok(())` when the hub ended it or we were cancelled.
-    async fn run_stream(&self, stream_id: StreamId) -> Result<(), Status> {
+    async fn run_stream(&self, stream_id: StreamId) -> Result<(), StreamError> {
         self.resolve_token()?;
+        // JWT: the access token comes first, so that a token endpoint that refuses opens no stream.
+        let mut following = match &self.settings.token_provider {
+            Some(provider) => {
+                // Subscribed before the fetch: a token published meanwhile is a change to follow.
+                let tokens = provider.subscribe();
+                let token = tokio::select! {
+                    token = provider.token() => token,
+                    _ = self.cancel.cancelled() => return Ok(()),
+                }
+                .map_err(|e| StreamError::Token(e.to_string()))?;
+                *self.jwt.lock().unwrap() = Some(token.value().clone());
+                Some(Following {
+                    tokens,
+                    sent: token.generation(),
+                })
+            }
+            None => None,
+        };
         let tls = tls::effective(self.settings.tls.as_ref(), &self.settings.address);
         let mut target = grpc_target(&self.settings.address);
         if tls.is_some() {
@@ -1065,14 +1189,27 @@ impl HubConnection {
                     return Ok(());
                 }
                 _ = tokio::time::sleep_until(handshake_deadline), if handshake.is_none() => {
-                    return Err(Status::deadline_exceeded("registration not confirmed in time"));
+                    return Err(Status::deadline_exceeded("registration not confirmed in time").into());
                 }
                 _ = ticker.tick() => {
                     let echo_timeout = interval * 3;
                     if last_echo.elapsed() > echo_timeout {
-                        return Err(Status::unavailable(format!("no heartbeat echo for {echo_timeout:?}")));
+                        return Err(Status::unavailable(format!("no heartbeat echo for {echo_timeout:?}")).into());
                     }
                     tx.send(heartbeat()).await.map_err(|_| Status::unavailable("stream closed"))?;
+                    self.follow_token_file(&tx, handshake.as_ref()).await?;
+                }
+                changed = async {
+                    match following.as_mut() {
+                        Some(f) => f.tokens.changed().await.is_ok(),
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if changed {
+                        self.follow_token(&tx, handshake.as_ref(), following.as_mut()).await?;
+                    } else {
+                        following = None;
+                    }
                 }
                 msg = stream.message() => match msg.map_err(|s| if handshake.is_none() { plain_text_hint(plain, s) } else { s })? {
                     None => return Ok(()),
@@ -1093,6 +1230,8 @@ impl HubConnection {
                                 tracing::info!(service = %self.service_name, instance = %self.instance_id, hub = %ack.hub_id, address = %self.settings.address, protocol = ack.protocol_version, heartbeat = ?interval, flow_control = h.flow_control(), "registered with the hub");
                                 self.go_live(stream_id, &tx, &h, &grants);
                                 handshake = Some(h);
+                                // A token published since the Register went out.
+                                self.follow_token(&tx, handshake.as_ref(), following.as_mut()).await?;
                             }
                             // Every later Register is acked too; the values do not change.
                             Some(Handshake::V2(_)) => {
@@ -1131,6 +1270,93 @@ impl HubConnection {
                 },
             }
         }
+    }
+
+    /// The provider published a token: it is what later `Register`s and streams carry; when the
+    /// hub's ack lists `credentials-refresh` and this stream has not sent it yet, it goes to the hub
+    /// as `ClientMessage.credentials`. A stream without the capability is left alone (its hub closes
+    /// it at the old token's expiry and the reconnect registers with the new one).
+    async fn follow_token(
+        &self,
+        tx: &mpsc::Sender<ClientMessage>,
+        handshake: Option<&Handshake>,
+        following: Option<&mut Following>,
+    ) -> Result<(), Status> {
+        let Some(following) = following else {
+            return Ok(());
+        };
+        let Some(token) = following.tokens.borrow_and_update().clone() else {
+            return Ok(());
+        };
+        if token.generation() <= following.sent {
+            return Ok(());
+        }
+        *self.jwt.lock().unwrap() = Some(token.value().clone());
+        if !handshake.is_some_and(Handshake::credentials_refresh) {
+            return Ok(());
+        }
+        following.sent = token.generation();
+        self.send_refresh(
+            tx,
+            proto::credentials::Kind::Jwt(token.value().expose().to_string()),
+        )
+        .await?;
+        tracing::debug!(service = %self.service_name, address = %self.settings.address, expires_at = ?token.expires_at(), "access token refreshed on the hub stream");
+        Ok(())
+    }
+
+    /// A static token session whose `token_file` changed: the new token goes to a hub that offers
+    /// `credentials-refresh` (rotation without a reconnect). A file that cannot be read or is
+    /// empty changes nothing, as at a reconnect.
+    async fn follow_token_file(
+        &self,
+        tx: &mpsc::Sender<ClientMessage>,
+        handshake: Option<&Handshake>,
+    ) -> Result<(), Status> {
+        let Some(path) = self.settings.token_file.as_ref() else {
+            return Ok(());
+        };
+        if self.settings.token_provider.is_some()
+            || !handshake.is_some_and(Handshake::credentials_refresh)
+        {
+            return Ok(());
+        }
+        let Ok(Some(token)) = crate::security::read_token_file(path) else {
+            return Ok(());
+        };
+        {
+            let mut current = self.token.lock().unwrap();
+            if current.as_ref() == Some(&token) {
+                return Ok(());
+            }
+            *current = Some(token.clone());
+        }
+        self.send_refresh(
+            tx,
+            proto::credentials::Kind::Token(token.expose().to_string()),
+        )
+        .await?;
+        tracing::debug!(service = %self.service_name, address = %self.settings.address, "hub token file changed; refreshed on the hub stream");
+        Ok(())
+    }
+
+    async fn send_refresh(
+        &self,
+        tx: &mpsc::Sender<ClientMessage>,
+        kind: proto::credentials::Kind,
+    ) -> Result<(), Status> {
+        tx.send(ClientMessage {
+            message: Some(client_message::Message::Credentials(proto::Credentials {
+                kind: Some(kind),
+            })),
+        })
+        .await
+        .map_err(|_| Status::unavailable("stream closed"))?;
+        self.refreshes_sent.fetch_add(1, Ordering::Relaxed);
+        if let Some(h) = self.hooks.get() {
+            h.refreshes_sent.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Closes the stream on a shutdown without losing what is still on its way to the hub (a
@@ -1215,6 +1441,25 @@ impl HubConnection {
         Ok(())
     }
 
+    /// The credential a `Register` carries: the access token of the provider (JWT), else the
+    /// static token.
+    fn credentials(&self) -> Option<proto::Credentials> {
+        let kind = if self.settings.token_provider.is_some() {
+            self.jwt
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|t| proto::credentials::Kind::Jwt(t.expose().to_string()))
+        } else {
+            self.token
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|t| proto::credentials::Kind::Token(t.expose().to_string()))
+        };
+        kind.map(|kind| proto::Credentials { kind: Some(kind) })
+    }
+
     /// The `Register` of this instance with the types set now.
     fn register(&self, initial_permits: u32) -> ClientMessage {
         let types = self.types.lock().unwrap().clone();
@@ -1225,14 +1470,7 @@ impl HubConnection {
             query_types: types.exclusive_query_types(),
             protocol_version: PROTOCOL_VERSION,
             capabilities: CAPABILITIES.iter().map(|c| c.to_string()).collect(),
-            credentials: self
-                .token
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|t| proto::Credentials {
-                    kind: Some(proto::credentials::Kind::Token(t.expose().to_string())),
-                }),
+            credentials: self.credentials(),
             client_version: CLIENT_VERSION.to_string(),
             initial_permits,
             load_factor: self.settings.load_factor,
@@ -1506,7 +1744,8 @@ mod tests {
                 "instance-status",
                 "scatter-gather",
                 "streaming",
-                "subscription"
+                "subscription",
+                "credentials-refresh"
             ]
         );
         assert!(CLIENT_VERSION.starts_with("kraken-messaging-rs/"));

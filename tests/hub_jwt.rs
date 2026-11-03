@@ -7,10 +7,12 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kraken_messaging::hub::{FetchResult, HubConnection, HubSettings, Inbound, TokenProvider};
+use kraken_messaging::hub::{
+    AuthKind, FetchResult, HubConnection, HubPool, HubSettings, Inbound, TokenProvider,
+};
 use kraken_messaging::proto::{self, ClientMessage, client_message};
 use kraken_messaging::{HubOAuth2, SecretString};
-use support::fake_hub::FakeHub;
+use support::fake_hub::{Acl, AuthMode, FakeHub};
 use support::idp::{self, Idp, Mode};
 use support::logs::Captured;
 use tokio::sync::mpsc;
@@ -427,4 +429,450 @@ async fn an_expired_token_is_not_served_when_the_endpoint_is_down() {
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let err = provider.token().await.expect_err("expired and no new one");
     assert_eq!(err.result(), FetchResult::HttpError);
+}
+
+// ---- the provider on the hub connections ----
+
+fn jwt_settings(address: String, provider: &Arc<TokenProvider>) -> HubSettings {
+    HubSettings {
+        address,
+        heartbeat_interval: Duration::from_secs(1),
+        backoff_min: Duration::from_millis(20),
+        backoff_max: Duration::from_millis(300),
+        token_provider: Some(Arc::clone(provider)),
+        ..HubSettings::default()
+    }
+}
+
+fn jwt_of(register: &proto::Register) -> Option<String> {
+    match register.credentials.clone().and_then(|c| c.kind) {
+        Some(proto::credentials::Kind::Jwt(j)) => Some(j),
+        _ => None,
+    }
+}
+
+fn jwt_hub_acl(hub: &FakeHub) {
+    hub.set_auth(AuthMode::Enforce, &[]);
+    hub.set_services(&[Acl::new("svc", &["*"], &["*"])]);
+}
+
+async fn wait_for_registers(hub: &FakeHub, n: usize) {
+    until("registers", Duration::from_secs(5), || {
+        futures::executor::block_on(hub.registers()).len() >= n
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_register_carries_the_fetched_jwt_and_declares_credentials_refresh() {
+    let idp = Idp::start("svc", SECRET).await;
+    let hub = FakeHub::start().await;
+    jwt_hub_acl(&hub);
+    let provider = provider(&idp);
+    let conn = connection(jwt_settings(hub.address(), &provider), "svc");
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+
+    let register = hub.registers().await.remove(0);
+    let jwt = jwt_of(&register).expect("a jwt credential, not a token");
+    assert_eq!(jwt, provider.token().await.unwrap().value().expose());
+    assert_eq!(idp::claims(&jwt)["azp"], "svc");
+    assert!(
+        register
+            .capabilities
+            .iter()
+            .any(|c| c == "credentials-refresh")
+    );
+    assert!(hub.rejections().is_empty());
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn a_static_token_session_declares_credentials_refresh_too() {
+    let hub = FakeHub::start().await;
+    let conn = connection(
+        HubSettings {
+            address: hub.address(),
+            token: Some(SecretString::new("a-static-token")),
+            ..HubSettings::default()
+        },
+        "svc",
+    );
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    assert!(
+        hub.registers().await[0]
+            .capabilities
+            .iter()
+            .any(|c| c == "credentials-refresh")
+    );
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn two_hubs_share_one_token_and_one_fetch() {
+    let idp = Idp::start("svc", SECRET).await;
+    let (a, b) = (FakeHub::start().await, FakeHub::start().await);
+    for hub in [&a, &b] {
+        jwt_hub_acl(hub);
+    }
+    let provider = provider(&idp);
+    let (tx, _rx) = mpsc::channel::<Inbound>(16);
+    let pool = HubPool::new(
+        jwt_settings(format!("{},{}", a.address(), b.address()), &provider),
+        "svc".into(),
+        uuid::Uuid::new_v4().to_string(),
+        tx,
+    )
+    .unwrap();
+    pool.start();
+    assert!(pool.await_all_registered(Duration::from_secs(5)).await);
+
+    let jwts: Vec<_> = [&a, &b]
+        .into_iter()
+        .map(|h| jwt_of(&futures::executor::block_on(h.registers())[0]).expect("jwt"))
+        .collect();
+    assert_eq!(jwts[0], jwts[1], "one token for every hub");
+    assert_eq!(idp.token_request_count().await, 1, "one fetch for N hubs");
+    pool.shutdown().await;
+    a.stop();
+    b.stop();
+}
+
+#[tokio::test]
+async fn connections_that_start_together_fetch_one_token() {
+    let idp = Idp::start("svc", SECRET).await;
+    idp.set_delay(Duration::from_millis(300));
+    let hub = FakeHub::start().await;
+    jwt_hub_acl(&hub);
+    let provider = provider(&idp);
+    let conns: Vec<_> = (0..5)
+        .map(|_| connection(jwt_settings(hub.address(), &provider), "svc"))
+        .collect();
+    for c in &conns {
+        c.start();
+    }
+    for c in &conns {
+        assert!(c.await_registered(Duration::from_secs(5)).await);
+    }
+    assert_eq!(idp.token_request_count().await, 1, "single-flight");
+    for c in &conns {
+        c.shutdown().await;
+    }
+    hub.stop();
+}
+
+#[tokio::test]
+async fn a_refreshed_token_goes_to_the_hubs_that_offer_credentials_refresh_and_to_no_other() {
+    let idp = Idp::start("svc", SECRET).await;
+    idp.set_lifetime(6); // refreshed after ~1.2 s
+    // Distinct hub ids: a pool keeps one connection per hub.
+    let (capable, plain) = (
+        FakeHub::start_with_id("capable").await,
+        FakeHub::start_with_id("plain").await,
+    );
+    for hub in [&capable, &plain] {
+        jwt_hub_acl(hub);
+    }
+    capable.set_credentials_refresh(true);
+    let provider = provider(&idp);
+    let (tx, _rx) = mpsc::channel::<Inbound>(16);
+    let pool = HubPool::new(
+        jwt_settings(
+            format!("{},{}", capable.address(), plain.address()),
+            &provider,
+        ),
+        "svc".into(),
+        uuid::Uuid::new_v4().to_string(),
+        tx,
+    )
+    .unwrap();
+    pool.start();
+    assert!(pool.await_all_registered(Duration::from_secs(5)).await);
+    let registered = jwt_of(&capable.registers().await[0]).unwrap();
+
+    until("the refresh", Duration::from_secs(5), || {
+        !capable.refreshes().is_empty()
+    })
+    .await;
+    let refreshes = capable.refreshes();
+    assert_eq!(
+        refreshes.len(),
+        1,
+        "one refresh per new token: {refreshes:?}"
+    );
+    let Some(proto::credentials::Kind::Jwt(sent)) = refreshes[0].1.kind.clone() else {
+        panic!("a jwt refresh: {:?}", refreshes[0]);
+    };
+    assert_ne!(sent, registered, "the new token, not the registered one");
+    assert_eq!(idp::claims(&sent)["azp"], "svc");
+    assert_eq!(
+        sent,
+        provider.token().await.unwrap().value().expose(),
+        "the provider's current token"
+    );
+    // The same token reached both hubs' provider-side at once: give a (wrongly) sent refresh time to
+    // arrive before asserting that none did.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(plain.refreshes().is_empty(), "no capability, no refresh");
+    assert_eq!(
+        pool.credentials_refreshes_sent(),
+        1,
+        "the metric's counterpart"
+    );
+    assert_eq!(pool.auth().kind, AuthKind::Jwt);
+    assert_eq!(
+        pool.auth().token_expires_at,
+        Some(provider.token().await.unwrap().expires_at())
+    );
+    // Nobody reconnected: one Register per hub.
+    assert_eq!(capable.registers().await.len(), 1);
+    assert_eq!(plain.registers().await.len(), 1);
+    pool.shutdown().await;
+    capable.stop();
+    plain.stop();
+}
+
+#[tokio::test]
+async fn a_new_stream_after_a_refresh_registers_with_the_new_token() {
+    let idp = Idp::start("svc", SECRET).await;
+    idp.set_lifetime(6);
+    let hub = FakeHub::start().await;
+    jwt_hub_acl(&hub);
+    hub.set_ack(Some(support::fake_hub::default_ack()));
+    hub.set_credentials_refresh(true);
+    let provider = provider(&idp);
+    let conn = connection(jwt_settings(hub.address(), &provider), "svc");
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    let first = jwt_of(&hub.registers().await[0]).unwrap();
+    until("the refresh", Duration::from_secs(5), || {
+        !hub.refreshes().is_empty()
+    })
+    .await;
+    hub.drop_streams();
+    wait_for_registers(&hub, 2).await;
+    let second = jwt_of(&hub.registers().await[1]).unwrap();
+    assert_ne!(first, second);
+    assert_eq!(second, provider.token().await.unwrap().value().expose());
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn a_token_endpoint_that_refuses_opens_no_stream_logs_one_error_and_recovers() {
+    let captured = Captured::default();
+    let _logs = captured.install();
+    let idp = Idp::start("svc", "the-real-secret").await;
+    let hub = FakeHub::start().await;
+    jwt_hub_acl(&hub);
+    // The client has the wrong secret: the endpoint answers 401 invalid_client.
+    let provider = provider(&idp);
+    let conn = connection(jwt_settings(hub.address(), &provider), "svc");
+    conn.start();
+    until("three attempts", Duration::from_secs(5), || {
+        futures::executor::block_on(idp.token_request_count()) >= 3
+    })
+    .await;
+    assert_eq!(hub.streams(), 0, "no stream was opened");
+    assert!(!conn.is_connected());
+    let rejection = conn.last_rejection().expect("surfaced like a rejection");
+    assert!(rejection.contains("invalid_client"), "{rejection}");
+    assert!(
+        rejection.contains("Invalid client credentials"),
+        "{rejection}"
+    );
+
+    let lines: Vec<String> = captured
+        .lines()
+        .into_iter()
+        .filter(|l| l.contains("access token"))
+        .collect();
+    assert_eq!(
+        lines.iter().filter(|l| l.contains(" ERROR ")).count(),
+        1,
+        "one ERROR per distinct error: {lines:#?}"
+    );
+    assert!(lines.iter().any(|l| l.contains(" DEBUG ")), "{lines:#?}");
+
+    // The endpoint (here: the secret it expects) recovers: the next attempt registers.
+    idp.set_secret(SECRET);
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    assert_eq!(conn.last_rejection(), None, "cleared by the registration");
+    assert!(!hub.registers().await.is_empty());
+    for line in captured.lines() {
+        assert!(
+            !line.contains(SECRET) && !line.contains("the-real-secret"),
+            "{line}"
+        );
+    }
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn jwks_not_loaded_yet_is_a_retry_not_a_logged_rejection() {
+    let captured = Captured::default();
+    let _logs = captured.install();
+    let idp = Idp::start("svc", SECRET).await;
+    let hub = FakeHub::start().await;
+    jwt_hub_acl(&hub);
+    hub.set_jwks_loaded(false);
+    let provider = provider(&idp);
+    let conn = connection(jwt_settings(hub.address(), &provider), "svc");
+    conn.start();
+    until("three attempts", Duration::from_secs(5), || {
+        hub.streams() >= 3
+    })
+    .await;
+    assert_eq!(
+        conn.last_rejection(),
+        None,
+        "UNAVAILABLE is not a rejection"
+    );
+    assert!(
+        !captured.lines().iter().any(|l| l.contains(" ERROR ")),
+        "{:#?}",
+        captured.lines()
+    );
+    hub.set_jwks_loaded(true);
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn a_token_for_another_service_is_a_permission_denied_rejection() {
+    let idp = Idp::start("svc", SECRET).await;
+    idp.set_azp(Some("somebody-else"));
+    let hub = FakeHub::start().await;
+    jwt_hub_acl(&hub);
+    let provider = provider(&idp);
+    let conn = connection(jwt_settings(hub.address(), &provider), "svc");
+    conn.start();
+    until("a rejection", Duration::from_secs(5), || {
+        conn.last_rejection().is_some()
+    })
+    .await;
+    let rejection = conn.last_rejection().unwrap();
+    assert!(rejection.contains("azp"), "{rejection}");
+    assert_eq!(hub.rejections()[0].code, tonic::Code::PermissionDenied);
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn a_refused_refresh_is_a_registration_rejection() {
+    let captured = Captured::default();
+    let _logs = captured.install();
+    let idp = Idp::start("svc", SECRET).await;
+    idp.set_lifetime(6);
+    let hub = FakeHub::start().await;
+    jwt_hub_acl(&hub);
+    hub.set_ack(Some(support::fake_hub::default_ack()));
+    hub.set_credentials_refresh(true);
+    let provider = provider(&idp);
+    let conn = connection(jwt_settings(hub.address(), &provider), "svc");
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    // The ACL entry goes away: the refresh (and the Register after it) is refused.
+    hub.set_services(&[]);
+    until("the refresh is refused", Duration::from_secs(5), || {
+        conn.last_rejection().is_some()
+    })
+    .await;
+    assert!(conn.last_rejection().unwrap().contains("no ACL entry"));
+    assert_eq!(hub.rejections()[0].code, tonic::Code::PermissionDenied);
+    assert!(
+        captured
+            .lines()
+            .iter()
+            .any(|l| l.contains(" ERROR ") && l.contains("rejected the registration")),
+        "{:#?}",
+        captured.lines()
+    );
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn a_rotated_token_file_is_sent_as_a_refresh_without_reconnecting() {
+    let dir = temp_dir();
+    let file = dir.join("hub-token");
+    std::fs::write(&file, "first-token\n").unwrap();
+    let hub = FakeHub::start().await;
+    hub.set_auth(
+        AuthMode::Enforce,
+        &[
+            ("first-token", Acl::new("svc", &["*"], &["*"])),
+            ("second-token", Acl::new("svc", &["*"], &["*"])),
+        ],
+    );
+    hub.set_ack(Some(support::fake_hub::default_ack()));
+    hub.set_credentials_refresh(true);
+    let conn = connection(
+        HubSettings {
+            address: hub.address(),
+            heartbeat_interval: Duration::from_millis(200),
+            token_file: Some(file.clone()),
+            ..HubSettings::default()
+        },
+        "svc",
+    );
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    assert!(hub.refreshes().is_empty(), "nothing changed yet");
+    std::fs::write(&file, "second-token\n").unwrap();
+    until("the refresh", Duration::from_secs(5), || {
+        !hub.refreshes().is_empty()
+    })
+    .await;
+    let refreshes = hub.refreshes();
+    assert_eq!(
+        refreshes[0].1.kind,
+        Some(proto::credentials::Kind::Token("second-token".into()))
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(hub.refreshes().len(), 1, "one refresh per change");
+    assert_eq!(hub.registers().await.len(), 1, "no reconnect");
+    conn.shutdown().await;
+    hub.stop();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn the_auth_status_names_the_kind_the_expiry_and_the_last_fetch_error() {
+    let hub = FakeHub::start().await;
+    let none = connection(
+        HubSettings {
+            address: hub.address(),
+            ..HubSettings::default()
+        },
+        "svc",
+    );
+    assert_eq!(none.auth().kind, AuthKind::None);
+    let token = connection(
+        HubSettings {
+            address: hub.address(),
+            token: Some(SecretString::new("t")),
+            ..HubSettings::default()
+        },
+        "svc",
+    );
+    assert_eq!(token.auth().kind, AuthKind::Token);
+    assert_eq!(AuthKind::Jwt.label(), "jwt");
+
+    let idp = Idp::start("svc", SECRET).await;
+    let provider = provider(&idp);
+    let jwt = connection(jwt_settings(hub.address(), &provider), "svc");
+    assert_eq!(jwt.auth().kind, AuthKind::Jwt);
+    assert_eq!(jwt.auth().token_expires_at, None, "before the first fetch");
+    let fetched = provider.token().await.unwrap();
+    assert_eq!(jwt.auth().token_expires_at, Some(fetched.expires_at()));
+    idp.set_mode(Mode::Status(503));
+    provider.refresh().await.expect_err("503");
+    assert!(jwt.auth().last_error.unwrap().contains("503"));
+    hub.stop();
 }

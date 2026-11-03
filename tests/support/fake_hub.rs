@@ -88,6 +88,15 @@
 //! [`FakeHub::rejections`] with the token it carried and when it arrived. A session without a
 //! valid token (permissive) is not judged per request. Patterns as the hub parses them: exact,
 //! `prefix.*` (a type longer than `prefix.`), `*`; `Acl::new` panics on any other wildcard.
+//! JWT credentials (P5b, ADR 0019): `set_services(&[Acl])` is the `[[service]]` table. A `Register`
+//! (or refresh) carrying `jwt` is decoded without verifying the signature: its `azp` must be the
+//! `Register.service_name` (else `PERMISSION_DENIED` "token azp ... is not service ...") and name
+//! an entry of that table (else `PERMISSION_DENIED` "no ACL entry for service ..."); until
+//! `set_jwks_loaded(true)` (the default) the hub answers a JWT `Register` with `UNAVAILABLE` "jwks
+//! not loaded yet". `set_credentials_refresh(true)` offers the capability `credentials-refresh` to
+//! a client that declares it; a `ClientMessage.credentials` is recorded ([`FakeHub::refreshes`])
+//! and, in `Enforce`, must resolve to the session's own service (else the stream ends with the
+//! status, like a refused `Register`); the session then holds the new credential's entry.
 //! Whatever the mode but `Off`, a `Register` whose instance id an open session of another service
 //! holds is closed with `PERMISSION_DENIED "instance id <first 8 chars> belongs to another
 //! service"` and nothing changes (the holder keeps its session); `Off` replaces it as before.
@@ -316,6 +325,8 @@ fn allowed(patterns: &[String], ty: &str) -> bool {
 struct Auth {
     mode: Option<AuthMode>,
     tokens: HashMap<String, Acl>,
+    /// The `[[service]]` table: azp → what that service may do.
+    services: HashMap<String, Acl>,
 }
 
 /// A refused `Register`: the status it was closed with, the token it carried, when.
@@ -396,6 +407,10 @@ pub struct State {
     ends: StdMutex<Vec<(usize, proto::ReplyEnd)>>,
     flows: StdMutex<Vec<(usize, proto::Flow)>>,
     cancels: StdMutex<Vec<(usize, proto::Cancel)>>,
+    /// The JWKS is loaded: JWT `Register`s are judged (else `UNAVAILABLE`).
+    jwks_loaded: AtomicBool,
+    /// Offer `credentials-refresh` to clients that declare it.
+    credentials_refresh: AtomicBool,
     /// `ClientMessage.credentials` (P5b): (stream number, the new credential).
     refreshes: StdMutex<Vec<(usize, proto::Credentials)>>,
 }
@@ -419,19 +434,10 @@ impl State {
         }
         let mut found: Option<tonic::Status> = None;
         if principal.is_none() {
-            let token = match r.credentials.as_ref().and_then(|c| c.kind.as_ref()) {
-                Some(proto::credentials::Kind::Token(t)) if !t.is_empty() => Some(t.clone()),
-                _ => None,
-            };
-            let acl = token
-                .as_ref()
-                .and_then(|t| self.auth.lock().unwrap().tokens.get(t).cloned());
-            if acl.is_none() {
-                found = Some(tonic::Status::unauthenticated(if token.is_none() {
-                    "missing token"
-                } else {
-                    "unknown token"
-                }));
+            let resolved = self.resolve(r.credentials.as_ref(), Some(&r.service_name));
+            let acl = resolved.as_ref().ok().cloned();
+            if let Err(status) = resolved {
+                found = Some(status);
             }
             *principal = Some(acl);
         }
@@ -477,6 +483,81 @@ impl State {
         }
     }
 
+    /// The ACL entry a credential stands for: a token's entry, or (a JWT) the `[[service]]` entry
+    /// its `azp` names, which must be `service` when that is known. A token's service-name check
+    /// is the caller's.
+    fn resolve(
+        &self,
+        credentials: Option<&proto::Credentials>,
+        service: Option<&str>,
+    ) -> Result<Acl, tonic::Status> {
+        let auth = self.auth.lock().unwrap();
+        match credentials.and_then(|c| c.kind.as_ref()) {
+            Some(proto::credentials::Kind::Token(t)) if !t.is_empty() => auth
+                .tokens
+                .get(t)
+                .cloned()
+                .ok_or_else(|| tonic::Status::unauthenticated("unknown token")),
+            Some(proto::credentials::Kind::Jwt(jwt)) if !jwt.is_empty() => {
+                if !self.jwks_loaded.load(Ordering::SeqCst) {
+                    return Err(tonic::Status::unavailable("jwks not loaded yet"));
+                }
+                let azp = jwt_claims(jwt)
+                    .and_then(|c| c["azp"].as_str().map(str::to_string))
+                    .ok_or_else(|| tonic::Status::unauthenticated("malformed jwt (no azp)"))?;
+                if let Some(service) = service.filter(|s| *s != azp) {
+                    return Err(tonic::Status::permission_denied(format!(
+                        "token azp '{azp}' is not service '{service}'"
+                    )));
+                }
+                auth.services.get(&azp).cloned().ok_or_else(|| {
+                    tonic::Status::permission_denied(format!("no ACL entry for service '{azp}'"))
+                })
+            }
+            _ => Err(tonic::Status::unauthenticated("missing token")),
+        }
+    }
+
+    /// Judges a `ClientMessage.credentials`: it must stand for the session's own service. `Err`
+    /// closes the stream (enforce); a permissive hub records it and keeps the old principal.
+    fn admit_refresh(
+        &self,
+        credentials: &proto::Credentials,
+        principal: &mut Principal,
+    ) -> Result<(), tonic::Status> {
+        let mode = self.mode();
+        if mode == AuthMode::Off {
+            return Ok(());
+        }
+        let session = principal.as_ref().and_then(Option::as_ref);
+        let outcome = self
+            .resolve(Some(credentials), session.map(|a| a.service.as_str()))
+            .and_then(|acl| match session {
+                Some(own) if own.service != acl.service => {
+                    Err(tonic::Status::permission_denied(format!(
+                        "credentials are for service '{}', not '{}'",
+                        acl.service, own.service
+                    )))
+                }
+                _ => Ok(acl),
+            });
+        match outcome {
+            Ok(acl) => {
+                *principal = Some(Some(acl));
+                Ok(())
+            }
+            Err(status) if mode == AuthMode::Enforce => Err(status),
+            Err(status) => {
+                self.violations.lock().unwrap().push(format!(
+                    "refresh {:?}: {}",
+                    status.code(),
+                    status.message()
+                ));
+                Ok(())
+            }
+        }
+    }
+
     /// The instance id of `r` is held by an open session of another service.
     fn held_by_another_service(&self, stream_no: usize, r: &proto::Register) -> bool {
         let holder = match self.sessions.lock().unwrap().get(&r.instance_id) {
@@ -512,6 +593,25 @@ impl State {
             &format!("type '{}' is not allowed to be sent", req.r#type),
         ))
     }
+}
+
+/// The token or JWT a credential carries, for [`Rejection::token`].
+fn credential_text(credentials: Option<&proto::Credentials>) -> Option<String> {
+    match credentials.and_then(|c| c.kind.as_ref()) {
+        Some(proto::credentials::Kind::Token(t)) => Some(t.clone()),
+        Some(proto::credentials::Kind::Jwt(j)) => Some(j.clone()),
+        None => None,
+    }
+}
+
+/// The claims of a JWT, read without verifying it (the fake hub trusts its tests).
+pub fn jwt_claims(jwt: &str) -> Option<serde_json::Value> {
+    use base64::Engine;
+    let payload = jwt.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// What happened on the fake hub, in order.
@@ -1733,10 +1833,7 @@ impl Hub for Service {
                                     state.rejections.lock().unwrap().push(Rejection {
                                         code: status.code(),
                                         message: status.message().to_string(),
-                                        token: match r.credentials.as_ref().and_then(|c| c.kind.as_ref()) {
-                                            Some(proto::credentials::Kind::Token(t)) => Some(t.clone()),
-                                            _ => None,
-                                        },
+                                        token: credential_text(r.credentials.as_ref()),
                                         at: std::time::Instant::now(),
                                     });
                                     // Like the hub: the stream ends with the status, nothing of the registration stays.
@@ -1749,6 +1846,7 @@ impl Hub for Service {
                                 let wants_scatter = r.capabilities.iter().any(|c| c == "scatter-gather");
                                 let wants_streaming = r.capabilities.iter().any(|c| c == "streaming");
                                 let wants_subscription = r.capabilities.iter().any(|c| c == "subscription");
+                                let wants_refresh = r.capabilities.iter().any(|c| c == "credentials-refresh");
                                 state.log(Event::Register { stream: stream_no, types: r.command_types.len() + r.query_types.len() + r.shared_query_types.len() });
                                 let scatter = wants_scatter && v2 && state.scatter_gather.load(Ordering::SeqCst) && state.ack.lock().unwrap().is_some();
                                 let streaming = wants_streaming && v2 && state.streaming.load(Ordering::SeqCst) && state.ack.lock().unwrap().is_some();
@@ -1796,6 +1894,9 @@ impl Hub for Service {
                                     if wants_subscription && state.subscription.load(Ordering::SeqCst) {
                                         ack.capabilities.push("subscription".to_string());
                                     }
+                                    if wants_refresh && state.credentials_refresh.load(Ordering::SeqCst) {
+                                        ack.capabilities.push("credentials-refresh".to_string());
+                                    }
                                     ack
                                 });
                                 if let (true, Some(ack)) = (v2, ack) {
@@ -1834,7 +1935,19 @@ impl Hub for Service {
                                 }
                             }
                             client_message::Message::Status(st) => state.statuses.lock().unwrap().push((stream_no, st)),
-                            client_message::Message::Credentials(c) => state.refreshes.lock().unwrap().push((stream_no, c)),
+                            client_message::Message::Credentials(c) => {
+                                state.refreshes.lock().unwrap().push((stream_no, c.clone()));
+                                if let Err(status) = state.admit_refresh(&c, &mut principal) {
+                                    state.rejections.lock().unwrap().push(Rejection {
+                                        code: status.code(),
+                                        message: status.message().to_string(),
+                                        token: credential_text(Some(&c)),
+                                        at: std::time::Instant::now(),
+                                    });
+                                    let _ = tx.send(Err(status)).await;
+                                    break;
+                                }
+                            }
                             client_message::Message::Request(req) => {
                                 state.requests.lock().await.push(req.clone());
                                 if let Some(denied) = state.check_send(&principal, &req) {
@@ -1992,6 +2105,8 @@ impl FakeHub {
             flows: StdMutex::new(vec![]),
             cancels: StdMutex::new(vec![]),
             refreshes: StdMutex::new(vec![]),
+            jwks_loaded: AtomicBool::new(true),
+            credentials_refresh: AtomicBool::new(false),
         });
         let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2254,6 +2369,25 @@ impl FakeHub {
             .iter()
             .map(|(t, a)| (t.to_string(), a.clone()))
             .collect();
+    }
+
+    /// The `[[service]]` table for JWT credentials, replacing it (see the module docs). Streams
+    /// already open keep the identity they registered with.
+    pub fn set_services(&self, services: &[Acl]) {
+        self.state.auth.lock().unwrap().services = services
+            .iter()
+            .map(|a| (a.service.clone(), a.clone()))
+            .collect();
+    }
+
+    /// `false`: a JWT `Register` is answered with `UNAVAILABLE` "jwks not loaded yet".
+    pub fn set_jwks_loaded(&self, loaded: bool) {
+        self.state.jwks_loaded.store(loaded, Ordering::SeqCst);
+    }
+
+    /// Offer the `credentials-refresh` capability to clients that declare it.
+    pub fn set_credentials_refresh(&self, on: bool) {
+        self.state.credentials_refresh.store(on, Ordering::SeqCst);
     }
 
     /// The refused `Register`s so far, in order.

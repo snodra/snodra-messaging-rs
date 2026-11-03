@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -49,6 +49,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::MessagingError;
 use crate::proto::{ClientMessage, InstanceStatus, client_message};
 
+use super::auth::AuthStatus;
 use super::connection::{
     Handshake, Hooks, HubConnection, HubSettings, Inbound, RegisteredTypes, StreamId,
 };
@@ -117,6 +118,8 @@ pub struct HubPool {
     owners: Mutex<HashMap<String, String>>,
     turn: AtomicUsize,
     in_flight: Arc<AtomicUsize>,
+    /// Credential refreshes written to any hub (monotonic: members come and go).
+    refreshes_sent: Arc<AtomicU64>,
     changes: watch::Sender<u64>,
     probes: Mutex<Vec<PendingProbe>>,
     resolver: Mutex<Resolver>,
@@ -195,6 +198,7 @@ impl HubPool {
             owners: Mutex::new(HashMap::new()),
             turn: AtomicUsize::new(0),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            refreshes_sent: Arc::new(AtomicU64::new(0)),
             changes,
             probes: Mutex::new(vec![]),
             resolver: Mutex::new(Arc::new(|host, port| {
@@ -312,6 +316,21 @@ impl HubPool {
     /// (legacy, or an empty `RegisterAck.hub_id`) by its target as `host:port`.
     pub fn hub_ids(&self) -> Vec<String> {
         self.live().into_iter().map(|l| l.hub_id).collect()
+    }
+
+    /// How the pool authenticates (ADR 0019): the kind, and for a JWT the expiry of the current
+    /// access token and the last token fetch error. The same for every hub.
+    pub fn auth(&self) -> AuthStatus {
+        match self.members().first() {
+            Some(m) => m.conn.auth(),
+            None => HubConnection::auth_of(&self.settings),
+        }
+    }
+
+    /// The credential refreshes (`ClientMessage.credentials`) written to any hub so far
+    /// (`kraken_messaging_hub_credentials_refreshes_sent_total`).
+    pub fn credentials_refreshes_sent(&self) -> u64 {
+        self.refreshes_sent.load(Ordering::Relaxed)
     }
 
     /// Every connection of the pool, closed duplicates and draining ones included.
@@ -522,6 +541,7 @@ impl HubPool {
                 }
             }),
             in_flight: Arc::clone(&self.in_flight),
+            refreshes_sent: Arc::clone(&self.refreshes_sent),
         });
         let member = Arc::new(Member {
             conn,
