@@ -308,6 +308,53 @@ async fn the_hub_closing_at_not_after_is_a_reconnect_with_the_renewed_file() {
 }
 
 #[tokio::test]
+async fn the_hubs_certificate_expired_close_is_a_normal_reconnect_not_a_rejection() {
+    let w = world(true).await;
+    let (tls, _) = w.issue("svc", &ClientSpec::service("svc"));
+    let captured = Captured::default();
+    let _logs = captured.install();
+    // The default backoff_max (5 s): a rejection would wait that long, a normal reconnect starts
+    // from backoff_min.
+    let conn = connection(
+        HubSettings {
+            backoff_max: HubSettings::default().backoff_max,
+            ..settings(w.hub.address(), tls.clone())
+        },
+        "svc",
+    );
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    let second = w.renew(&tls, &ClientSpec::service("svc"));
+    w.hub
+        .close_streams_with(tonic::Code::Unauthenticated, "certificate expired");
+    let closed = Instant::now();
+    let deadline = closed + Duration::from_secs(8);
+    while w.hub.peer_fingerprints().len() < 2 {
+        assert!(Instant::now() < deadline, "no reconnect");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        closed.elapsed() < Duration::from_secs(2),
+        "reconnected after {:?}: waited like for a rejection",
+        closed.elapsed()
+    );
+    assert_eq!(w.hub.peer_fingerprints()[1].1, second);
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    assert_eq!(conn.last_rejection(), None);
+    let log = captured.text();
+    assert!(!log.contains("hub rejected the registration"), "{log}");
+    assert!(!log.contains(" ERROR "), "{log}");
+    let info: Vec<_> = captured
+        .lines()
+        .into_iter()
+        .filter(|l| l.contains("INFO") && l.contains("certificate expired"))
+        .collect();
+    assert_eq!(info.len(), 1, "{log}");
+    conn.shutdown().await;
+    w.hub.stop();
+}
+
+#[tokio::test]
 async fn files_caught_half_way_through_a_rotation_keep_the_last_good_pair() {
     let w = world(true).await;
     let (tls, first) = w.issue("svc", &ClientSpec::service("svc"));

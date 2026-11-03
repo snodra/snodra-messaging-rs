@@ -20,7 +20,10 @@
 //! `UNAUTHENTICATED` or `PERMISSION_DENIED` is a registration rejection (the last two are the hub's
 //! access control, ADR 0018): it is kept in [`HubConnection::last_rejection`] (until a stream
 //! registers), retried at `backoff_max` and logged at `error` once per distinct message, then at
-//! `debug`.
+//! `debug`. The exception is a session that reached the handshake with a client certificate
+//! configured and that the hub ends with `UNAUTHENTICATED` (its "certificate expired" close at the
+//! certificate's notAfter): that is a normal reconnect at the normal backoff, logged at `info`,
+//! not a rejection (the files are read again at the reconnect).
 //!
 //! Access control (P5a): the static token, from `HubSettings::token` or, winning over it, read from
 //! `HubSettings::token_file` before every connect, goes in `Register.credentials.token` of every
@@ -1191,6 +1194,18 @@ impl HubConnection {
                 }
                 backoff = (backoff * 2).min(max);
                 wait
+            } else if reached_handshake
+                && status.code() == Code::Unauthenticated
+                && self.presents_certificate()
+            {
+                // The hub ends a certificate session at the certificate's notAfter ("certificate
+                // expired", no grace): not a refusal of the registration. Back at the normal
+                // backoff, reading the files again (a renewed pair is presented; the expired one
+                // fails the next attempt at the pair check, which is logged as such).
+                let wait = jittered(backoff, max, random_unit());
+                tracing::info!(service = %self.service_name, instance = %self.instance_id, address = %self.settings.address, reason = status.message(), retry_in = ?wait, "the hub ended the certificate session; reconnecting with the certificate in the files");
+                backoff = (backoff * 2).min(max);
+                wait
             } else if is_rejection(status.code()) {
                 *self.last_rejection.lock().unwrap() = Some(status.message().to_string());
                 let wait = jittered(max, max, random_unit());
@@ -1719,6 +1734,14 @@ impl HubConnection {
             Err(LoadError::WrongService(message)) => Err(Status::permission_denied(message)),
             Err(LoadError::Expired(message)) => Err(Status::unauthenticated(message)),
         }
+    }
+
+    /// True when a client certificate is configured (the session authenticates by it).
+    fn presents_certificate(&self) -> bool {
+        self.settings
+            .tls
+            .as_ref()
+            .is_some_and(HubTls::has_client_certificate)
     }
 
     /// Records the client certificate the stream going live presents; a different one than the
