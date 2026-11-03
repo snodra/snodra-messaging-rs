@@ -444,10 +444,11 @@ impl HubPool {
         &self,
         routing_key: &str,
         capability: Option<&str>,
+        wait: Option<Duration>,
         mut build: impl FnMut(StreamId, &Handshake) -> Result<(ClientMessage, T), MessagingError>,
     ) -> Result<(StreamId, T), MessagingError> {
         let mut last = None;
-        let ranked = self.ranked(routing_key, capability);
+        let ranked = self.ranked_waiting(routing_key, capability, wait).await;
         if ranked.is_empty()
             && let Some(capability) = capability
             && !self.live().is_empty()
@@ -480,10 +481,11 @@ impl HubPool {
         &self,
         routing_key: &str,
         tried: &[String],
+        wait: Option<Duration>,
         mut build: impl FnMut(StreamId, &Handshake) -> Result<(ClientMessage, T), MessagingError>,
     ) -> Result<(StreamId, T, String), MessagingError> {
         let mut last = None;
-        for conn in self.ranked(routing_key, None) {
+        for conn in self.ranked_waiting(routing_key, None, wait).await {
             if tried.iter().any(|a| a == conn.address()) {
                 continue;
             }
@@ -567,6 +569,44 @@ impl HubPool {
                 })
             })
             .collect()
+    }
+
+    /// Like [`ranked`](Self::ranked), but when no hub is routable only because a certificate
+    /// rollover has taken the hub(s) out of the routing, waits for one to be back, for at most
+    /// `wait` (the caller's remaining deadline; without one, [`ROLL_RECONNECT_LIMIT`], when the
+    /// rollover gives up anyway). Empty when the wait runs out, or when nothing is rolling.
+    async fn ranked_waiting(
+        &self,
+        routing_key: &str,
+        capability: Option<&str>,
+        wait: Option<Duration>,
+    ) -> Vec<Arc<HubConnection>> {
+        let ranked = self.ranked(routing_key, capability);
+        if !ranked.is_empty() || !self.rolling() {
+            return ranked;
+        }
+        let limit = wait
+            .unwrap_or(ROLL_RECONNECT_LIMIT)
+            .min(ROLL_RECONNECT_LIMIT);
+        let deadline = tokio::time::Instant::now() + limit;
+        let mut changes = self.changes.subscribe();
+        loop {
+            tokio::select! {
+                _ = changes.changed() => {}
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                _ = tokio::time::sleep_until(deadline) => return self.ranked(routing_key, capability),
+                _ = self.cancel.cancelled() => return vec![],
+            }
+            let ranked = self.ranked(routing_key, capability);
+            if !ranked.is_empty() || !self.rolling() {
+                return ranked;
+            }
+        }
+    }
+
+    /// True while a certificate rollover has a connection out of the routing.
+    fn rolling(&self) -> bool {
+        self.members().iter().any(|m| m.role() == Role::Rolling)
     }
 
     /// The live hubs (those whose ack lists `capability`, when given) in the order a request with

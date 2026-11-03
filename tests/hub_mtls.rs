@@ -1048,3 +1048,90 @@ async fn a_reply_that_arrives_while_the_stream_is_closing_for_the_roll_reaches_i
     c.shutdown().await;
     w.hub.stop();
 }
+
+/// One hub, no retry policy; the hub keeps its side of a closed stream open for `linger`, so the
+/// roll's close (and the reconnect after it) takes at least that long.
+async fn single_hub_client(w: &World, tls: &HubTls, linger: Duration) -> Client {
+    w.hub.set_responder(|req| Some(ok_reply(&req))).await;
+    w.hub.set_half_close(linger, Vec::new);
+    client(settings(w.hub.address(), tls.clone())).await
+}
+
+#[tokio::test]
+async fn a_send_during_a_single_hub_roll_waits_for_the_new_stream_instead_of_failing() {
+    let w = world(true).await;
+    let (tls, first) = w.issue("svc", &ClientSpec::service("svc"));
+    let c = single_hub_client(&w, &tls, Duration::from_millis(600)).await;
+    assert!(c.pool.await_all_registered(Duration::from_secs(5)).await);
+    c.presenting(&first).await;
+    let second = w.renew(&tls, &ClientSpec::service("svc"));
+    // The old stream is closing (the hub lingers 600 ms): nothing is routable, only because of the roll.
+    eventually("the stream is closed for the roll", || {
+        w.hub.events().contains(&Event::Register {
+            stream: 1,
+            types: 0,
+        })
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let started = Instant::now();
+    // The default retry policy (none): the call itself waits for the new stream.
+    c.sender
+        .send_command(
+            &Ping {},
+            SendOptions {
+                timeout: Some(Duration::from_secs(10)),
+                ..SendOptions::default()
+            },
+        )
+        .await
+        .expect("a send during the roll waits for the new stream");
+    assert!(
+        started.elapsed() >= Duration::from_millis(200),
+        "it did wait"
+    );
+    c.presenting(&second).await;
+    c.shutdown().await;
+    w.hub.stop();
+}
+
+#[tokio::test]
+async fn a_send_stops_waiting_for_the_roll_at_its_own_deadline() {
+    let w = world(true).await;
+    let (tls, first) = w.issue("svc", &ClientSpec::service("svc"));
+    let c = single_hub_client(&w, &tls, Duration::from_millis(1500)).await;
+    assert!(c.pool.await_all_registered(Duration::from_secs(5)).await);
+    c.presenting(&first).await;
+    w.renew(&tls, &ClientSpec::service("svc"));
+    eventually("the stream is closed for the roll", || {
+        w.hub.events().contains(&Event::Register {
+            stream: 1,
+            types: 0,
+        })
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let started = Instant::now();
+    let err = c
+        .sender
+        .send_command(
+            &Ping {},
+            SendOptions {
+                timeout: Some(Duration::from_millis(300)),
+                ..SendOptions::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, kraken_messaging::MessagingError::HubUnavailable(_)),
+        "{err:?}"
+    );
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(250) && waited < Duration::from_millis(900),
+        "waited {waited:?}"
+    );
+    c.shutdown().await;
+    w.hub.stop();
+}

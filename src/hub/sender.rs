@@ -1445,7 +1445,7 @@ impl Sender {
         let (mode, capability, _) = call.mode();
         let sent = self
             .hubs
-            .send_where("", Some(capability), |stream, handshake| {
+            .send_where("", Some(capability), chosen, |stream, handshake| {
                 // Ranked on a snapshot: the stream current now may belong to a re-handshake with
                 // an older hub, which would answer UNSUPPORTED (a P4a hub) or serve the request
                 // as a unary query (older). Refused, nothing written: the next capable hub is tried.
@@ -1570,7 +1570,7 @@ impl Sender {
         let mut events = None;
         let sent = self
             .hubs
-            .send_where("", Some(SCATTER_GATHER), |stream, handshake| {
+            .send_where("", Some(SCATTER_GATHER), chosen, |stream, handshake| {
                 // The hubs were ranked on a snapshot: the stream current now may belong to a
                 // re-handshake with an older hub, which would serve the gather as a unary query
                 // (its reply ignored here, the local guard the only end). Refused, nothing
@@ -1687,7 +1687,7 @@ impl Sender {
             let mut answer = None;
             let sent = self
                 .hubs
-                .send_excluding(call.routing_key, &declined, |stream, handshake| {
+                .send_excluding(call.routing_key, &declined, chosen, |stream, handshake| {
                     let (timeout_ms, guard) = request_timing(handshake, type_name, chosen);
                     let (tx, rx) = oneshot::channel();
                     answer = Some(rx);
