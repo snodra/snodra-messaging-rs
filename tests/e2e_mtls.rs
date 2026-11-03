@@ -415,20 +415,46 @@ async fn the_hub_closing_at_not_after_leads_to_a_reconnect_with_the_renewed_file
 #[tokio::test]
 async fn rotating_the_files_moves_the_session_to_the_new_certificate_with_no_failed_request() {
     require_docker!();
+    rotation(Rotated::Sender).await;
+}
+
+/// The single owner instance of `billing.GetInvoice` is the one that rotates: while its hub is
+/// rolled over it is deregistered there, the hub answers `NO_HANDLER`, and the sender moves the
+/// request to the other hub, where the owner still is.
+#[tokio::test]
+async fn rotating_the_only_owners_files_leaves_no_request_without_a_handler() {
+    require_docker!();
+    rotation(Rotated::Owner).await;
+}
+
+#[derive(Clone, Copy)]
+enum Rotated {
+    /// `orders`, which sends through the pool.
+    Sender,
+    /// `billing`, the one instance that handles the query.
+    Owner,
+}
+
+async fn rotation(rotated: Rotated) {
     let f = fixture();
     let (a, b) = tokio::join!(
         f.hub("required", Some(free_port()), Some("mtls-hub-1")),
         f.hub("required", Some(free_port()), Some("mtls-hub-2")),
     );
     let both = format!("{},{}", a.address, b.address);
-    let (billing_tls, _) = f.tls("billing", &ClientSpec::service("billing"));
-    let (orders_tls, first) = f.tls("orders", &ClientSpec::service("orders"));
+    let (billing_tls, billing_first) = f.tls("billing", &ClientSpec::service("billing"));
+    let (orders_tls, orders_first) = f.tls("orders", &ClientSpec::service("orders"));
+    let (rotated_name, rotated_tls, first) = match rotated {
+        Rotated::Sender => ("orders", orders_tls.clone(), orders_first),
+        Rotated::Owner => ("billing", billing_tls.clone(), billing_first),
+    };
 
-    // billing serves on both hubs (its own pool, a stable certificate).
+    // billing serves on both hubs (its own pool); the files checked every 300 ms.
     let (btx, brx) = mpsc::channel::<Inbound>(64);
     let billing = HubPool::new(
         HubSettings {
             address: both.clone(),
+            heartbeat_interval: Duration::from_millis(300),
             backoff_min: Duration::from_millis(100),
             backoff_max: Duration::from_secs(1),
             tls: Some(billing_tls),
@@ -444,7 +470,7 @@ async fn rotating_the_files_moves_the_session_to_the_new_certificate_with_no_fai
     serve("billing", brx, billing_sender);
     billing.start();
 
-    // orders sends through its own pool; its files are the ones rotated; checked every 300 ms.
+    // orders sends through its own pool.
     let (otx, orx) = mpsc::channel::<Inbound>(64);
     let orders = HubPool::new(
         HubSettings {
@@ -465,7 +491,11 @@ async fn rotating_the_files_moves_the_session_to_the_new_certificate_with_no_fai
     orders.start();
     assert!(billing.await_all_registered(Duration::from_secs(20)).await);
     assert!(orders.await_all_registered(Duration::from_secs(20)).await);
-    assert_eq!(orders.auth().certificate.unwrap().fingerprint, first);
+    let rotating = match rotated {
+        Rotated::Sender => &orders,
+        Rotated::Owner => &billing,
+    };
+    assert_eq!(rotating.auth().certificate.unwrap().fingerprint, first);
 
     let (sent, failed) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let first_failure = Arc::new(std::sync::Mutex::new(None::<String>));
@@ -501,13 +531,15 @@ async fn rotating_the_files_moves_the_session_to_the_new_certificate_with_no_fai
         })
     };
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let second = f.renew(&orders_tls, &ClientSpec::service("orders"));
+    let second = f.renew(&rotated_tls, &ClientSpec::service(rotated_name));
     assert_ne!(first, second);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let status = orders.auth().certificate.unwrap();
+        let status = rotating.auth().certificate.unwrap();
         if status.fingerprint == second
-            && orders.await_all_registered(Duration::from_millis(50)).await
+            && rotating
+                .await_all_registered(Duration::from_millis(50))
+                .await
         {
             assert_eq!(status.rotations, 1);
             break;

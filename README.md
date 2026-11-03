@@ -262,6 +262,15 @@ every instance registers on every hub, and the client picks a hub per request.
   kraken-messaging). `HubUnavailable` means no hub took it. A request the transport had already
   taken fails with `HubConnectionLost` when its stream drops (outcome unknown: it may be on the
   wire); the retry policy then decides (queries are retried, commands are not). Replies go on the stream the request arrived on.
+- **`NO_HANDLER` failover.** A unary send (a command or a point query; not a scatter-gather,
+  stream or subscription) that a hub answers with `NO_HANDLER` was never delivered, so the other
+  live, acknowledged hubs get it in turn, each at most once and within the caller's remaining
+  timeout; if all decline, the last `NO_HANDLER` comes back at once, with no extra delay. A keyed
+  command moves too (its preferred hub has no handler, so affinity cannot be kept anyway), in
+  rendezvous order. This is what keeps a single owner instance reachable while it is deregistered on
+  one hub, e.g. during a [client certificate rotation](#authenticating-with-a-client-certificate-mtls)
+  of the owner. It does not depend on the opt-in retry policy, which may still retry `NoHandler`
+  afterwards by its own rules.
 - **Permits.** A stream offers `ceil(max_concurrent_handlers / N)` permits, N being the hubs live
   when its `Register` is written, itself included (a hub still on its first connect attempt counts
   as live, so hubs that start together split from the start). When N shrinks from N_old to N_new

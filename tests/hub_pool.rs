@@ -918,3 +918,88 @@ async fn a_failed_resolution_keeps_the_current_hubs() {
     assert_eq!(a.connected_clients().await, 1);
     c.shutdown().await;
 }
+
+fn no_handler(req: &proto::Request) -> ServerMessage {
+    ServerMessage {
+        message: Some(server_message::Message::Error(proto::Error {
+            request_id: req.id.clone(),
+            code: proto::ErrorCode::NoHandler as i32,
+            message: format!("no handler for {}", req.r#type),
+            details: vec![],
+        })),
+    }
+}
+
+/// A hub that has no owner for any type.
+async fn without_owner(id: &str) -> FakeHub {
+    let hub = FakeHub::start_with_id(id).await;
+    hub.set_responder(|req| Some(no_handler(&req))).await;
+    hub
+}
+
+/// A single owner instance is registered on hub B only (or deregistered on hub A, as during a
+/// certificate rollover): a send whose routing picks hub A gets `NO_HANDLER` there, which means
+/// the request was never delivered, so it goes to hub B, and succeeds.
+#[tokio::test]
+async fn no_handler_from_one_hub_fails_over_to_the_other_live_hubs() {
+    let (a, b) = (without_owner("hub-a").await, answering("hub-b").await);
+    let c = client(settings(addresses(&[&a, &b]))).await;
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    for _ in 0..6 {
+        c.sender
+            .send_command(&Ping {}, SendOptions::default())
+            .await
+            .expect("hub-b can deliver");
+    }
+    assert!(
+        a.requests().await.len() >= 2,
+        "round robin never picked hub-a"
+    );
+    assert_eq!(b.requests().await.len(), 6, "every command ends on hub-b");
+    // A keyed command whose preferred hub has no handler: affinity cannot be kept, it moves too.
+    let key = (0..)
+        .map(|i| format!("agg-{i}"))
+        .find(|k| rendezvous_score("hub-a", k) > rendezvous_score("hub-b", k))
+        .unwrap();
+    c.sender
+        .send_command(
+            &Ping {},
+            SendOptions {
+                routing_key: Some(key),
+                ..SendOptions::default()
+            },
+        )
+        .await
+        .expect("a keyed command fails over as well");
+    // A query, the same.
+    c.sender
+        .send_query(&Look {}, SendOptions::default())
+        .await
+        .expect("a query fails over");
+    c.shutdown().await;
+}
+
+/// With no owner on any hub the answer is the last `NO_HANDLER`, at once: each hub is tried once.
+#[tokio::test]
+async fn with_no_owner_anywhere_every_hub_is_tried_once_and_no_handler_comes_back_promptly() {
+    let (a, b) = (without_owner("hub-a").await, without_owner("hub-b").await);
+    let c = client(settings(addresses(&[&a, &b]))).await;
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    for round in 1..=3usize {
+        let started = std::time::Instant::now();
+        let error = c
+            .sender
+            .send_command(&Ping {}, SendOptions::default())
+            .await
+            .expect_err("nobody handles it");
+        assert!(matches!(error, MessagingError::NoHandler(_)), "{error:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(a.requests().await.len(), round, "hub-a tried once per send");
+        assert_eq!(b.requests().await.len(), round, "hub-b tried once per send");
+    }
+    c.shutdown().await;
+}

@@ -1671,11 +1671,23 @@ impl Sender {
         // replaces it (new stream, new channel: a late Disconnected of the failed stream finds
         // nothing of it); when no hub takes the write it is removed (never written).
         let mut moves = 0;
+        // Hubs that answered `NO_HANDLER` (the request was never delivered there), and the last such
+        // answer: the other live hubs get the request in turn, each at most once, within `chosen`.
+        let started = tokio::time::Instant::now();
+        let mut declined: Vec<String> = Vec::new();
+        let mut no_handler = false;
         loop {
+            let chosen = match (chosen, no_handler) {
+                (Some(c), true) => match c.checked_sub(started.elapsed()) {
+                    Some(left) if !left.is_zero() => Some(left.max(MIN_TIMEOUT)),
+                    _ => return Err(MessagingError::NoHandler(type_name.to_string())),
+                },
+                (c, _) => c,
+            };
             let mut answer = None;
             let sent = self
                 .hubs
-                .send_with(call.routing_key, |stream, handshake| {
+                .send_excluding(call.routing_key, &declined, |stream, handshake| {
                     let (timeout_ms, guard) = request_timing(handshake, type_name, chosen);
                     let (tx, rx) = oneshot::channel();
                     answer = Some(rx);
@@ -1704,16 +1716,26 @@ impl Sender {
                     Ok((msg, guard))
                 })
                 .await;
-            let (guard, rx) = match (sent, answer) {
-                (Ok((_, guard)), Some(rx)) => (guard, rx),
+            let (guard, rx, hub) = match (sent, answer) {
+                (Ok((_, guard, hub)), Some(rx)) => (guard, rx, hub),
                 (Err(e), _) => {
                     self.take(&id);
-                    return Err(e);
+                    // No other hub is left to try: the last `NO_HANDLER` is the answer.
+                    return Err(if no_handler {
+                        MessagingError::NoHandler(type_name.to_string())
+                    } else {
+                        e
+                    });
                 }
                 (Ok(_), None) => unreachable!("a written request was built"),
             };
             // The hub emits TIMEOUT itself; the guard covers a hub that never answers at all.
             match tokio::time::timeout(guard, rx).await {
+                Ok(Ok(Outcome::Done(Err(MessagingError::NoHandler(_))))) => {
+                    tracing::debug!(r#type = type_name, hub = %hub, "no handler on this hub; trying the others");
+                    declined.push(hub);
+                    no_handler = true;
+                }
                 Ok(Ok(Outcome::Done(result))) => return result,
                 Ok(Ok(Outcome::NotWritten)) => {
                     moves += 1;

@@ -434,17 +434,7 @@ impl HubPool {
     /// rendezvous with one. When the write fails or `build` refuses the stream (nothing was
     /// written) the next hub in that order is tried, so `build` may run more than once, each time
     /// for another stream; the last error (`HubUnavailable`, or `build`'s) is returned when no hub
-    /// took it.
-    pub(crate) async fn send_with<T>(
-        &self,
-        routing_key: &str,
-        build: impl FnMut(StreamId, &Handshake) -> Result<(ClientMessage, T), MessagingError>,
-    ) -> Result<(StreamId, T), MessagingError> {
-        self.send_where(routing_key, None, build).await
-    }
-
-    /// [`send_with`](Self::send_with) over the live hubs whose ack lists `capability` only
-    /// (`None`: every live hub). `UnsupportedByHub` when hubs are live but none lists it (nothing
+    /// took it. Over the live hubs whose ack lists `capability` only (`None`: every live hub). `UnsupportedByHub` when hubs are live but none lists it (nothing
     /// was written); `HubUnavailable` when none is live. The hubs are ranked on a snapshot of
     /// their handshakes; `build` sees the handshake of the stream current at the write and should
     /// check the capability again (a hub re-handshaken in between may have lost it).
@@ -470,6 +460,36 @@ impl HubPool {
                 .await
             {
                 Ok(sent) => return Ok(sent),
+                Err(e) => {
+                    tracing::debug!(hub = %conn.address(), "not written, trying the next hub: {e}");
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last
+            .unwrap_or_else(|| MessagingError::HubUnavailable("not connected to the hub".into())))
+    }
+
+    /// Like [`send_where`](Self::send_where) over the live hubs whose address is not in `tried`, which also
+    /// returns the address of the hub that took the write. For a request a hub declined with
+    /// `NO_HANDLER` (it was never delivered): the next hub in the routing order gets it. An error
+    /// (`HubUnavailable`) when no other live hub takes it.
+    pub(crate) async fn send_excluding<T>(
+        &self,
+        routing_key: &str,
+        tried: &[String],
+        mut build: impl FnMut(StreamId, &Handshake) -> Result<(ClientMessage, T), MessagingError>,
+    ) -> Result<(StreamId, T, String), MessagingError> {
+        let mut last = None;
+        for conn in self.ranked(routing_key, None) {
+            if tried.iter().any(|a| a == conn.address()) {
+                continue;
+            }
+            match conn
+                .send_with(|stream, handshake| build(stream, handshake))
+                .await
+            {
+                Ok((stream, extra)) => return Ok((stream, extra, conn.address().to_string())),
                 Err(e) => {
                     tracing::debug!(hub = %conn.address(), "not written, trying the next hub: {e}");
                     last = Some(e);
