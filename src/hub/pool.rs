@@ -37,8 +37,8 @@
 //!   reads the files once per heartbeat period (`HubSettings::heartbeat_interval`). When they hold
 //!   a valid pair that a live connection is not presenting (the content changed), the
 //!   connections are rolled over to it one hub at a time, in target order: the hub is told the
-//!   instance is stopping (a `Register` with no types, and a hub that has another live hub is
-//!   left out of the routing), the pool waits (at most [`ROLL_IDLE_LIMIT`]) for the requests
+//!   instance is stopping (a `Register` with no types; a hub that has another live hub is
+//!   left out of the routing at once, the only hub once its handlers have finished), the pool waits (at most [`ROLL_IDLE_LIMIT`]) for the requests
 //!   written to it and the handlers of its requests to finish, closes the stream gracefully
 //!   (half-close, the hub gets [`SHUTDOWN_CLOSE_TIMEOUT`](super::connection::SHUTDOWN_CLOSE_TIMEOUT)
 //!   to finish), and the connection reconnects with the new pair; only when it is registered again
@@ -978,19 +978,15 @@ impl HubPool {
             tracing::debug!(address = %member.address(), "no stream to deregister on: {e}");
         }
         let deadline = tokio::time::Instant::now() + ROLL_IDLE_LIMIT;
-        tokio::select! {
-            _ = self.cancel.cancelled() => return true,
-            _ = tokio::time::sleep(ROLL_SETTLE) => {}
+        if !self.settle_and_wait_idle(member, deadline).await {
+            return true;
         }
-        while !self.idle(conn) {
-            if tokio::time::Instant::now() >= deadline {
-                tracing::warn!(service = %self.service_name, address = %member.address(), "requests still running after {ROLL_IDLE_LIMIT:?}, closing the hub stream for the certificate rollover anyway");
-                break;
-            }
-            tokio::select! {
-                _ = self.cancel.cancelled() => return true,
-                _ = tokio::time::sleep(DRAIN_POLL) => {}
-            }
+        // The only hub kept taking requests while its handlers finished; now it is out of the
+        // routing, and what was written to it in the meantime is waited for too.
+        if member.change_role(Role::Active, Role::Rolling)
+            && !self.settle_and_wait_idle(member, deadline).await
+        {
+            return true;
         }
         conn.roll_over(stream);
         let deadline = tokio::time::Instant::now() + ROLL_RECONNECT_LIMIT;
@@ -1009,6 +1005,30 @@ impl HubPool {
         member.change_role(Role::Rolling, Role::Active);
         self.changes.send_modify(|n| *n += 1);
         back
+    }
+
+    /// Waits for the requests of `member`'s stream to finish, until `deadline` (logged at `warn`
+    /// when it runs out); false when the pool is shutting down.
+    async fn settle_and_wait_idle(
+        &self,
+        member: &Arc<Member>,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        tokio::select! {
+            _ = self.cancel.cancelled() => return false,
+            _ = tokio::time::sleep(ROLL_SETTLE) => {}
+        }
+        while !self.idle(&member.conn) {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(service = %self.service_name, address = %member.address(), "requests still running after {ROLL_IDLE_LIMIT:?}, closing the hub stream for the certificate rollover anyway");
+                break;
+            }
+            tokio::select! {
+                _ = self.cancel.cancelled() => return false,
+                _ = tokio::time::sleep(DRAIN_POLL) => {}
+            }
+        }
+        true
     }
 
     /// No handler of its requests running and none of our requests written to it unanswered.

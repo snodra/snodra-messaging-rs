@@ -800,3 +800,67 @@ async fn shutdown_stops_watching_the_files() {
     assert_eq!(pool.background_tasks(), 0);
     w.hub.stop();
 }
+
+#[tokio::test]
+async fn with_one_hub_the_roll_has_a_short_gap_that_a_retry_policy_covers() {
+    let w = world(true).await;
+    w.hub.set_responder(|req| Some(ok_reply(&req))).await;
+    let (tls, first) = w.issue("svc", &ClientSpec::service("svc"));
+    let (tx, mut rx) = mpsc::channel::<Inbound>(64);
+    let pool = HubPool::new(
+        settings(w.hub.address(), tls.clone()),
+        "svc".into(),
+        uuid::Uuid::new_v4().to_string(),
+        tx,
+    )
+    .unwrap();
+    let sender = Sender::with_pool(
+        Arc::clone(&pool),
+        SenderSettings {
+            retry: Some(kraken_messaging::RetryPolicy {
+                max_attempts: 5,
+                initial_backoff: Duration::from_millis(30),
+                ..kraken_messaging::RetryPolicy::default()
+            }),
+            ..SenderSettings::default()
+        },
+    );
+    let forward = Arc::clone(&sender);
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            forward.on_inbound(msg);
+        }
+    });
+    pool.start();
+    assert!(pool.await_all_registered(Duration::from_secs(5)).await);
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let failures = Arc::new(Mutex::new(Vec::<String>::new()));
+    let trickle = {
+        let (sender, running, failures) = (
+            Arc::clone(&sender),
+            Arc::clone(&running),
+            Arc::clone(&failures),
+        );
+        tokio::spawn(async move {
+            while running.load(std::sync::atomic::Ordering::SeqCst) {
+                if let Err(e) = sender.send_command(&Ping {}, SendOptions::default()).await {
+                    failures.lock().unwrap().push(e.to_string());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let second = w.renew(&tls, &ClientSpec::service("svc"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pool.auth().certificate.map(|c| c.fingerprint) != Some(second.clone()) {
+        assert!(Instant::now() < deadline, "not rolled over from {first}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    running.store(false, std::sync::atomic::Ordering::SeqCst);
+    trickle.await.unwrap();
+    assert_eq!(*failures.lock().unwrap(), Vec::<String>::new());
+    pool.shutdown().await;
+    w.hub.stop();
+}
