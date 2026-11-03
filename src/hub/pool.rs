@@ -34,22 +34,30 @@
 //!   of ours written to it unanswered, no handler of its requests running), at most
 //!   [`DRAIN_LIMIT`] later. A failed or empty resolution keeps the current hubs.
 //! - **Client certificate rotation** (mutual TLS, P5c). With `hub_tls.client_cert_file` the pool
-//!   reads the files every `HubSettings::certificate_check_interval` (3 s, as the Kotlin client does). When they hold
-//!   a valid pair that a live connection is not presenting (the content changed), the
-//!   connections are rolled over to it one hub at a time, in target order: the hub is told the
-//!   instance is stopping (a `Register` with no types; a hub that has another live hub is
-//!   left out of the routing at once, the only hub once its handlers have finished), the pool waits (at most [`ROLL_IDLE_LIMIT`]) for the requests
-//!   written to it and the handlers of its requests to finish, closes the stream gracefully
-//!   (half-close, the hub gets [`SHUTDOWN_CLOSE_TIMEOUT`](super::connection::SHUTDOWN_CLOSE_TIMEOUT)
-//!   to finish), and the connection reconnects with the new pair; only when it is registered again
-//!   (at most [`ROLL_RECONNECT_LIMIT`]) is the next hub rolled. A pair that does not load (a
-//!   rotation caught half way, a key that is not the certificate's, a certificate for another
-//!   service, an expired one) leaves every connection as it is and is logged at `error` once per
-//!   distinct problem (when it persists for a second period). A hub that does not take the new
-//!   pair back in time stops the rollover (logged at `error`, the other hubs keep what they
-//!   have). A pool with one hub has a short gap: requests written then fail like on any lost
-//!   stream. A certificate with less than a tenth of its lifetime (at most 24 h) left, and no
-//!   renewed file, is warned about once.
+//!   reads the files every `HubSettings::certificate_check_interval` (3 s, as the Kotlin client
+//!   does). When they hold a valid pair (not expired, and past its notBefore) that a live
+//!   connection is not presenting (the content changed), it waits a random delay (uniform in
+//!   `[0, min(certificate_roll_delay_max (30 s), 10 % of the presented certificate's remaining
+//!   validity)]`, once per pair, so replicas that see the renewal together do not all leave the
+//!   routing at once), reads the files again, and rolls the connections over one hub at a time,
+//!   in target order: the hub is told the instance is stopping (a `Register` with no types; a hub
+//!   that has another live hub is left out of the routing at once, the only hub once its handlers
+//!   have finished), the pool waits (at most [`ROLL_IDLE_LIMIT`]) for the requests written to it
+//!   and the handlers of its requests to finish (the streaming queries and subscriptions this
+//!   instance itself consumes are not waited for: they end when their owners decide, and the roll
+//!   cuts them, the consumer sees the loss), closes the stream gracefully (half-close, the hub
+//!   gets [`SHUTDOWN_CLOSE_TIMEOUT`](super::connection::SHUTDOWN_CLOSE_TIMEOUT) to finish, and
+//!   what it sends meanwhile, late replies included, is still handled), and the connection
+//!   reconnects with the new pair; only when it is registered again (at most
+//!   [`ROLL_RECONNECT_LIMIT`]) is the next hub rolled. While no hub is routable only because of
+//!   the roll (a single hub), a send waits for one within its own deadline. A pair that does not
+//!   load (a rotation caught half way, a key that is not the certificate's, a certificate for
+//!   another service, an expired one) leaves every connection as it is and is logged at `error`
+//!   once per distinct problem (when it persists for a second period); one that is not valid yet
+//!   is waited for. A hub that does not take the new pair back in time stops the rollover
+//!   (logged at `error`, the other hubs keep what they have). Requests already written to a hub
+//!   when its stream is closed fail like on any lost stream. A certificate with less than a tenth
+//!   of its lifetime (at most 24 h) left, and no renewed file, is warned about once.
 
 use std::collections::HashMap;
 use std::future::Future;
