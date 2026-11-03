@@ -232,7 +232,8 @@ async fn new_hub_acks_with_its_configured_values_and_applies_type_overrides() {
             "instance-status",
             "scatter-gather",
             "streaming",
-            "subscription"
+            "subscription",
+            "credentials-refresh"
         ],
         "the hub shares what we declared"
     );

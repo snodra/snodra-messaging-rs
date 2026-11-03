@@ -257,7 +257,8 @@ async fn register_declares_protocol_v2_and_client_version() {
             "instance-status",
             "scatter-gather",
             "streaming",
-            "subscription"
+            "subscription",
+            "credentials-refresh"
         ]
     );
     assert_eq!(r.client_version, CLIENT_VERSION);
