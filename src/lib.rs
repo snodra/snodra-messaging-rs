@@ -7,6 +7,7 @@ pub mod codec;
 pub mod config;
 pub mod context;
 pub mod error;
+pub mod external;
 pub mod hub;
 pub mod identity;
 pub mod kafka;

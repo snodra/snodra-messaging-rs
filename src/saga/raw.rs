@@ -58,6 +58,10 @@ pub fn classify_failure(error: &MessagingError) -> RawOutcome {
         MessagingError::InvalidMessage(_) | MessagingError::Serialization(_) => {
             RawOutcome::Permanent(FailureReason::Invalid, message)
         }
+        MessagingError::RetryableExternal(_) => RawOutcome::Transient(message),
+        MessagingError::UnknownOutcome(_) => {
+            RawOutcome::Permanent(FailureReason::UnknownOutcome, message)
+        }
         MessagingError::RemoteHandler { details, .. } => {
             if has_marker(details, RETRYABLE_MARKER) {
                 RawOutcome::Transient(message)

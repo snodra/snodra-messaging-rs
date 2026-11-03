@@ -26,7 +26,7 @@ pub use context::SagaContext;
 pub use definition::{SagaDefinition, SagaType};
 pub use failed::{FailureReason, SagaCommandFailed};
 pub use indexes::{ensure_external_call_indexes, ensure_saga_indexes};
-pub use metrics::{EventOutcome, NoopSagaMetrics, SagaMetrics};
+pub use metrics::{EventOutcome, ExternalOutcome, NoopSagaMetrics, SagaMetrics};
 pub use ports::{SagaPorts, StoreError, Tx};
 pub use raw::{
     LocalFirstSender, LocalRawCommandSender, RETRYABLE_MARKER, RawCommandSender, RawOutcome,

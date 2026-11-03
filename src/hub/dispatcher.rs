@@ -768,16 +768,21 @@ pub(crate) fn invocation_error(type_name: &str, invocation: Invocation) -> Messa
             message,
             details,
         },
+        // An adapter's failure kind travels as a handler error with its marker (ruling 12).
+        Invocation::Handler(
+            e @ (MessagingError::RetryableExternal(_) | MessagingError::UnknownOutcome(_)),
+        ) => MessagingError::RemoteHandler {
+            type_name: type_name.to_string(),
+            message: e.to_string(),
+            details: e.reply_details(),
+        },
         Invocation::Handler(e) => handler_error(e.to_string()),
     }
 }
 
 /// The hub `Error` a handler's failure becomes (inside a `Reply` or a `ReplyEnd`).
 fn hub_error(request_id: &str, e: &MessagingError) -> proto::Error {
-    let (code, details) = match e {
-        MessagingError::RemoteHandler { details, .. } => (ErrorCode::HandlerError, details.clone()),
-        other => (other.to_reply_code(), vec![]),
-    };
+    let (code, details) = (e.to_reply_code(), e.reply_details());
     proto::Error {
         request_id: request_id.to_string(),
         code: code as i32,

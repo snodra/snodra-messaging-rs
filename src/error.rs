@@ -50,6 +50,21 @@ pub enum MessagingError {
     Storage(String),
     #[error("transport error: {0}")]
     Transport(String),
+    /// An adapter's external call failed in a way a later attempt may cure (a timeout, a 503, a
+    /// rate limit): Kotlin's `RetryableExternalException`. Adapters never retry internally; the
+    /// saga relay owns the backoff. It crosses the hub as `HANDLER_ERROR` with the
+    /// [`RETRYABLE_MARKER`](crate::saga::RETRYABLE_MARKER) in `details` (ADR 0021 ruling 12), and an
+    /// idempotent handler resets its call record for it, so the next attempt runs the body.
+    #[error("{0}")]
+    RetryableExternal(String),
+    /// Whether the external system acted is unknown (a connection broke after the request went
+    /// out, or an earlier call of the key crashed mid-way): Kotlin's
+    /// `ExternalCallUnknownOutcomeException`. It crosses the hub as `HANDLER_ERROR` with the
+    /// [`UNKNOWN_OUTCOME_MARKER`](crate::saga::UNKNOWN_OUTCOME_MARKER) in `details`; the relay
+    /// reports it as `SagaCommandFailed(UNKNOWN_OUTCOME)`, and an idempotent handler never calls the
+    /// key's body again (ruling 39).
+    #[error("{0}")]
+    UnknownOutcome(String),
 }
 
 impl MessagingError {
@@ -72,6 +87,17 @@ impl MessagingError {
                 message: message.to_string(),
                 details: details.to_vec(),
             },
+        }
+    }
+
+    /// The `details` a handler's error carries inside a `Reply`: an adapter's failure kind
+    /// (ruling 12), or what a remote handler sent.
+    pub fn reply_details(&self) -> Vec<u8> {
+        match self {
+            Self::RemoteHandler { details, .. } => details.clone(),
+            Self::RetryableExternal(_) => crate::saga::RETRYABLE_MARKER.to_vec(),
+            Self::UnknownOutcome(_) => crate::saga::UNKNOWN_OUTCOME_MARKER.to_vec(),
+            _ => Vec::new(),
         }
     }
 

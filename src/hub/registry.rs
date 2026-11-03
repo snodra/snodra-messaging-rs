@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 use crate::codec;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
+use crate::external::{ExternalCallsHandle, IdempotencyKey};
 use crate::identity::Guard;
 use crate::types::{Command, Event, MessageType, Query, StreamingQuery, SubscriptionQuery};
 
@@ -68,6 +69,8 @@ pub struct HandlerRegistry {
     shared: HashSet<&'static str>,
     events: HashMap<&'static str, Vec<EventHandler>>,
     guards: HashMap<&'static str, Guard>,
+    /// The labels (wire type names) of the idempotent handlers, sorted on read.
+    idempotent: Vec<&'static str>,
 }
 
 impl HandlerRegistry {
@@ -223,6 +226,88 @@ impl HandlerRegistry {
             })
         });
         self.events.entry(E::TYPE).or_default().push(erased);
+    }
+
+    /// An idempotent command handler: an adapter to an external system (ADR 0021 ruling 17; the
+    /// `@IdempotentHandler @CommandHandler` of Rust). Each call is recorded in `external_calls`
+    /// under `key` (by default the `idempotency-key` header the saga relay sets), so a repeat of
+    /// the key never runs `handler` twice: a success replays the stored reply, a failure returns
+    /// the stored error, a [`MessagingError::RetryableExternal`] lets the next call run again, and
+    /// a call that crashed mid-way is an unknown outcome
+    /// ([`MessagingError::UnknownOutcome`]) unless `external_idempotent` says the partner
+    /// de-duplicates by the key (then it is called again after the lease). See
+    /// [`crate::external::calls`]. `calls` is bound by the builder's `start()`; the handler is
+    /// labelled with `C::TYPE` in errors and metrics.
+    ///
+    /// # Panics
+    /// When `C` already has a handler here.
+    pub fn idempotent_command<C, F, Fut>(
+        &mut self,
+        calls: &ExternalCallsHandle,
+        key: IdempotencyKey<C>,
+        external_idempotent: bool,
+        handler: F,
+    ) where
+        C: Command,
+        F: Fn(C, MessageContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<C::Reply, MessagingError>> + Send + 'static,
+    {
+        let calls = calls.clone();
+        let handler = Arc::new(handler);
+        self.command::<C, _, _>(move |command, ctx| {
+            let calls = calls.clone();
+            let handler = Arc::clone(&handler);
+            async move {
+                let label = C::TYPE;
+                let calls = calls.get(label)?;
+                let key = key.resolve(&command, &ctx, label)?;
+                calls
+                    .execute(label, &key, external_idempotent, handler(command, ctx))
+                    .await
+            }
+        });
+        self.idempotent.push(C::TYPE);
+    }
+
+    /// An idempotent event handler (an `@IdempotentHandler @EventHandler`): as
+    /// [`idempotent_command`](Self::idempotent_command), with the event's reply always `()`. Its
+    /// body runs inside stage 1's transaction (ruling 43: a slow external call there holds the
+    /// transaction open, prefer a command handler for those); the call record is written apart, so
+    /// a rolled-back stage 1 does not forget a call that happened and the redelivery replays it.
+    pub fn idempotent_event<E, F, Fut>(
+        &mut self,
+        calls: &ExternalCallsHandle,
+        key: IdempotencyKey<E>,
+        external_idempotent: bool,
+        handler: F,
+    ) where
+        E: Event,
+        F: Fn(E, EventContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), MessagingError>> + Send + 'static,
+    {
+        let calls = calls.clone();
+        let handler = Arc::new(handler);
+        self.event::<E, _, _>(move |event, ctx| {
+            let calls = calls.clone();
+            let handler = Arc::clone(&handler);
+            async move {
+                let label = E::TYPE;
+                let calls = calls.get(label)?;
+                let key = key.resolve(&event, &ctx.message, label)?;
+                calls
+                    .execute(label, &key, external_idempotent, handler(event, ctx))
+                    .await
+            }
+        });
+        self.idempotent.push(E::TYPE);
+    }
+
+    /// The labels (wire type names) of the idempotent handlers registered here, sorted.
+    pub fn idempotent_handlers(&self) -> Vec<String> {
+        let mut labels: Vec<String> = self.idempotent.iter().map(|l| l.to_string()).collect();
+        labels.sort();
+        labels.dedup();
+        labels
     }
 
     /// Opt-in authorization for a registered command or query (the `@RequiresAuthentication` of Rust).

@@ -29,13 +29,17 @@ use tokio_util::task::TaskTracker;
 use crate::config::Config;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
+use crate::external::{ExternalCallSettings, ExternalCalls, ExternalCallsHandle, IdempotencyKey};
 use crate::hub::{
     Dispatcher, EventContext, HandlerRegistry, HubPool, HubSettings, Inbound, QueryUpdateEmitter,
     Sender, SenderSettings, TokenProvider,
 };
 use crate::identity::{Guard, IdentityResolver, JwksVerifier};
 use crate::kafka::{EventBus, EventConsumer, OutboxPublisher, ensure_indexes};
-use crate::saga::{SagaDefinition, SagaType, validate_registrations};
+use crate::saga::{
+    Clock, NoopSagaMetrics, SagaDefinition, SagaType, ensure_external_call_indexes,
+    validate_registrations,
+};
 use crate::types::{Command, Event, MessageType, Query, StreamingQuery, SubscriptionQuery};
 
 /// How long a shutdown waits for the subscriptions' `ReplyEnd`s to be written.
@@ -53,6 +57,8 @@ pub struct KrakenMessagingBuilder {
     emitter: QueryUpdateEmitter,
     /// The saga registrations, checked by `start()`.
     sagas: Vec<Result<SagaType, MessagingError>>,
+    /// What the idempotent handlers record their calls in, bound by `start()`.
+    external_calls: ExternalCallsHandle,
 }
 
 pub struct KrakenMessaging {
@@ -104,6 +110,7 @@ impl KrakenMessaging {
             sender,
             emitter: QueryUpdateEmitter::new(config.hub_max_subscriptions),
             sagas: Vec::new(),
+            external_calls: ExternalCallsHandle::new(),
             config,
         })
     }
@@ -370,6 +377,68 @@ impl KrakenMessagingBuilder {
         self
     }
 
+    /// An idempotent command handler, an adapter to an external system (ADR 0021 ruling 17, the
+    /// `@IdempotentHandler @CommandHandler` of Rust): each call is recorded in `external_calls`
+    /// under `key` (`IdempotencyKey::default()` is the `idempotency-key` header the saga relay
+    /// sets), so a repeat of the key never runs `handler` twice. Return
+    /// [`MessagingError::RetryableExternal`] for a failure a later attempt may cure and
+    /// [`MessagingError::UnknownOutcome`] when the partner may have acted; never retry inside the
+    /// handler (the relay owns the backoff). `external_idempotent`: the partner de-duplicates by
+    /// the key the adapter passes it, so a call that crashed mid-way is called again after the
+    /// lease instead of reporting an unknown outcome. See [`crate::external::calls`].
+    ///
+    /// ```ignore
+    /// builder.idempotent_command::<PrintBanner, _, _>(IdempotencyKey::default(), false, |c, ctx| async move {
+    ///     printer.print(&c.text, &ctx.headers["idempotency-key"]).await
+    /// })
+    /// ```
+    ///
+    /// # Panics
+    /// When `C` already has a handler here.
+    pub fn idempotent_command<C, F, Fut>(
+        mut self,
+        key: IdempotencyKey<C>,
+        external_idempotent: bool,
+        handler: F,
+    ) -> Self
+    where
+        C: Command,
+        F: Fn(C, MessageContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<C::Reply, MessagingError>> + Send + 'static,
+    {
+        self.registry.idempotent_command::<C, F, Fut>(
+            &self.external_calls,
+            key,
+            external_idempotent,
+            handler,
+        );
+        self
+    }
+
+    /// An idempotent event handler (an `@IdempotentHandler @EventHandler`): see
+    /// [`idempotent_command`](Self::idempotent_command). Its body runs inside the ordinary
+    /// handlers' transaction (ruling 43), so a slow external call holds it open: prefer a command
+    /// handler for slow calls.
+    pub fn idempotent_event<E, F, Fut>(
+        mut self,
+        key: IdempotencyKey<E>,
+        external_idempotent: bool,
+        handler: F,
+    ) -> Self
+    where
+        E: Event,
+        F: Fn(E, EventContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), MessagingError>> + Send + 'static,
+    {
+        self.registry.idempotent_event::<E, F, Fut>(
+            &self.external_calls,
+            key,
+            external_idempotent,
+            handler,
+        );
+        self
+    }
+
     /// Opt-in authorization for a command or query registered before this call.
     pub fn requires<M: MessageType>(mut self, guard: Guard) -> Self {
         self.registry.requires::<M>(guard);
@@ -417,10 +486,20 @@ impl KrakenMessagingBuilder {
             sender,
             emitter,
             sagas,
+            external_calls,
         } = self;
         // Definition errors first: nothing is connected or created for a saga that cannot run.
         let _sagas = validate_registrations(sagas)?;
         ensure_indexes(&db, config.outbox_retention, config.idempotency_retention).await?;
+        if !registry.idempotent_handlers().is_empty() {
+            ensure_external_call_indexes(&db, Duration::from_secs(30 * 86_400)).await?;
+            external_calls.bind(ExternalCalls::new(
+                db.clone(),
+                Clock::system(),
+                ExternalCallSettings::default(),
+                Arc::new(NoopSagaMetrics),
+            )?);
+        }
         let registry = Arc::new(registry);
         let verifier = match (&config.jwks_url, &config.issuer) {
             (Some(url), Some(issuer)) => Some(JwksVerifier::new(url.clone(), issuer.clone())),

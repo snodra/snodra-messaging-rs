@@ -16,6 +16,35 @@ pub enum EventOutcome {
     Parked,
 }
 
+/// How one call of an idempotent handler ended (`kraken_external_calls_total{handler,outcome}`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExternalOutcome {
+    /// The body ran and succeeded.
+    Succeeded,
+    /// The stored reply of an earlier success was returned.
+    Replayed,
+    /// The body failed for good (stored; later calls fail the same way), or a stored failure was
+    /// returned again.
+    Failed,
+    /// The body asked for a later attempt, or another call of the same key was in flight.
+    Retryable,
+    /// An earlier call crashed and its outcome is unknown, or the adapter said so itself.
+    Unknown,
+}
+
+impl ExternalOutcome {
+    /// The tag value, as Kotlin's (`succeeded`, `replayed`, `failed`, `retryable`, `unknown`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExternalOutcome::Succeeded => "succeeded",
+            ExternalOutcome::Replayed => "replayed",
+            ExternalOutcome::Failed => "failed",
+            ExternalOutcome::Retryable => "retryable",
+            ExternalOutcome::Unknown => "unknown",
+        }
+    }
+}
+
 pub trait SagaMetrics: Send + Sync {
     fn saga_started(&self, _saga_type: &str) {}
     fn saga_ended(&self, _saga_type: &str) {}
@@ -27,6 +56,9 @@ pub trait SagaMetrics: Send + Sync {
     /// The SCHEDULED deadlines past their due time after a scheduler poll, per deadline name
     /// (empty when none): `kraken_deadlines_due{name}`.
     fn deadlines_overdue(&self, _by_name: &HashMap<String, u64>) {}
+
+    /// How one call of the idempotent handler `handler` (its message's wire type name) ended.
+    fn external_call(&self, _handler: &str, _outcome: ExternalOutcome) {}
 
     /// A `SagaCommandFailed` for `command_type` reached no saga or handler (or could not be
     /// delivered): logged at error, `kraken_saga_command_failures_total`.
