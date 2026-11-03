@@ -827,6 +827,47 @@ async fn a_refreshed_token_goes_to_the_hubs_that_offer_credentials_refresh_and_t
 }
 
 #[tokio::test]
+async fn a_renewal_published_before_the_register_ack_is_sent_right_after_the_ack() {
+    let idp = Idp::start("svc", SECRET).await;
+    let hub = FakeHub::start().await;
+    jwt_hub_acl(&hub);
+    hub.set_ack(Some(support::fake_hub::default_ack()));
+    hub.set_credentials_refresh(true);
+    hub.set_ack_delay(Duration::from_millis(1200));
+    let provider = provider(&idp);
+    let conn = connection(jwt_settings(hub.address(), &provider), "svc");
+    conn.start();
+    wait_for_registers(&hub, 1).await;
+    let registered_with = jwt_of(&hub.registers().await[0]).unwrap();
+
+    // The Register is out, the ack is not: the provider publishes a new token now. The stream
+    // cannot send it yet (it does not know that the hub takes refreshes).
+    let renewed = provider.refresh().await.unwrap();
+    assert_ne!(renewed.value().expose(), registered_with);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(conn.handshake().is_none(), "the ack is still held back");
+    assert!(hub.refreshes().is_empty());
+
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    until("the renewal after the ack", Duration::from_secs(3), || {
+        !hub.refreshes().is_empty()
+    })
+    .await;
+    let refreshes = hub.refreshes();
+    assert_eq!(refreshes.len(), 1);
+    assert_eq!(
+        refreshes[0].1.kind,
+        Some(proto::credentials::Kind::Jwt(
+            renewed.value().expose().to_string()
+        )),
+        "the token published during the handshake, not the one the stream registered with"
+    );
+    assert_eq!(hub.registers().await.len(), 1, "no reconnect");
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
 async fn a_new_stream_after_a_refresh_registers_with_the_new_token() {
     let idp = Idp::start("svc", SECRET).await;
     idp.set_lifetime(6);

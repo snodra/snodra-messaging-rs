@@ -106,7 +106,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use kraken_messaging::proto::hub_server::{Hub, HubServer};
@@ -409,6 +409,8 @@ pub struct State {
     cancels: StdMutex<Vec<(usize, proto::Cancel)>>,
     /// The JWKS is loaded: JWT `Register`s are judged (else `UNAVAILABLE`).
     jwks_loaded: AtomicBool,
+    /// How long the `RegisterAck` is held back after the `Register` was recorded (milliseconds).
+    ack_delay_ms: AtomicU64,
     /// While set, every JWT `Register` and refresh is refused with this status (the hub judging the
     /// token: "token expired", "unknown signing key", ...).
     jwt_refusal: StdMutex<Option<(tonic::Code, String)>>,
@@ -1911,6 +1913,10 @@ impl Hub for Service {
                                     }
                                     ack
                                 });
+                                let delay = state.ack_delay_ms.load(Ordering::SeqCst);
+                                if delay > 0 {
+                                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                                }
                                 if let (true, Some(ack)) = (v2, ack) {
                                     let msg = ServerMessage { message: Some(server_message::Message::RegisterAck(ack)) };
                                     if tx.send(Ok(msg)).await.is_err() { break; }
@@ -2118,6 +2124,7 @@ impl FakeHub {
             cancels: StdMutex::new(vec![]),
             refreshes: StdMutex::new(vec![]),
             jwks_loaded: AtomicBool::new(true),
+            ack_delay_ms: AtomicU64::new(0),
             jwt_refusal: StdMutex::new(None),
             close_with: StdMutex::new(None),
             credentials_refresh: AtomicBool::new(false),
@@ -2373,6 +2380,14 @@ impl FakeHub {
     pub fn drop_streams(&self) {
         *self.state.close_with.lock().unwrap() = None;
         let _ = self.state.drop_tx.send(());
+    }
+
+    /// Holds the `RegisterAck` back by `delay` after the `Register` was recorded (a slow hub: the
+    /// client's registration is in flight, the handshake not complete).
+    pub fn set_ack_delay(&self, delay: Duration) {
+        self.state
+            .ack_delay_ms
+            .store(delay.as_millis() as u64, Ordering::SeqCst);
     }
 
     /// Ends every open stream with `code` and `message` (a hub closing a session: "credentials
