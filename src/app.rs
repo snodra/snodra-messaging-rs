@@ -141,8 +141,9 @@ impl KrakenMessaging {
     }
 
     /// How this instance authenticates to the hubs: `none`, a static `token` or a `jwt`
-    /// (Keycloak client credentials, ADR 0019), the current access token's expiry and the last
-    /// token fetch error.
+    /// (Keycloak client credentials, ADR 0019), the current access token's expiry, the last
+    /// token fetch error and the token fetch counts by result
+    /// (`kraken_messaging_hub_token_fetches_total{result}`).
     pub fn hub_auth(&self) -> crate::hub::AuthStatus {
         self.hubs.auth()
     }

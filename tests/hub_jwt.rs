@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kraken_messaging::hub::{
-    AuthKind, FetchResult, HubConnection, HubPool, HubSettings, Inbound, TokenProvider,
+    AuthKind, FetchResult, HubConnection, HubPool, HubSettings, Inbound, TokenProvider, TokenStats,
 };
 use kraken_messaging::proto::{self, ClientMessage, client_message};
 use kraken_messaging::{HubOAuth2, SecretString};
@@ -1160,5 +1160,41 @@ async fn the_auth_status_names_the_kind_the_expiry_and_the_last_fetch_error() {
     idp.set_mode(Mode::Status(503));
     provider.refresh().await.expect_err("503");
     assert!(jwt.auth().last_error.unwrap().contains("503"));
+    hub.stop();
+}
+
+#[tokio::test]
+async fn the_auth_status_carries_the_token_fetch_counts() {
+    let hub = FakeHub::start().await;
+    let token = connection(
+        HubSettings {
+            address: hub.address(),
+            token: Some(SecretString::new("t")),
+            ..HubSettings::default()
+        },
+        "svc",
+    );
+    assert_eq!(token.auth().token_fetches, TokenStats::default());
+
+    let idp = Idp::start("svc", SECRET).await;
+    let provider = provider(&idp);
+    let pool_side = connection(jwt_settings(hub.address(), &provider), "svc");
+    assert_eq!(pool_side.auth().token_fetches, TokenStats::default());
+    provider.token().await.unwrap();
+    idp.set_mode(Mode::Status(503));
+    provider.refresh().await.expect_err("503");
+    idp.set_mode(Mode::OAuthError(401, "invalid_client", "nope"));
+    provider.refresh().await.expect_err("401");
+    let counts = pool_side.auth().token_fetches;
+    assert_eq!(
+        counts,
+        TokenStats {
+            ok: 1,
+            http_error: 1,
+            oauth_error: 1,
+            ..TokenStats::default()
+        }
+    );
+    assert_eq!(counts, provider.stats());
     hub.stop();
 }

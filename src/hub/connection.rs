@@ -71,7 +71,7 @@ use crate::proto::{
 use crate::retry::{jittered, random_unit};
 use crate::security::{HubTls, SecretString};
 
-use super::auth::{AccessToken, AuthKind, AuthStatus, TokenProvider};
+use super::auth::{AccessToken, AuthKind, AuthStatus, TokenProvider, TokenStats};
 use super::tls;
 
 /// The hub protocol version this client speaks (`Register.protocol_version`).
@@ -827,7 +827,7 @@ impl HubConnection {
     }
 
     /// How this connection authenticates: the kind, and for a JWT the expiry of the current
-    /// access token and the last token fetch error.
+    /// access token, the last token fetch error and the fetch counts.
     pub fn auth(&self) -> AuthStatus {
         Self::auth_of(&self.settings)
     }
@@ -847,6 +847,7 @@ impl HubConnection {
             },
             token_expires_at: None,
             last_error: None,
+            token_fetches: TokenStats::default(),
         }
     }
 

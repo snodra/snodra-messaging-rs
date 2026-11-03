@@ -247,6 +247,9 @@ pub struct AuthStatus {
     pub token_expires_at: Option<SystemTime>,
     /// The last token fetch error (clipped), cleared by the next success (`Jwt` only).
     pub last_error: Option<String>,
+    /// Token fetches so far by result (`Jwt` only; all zero otherwise): the library's counterpart
+    /// of `kraken_messaging_hub_token_fetches_total{result}`.
+    pub token_fetches: TokenStats,
 }
 
 /// The wall clock the provider reads (replaceable in tests).
@@ -436,6 +439,7 @@ impl TokenProvider {
             kind: AuthKind::Jwt,
             token_expires_at: self.cached().map(|t| t.expires_at),
             last_error: self.last_error.lock().unwrap().clone(),
+            token_fetches: self.stats(),
         }
     }
 

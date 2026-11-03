@@ -723,6 +723,16 @@ hub closes a JWT session `KRAKEN_HUB_JWT_EXPIRY_GRACE`, 30 s, after `exp` otherw
 whose hub does not offer the capability gets nothing; its next reconnect uses the new token. A failed
 background refresh keeps the current token and retries after 1 s, 2 s ... 30 s.
 
+A token is fresh only while both the monotonic clock and the **wall clock** say more than its margin
+remains (the monotonic clocks, `Instant` and tokio's timers, stand still while a laptop sleeps, so a
+service waking after `exp` would otherwise keep serving its cached token), and the refresh loop wakes
+at least every 30 s to look at the wall clock again. A stream the hub ends with `UNAUTHENTICATED` (a
+`Register` or refresh refused, or a later close: "token expired", "unknown signing key", "credentials
+expired") retires the access token it used, so the next stream fetches a new one; `PERMISSION_DENIED`
+(wrong `azp`, no ACL entry) does not, because a new token would not help and the IdP is not to be
+hammered. `KrakenMessaging::shutdown()` closes the provider (`TokenProvider::close`): the refresh loop
+ends and no further request reaches the IdP even if a `Sender` is still held.
+
 If no token can be had (the endpoint answers 401 `invalid_client`, is unreachable or misbehaves) the
 stream is **not opened**: `last_rejection()` reads `no access token for <service> (<instance>):
 <what the endpoint said>` (clipped to 200 characters; distinguishable from a hub refusal), it is logged
@@ -730,11 +740,13 @@ at `error` once per distinct message and then at `debug`, and the attempt is ret
 reconnect backoff, so a recovered endpoint is used at once. A hub that has not loaded its JWKS yet
 answers `UNAVAILABLE` "jwks not loaded yet": an ordinary retry, not a logged rejection.
 
-The client secret and the tokens never appear in logs, errors or `Debug` output. For what is
+The client secret and the tokens never appear in logs, errors or `Debug` output (an endpoint that echoes the
+`Authorization` header or the secret in its error text has them masked as `***`). For what is
 running, `KrakenMessaging::hub_auth()` (also `HubPool::auth()`, `HubConnection::auth()`) gives the
-`AuthKind` (`none`, `token`, `jwt`), the current token's expiry and the last token fetch error;
-`TokenProvider::stats()` counts fetches by result (`ok`, `http_error`, `oauth_error`, `io_error`,
-`bad_response`) and `hub_credentials_refreshes_sent()` the refreshes written. This crate has no
+`AuthKind` (`none`, `token`, `jwt`), the current token's expiry, the last token fetch error and
+`token_fetches`, the fetch counts by result (`ok`, `http_error`, `oauth_error`, `io_error`,
+`bad_response`; also `TokenProvider::stats()`); `hub_credentials_refreshes_sent()` counts the
+refreshes written. This crate has no
 metrics registry, so these counters stand in for `kraken_messaging_hub_token_fetches_total{result}`
 and `kraken_messaging_hub_credentials_refreshes_sent_total`. A static token session whose
 `KRAKEN_HUB_TOKEN_FILE` changes also sends a refresh (checked once per heartbeat) on streams that
@@ -762,7 +774,7 @@ time, and for a token against the P4c hub in `tests/hub_compat.rs`. JWT authenti
 at test time, and the fake hub, which accepts a JWT without verifying it, offers `credentials-refresh`
 and records refreshes) and in `tests/e2e_jwt.rs` against `kraken-hub:dev` (`KRAKEN_HUB_IMAGE`) in
 `enforce` with a `[[service]]` ACL entry, 2 s expiry grace and no leeway: the JWKS is served to the
-hub by a small busybox container on the bridge network and tokens live 6 s, so the session
+hub by a small container (the official `busybox` image's `httpd`) on the bridge network and tokens live 6 s, so the session
 surviving past `exp` plus the grace proves the refresh.
 
 ## Upgrading
