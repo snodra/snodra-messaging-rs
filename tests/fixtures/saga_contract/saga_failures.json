@@ -1,0 +1,13 @@
+{
+  "_id": "PaymentSaga:evt-9",
+  "_class": "io.damoreira.kraken.messaging.saga.SagaFailureDocument",
+  "sagaType": "PaymentSaga",
+  "eventId": "evt-9",
+  "eventType": "examples.OrderPlaced",
+  "payload": "{\"orderId\":\"o-9\"}",
+  "headers": {"correlationId": "corr-9", "userId": "u-1"},
+  "error": "IllegalStateException: boom",
+  "attempts": 2,
+  "firstFailedAt": {"$date": "2026-11-03T10:10:00Z"},
+  "lastFailedAt": {"$date": "2026-11-03T10:10:00.100Z"}
+}

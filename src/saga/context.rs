@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
 
+use super::store::DispatchKind;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
 use crate::types::{Command, Event};
@@ -13,14 +14,6 @@ use crate::types::{Command, Event};
 /// Entries of one saga handling take `seq = version * SEQ_STRIDE + index`, so the index must stay
 /// below it (ruling 6: at most 999 messages per handling).
 pub(crate) const SEQ_STRIDE: i64 = 1000;
-
-/// Whether a `saga_dispatch` entry is a command (through the hub or the service's own handler) or
-/// an event (through the outbox).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DispatchKind {
-    Command,
-    Event,
-}
 
 /// A command or event a handler recorded; the runtime turns it into a `saga_dispatch` entry.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -12,12 +12,16 @@
 mod context;
 mod definition;
 mod failed;
+mod indexes;
+pub mod store;
 
 pub use context::SagaContext;
 pub use definition::SagaDefinition;
 pub use failed::{FailureReason, SagaCommandFailed};
+pub use indexes::{ensure_external_call_indexes, ensure_saga_indexes};
 
-pub(crate) use context::{AssociationChange, DeadlineOp, DispatchKind, Effects, RecordedDispatch};
+pub(crate) use context::{AssociationChange, DeadlineOp, Effects, RecordedDispatch};
 pub(crate) use definition::{
     ErasedDeadlineHandler, ErasedHandler, SagaType, ValueSource, validate_registrations,
 };
+pub(crate) use store::DispatchKind;

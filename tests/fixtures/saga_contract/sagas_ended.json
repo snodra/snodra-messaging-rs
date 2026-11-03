@@ -1,0 +1,12 @@
+{
+  "_id": "0b9a8c52-77a1-4d5b-8f0e-52c7d1e0a001",
+  "_class": "io.damoreira.kraken.messaging.saga.SagaDocument",
+  "type": "PaymentSaga",
+  "state": "{}",
+  "associations": [],
+  "ended": true,
+  "endedAt": {"$date": "2026-11-03T11:00:00Z"},
+  "version": {"$numberLong": "0"},
+  "createdAt": {"$date": "2026-11-03T10:00:00Z"},
+  "updatedAt": {"$date": "2026-11-03T11:00:00Z"}
+}

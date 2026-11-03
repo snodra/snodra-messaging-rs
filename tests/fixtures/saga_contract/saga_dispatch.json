@@ -1,0 +1,20 @@
+{
+  "_id": "7f6c1f0e-5a53-4f3e-9a0a-1d2f6f0c9b11:3001",
+  "_class": "io.damoreira.kraken.messaging.saga.SagaDispatchDocument",
+  "sagaId": "7f6c1f0e-5a53-4f3e-9a0a-1d2f6f0c9b11",
+  "seq": {"$numberLong": "3001"},
+  "kind": "COMMAND",
+  "type": "examples.PrintBanner",
+  "payload": "{\"jobId\":\"j-1\",\"text\":\"hello\"}",
+  "headers": {"correlation-id": "corr-1"},
+  "routingKey": "j-1",
+  "createdAt": {"$date": "2026-11-03T10:05:00Z"},
+  "attempts": 10,
+  "nextAttemptAt": {"$date": "2026-11-03T10:06:00Z"},
+  "failedAt": {"$date": "2026-11-03T10:06:01Z"},
+  "failureReason": "UNKNOWN_OUTCOME",
+  "failureMessage": "the printer hung up",
+  "noticePending": true,
+  "noticeAttempts": 2,
+  "noticeNextAt": {"$date": "2026-11-03T10:06:30Z"}
+}
