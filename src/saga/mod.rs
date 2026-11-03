@@ -19,6 +19,7 @@ mod raw;
 mod relay;
 mod retry;
 mod runtime;
+pub mod stats;
 pub mod store;
 
 pub use clock::{Clock, ManualClock};
@@ -38,5 +39,6 @@ pub use failures::SagaFailures;
 pub use relay::{RelaySettings, SagaDispatchRelay};
 pub use retry::SagaRetry;
 pub use runtime::SagaRuntime;
+pub use stats::SagaStats;
 
 pub(crate) use definition::validate_registrations;

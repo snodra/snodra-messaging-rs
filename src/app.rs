@@ -44,7 +44,7 @@ use crate::kafka::{
     EventBus, EventConsumer, LocalEventDispatcher, NoSagas, OutboxPublisher, ensure_indexes,
 };
 use crate::saga::{
-    Clock, NoopSagaMetrics, SagaDefinition, SagaType, ensure_external_call_indexes,
+    Clock, SagaDefinition, SagaStats, SagaType, ensure_external_call_indexes,
     validate_registrations,
 };
 use crate::types::{Command, Event, MessageType, Query, StreamingQuery, SubscriptionQuery};
@@ -68,6 +68,8 @@ pub struct KrakenMessagingBuilder {
     external_calls: ExternalCallsHandle,
     /// The partner topics, consumed from `start()`.
     sources: Vec<SourceRegistration>,
+    /// What the runtime, relay, scheduler and idempotent handlers report to.
+    stats: SagaStats,
 }
 
 pub struct KrakenMessaging {
@@ -82,6 +84,7 @@ pub struct KrakenMessaging {
     tasks: Vec<JoinHandle<()>>,
     handlers: TaskTracker,
     ingress: ExternalEventIngress,
+    stats: SagaStats,
 }
 
 impl KrakenMessaging {
@@ -122,6 +125,7 @@ impl KrakenMessaging {
             sagas: Vec::new(),
             external_calls: ExternalCallsHandle::new(),
             sources: Vec::new(),
+            stats: SagaStats::new(),
             config,
         })
     }
@@ -172,6 +176,13 @@ impl KrakenMessaging {
     /// ```
     pub fn ingress(&self) -> ExternalEventIngress {
         self.ingress.clone()
+    }
+
+    /// The saga, deadline, dispatch and external-call statistics (S2-R7): the Kotlin meters'
+    /// names and labels as counters and gauges, see [`SagaStats`] and
+    /// [`crate::saga::stats`]. All zero in a service without sagas or idempotent handlers.
+    pub fn saga_stats(&self) -> SagaStats {
+        self.stats.clone()
     }
 
     pub fn instance_id(&self) -> &str {
@@ -548,6 +559,7 @@ impl KrakenMessagingBuilder {
             sagas,
             external_calls,
             sources,
+            stats,
         } = self;
         // Definition errors first: nothing is connected or created for a saga that cannot run.
         let _sagas = validate_registrations(sagas)?;
@@ -561,7 +573,7 @@ impl KrakenMessagingBuilder {
                 db.clone(),
                 Clock::system(),
                 ExternalCallSettings::default(),
-                Arc::new(NoopSagaMetrics),
+                Arc::new(stats.clone()),
             )?);
         }
         let registry = Arc::new(registry);
@@ -672,6 +684,7 @@ impl KrakenMessagingBuilder {
             tasks,
             handlers,
             ingress,
+            stats,
         })
     }
 }
