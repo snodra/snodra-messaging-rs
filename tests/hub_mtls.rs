@@ -864,3 +864,26 @@ async fn with_one_hub_the_roll_has_a_short_gap_that_a_retry_policy_covers() {
     pool.shutdown().await;
     w.hub.stop();
 }
+
+#[tokio::test]
+async fn a_renewed_pair_is_not_rolled_to_before_its_not_before() {
+    let w = world(true).await;
+    let (tls, first) = w.issue("svc", &ClientSpec::service("svc"));
+    let c = client(settings(w.hub.address(), tls.clone())).await;
+    assert!(c.pool.await_all_registered(Duration::from_secs(5)).await);
+    c.presenting(&first).await;
+    // A renewal whose validity starts in 3 s (the issuer's clock runs ahead, or a pre-issued pair).
+    let second = w.renew(
+        &tls,
+        &ClientSpec::service("svc").starting_in(Duration::from_secs(3)),
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // Still the first pair on the first stream: nothing closed, nothing re-registered.
+    assert_eq!(w.hub.events().len(), 1, "{:?}", w.hub.events());
+    assert_eq!(c.pool.auth().certificate.unwrap().fingerprint, first);
+    // Valid now: it is rolled to.
+    c.presenting_within(&second, Duration::from_secs(10)).await;
+    assert_eq!(c.pool.auth().certificate.unwrap().rotations, 1);
+    c.shutdown().await;
+    w.hub.stop();
+}

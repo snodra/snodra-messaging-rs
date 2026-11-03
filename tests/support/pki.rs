@@ -79,6 +79,12 @@ impl ClientSpec {
         }
     }
 
+    /// Not valid yet: valid from `delay` from now.
+    pub fn starting_in(mut self, delay: std::time::Duration) -> Self {
+        self.not_before = time::OffsetDateTime::now_utc() + delay;
+        self
+    }
+
     /// Valid from an hour ago for `lifetime` from now.
     pub fn living(mut self, lifetime: std::time::Duration) -> Self {
         self.not_after = time::OffsetDateTime::now_utc() + lifetime;

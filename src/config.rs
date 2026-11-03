@@ -472,7 +472,7 @@ impl Config {
         let invalid = |e: crate::hub::LoadError| MessagingError::InvalidMessage(e.to_string());
         let identity =
             crate::hub::load_client_certificate(cert, key, &self.service_name).map_err(invalid)?;
-        crate::hub::check_not_expired(&identity, std::time::SystemTime::now()).map_err(invalid)
+        crate::hub::check_valid_at(&identity, std::time::SystemTime::now()).map_err(invalid)
     }
 
     fn validate_oauth2(&self, oauth2: &HubOAuth2) -> Result<(), MessagingError> {

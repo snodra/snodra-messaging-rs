@@ -157,6 +157,8 @@ struct CertificateWatch {
     warned: Option<String>,
     /// The digest of the pair a hub did not take back in time: not tried again until it changes.
     refused: Option<[u8; 32]>,
+    /// The digest of the pair that is not valid yet (logged once).
+    waiting: Option<[u8; 32]>,
 }
 
 pub struct HubPool {
@@ -886,23 +888,31 @@ impl HubPool {
             return;
         };
         let now = SystemTime::now();
-        let disk = mtls::load(cert_file, key_file, &self.service_name).and_then(|identity| {
-            mtls::check_not_expired(&identity, now)?;
-            Ok(identity)
-        });
-        let disk = match disk {
-            Ok(identity) => {
-                self.certificate.lock().unwrap().problem = None;
-                Some(identity)
-            }
+        // A pair that is not valid yet is not adopted (the hub would refuse its handshake):
+        // the roll waits for its notBefore; it still counts as a renewal on disk.
+        let (disk, valid) = match mtls::load(cert_file, key_file, &self.service_name) {
+            Ok(identity) => match mtls::check_valid_at(&identity, now) {
+                Ok(()) => (Some(identity), true),
+                Err(mtls::LoadError::NotYetValid(reason)) => {
+                    self.note_waiting_for_validity(&identity, &reason);
+                    (Some(identity), false)
+                }
+                Err(e) => {
+                    self.note_certificate_problem(e.message());
+                    (None, false)
+                }
+            },
             Err(e) => {
                 self.note_certificate_problem(e.message());
-                None
+                (None, false)
             }
         };
+        if disk.is_some() {
+            self.certificate.lock().unwrap().problem = None;
+        }
         let live = self.live();
         self.warn_near_expiry(&live, disk.as_ref(), cert_file, now);
-        let Some(disk) = disk else {
+        let Some(disk) = disk.filter(|_| valid) else {
             return;
         };
         {
@@ -929,6 +939,15 @@ impl HubPool {
                 tracing::error!(service = %self.service_name, address = %member.address(), fingerprint = %disk.fingerprint, "the hub did not register again with the renewed client certificate in time; the other hubs keep the certificate they have until the files change again");
                 return;
             }
+        }
+    }
+
+    /// A renewed pair that is not valid yet is waited for: logged at `info` once per pair.
+    fn note_waiting_for_validity(&self, identity: &ClientIdentity, reason: &str) {
+        let mut watch = self.certificate.lock().unwrap();
+        if watch.waiting != Some(identity.digest) {
+            watch.waiting = Some(identity.digest);
+            tracing::info!(service = %self.service_name, reason, "the renewed client certificate is not valid yet; the connections keep the one they present until it is");
         }
     }
 

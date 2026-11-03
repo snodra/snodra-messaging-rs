@@ -62,12 +62,17 @@ pub(crate) enum LoadError {
     WrongService(String),
     /// The leaf's validity has ended.
     Expired(String),
+    /// The leaf's validity has not begun.
+    NotYetValid(String),
 }
 
 impl LoadError {
     pub fn message(&self) -> &str {
         match self {
-            LoadError::Unusable(m) | LoadError::WrongService(m) | LoadError::Expired(m) => m,
+            LoadError::Unusable(m)
+            | LoadError::WrongService(m)
+            | LoadError::Expired(m)
+            | LoadError::NotYetValid(m) => m,
         }
     }
 }
@@ -231,11 +236,18 @@ fn load_pair(cert_file: &Path, key_file: &Path) -> Result<ClientIdentity, String
     })
 }
 
-/// [`LoadError::Expired`] when the leaf of `identity` has expired at `now`.
-pub(crate) fn check_not_expired(
-    identity: &ClientIdentity,
-    now: SystemTime,
-) -> Result<(), LoadError> {
+/// [`LoadError::Expired`] when the leaf of `identity` has expired at `now`,
+/// [`LoadError::NotYetValid`] when its validity has not begun.
+pub(crate) fn check_valid_at(identity: &ClientIdentity, now: SystemTime) -> Result<(), LoadError> {
+    if now < identity.not_before {
+        let begins: chrono::DateTime<chrono::Utc> = identity.not_before.into();
+        return Err(LoadError::NotYetValid(format!(
+            "the client certificate {} ({}) is not valid before {}",
+            identity.fingerprint,
+            identity.service,
+            begins.format("%Y-%m-%dT%H:%M:%SZ")
+        )));
+    }
     if now < identity.not_after {
         return Ok(());
     }

@@ -1685,7 +1685,7 @@ impl HubConnection {
         };
         let now = SystemTime::now();
         let loaded = mtls::load(cert, key, &self.service_name).and_then(|identity| {
-            mtls::check_not_expired(&identity, now)?;
+            mtls::check_valid_at(&identity, now)?;
             Ok(identity)
         });
         match loaded {
@@ -1694,7 +1694,7 @@ impl HubConnection {
                 *self.identity.lock().unwrap() = Some(identity.clone());
                 Ok(identity)
             }
-            Err(LoadError::Unusable(message)) => {
+            Err(LoadError::Unusable(message) | LoadError::NotYetValid(message)) => {
                 let last = self
                     .identity
                     .lock()
