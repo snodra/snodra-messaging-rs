@@ -57,6 +57,33 @@ pub struct HubTls {
     pub server_name: Option<String>,
 }
 
+/// The OAuth2 client-credentials setup that authenticates this service to the hubs with a Keycloak
+/// access token (JWT; roadmap P5b, hub ADR 0019). `Config.hub_oauth2`; mutually exclusive with a
+/// static hub token. Build it with `..HubOAuth2::default()` so fields added later do not break you.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HubOAuth2 {
+    /// The realm's token endpoint (`KRAKEN_HUB_OAUTH2_TOKEN_URI`), e.g.
+    /// `https://keycloak/realms/kraken/protocol/openid-connect/token`. `http://` is allowed (a
+    /// compose network) and logs one warning unless the host is loopback or a single-label name.
+    pub token_uri: String,
+    /// The Keycloak client id (`KRAKEN_HUB_OAUTH2_CLIENT_ID`); it must be the service name, because
+    /// the hub checks the token's `azp` against `Register.service_name`. `from_env` defaults it to
+    /// `KRAKEN_SERVICE_NAME`.
+    pub client_id: String,
+    /// The client secret (`KRAKEN_HUB_OAUTH2_CLIENT_SECRET`). Never logged (`Debug` prints `"***"`).
+    /// Replaced by `client_secret_file` when that is set.
+    pub client_secret: Option<SecretString>,
+    /// A file holding the client secret (`KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE`), read at startup
+    /// and again on every token fetch, so a rotated secret applies without a restart. **It wins
+    /// over `client_secret`.** Surrounding whitespace is trimmed.
+    pub client_secret_file: Option<PathBuf>,
+    /// The `scope` sent with the grant (`KRAKEN_HUB_OAUTH2_SCOPE`, space-separated as sent), if any.
+    pub scope: Option<String>,
+    /// PEM file with extra root certificates for an `https://` token endpoint
+    /// (`KRAKEN_HUB_OAUTH2_CA`), added to the platform roots. Not the hub CA (`HubTls.ca_file`).
+    pub ca_file: Option<PathBuf>,
+}
+
 /// The token in `path`, surrounding whitespace (the trailing newline of a secret file) removed;
 /// `None` when the file is empty. The error never carries file content.
 pub(crate) fn read_token_file(path: &Path) -> std::io::Result<Option<SecretString>> {

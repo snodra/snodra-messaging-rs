@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::error::MessagingError;
 use crate::hub::HubTargets;
 use crate::retry::RetryPolicy;
-use crate::security::{HubTls, SecretString};
+use crate::security::{HubOAuth2, HubTls, SecretString};
 
 /// `Config.hub_stream_credit_timeout` when nothing sets it: the hub's default maximum stream
 /// duration (`KRAKEN_HUB_MAX_STREAM_DURATION`, 10 minutes), after which the hub ends any stream
@@ -81,6 +81,11 @@ pub struct Config {
     /// with `https://` (then TLS with the platform roots). Needed when the hub sets
     /// `KRAKEN_HUB_TLS_CERT`.
     pub hub_tls: Option<HubTls>,
+    /// Authenticate to the hubs with a Keycloak client-credentials access token (JWT) instead of a
+    /// static token (`KRAKEN_HUB_OAUTH2_TOKEN_URI` set makes it `Some`; ADR 0019). One token
+    /// provider serves every hub connection and refreshes the token before it expires. Mutually
+    /// exclusive with `hub_token` / `hub_token_file` ([`Config::validate`]).
+    pub hub_oauth2: Option<HubOAuth2>,
     pub kafka_bootstrap: String,
     pub kafka_topic: String,
     pub consumer_enabled: bool,
@@ -125,6 +130,7 @@ impl Config {
             hub_token: None,
             hub_token_file: None,
             hub_tls: None,
+            hub_oauth2: None,
             kafka_bootstrap: kafka_bootstrap.to_string(),
             kafka_topic: crate::kafka::EVENTS_TOPIC.to_string(),
             consumer_enabled: true,
@@ -155,7 +161,10 @@ impl Config {
     /// `KRAKEN_HUB_RETRY_MAX_BACKOFF_MS`, `KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS`,
     /// `KRAKEN_HUB_TOKEN`, `KRAKEN_HUB_TOKEN_FILE`, `KRAKEN_HUB_TLS` (`true` turns TLS on),
     /// `KRAKEN_HUB_TLS_CA`, `KRAKEN_HUB_TLS_SERVER_NAME` (both need `KRAKEN_HUB_TLS=true`),
-    /// `KRAKEN_HUB_MAX_SUBSCRIPTIONS`.
+    /// `KRAKEN_HUB_MAX_SUBSCRIPTIONS`, `KRAKEN_HUB_OAUTH2_TOKEN_URI` (turns JWT authentication on;
+    /// then `KRAKEN_HUB_OAUTH2_CLIENT_SECRET` or `KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE` is needed,
+    /// and `KRAKEN_HUB_OAUTH2_CLIENT_ID` defaults to the service name), `KRAKEN_HUB_OAUTH2_SCOPE`,
+    /// `KRAKEN_HUB_OAUTH2_CA`.
     /// `KRAKEN_HUB_RETRY_ENABLED=true` sets `hub_retry` to the
     /// policy the other `KRAKEN_HUB_RETRY_*` variables describe (defaults: 3 attempts, 100 ms
     /// doubling to 2 s); those are validated whether or not retry is enabled.
@@ -270,6 +279,36 @@ impl Config {
                 "KRAKEN_HUB_TLS_CA and KRAKEN_HUB_TLS_SERVER_NAME need KRAKEN_HUB_TLS=true".into(),
             ));
         }
+        let oauth2_secret = optional("KRAKEN_HUB_OAUTH2_CLIENT_SECRET");
+        let oauth2_secret_file = optional("KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE");
+        let oauth2_client_id = optional("KRAKEN_HUB_OAUTH2_CLIENT_ID");
+        let oauth2_scope = optional("KRAKEN_HUB_OAUTH2_SCOPE");
+        let oauth2_ca = optional("KRAKEN_HUB_OAUTH2_CA");
+        match optional("KRAKEN_HUB_OAUTH2_TOKEN_URI") {
+            Some(uri) => {
+                c.hub_oauth2 = Some(HubOAuth2 {
+                    token_uri: uri.trim().to_string(),
+                    client_id: oauth2_client_id
+                        .map(|v| v.trim().to_string())
+                        .unwrap_or_else(|| c.service_name.clone()),
+                    client_secret: oauth2_secret.map(|v| SecretString::new(v.trim())),
+                    client_secret_file: oauth2_secret_file.map(|v| PathBuf::from(v.trim())),
+                    scope: oauth2_scope.map(|v| v.trim().to_string()),
+                    ca_file: oauth2_ca.map(|v| PathBuf::from(v.trim())),
+                });
+            }
+            None if oauth2_secret.is_some()
+                || oauth2_secret_file.is_some()
+                || oauth2_client_id.is_some()
+                || oauth2_scope.is_some()
+                || oauth2_ca.is_some() =>
+            {
+                return Err(MessagingError::InvalidMessage(
+                    "the KRAKEN_HUB_OAUTH2_* variables need KRAKEN_HUB_OAUTH2_TOKEN_URI".into(),
+                ));
+            }
+            None => {}
+        }
         if let Some(v) = optional("KRAKEN_CONSUMER_ENABLED") {
             c.consumer_enabled = flag("KRAKEN_CONSUMER_ENABLED", &v)?;
         }
@@ -300,7 +339,9 @@ impl Config {
     /// `max_concurrent_handlers` 0, an invalid `hub_retry` policy, a zero
     /// `hub_stream_credit_timeout`, a zero `hub_max_subscriptions`, a `hub_token_file` that cannot
     /// be read, a `hub_tls` CA file that cannot be read or holds no certificate, an empty
-    /// `hub_tls` server name. Called by `from_env` and by `KrakenMessaging::builder`; error
+    /// `hub_tls` server name, `hub_oauth2` together with a static hub token, without a token URI
+    /// that is `http(s)://`, without a secret or with an unreadable secret file or CA file.
+    /// Called by `from_env` and by `KrakenMessaging::builder`; error
     /// messages never carry the token.
     pub fn validate(&self) -> Result<(), MessagingError> {
         if self.service_name.trim().is_empty() {
@@ -365,6 +406,9 @@ impl Config {
                 ))
             })?;
         }
+        if let Some(oauth2) = &self.hub_oauth2 {
+            self.validate_oauth2(oauth2)?;
+        }
         if let Some(tls) = &self.hub_tls {
             if tls
                 .server_name
@@ -383,6 +427,56 @@ impl Config {
                     ))
                 })?;
             }
+        }
+        Ok(())
+    }
+
+    fn validate_oauth2(&self, oauth2: &HubOAuth2) -> Result<(), MessagingError> {
+        let invalid = |m: String| Err(MessagingError::InvalidMessage(m));
+        if self.hub_token.as_ref().is_some_and(|t| !t.is_blank()) || self.hub_token_file.is_some() {
+            return invalid("hub_oauth2 (KRAKEN_HUB_OAUTH2_TOKEN_URI) and a static hub token (hub_token / hub_token_file, KRAKEN_HUB_TOKEN / KRAKEN_HUB_TOKEN_FILE) are both set: use one".into());
+        }
+        let scheme_ok = reqwest::Url::parse(oauth2.token_uri.trim())
+            .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some());
+        if !scheme_ok {
+            return invalid(format!(
+                "hub_oauth2.token_uri (KRAKEN_HUB_OAUTH2_TOKEN_URI) must be an http:// or https:// URL, got '{}'",
+                oauth2.token_uri
+            ));
+        }
+        if oauth2.client_id.trim().is_empty() {
+            return invalid(
+                "hub_oauth2.client_id (KRAKEN_HUB_OAUTH2_CLIENT_ID) must not be empty".into(),
+            );
+        }
+        let inline = oauth2.client_secret.as_ref().is_some_and(|s| !s.is_blank());
+        match &oauth2.client_secret_file {
+            Some(path) => {
+                let secret = crate::security::read_token_file(path).map_err(|e| {
+                    MessagingError::InvalidMessage(format!(
+                        "hub_oauth2.client_secret_file (KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE) '{}' cannot be read: {e}",
+                        path.display()
+                    ))
+                })?;
+                if secret.is_none() {
+                    return invalid(format!(
+                        "hub_oauth2.client_secret_file (KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE) '{}' is empty",
+                        path.display()
+                    ));
+                }
+            }
+            None if !inline => {
+                return invalid("hub_oauth2 needs a client secret: set hub_oauth2.client_secret (KRAKEN_HUB_OAUTH2_CLIENT_SECRET) or hub_oauth2.client_secret_file (KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE)".into());
+            }
+            None => {}
+        }
+        if let Some(ca) = &oauth2.ca_file {
+            crate::hub::read_ca_file(ca).map_err(|e| {
+                MessagingError::InvalidMessage(format!(
+                    "hub_oauth2.ca_file (KRAKEN_HUB_OAUTH2_CA) '{}': {e}",
+                    ca.display()
+                ))
+            })?;
         }
         Ok(())
     }
@@ -890,6 +984,152 @@ mod tests {
             ..code_config()
         };
         assert!(blank_name.validate().is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn oauth2_is_off_unless_a_token_uri_is_set_and_defaults_the_client_id_to_the_service() {
+        assert_eq!(from(&[]).hub_oauth2, None);
+        let c = from(&[
+            (
+                "KRAKEN_HUB_OAUTH2_TOKEN_URI",
+                "https://idp.example/realms/kraken/protocol/openid-connect/token",
+            ),
+            ("KRAKEN_HUB_OAUTH2_CLIENT_SECRET", " s3cr3t-client-secret\n"),
+        ]);
+        let o = c.hub_oauth2.as_ref().expect("oauth2 on");
+        assert_eq!(
+            o.token_uri,
+            "https://idp.example/realms/kraken/protocol/openid-connect/token"
+        );
+        assert_eq!(
+            o.client_id, "svc",
+            "the service name, like the Kotlin starter"
+        );
+        assert_eq!(
+            o.client_secret.as_ref().map(SecretString::expose),
+            Some("s3cr3t-client-secret")
+        );
+        assert_eq!(
+            (&o.client_secret_file, &o.scope, &o.ca_file),
+            (&None, &None, &None)
+        );
+        for printed in [format!("{c:?}"), format!("{c:#?}"), format!("{o:?}")] {
+            assert!(!printed.contains("s3cr3t-client-secret"), "{printed}");
+            assert!(printed.contains("\"***\""), "{printed}");
+        }
+    }
+
+    #[test]
+    fn every_oauth2_variable_is_read() {
+        let dir = secret_dir();
+        let (secret, ca) = (dir.join("secret"), dir.join("ca.pem"));
+        std::fs::write(&secret, "from-the-file\n").unwrap();
+        std::fs::write(
+            &ca,
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let c = from(&[
+            ("KRAKEN_HUB_OAUTH2_TOKEN_URI", "http://keycloak:8080/token"),
+            ("KRAKEN_HUB_OAUTH2_CLIENT_ID", "orders-service"),
+            ("KRAKEN_HUB_OAUTH2_CLIENT_SECRET", "inline"),
+            (
+                "KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE",
+                secret.to_str().unwrap(),
+            ),
+            ("KRAKEN_HUB_OAUTH2_SCOPE", "hub orders"),
+            ("KRAKEN_HUB_OAUTH2_CA", ca.to_str().unwrap()),
+        ]);
+        let o = c.hub_oauth2.unwrap();
+        assert_eq!(o.client_id, "orders-service");
+        assert_eq!(o.client_secret_file.as_deref(), Some(secret.as_path()));
+        assert_eq!(o.scope.as_deref(), Some("hub orders"));
+        assert_eq!(o.ca_file.as_deref(), Some(ca.as_path()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn oauth2_needs_a_secret_a_readable_secret_file_and_an_http_token_uri() {
+        let uri = ("KRAKEN_HUB_OAUTH2_TOKEN_URI", "http://keycloak:8080/token");
+        let mentions = |vars: &[(&str, &str)], text: &str| {
+            let r = try_from(vars);
+            assert!(
+                matches!(r, Err(MessagingError::InvalidMessage(ref m)) if m.contains(text)),
+                "{vars:?}: {r:?}"
+            );
+        };
+        mentions(&[uri], "KRAKEN_HUB_OAUTH2_CLIENT_SECRET");
+        mentions(
+            &[uri, ("KRAKEN_HUB_OAUTH2_CLIENT_SECRET", "  ")],
+            "KRAKEN_HUB_OAUTH2_CLIENT_SECRET",
+        );
+        mentions(
+            &[
+                uri,
+                ("KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE", "/no/such/secret"),
+            ],
+            "KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE",
+        );
+        mentions(
+            &[
+                ("KRAKEN_HUB_OAUTH2_TOKEN_URI", "ftp://keycloak/token"),
+                ("KRAKEN_HUB_OAUTH2_CLIENT_SECRET", "x"),
+            ],
+            "KRAKEN_HUB_OAUTH2_TOKEN_URI",
+        );
+        mentions(
+            &[
+                ("KRAKEN_HUB_OAUTH2_TOKEN_URI", "not a uri"),
+                ("KRAKEN_HUB_OAUTH2_CLIENT_SECRET", "x"),
+            ],
+            "KRAKEN_HUB_OAUTH2_TOKEN_URI",
+        );
+        mentions(
+            &[
+                uri,
+                ("KRAKEN_HUB_OAUTH2_CLIENT_SECRET", "x"),
+                ("KRAKEN_HUB_OAUTH2_CA", "/no/such/ca.pem"),
+            ],
+            "KRAKEN_HUB_OAUTH2_CA",
+        );
+        // The other variables mean nothing without the token URI: a typo must not pass silently.
+        mentions(
+            &[("KRAKEN_HUB_OAUTH2_CLIENT_SECRET", "x")],
+            "KRAKEN_HUB_OAUTH2_TOKEN_URI",
+        );
+    }
+
+    #[test]
+    fn oauth2_and_a_static_hub_token_together_are_a_startup_error_naming_both() {
+        let oauth2 = [
+            ("KRAKEN_HUB_OAUTH2_TOKEN_URI", "http://keycloak:8080/token"),
+            ("KRAKEN_HUB_OAUTH2_CLIENT_SECRET", "x"),
+        ];
+        let dir = secret_dir();
+        let file = dir.join("token");
+        std::fs::write(&file, "tok\n").unwrap();
+        for (name, value) in [
+            ("KRAKEN_HUB_TOKEN", "a-static-token"),
+            ("KRAKEN_HUB_TOKEN_FILE", file.to_str().unwrap()),
+        ] {
+            let mut vars = oauth2.to_vec();
+            vars.push((name, value));
+            let r = try_from(&vars);
+            assert!(
+                matches!(r, Err(MessagingError::InvalidMessage(ref m))
+                    if m.contains("KRAKEN_HUB_OAUTH2_TOKEN_URI") && m.contains(name)),
+                "{name}: {r:?}"
+            );
+        }
+        // A blank static token is no token (as everywhere else).
+        let mut vars = oauth2.to_vec();
+        vars.push(("KRAKEN_HUB_TOKEN", " "));
+        assert!(try_from(&vars).is_ok());
+        // Set in code, the same.
+        let mut c = from(&oauth2);
+        c.hub_token = Some(SecretString::new("static"));
+        assert!(c.validate().is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

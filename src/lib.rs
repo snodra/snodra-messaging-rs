@@ -24,5 +24,5 @@ pub use hub::{
 };
 pub use identity::{Guard, Identity};
 pub use retry::RetryPolicy;
-pub use security::{HubTls, SecretString};
+pub use security::{HubOAuth2, HubTls, SecretString};
 pub use types::{Command, Event, MessageType, Query, StreamingQuery, SubscriptionQuery};
