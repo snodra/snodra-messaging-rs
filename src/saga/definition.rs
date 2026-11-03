@@ -95,6 +95,7 @@ impl SagaType {
     }
 
     /// Whether any handler of this type reacts to events of `type_name`.
+    #[cfg(test)]
     pub(crate) fn interested_in(&self, type_name: &str) -> bool {
         self.handlers.contains_key(type_name)
             || (self.command_failed.is_some() && type_name == SagaCommandFailed::TYPE)

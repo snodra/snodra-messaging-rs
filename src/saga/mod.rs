@@ -6,11 +6,9 @@
 //! synchronous closures that only record what they want done on a [`SagaContext`] (the runtime
 //! does the I/O after the saga's transaction committed).
 
-// The erased model is consumed by the runtime, the relay and the scheduler of the later S2 tasks.
-#![allow(dead_code, unused_imports)]
-
 mod clock;
 mod context;
+mod deadlines;
 mod definition;
 mod failed;
 mod indexes;
@@ -34,12 +32,9 @@ pub use raw::{
     UNKNOWN_OUTCOME_MARKER, classify_failure,
 };
 
+pub use deadlines::{DeadlineScheduler, DeadlineSettings};
 pub use relay::{RelaySettings, SagaDispatchRelay};
 pub use retry::SagaRetry;
 pub use runtime::SagaRuntime;
 
-pub(crate) use context::{AssociationChange, DeadlineOp, Effects, RecordedDispatch};
-pub(crate) use definition::{
-    ErasedDeadlineHandler, ErasedHandler, ValueSource, validate_registrations,
-};
-pub(crate) use store::DispatchKind;
+pub(crate) use definition::validate_registrations;
