@@ -15,7 +15,7 @@ mod tls;
 
 pub use auth::{
     AccessToken, AuthKind, AuthStatus, FetchResult, TokenError, TokenProvider, TokenStats,
-    WallClock, refresh_margin,
+    WAKE_INTERVAL, WallClock, refresh_margin,
 };
 pub use connection::{
     CAPABILITIES, CLIENT_VERSION, CREDENTIALS_REFRESH, FLOW_CONTROL, Handshake, HubConnection,

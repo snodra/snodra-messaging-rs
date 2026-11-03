@@ -624,6 +624,9 @@ pub struct HubConnection {
     token: Mutex<Option<SecretString>>,
     /// The access token the current (and next) stream registers with: the provider's latest.
     jwt: Mutex<Option<SecretString>>,
+    /// The access token the current stream presented to its hub (its `Register`'s, or the last
+    /// refresh it sent): the one to retire when the hub turns the stream down as unauthenticated.
+    presented: Mutex<Option<SecretString>>,
     /// `ClientMessage.credentials` written on this connection's streams.
     refreshes_sent: AtomicU64,
     /// The empty-token-file warning was logged and no good read has followed it.
@@ -715,6 +718,7 @@ impl HubConnection {
             last_rejection: Mutex::new(None),
             token: Mutex::new(None),
             jwt: Mutex::new(None),
+            presented: Mutex::new(None),
             refreshes_sent: AtomicU64::new(0),
             empty_file_warned: AtomicBool::new(false),
             failed_once: AtomicBool::new(false),
@@ -1106,20 +1110,22 @@ impl HubConnection {
     }
 
     /// The hub ended the stream with `UNAUTHENTICATED` (a Register or refresh refused, "token
-    /// expired", "unknown signing key", "credentials expired" ...): the access token it was given is
+    /// expired", "unknown signing key", "credentials expired" ...): the access token it presented is
     /// not offered again, the next stream gets a new one. `PERMISSION_DENIED` (wrong `azp`, no ACL
     /// entry) leaves it: a new token would not help and the IdP is not to be hammered.
     fn retire_refused_token(&self, status: &Status) {
         if status.code() != Code::Unauthenticated {
             return;
         }
-        let (Some(provider), Some(jwt)) = (
+        // Only what this stream presented, and the provider drops it only while it is still the
+        // current one: a newer token fetched meanwhile is not discarded.
+        let (Some(provider), Some(token)) = (
             &self.settings.token_provider,
-            self.jwt.lock().unwrap().clone(),
+            self.presented.lock().unwrap().take(),
         ) else {
             return;
         };
-        provider.invalidate(&jwt);
+        provider.invalidate(&token);
     }
 
     /// One stream from connect to failure. `Ok(())` when the hub ended it or we were cancelled.
@@ -1136,6 +1142,7 @@ impl HubConnection {
                 }
                 .map_err(|e| StreamError::Token(e.to_string()))?;
                 *self.jwt.lock().unwrap() = Some(token.value().clone());
+                *self.presented.lock().unwrap() = Some(token.value().clone());
                 Some(Following {
                     tokens,
                     sent: token.generation(),
@@ -1329,6 +1336,7 @@ impl HubConnection {
             proto::credentials::Kind::Jwt(token.value().expose().to_string()),
         )
         .await?;
+        *self.presented.lock().unwrap() = Some(token.value().clone());
         tracing::debug!(service = %self.service_name, address = %self.settings.address, expires_at = ?token.expires_at(), "access token refreshed on the hub stream");
         Ok(())
     }

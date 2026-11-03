@@ -511,6 +511,23 @@ async fn a_token_fetched_during_a_failure_streak_is_not_fetched_again_by_the_ret
     );
 }
 
+#[tokio::test]
+async fn the_default_wake_interval_renews_within_a_few_seconds_of_a_wake_from_suspend() {
+    let idp = Idp::start("svc", SECRET).await;
+    idp.set_lifetime(300);
+    let (provider, skew) = skewed_provider(&idp, kraken_messaging::hub::WAKE_INTERVAL);
+    let mut tokens = provider.subscribe();
+    provider.token().await.unwrap();
+    tokens.changed().await.unwrap();
+    // The loop is now asleep towards a refresh point that is minutes away.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    skew.store(400, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(7), tokens.changed())
+        .await
+        .expect("renewed within one wake slice (5 s) of the wall clock jump")
+        .unwrap();
+}
+
 /// A provider whose wall clock runs `skew` seconds ahead of the real one (what a machine that
 /// slept sees: the monotonic clocks stood still, the wall clock moved).
 fn skewed_provider(
@@ -568,6 +585,8 @@ async fn the_refresh_loop_notices_a_wall_clock_jump_without_waiting_for_the_mono
     let mut tokens = provider.subscribe();
     provider.token().await.unwrap();
     tokens.changed().await.unwrap();
+    // The loop is now asleep towards a refresh point that is minutes away.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     skew.store(400, std::sync::atomic::Ordering::SeqCst);
     tokio::time::timeout(Duration::from_secs(5), async {
         tokens.changed().await.unwrap();
@@ -1000,6 +1019,38 @@ async fn an_unauthenticated_close_of_a_live_stream_makes_the_next_stream_fetch_a
     let second = jwt_of(&hub.registers().await[1]).unwrap();
     assert_ne!(first, second, "a new token, not the one the hub gave up on");
     assert_eq!(idp.issued(), 2);
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[tokio::test]
+async fn a_stream_refused_on_an_old_token_does_not_discard_a_newer_one_fetched_meanwhile() {
+    let idp = Idp::start("svc", SECRET).await;
+    idp.set_lifetime(300);
+    let hub = FakeHub::start().await;
+    jwt_hub_acl(&hub);
+    hub.set_ack(Some(support::fake_hub::default_ack()));
+    // The hub does not offer credentials-refresh: the stream never sends the newer token.
+    hub.set_ack_delay(Duration::from_millis(1200));
+    let provider = provider(&idp);
+    let conn = connection(jwt_settings(hub.address(), &provider), "svc");
+    conn.start();
+    wait_for_registers(&hub, 1).await;
+    let presented = jwt_of(&hub.registers().await[0]).unwrap();
+
+    // While the ack is held back a newer token is fetched (published, not presented), and the hub
+    // then closes the stream as unauthenticated.
+    let newer = provider.refresh().await.unwrap();
+    hub.close_streams_with(tonic::Code::Unauthenticated, "token expired");
+    wait_for_registers(&hub, 2).await;
+    let next = jwt_of(&hub.registers().await[1]).unwrap();
+    assert_ne!(next, presented);
+    assert_eq!(
+        next,
+        newer.value().expose(),
+        "the newer token survived: only the one the stream presented was retired"
+    );
+    assert_eq!(idp.issued(), 2, "no third fetch");
     conn.shutdown().await;
     hub.stop();
 }

@@ -12,7 +12,7 @@
 //! - A background task refreshes the token at that point and publishes it on a watch channel
 //!   ([`TokenProvider::subscribe`]), which every live hub stream follows to send
 //!   `ClientMessage.credentials`. A failed proactive refresh keeps the current token and retries
-//!   after 1 s, 2 s ... 30 s. The loop wakes at least every 30 s ([`WAKE_INTERVAL`]) and looks at the
+//!   after 1 s, 2 s ... 30 s. The loop wakes at least every 5 s ([`WAKE_INTERVAL`]) and looks at the
 //!   wall clock again, so a wake from suspend refreshes at once. A new stream never gets a token that is past its margin: when the
 //!   endpoint cannot give a new one the stream is not opened.
 //!
@@ -48,7 +48,7 @@ pub const RETRY_MIN: Duration = Duration::from_secs(1);
 pub const RETRY_MAX: Duration = Duration::from_secs(30);
 /// The refresh loop wakes at least this often and looks at the wall clock: the monotonic clocks
 /// (`Instant`, tokio's timers) stand still while a laptop sleeps, the wall clock does not.
-pub const WAKE_INTERVAL: Duration = Duration::from_secs(30);
+pub const WAKE_INTERVAL: Duration = Duration::from_secs(5);
 /// An error text is clipped to this many characters.
 pub const ERROR_CLIP: usize = 200;
 

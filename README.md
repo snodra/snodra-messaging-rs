@@ -726,9 +726,9 @@ background refresh keeps the current token and retries after 1 s, 2 s ... 30 s.
 A token is fresh only while both the monotonic clock and the **wall clock** say more than its margin
 remains (the monotonic clocks, `Instant` and tokio's timers, stand still while a laptop sleeps, so a
 service waking after `exp` would otherwise keep serving its cached token), and the refresh loop wakes
-at least every 30 s to look at the wall clock again. A stream the hub ends with `UNAUTHENTICATED` (a
+at least every 5 s to look at the wall clock again. A stream the hub ends with `UNAUTHENTICATED` (a
 `Register` or refresh refused, or a later close: "token expired", "unknown signing key", "credentials
-expired") retires the access token it used, so the next stream fetches a new one; `PERMISSION_DENIED`
+expired") retires the access token it presented (its `Register`'s, or the last refresh it sent; a newer token fetched meanwhile is kept), so the next stream fetches a new one, paced by the normal reconnect backoff; `PERMISSION_DENIED`
 (wrong `azp`, no ACL entry) does not, because a new token would not help and the IdP is not to be
 hammered. `KrakenMessaging::shutdown()` closes the provider (`TokenProvider::close`): the refresh loop
 ends and no further request reaches the IdP even if a `Sender` is still held.
