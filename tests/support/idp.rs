@@ -99,7 +99,9 @@ impl Respond for Token {
                         "azp": cfg.azp.clone().unwrap_or_else(|| cfg.client_id.clone()),
                         "typ": "Bearer",
                         "sub": format!("service-account-{}", cfg.client_id),
-                        "iat": now,
+                        // A few seconds back: the hub of an e2e test runs with no leeway, in a VM
+                        // whose clock may trail the host's by a moment.
+                        "iat": now.saturating_sub(10),
                         "exp": now + cfg.lifetime,
                         "jti": format!("token-{n}"),
                     });

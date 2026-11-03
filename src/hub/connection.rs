@@ -1030,7 +1030,14 @@ impl HubConnection {
             let (status, no_token) = match outcome {
                 Ok(()) => (Status::unavailable("hub closed the stream"), false),
                 Err(StreamError::Hub(s)) => (s, false),
-                Err(StreamError::Token(message)) => (Status::unavailable(message), true),
+                // Distinguishable from a hub refusal: the hub was never asked.
+                Err(StreamError::Token(message)) => (
+                    Status::unauthenticated(format!(
+                        "no access token for {} ({}): {message}",
+                        self.service_name, self.instance_id
+                    )),
+                    true,
+                ),
             };
             // A hub that answered the Register (ack or echo) is healthy: come back quickly. One that
             // accepts the stream and then rejects it never reaches the handshake.

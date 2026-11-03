@@ -331,6 +331,14 @@ async fn no_secret_and_no_token_ever_reach_a_log_a_debug_print_or_an_error() {
         format!("{err}"),
         format!("{:?}", oauth2(&idp, "svc", SECRET)),
         format!("{:?}", provider.status()),
+        format!("{:?}", jwt_settings("static://hub:7000".into(), &provider)),
+        format!(
+            "{:?}",
+            kraken_messaging::Config {
+                hub_oauth2: Some(oauth2(&idp, "svc", SECRET)),
+                ..kraken_messaging::Config::new("svc", "hub:7000", "kafka:19092", "mongodb://m/db")
+            }
+        ),
     ];
     printed.extend(captured.lines());
     for text in printed {
@@ -346,7 +354,7 @@ async fn no_secret_and_no_token_ever_reach_a_log_a_debug_print_or_an_error() {
 #[tokio::test]
 async fn the_provider_refreshes_a_token_before_it_expires_and_publishes_it() {
     let idp = Idp::start("svc", SECRET).await;
-    idp.set_lifetime(6); // margin 4.8 s: replaced after ~1.2 s
+    idp.set_lifetime(6); // margin 3 s: replaced after ~3 s
     let provider = provider(&idp);
     let mut tokens = provider.subscribe();
     assert!(tokens.borrow().is_none(), "nothing before the first fetch");
@@ -354,7 +362,7 @@ async fn the_provider_refreshes_a_token_before_it_expires_and_publishes_it() {
     tokens.changed().await.unwrap();
     assert_eq!(tokens.borrow_and_update().as_ref().unwrap().generation(), 1);
 
-    let second = tokio::time::timeout(Duration::from_secs(4), async {
+    let second = tokio::time::timeout(Duration::from_secs(6), async {
         tokens.changed().await.unwrap();
         tokens.borrow_and_update().clone().unwrap()
     })
@@ -382,21 +390,21 @@ async fn a_failed_refresh_keeps_the_token_retries_and_recovers() {
     let first = provider.token().await.unwrap();
     idp.set_mode(Mode::Status(503));
 
-    // The refresh at ~1.2 s fails; the token that is still valid keeps being served.
-    until("the failed refresh", Duration::from_secs(4), || {
+    // The refresh at ~3 s fails; the failure is recorded and the refresh retried.
+    until("the failed refresh", Duration::from_secs(6), || {
         provider.status().last_error.is_some()
     })
     .await;
     assert!(provider.status().last_error.unwrap().contains("503"));
     assert_eq!(
-        provider.token().await.unwrap().value().expose(),
-        first.value().expose(),
-        "the endpoint is down but the token is valid: new streams get it"
+        provider.status().token_expires_at,
+        Some(first.expires_at()),
+        "the current token is kept"
     );
     // It retries (backoff 1 s, 2 s, ...) and recovers once the endpoint does.
     let failed = idp.token_request_count().await;
     idp.set_mode(Mode::Ok);
-    until("a new token", Duration::from_secs(4), || idp.issued() >= 2).await;
+    until("a new token", Duration::from_secs(5), || idp.issued() >= 2).await;
     assert!(idp.token_request_count().await > failed);
     until("the error cleared", Duration::from_secs(1), || {
         provider.status().last_error.is_none()
@@ -420,14 +428,17 @@ async fn a_failed_refresh_keeps_the_token_retries_and_recovers() {
 }
 
 #[tokio::test]
-async fn an_expired_token_is_not_served_when_the_endpoint_is_down() {
+async fn a_token_past_its_margin_is_not_served_when_the_endpoint_is_down() {
     let idp = Idp::start("svc", SECRET).await;
-    idp.set_lifetime(1);
+    idp.set_lifetime(1); // margin 0.5 s
     let provider = provider(&idp);
     provider.token().await.unwrap();
     idp.set_mode(Mode::Status(503));
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    let err = provider.token().await.expect_err("expired and no new one");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let err = provider
+        .token()
+        .await
+        .expect_err("valid for another 0.4 s, but past its margin: the stream is not opened");
     assert_eq!(err.result(), FetchResult::HttpError);
 }
 
@@ -567,7 +578,7 @@ async fn connections_that_start_together_fetch_one_token() {
 #[tokio::test]
 async fn a_refreshed_token_goes_to_the_hubs_that_offer_credentials_refresh_and_to_no_other() {
     let idp = Idp::start("svc", SECRET).await;
-    idp.set_lifetime(6); // refreshed after ~1.2 s
+    idp.set_lifetime(6); // refreshed after ~3 s
     // Distinct hub ids: a pool keeps one connection per hub.
     let (capable, plain) = (
         FakeHub::start_with_id("capable").await,
@@ -593,7 +604,7 @@ async fn a_refreshed_token_goes_to_the_hubs_that_offer_credentials_refresh_and_t
     assert!(pool.await_all_registered(Duration::from_secs(5)).await);
     let registered = jwt_of(&capable.registers().await[0]).unwrap();
 
-    until("the refresh", Duration::from_secs(5), || {
+    until("the refresh", Duration::from_secs(8), || {
         !capable.refreshes().is_empty()
     })
     .await;
@@ -648,7 +659,7 @@ async fn a_new_stream_after_a_refresh_registers_with_the_new_token() {
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);
     let first = jwt_of(&hub.registers().await[0]).unwrap();
-    until("the refresh", Duration::from_secs(5), || {
+    until("the refresh", Duration::from_secs(8), || {
         !hub.refreshes().is_empty()
     })
     .await;
@@ -679,6 +690,10 @@ async fn a_token_endpoint_that_refuses_opens_no_stream_logs_one_error_and_recove
     assert_eq!(hub.streams(), 0, "no stream was opened");
     assert!(!conn.is_connected());
     let rejection = conn.last_rejection().expect("surfaced like a rejection");
+    assert!(
+        rejection.starts_with("no access token for svc ("),
+        "distinguishable from a hub refusal: {rejection}"
+    );
     assert!(rejection.contains("invalid_client"), "{rejection}");
     assert!(
         rejection.contains("Invalid client credentials"),
@@ -825,7 +840,7 @@ async fn a_rotated_token_file_is_sent_as_a_refresh_without_reconnecting() {
     assert!(conn.await_registered(Duration::from_secs(5)).await);
     assert!(hub.refreshes().is_empty(), "nothing changed yet");
     std::fs::write(&file, "second-token\n").unwrap();
-    until("the refresh", Duration::from_secs(5), || {
+    until("the refresh", Duration::from_secs(8), || {
         !hub.refreshes().is_empty()
     })
     .await;

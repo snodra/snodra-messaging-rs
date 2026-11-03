@@ -128,6 +128,10 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 | `KRAKEN_HUB_MAX_SUBSCRIPTIONS` | 1024 | the most subscription queries this instance serves at once (see [Subscription queries](#subscription-queries)): a subscription request beyond it is refused with `ReplyEnd{error = RESOURCE_EXHAUSTED}` `subscription limit (N) reached`, which the subscriber sees as `HandlerBusy`; subscriptions hold no handler permit, so this is their only bound here; the hub has its own per-instance limit (`KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE`, 1024); at least 1 (`0` is rejected at startup, also when set in code) |
 | `KRAKEN_HUB_TOKEN` | none | the static access token sent in `Register.credentials.token` on every hub stream (`Config.hub_token`, a `SecretString` whose `Debug` prints `"***"`); needed when the hub runs `KRAKEN_HUB_AUTH_MODE=enforce`, ignored by a hub in `off` mode and by older hubs; an empty value is no token; never logged (see [Security](#security)) |
 | `KRAKEN_HUB_TOKEN_FILE` | none | a file holding the token, for container secrets (`Config.hub_token_file`); read at startup (an unreadable file is a startup error) and again before every reconnect, so a rotated secret needs no restart; **wins over `KRAKEN_HUB_TOKEN` when both are set**; surrounding whitespace is trimmed, an empty file is no token at startup, and after a good read it keeps the last token |
+| `KRAKEN_HUB_OAUTH2_TOKEN_URI` | none | turns JWT authentication on (`Config.hub_oauth2`): the Keycloak token endpoint, e.g. `https://keycloak/realms/kraken/protocol/openid-connect/token`; needs a client secret and excludes `KRAKEN_HUB_TOKEN` / `KRAKEN_HUB_TOKEN_FILE` (both set is a startup error); see [Authenticating with a JWT](#authenticating-with-a-jwt-keycloak-client-credentials) |
+| `KRAKEN_HUB_OAUTH2_CLIENT_ID` | `KRAKEN_SERVICE_NAME` | the Keycloak client id; it must be the service name (the hub checks the token's `azp` against it) |
+| `KRAKEN_HUB_OAUTH2_CLIENT_SECRET`, `KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE` | none | the client secret (`SecretString`, never logged), or a file holding it, **which wins** and is re-read on every token fetch so a rotated secret applies without a restart; one of them is required with the token URI |
+| `KRAKEN_HUB_OAUTH2_SCOPE`, `KRAKEN_HUB_OAUTH2_CA` | none | the `scope` sent with the grant (space-separated as sent); a PEM file with extra root certificates for an `https://` token endpoint, added to the platform roots (not the hub CA of `KRAKEN_HUB_TLS_CA`) |
 | `KRAKEN_HUB_TLS` | `false` | `true` makes every hub channel TLS (`Config.hub_tls = Some(HubTls { .. })`), for a static list and for `dns:///`; needed when the hub sets `KRAKEN_HUB_TLS_CERT`. An `https://` address turns TLS on by itself (system roots) |
 | `KRAKEN_HUB_TLS_CA` | none (system roots) | PEM file with the CA that signs the hub's certificate (`HubTls.ca_file`), re-read on every connect; needs `KRAKEN_HUB_TLS=true` |
 | `KRAKEN_HUB_TLS_SERVER_NAME` | the host of the address (for `dns:///name:port`, `name`) | the name the hub's certificate must carry, also sent as SNI (`HubTls.server_name`); needs `KRAKEN_HUB_TLS=true` |
@@ -693,6 +697,56 @@ KRAKEN_HUB_TOKEN_FILE=/run/secrets/orders-hub-token \
 KRAKEN_HUB_TLS=true KRAKEN_HUB_TLS_CA=/etc/kraken/ca.pem KRAKEN_HUB_TLS_SERVER_NAME=kraken-hub
 ```
 
+### Authenticating with a JWT (Keycloak client credentials)
+
+Instead of a static token a service can register with a short-lived Keycloak access token (roadmap
+P5b, hub [ADR 0019](../kraken/docs/adr/0019-hub-jwt-authentication.md)). In Keycloak, make the
+service a **confidential client with service accounts only** (no standard flow, no direct access
+grants) whose **client id is the service name**: the hub checks the token's `azp` against
+`Register.service_name` and takes the rights from its `[[service]]` ACL table of that name. Then set
+
+```bash
+KRAKEN_HUB_OAUTH2_TOKEN_URI=https://keycloak/realms/kraken/protocol/openid-connect/token \
+KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE=/run/secrets/orders-client-secret   # client id defaults to the service name
+```
+
+(`Config.hub_oauth2 = Some(HubOAuth2 { token_uri, client_id, client_secret, .. })` in code; the
+variables are in the table above.) One `TokenProvider` per `KrakenMessaging` fetches the token with
+the `client_credentials` grant (`client_secret_basic`: id and secret form-urlencoded, then base64,
+RFC 6749 2.3.1; 10 s timeout; response capped at 1 MiB; `token_type` must be `Bearer`; a missing
+`expires_in` means 60 s, with one warning) and every hub connection shares it: N hubs, one token,
+one fetch, concurrent connects wait for it. A token is used while more than its margin remains
+(20 % of its lifetime, at least 5 s, at most half of it) and is then replaced in the background,
+not on demand; every `Register` declares `credentials-refresh` and, on a stream whose hub offers
+it, the new token is sent as `ClientMessage.credentials`, so the session outlives the token (the
+hub closes a JWT session `KRAKEN_HUB_JWT_EXPIRY_GRACE`, 30 s, after `exp` otherwise). A stream
+whose hub does not offer the capability gets nothing; its next reconnect uses the new token. A failed
+background refresh keeps the current token and retries after 1 s, 2 s ... 30 s.
+
+If no token can be had (the endpoint answers 401 `invalid_client`, is unreachable or misbehaves) the
+stream is **not opened**: `last_rejection()` reads `no access token for <service> (<instance>):
+<what the endpoint said>` (clipped to 200 characters; distinguishable from a hub refusal), it is logged
+at `error` once per distinct message and then at `debug`, and the attempt is retried with the normal
+reconnect backoff, so a recovered endpoint is used at once. A hub that has not loaded its JWKS yet
+answers `UNAVAILABLE` "jwks not loaded yet": an ordinary retry, not a logged rejection.
+
+The client secret and the tokens never appear in logs, errors or `Debug` output. For what is
+running, `KrakenMessaging::hub_auth()` (also `HubPool::auth()`, `HubConnection::auth()`) gives the
+`AuthKind` (`none`, `token`, `jwt`), the current token's expiry and the last token fetch error;
+`TokenProvider::stats()` counts fetches by result (`ok`, `http_error`, `oauth_error`, `io_error`,
+`bad_response`) and `hub_credentials_refreshes_sent()` the refreshes written. This crate has no
+metrics registry, so these counters stand in for `kraken_messaging_hub_token_fetches_total{result}`
+and `kraken_messaging_hub_credentials_refreshes_sent_total`. A static token session whose
+`KRAKEN_HUB_TOKEN_FILE` changes also sends a refresh (checked once per heartbeat) on streams that
+acked `credentials-refresh`, so a token rotation needs no reconnect.
+
+`http://` token URIs are accepted (the sandbox uses `http://keycloak:8080`) with one warning unless the
+host is loopback or a single-label name: the secret then crosses the network in the clear.
+
+Differences from the Kotlin starter: the Rust configuration has no relaxed `KRAKEN_MESSAGING_*`
+binding (only `KRAKEN_HUB_OAUTH2_*`), no `/env` redaction layer to extend (`SecretString` prints
+`"***"`), and no metrics registry (accessors above).
+
 **Rollout: permissive first.** Hubs, services and the ACL are released independently, so go in this
 order: (1) roll the hub out with `KRAKEN_HUB_AUTH_MODE=permissive` and the ACL; it logs and counts
 every violation (`kraken_hub_auth_violations_total`) and refuses nothing; (2) roll the services out
@@ -703,11 +757,25 @@ and shows up as the `UNAUTHENTICATED` rejection above.
 Tested in `tests/hub_auth.rs` and `tests/hub_tls.rs` against the in-process fake hub (which implements
 the hub's modes and codes), in `tests/e2e_auth.rs` against `kraken-hub:p5a-hub`
 (`KRAKEN_HUB_P5A_IMAGE`) running `enforce` with an ACL file and a TLS certificate generated at test
-time, and for a token against the P4c hub in `tests/hub_compat.rs`.
+time, and for a token against the P4c hub in `tests/hub_compat.rs`. JWT authentication is tested in
+`tests/hub_jwt.rs` (a test OAuth2 token endpoint in `tests/support/idp.rs`, with ES256 keys generated
+at test time, and the fake hub, which accepts a JWT without verifying it, offers `credentials-refresh`
+and records refreshes) and in `tests/e2e_jwt.rs` against `kraken-hub:dev` (`KRAKEN_HUB_IMAGE`) in
+`enforce` with a `[[service]]` ACL entry, 2 s expiry grace and no leeway: the JWKS is served to the
+hub by a small busybox container on the bridge network and tokens live 6 s, so the session
+surviving past `exp` plus the grace proves the refresh.
 
 ## Upgrading
 
-What changes for a service moving to this version (P5a, then P4c, then P4b):
+What changes for a service moving to this version (P5b, then P5a, then P4c, then P4b):
+
+- **JWT authentication (P5b).** `Config` gained `hub_oauth2: Option<HubOAuth2>` (`Config::new` sets
+  `None`); `HubSettings` gained `token_provider: Option<Arc<TokenProvider>>` (`..HubSettings::default()`
+  keeps compiling); every `Register` now declares `credentials-refresh`, which `CAPABILITIES` lists
+  last; `Config::validate` refuses `hub_oauth2` together with a static hub token. `proto/hub.proto` adds
+  `ClientMessage.credentials`: code that matches `client_message::Message` exhaustively needs the new
+  arm. Nothing changes until `KRAKEN_HUB_OAUTH2_TOKEN_URI` is set. See
+  [Authenticating with a JWT](#authenticating-with-a-jwt-keycloak-client-credentials).
 
 - **Access control and TLS (P5a).** `Config` gained `hub_token: Option<SecretString>`,
   `hub_token_file: Option<PathBuf>` and `hub_tls: Option<HubTls>` (`KRAKEN_HUB_TOKEN`,
@@ -776,7 +844,7 @@ prove the client behaves as before against them. `tests/e2e_multi_hub.rs` and th
 run two or one `kraken-hub:p3-hub` (override with `KRAKEN_HUB_P3_IMAGE`); `tests/e2e_stream.rs` and the P4a compat test run `kraken-hub:p4b-hub` and
 `kraken-hub:p4a-hub` (`KRAKEN_HUB_P4B_IMAGE`, `KRAKEN_HUB_P4A_IMAGE`) and `tests/e2e_subscription.rs`
 two `kraken-hub:p4c-hub` (`KRAKEN_HUB_P4C_IMAGE`); `tests/e2e_auth.rs` runs `kraken-hub:p5a-hub`
-(`KRAKEN_HUB_P5A_IMAGE`) with an ACL file and TLS certificate generated at test time (they are written under
+(`KRAKEN_HUB_P5A_IMAGE`) with an ACL file and TLS certificate generated at test time and `tests/e2e_jwt.rs` runs `kraken-hub:dev` with JWT authentication (they are written under
 `target/tmp` and bind-mounted into the container); `tests/hub_pool.rs` runs
 the multi-hub rules against in-process fake hubs. Without Docker the integration tests print a notice and skip; with Docker but no hub
 image they fail with the build command. On Rancher Desktop export

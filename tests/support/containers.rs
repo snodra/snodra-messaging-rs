@@ -175,6 +175,8 @@ pub struct HubOptions {
     pub env: Vec<(String, String)>,
     /// Host directories bind-mounted read-only: (host path, container path).
     pub mounts: Vec<(String, String)>,
+    /// Extra `/etc/hosts` entries of the container: (name, address).
+    pub host_names: Vec<(String, std::net::IpAddr)>,
 }
 
 impl HubOptions {
@@ -184,6 +186,7 @@ impl HubOptions {
             port: None,
             env: vec![],
             mounts: vec![],
+            host_names: vec![],
         }
     }
 
@@ -194,6 +197,13 @@ impl HubOptions {
 
     pub fn env(mut self, name: &str, value: &str) -> HubOptions {
         self.env.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    /// Makes `name` resolve inside the container to `address` (a single-label name, so the hub
+    /// does not warn about plain http to it).
+    pub fn host_name(mut self, name: &str, address: std::net::IpAddr) -> HubOptions {
+        self.host_names.push((name.to_string(), address));
         self
     }
 
@@ -253,6 +263,9 @@ pub async fn hub_with(options: HubOptions) -> HubContainer {
             Mount::bind_mount(host.clone(), container.clone())
                 .with_access_mode(AccessMode::ReadOnly),
         );
+    }
+    for (name, address) in &options.host_names {
+        image = image.with_host(name.clone(), testcontainers::core::Host::Addr(*address));
     }
     let container = match options.port {
         Some(port) => {
@@ -351,5 +364,72 @@ pub async fn wait_until_reachable(address: &str) {
             "hub at {address} never became reachable"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// A container serving one static file over plain HTTP (busybox `httpd`, from Rancher's public mirror of the busybox image), for what a hub fetches
+/// from a server of the test: the JWKS. Reached by other containers on the default bridge at
+/// [`ip`](Self::ip) port 8080, so it needs nothing from the host's network.
+pub struct StaticServer {
+    pub container: ContainerAsync<GenericImage>,
+    pub ip: std::net::IpAddr,
+    _dir: std::path::PathBuf,
+}
+
+pub const STATIC_SERVER_PORT: u16 = 8080;
+
+/// Serves `content` at `/<name>`. The directory is created under `root` (inside the checkout, where
+/// a VM-based container runtime can mount it).
+pub async fn static_server(root: &std::path::Path, name: &str, content: &str) -> StaticServer {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = root.join(format!("www-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let file = dir.join(name);
+    std::fs::write(&file, content).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let image = GenericImage::new("rancher/mirrored-library-busybox", "1.36.1")
+        .with_exposed_port(STATIC_SERVER_PORT.tcp())
+        .with_wait_for(WaitFor::seconds(1))
+        .with_mount(
+            Mount::bind_mount(dir.display().to_string(), "/www")
+                .with_access_mode(AccessMode::ReadOnly),
+        )
+        .with_cmd([
+            "httpd",
+            "-f",
+            "-p",
+            &STATIC_SERVER_PORT.to_string(),
+            "-h",
+            "/www",
+        ]);
+    let container = image.start().await.expect("static server container");
+    let port = match container.get_host_port_ipv4(STATIC_SERVER_PORT.tcp()).await {
+        Ok(port) => port,
+        Err(e) => {
+            let out = container.stdout_to_vec().await.unwrap_or_default();
+            let err = container.stderr_to_vec().await.unwrap_or_default();
+            panic!(
+                "static server port: {e}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&out),
+                String::from_utf8_lossy(&err)
+            );
+        }
+    };
+    probe_or_fail(&format!("127.0.0.1:{port}")).await;
+    let ip = container
+        .get_bridge_ip_address()
+        .await
+        .expect("static server bridge address");
+    StaticServer {
+        container,
+        ip,
+        _dir: dir,
+    }
+}
+
+impl Drop for StaticServer {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self._dir);
     }
 }

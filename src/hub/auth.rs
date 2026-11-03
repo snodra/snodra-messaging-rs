@@ -6,13 +6,13 @@
 //!   2.3.1), 10 s timeout, response body capped at 1 MiB. `access_token` is required; `expires_in`
 //!   missing means 60 s (one warning); `token_type`, when present, must be `Bearer`.
 //! - The token is cached while more than its refresh margin remains (20 % of its lifetime, at least
-//!   5 s, at most 80 %); concurrent callers share one fetch ([`TokenProvider::token`],
+//!   5 s, at most half of it); concurrent callers share one fetch ([`TokenProvider::token`],
 //!   [`TokenProvider::refresh`]).
 //! - A background task refreshes the token at that point and publishes it on a watch channel
 //!   ([`TokenProvider::subscribe`]), which every live hub stream follows to send
 //!   `ClientMessage.credentials`. A failed proactive refresh keeps the current token and retries
-//!   after 1 s, 2 s ... 30 s; a token that is still valid is also what a new stream gets when
-//!   the endpoint cannot be reached in the margin window.
+//!   after 1 s, 2 s ... 30 s. A new stream never gets a token that is past its margin: when the
+//!   endpoint cannot give a new one the stream is not opened.
 //!
 //! The client secret (re-read from `client_secret_file` on every fetch) and the access tokens are
 //! never logged and never in an error or a `Debug` print.
@@ -39,10 +39,8 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 /// The lifetime assumed when the endpoint sends no `expires_in`.
 pub const DEFAULT_LIFETIME: Duration = Duration::from_secs(60);
-/// A token is refreshed at least this long before it expires...
+/// A token is refreshed at least this long before it expires (the Kotlin starter agrees)...
 pub const MIN_REFRESH_MARGIN: Duration = Duration::from_secs(5);
-/// ... but never earlier than this share of its lifetime.
-const MAX_MARGIN_PERCENT: u32 = 80;
 /// The wait after the first failed proactive refresh; it doubles up to [`RETRY_MAX`].
 pub const RETRY_MIN: Duration = Duration::from_secs(1);
 pub const RETRY_MAX: Duration = Duration::from_secs(30);
@@ -202,11 +200,10 @@ impl AccessToken {
 }
 
 /// How long before its expiry a token of `lifetime` is replaced: 20 % of it, at least 5 s, at
-/// most 80 % (a token that lives less than 6.25 s would otherwise be stale from the start).
+/// most half of it. The cap only matters below 10 s: without it a 6 s token would be renewed every
+/// second, at the hub's refresh throttle.
 pub fn refresh_margin(lifetime: Duration) -> Duration {
-    (lifetime / 5)
-        .max(MIN_REFRESH_MARGIN)
-        .min(lifetime / 100 * MAX_MARGIN_PERCENT)
+    (lifetime / 5).max(MIN_REFRESH_MARGIN).min(lifetime / 2)
 }
 
 /// What kind of credential the hub connections present.
@@ -333,16 +330,13 @@ impl TokenProvider {
     }
 
     /// A token to register with: the cached one while more than its refresh margin remains, else a
-    /// new one (concurrent callers wait for one fetch). When the endpoint cannot give one but the
-    /// cached token has not expired yet, that one.
+    /// new one (concurrent callers wait for one fetch). A token past its margin is never returned
+    /// when the fetch fails: the error is.
     pub async fn token(self: &Arc<Self>) -> Result<Arc<AccessToken>, TokenError> {
         if let Some(token) = self.cached().filter(|t| t.fresh()) {
             return Ok(token);
         }
-        match self.refresh().await {
-            Ok(token) => Ok(token),
-            Err(e) => self.cached().filter(|t| !t.remaining().is_zero()).ok_or(e),
-        }
+        self.refresh().await
     }
 
     /// Fetches a new token now (joining a fetch already under way), whatever the cache holds.
@@ -683,14 +677,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_refresh_margin_is_a_fifth_of_the_lifetime_at_least_5_seconds_at_most_80_percent() {
+    fn the_refresh_margin_is_a_fifth_of_the_lifetime_at_least_5_seconds_at_most_half() {
         let s = Duration::from_secs;
         assert_eq!(refresh_margin(s(300)), s(60));
         assert_eq!(refresh_margin(s(100)), s(20));
         assert_eq!(refresh_margin(s(25)), s(5));
         assert_eq!(refresh_margin(s(10)), s(5));
-        assert_eq!(refresh_margin(s(6)), Duration::from_millis(4800));
-        assert_eq!(refresh_margin(s(1)), Duration::from_millis(800));
+        assert_eq!(refresh_margin(s(6)), s(3));
+        assert_eq!(refresh_margin(s(1)), Duration::from_millis(500));
     }
 
     #[test]
