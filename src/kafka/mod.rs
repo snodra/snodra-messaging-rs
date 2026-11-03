@@ -2,12 +2,14 @@
 //! document-compatible with the Kotlin starter (`OutboxEventBus`, `OutboxPublisher`, `EventConsumer`).
 
 mod consumer;
+pub mod dispatch;
 pub mod headers;
 mod indexes;
 mod outbox;
 mod publisher;
 
-pub use consumer::{EventConsumer, RecordDisposition, classify};
+pub use consumer::{EventConsumer, RecordDisposition, classify, classify_with};
+pub use dispatch::{LocalEventDispatcher, NoSagas, SagaStage};
 pub use indexes::ensure_indexes;
 pub use outbox::{EventBus, OutboxDocument, new_outbox_document};
 pub use publisher::OutboxPublisher;

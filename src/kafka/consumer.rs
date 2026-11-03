@@ -5,22 +5,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mongodb::bson::{DateTime, doc};
-use mongodb::error::{ErrorKind, WriteFailure};
-use mongodb::{Client, ClientSession, Database};
+use mongodb::{Client, Database};
 use rdkafka::Message;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::{BorrowedMessage, Headers};
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::{PROCESSED_EVENTS_COLLECTION, headers};
+use super::dispatch::{LocalEventDispatcher, NoSagas, Outcome, SagaStage};
+use super::headers;
 use crate::codec;
-use crate::context::{CURRENT, MessageContext};
+use crate::context::MessageContext;
 use crate::error::MessagingError;
-use crate::hub::{EventContext, HandlerRegistry};
+use crate::hub::HandlerRegistry;
 
 /// What to do with a record, decided before any database work.
 #[derive(Debug, PartialEq, Eq)]
@@ -43,10 +41,25 @@ pub fn classify(
     offset: i64,
     registry: &HandlerRegistry,
 ) -> RecordDisposition {
+    classify_with(hdrs, payload, topic, partition, offset, |t| {
+        registry.has_event_handler(t)
+    })
+}
+
+/// [`classify`] with the interest in a type given as a predicate: the dispatcher's, which is an
+/// ordinary event handler or a saga type (a record only a saga wants is handled, not skipped).
+pub fn classify_with(
+    hdrs: &HashMap<String, String>,
+    payload: &[u8],
+    topic: &str,
+    partition: i32,
+    offset: i64,
+    interested: impl Fn(&str) -> bool,
+) -> RecordDisposition {
     let Some(type_name) = hdrs.get(headers::TYPE).filter(|t| !t.is_empty()) else {
         return RecordDisposition::Skip("record without type header");
     };
-    if !registry.has_event_handler(type_name) {
+    if !interested(type_name) {
         return RecordDisposition::Skip("no handler for this type");
     }
     if !codec::is_json_object(payload) {
@@ -65,20 +78,14 @@ pub fn classify(
 
 pub struct EventConsumer {
     consumer: StreamConsumer,
-    client: Client,
-    db: Database,
-    registry: Arc<HandlerRegistry>,
+    dispatcher: LocalEventDispatcher,
     topic: String,
     max_attempts: u32,
     backoff: Duration,
 }
 
-enum Outcome {
-    Handled,
-    Duplicate,
-}
-
 impl EventConsumer {
+    /// A consumer of the ordinary `event` handlers of `registry`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         bootstrap_servers: &str,
@@ -87,6 +94,34 @@ impl EventConsumer {
         client: Client,
         db: Database,
         registry: Arc<HandlerRegistry>,
+        max_attempts: u32,
+        backoff: Duration,
+    ) -> Result<Arc<EventConsumer>, MessagingError> {
+        Self::with_saga_stage(
+            bootstrap_servers,
+            group_id,
+            topic,
+            client,
+            db,
+            registry,
+            Arc::new(NoSagas),
+            max_attempts,
+            backoff,
+        )
+    }
+
+    /// [`new`](Self::new) with a saga stage: a record no ordinary handler wants but the saga stage
+    /// is interested in is handled too, and every record goes through the stage after the ordinary
+    /// handlers (see [`LocalEventDispatcher`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_saga_stage(
+        bootstrap_servers: &str,
+        group_id: &str,
+        topic: &str,
+        client: Client,
+        db: Database,
+        registry: Arc<HandlerRegistry>,
+        stage: Arc<dyn SagaStage>,
         max_attempts: u32,
         backoff: Duration,
     ) -> Result<Arc<EventConsumer>, MessagingError> {
@@ -99,9 +134,7 @@ impl EventConsumer {
             .create()?;
         Ok(Arc::new(EventConsumer {
             consumer,
-            client,
-            db,
-            registry,
+            dispatcher: LocalEventDispatcher::new(client, db, registry, stage),
             topic: topic.to_string(),
             max_attempts: max_attempts.max(1),
             backoff,
@@ -153,13 +186,13 @@ impl EventConsumer {
             })
             .unwrap_or_default();
         let payload = msg.payload().unwrap_or(&[]);
-        let (type_name, id) = match classify(
+        let (type_name, id) = match classify_with(
             &hdrs,
             payload,
             msg.topic(),
             msg.partition(),
             msg.offset(),
-            &self.registry,
+            |t| self.dispatcher.interested(t),
         ) {
             RecordDisposition::Skip(reason) => {
                 if reason != "no handler for this type" {
@@ -178,10 +211,15 @@ impl EventConsumer {
             tracing::warn!(r#type = %type_name, id = %id, "record has no id header, using topic-partition-offset for idempotency");
         }
         for attempt in 1..=self.max_attempts {
-            match self.process_once(&type_name, &id, &hdrs, payload).await {
-                Ok(Outcome::Handled) => return true,
-                Ok(Outcome::Duplicate) => {
-                    tracing::debug!(r#type = %type_name, id = %id, "duplicate event skipped");
+            let ctx = message_context(&type_name, &id, &hdrs);
+            match self
+                .dispatcher
+                .dispatch(&id, &type_name, payload, &ctx)
+                .await
+            {
+                Ok(Outcome::Handled | Outcome::Duplicate | Outcome::NoInterest) => return true,
+                Ok(Outcome::Unclaimed) => {
+                    tracing::debug!(r#type = %type_name, id = %id, "no saga instance applied the event");
                     return true;
                 }
                 Err(e) => {
@@ -199,119 +237,21 @@ impl EventConsumer {
         }
         true
     }
-
-    async fn process_once(
-        &self,
-        type_name: &str,
-        id: &str,
-        hdrs: &HashMap<String, String>,
-        payload: &[u8],
-    ) -> Result<Outcome, MessagingError> {
-        let mut session = self.client.start_session().await?;
-        session.start_transaction().await?;
-        let ctx = MessageContext {
-            message_id: id.to_string(),
-            type_name: type_name.to_string(),
-            correlation_id: hdrs
-                .get(headers::CORRELATION_ID)
-                .filter(|c| !c.is_empty())
-                .cloned()
-                .unwrap_or_else(|| id.to_string()),
-            identity: None,
-            authorization: None,
-            headers: hdrs.clone(),
-        };
-        // Marker first: a duplicate id never reaches the handler; a handler failure rolls the marker back.
-        match self.mark_processed(&mut session, id, type_name).await {
-            Ok(()) => {}
-            Err(MarkError::Duplicate) => {
-                let _ = session.abort_transaction().await;
-                return Ok(Outcome::Duplicate);
-            }
-            Err(MarkError::Other(e)) => {
-                let _ = session.abort_transaction().await;
-                return Err(e);
-            }
-        }
-        let session = Arc::new(Mutex::new(session));
-        let result = self
-            .run_handlers(type_name, payload, ctx, Arc::clone(&session))
-            .await;
-        let mut guard = session.lock().await;
-        match result {
-            Ok(()) => {
-                guard.commit_transaction().await?;
-                Ok(Outcome::Handled)
-            }
-            Err(e) => {
-                let _ = guard.abort_transaction().await;
-                Err(e)
-            }
-        }
-    }
-
-    async fn run_handlers(
-        &self,
-        type_name: &str,
-        payload: &[u8],
-        ctx: MessageContext,
-        session: Arc<Mutex<ClientSession>>,
-    ) -> Result<(), MessagingError> {
-        let handlers: Vec<_> = self.registry.event_handlers(type_name).to_vec();
-        for handler in handlers {
-            let ectx = EventContext {
-                message: ctx.clone(),
-                session: Arc::clone(&session),
-            };
-            let bytes = payload.to_vec();
-            let task =
-                tokio::spawn(CURRENT.scope(ctx.clone(), async move { handler(bytes, ectx).await }));
-            match task.await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => return Err(e),
-                Err(join) if join.is_panic() => {
-                    return Err(MessagingError::RemoteHandler {
-                        type_name: type_name.to_string(),
-                        message: "event handler panicked".into(),
-                        details: vec![],
-                    });
-                }
-                Err(join) => {
-                    return Err(MessagingError::Transport(format!(
-                        "event handler task failed: {join}"
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn mark_processed(
-        &self,
-        session: &mut ClientSession,
-        id: &str,
-        type_name: &str,
-    ) -> Result<(), MarkError> {
-        let marker = doc! { "_id": id, "type": type_name, "processedAt": DateTime::now() };
-        match self
-            .db
-            .collection::<mongodb::bson::Document>(PROCESSED_EVENTS_COLLECTION)
-            .insert_one(marker)
-            .session(&mut *session)
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(e) if is_duplicate_key(&e) => Err(MarkError::Duplicate),
-            Err(e) => Err(MarkError::Other(e.into())),
-        }
-    }
 }
 
-enum MarkError {
-    Duplicate,
-    Other(MessagingError),
-}
-
-fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
-    matches!(&*e.kind, ErrorKind::Write(WriteFailure::WriteError(w)) if w.code == 11000)
+/// What the handlers of a record see: its id and type, the correlation id header (else the id) and
+/// every header.
+fn message_context(type_name: &str, id: &str, hdrs: &HashMap<String, String>) -> MessageContext {
+    MessageContext {
+        message_id: id.to_string(),
+        type_name: type_name.to_string(),
+        correlation_id: hdrs
+            .get(headers::CORRELATION_ID)
+            .filter(|c| !c.is_empty())
+            .cloned()
+            .unwrap_or_else(|| id.to_string()),
+        identity: None,
+        authorization: None,
+        headers: hdrs.clone(),
+    }
 }
