@@ -266,6 +266,7 @@ pub struct TokenProvider {
     last_error: Mutex<Option<String>>,
     expires_in_warned: AtomicBool,
     refresher_started: AtomicBool,
+    closed: AtomicBool,
     cancel: CancellationToken,
     clock: WallClock,
     wake: Duration,
@@ -353,6 +354,7 @@ impl TokenProvider {
             last_error: Mutex::new(None),
             expires_in_warned: AtomicBool::new(false),
             refresher_started: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
             cancel: CancellationToken::new(),
             clock,
             wake,
@@ -363,6 +365,9 @@ impl TokenProvider {
     /// new one (concurrent callers wait for one fetch). A token past its margin is never returned
     /// when the fetch fails: the error is.
     pub async fn token(self: &Arc<Self>) -> Result<Arc<AccessToken>, TokenError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(Self::closed_error());
+        }
         if let Some(token) = self.cached().filter(|t| t.fresh((self.clock)())) {
             return Ok(token);
         }
@@ -371,6 +376,9 @@ impl TokenProvider {
 
     /// Fetches a new token now (joining a fetch already under way), whatever the cache holds.
     pub async fn refresh(self: &Arc<Self>) -> Result<Arc<AccessToken>, TokenError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(Self::closed_error());
+        }
         let flight = {
             let mut inflight = self.inflight.lock().unwrap();
             match inflight.as_ref() {
@@ -390,6 +398,19 @@ impl TokenProvider {
             }
         };
         flight.await
+    }
+
+    /// Stops the provider for good (idempotent): the background refresh ends and no request goes
+    /// to the token endpoint any more; [`token`](Self::token) and [`refresh`](Self::refresh)
+    /// return an error. Without it the loop runs until the last `Arc` is dropped, which a retained
+    /// handle can delay arbitrarily. [`HubPool::shutdown`](super::HubPool::shutdown) calls it.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.cancel.cancel();
+    }
+
+    fn closed_error() -> TokenError {
+        TokenError::new(FetchResult::IoError, "the OAuth2 token provider is closed")
     }
 
     /// The hub turned `token` down as unauthenticated (expired, unknown signing key, ...): it is not

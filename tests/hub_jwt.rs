@@ -643,6 +643,51 @@ async fn two_hubs_share_one_token_and_one_fetch() {
 }
 
 #[tokio::test]
+async fn after_the_pool_shuts_down_the_provider_asks_the_idp_for_nothing_more() {
+    let idp = Idp::start("svc", SECRET).await;
+    idp.set_lifetime(3); // margin 1.5 s: a refresh is due soon
+    let hub = FakeHub::start().await;
+    jwt_hub_acl(&hub);
+    // A retained handle (a `Sender` in the application) keeps the provider alive.
+    let provider = provider(&idp);
+    let (tx, _rx) = mpsc::channel::<Inbound>(16);
+    let pool = HubPool::new(
+        jwt_settings(hub.address(), &provider),
+        "svc".into(),
+        uuid::Uuid::new_v4().to_string(),
+        tx,
+    )
+    .unwrap();
+    pool.start();
+    assert!(pool.await_all_registered(Duration::from_secs(5)).await);
+    pool.shutdown().await;
+
+    let requests = idp.token_request_count().await;
+    tokio::time::sleep(Duration::from_millis(3200)).await; // past two refresh points
+    assert_eq!(
+        idp.token_request_count().await,
+        requests,
+        "no token request after the shutdown"
+    );
+    let err = provider.token().await.expect_err("a closed provider");
+    assert!(err.to_string().contains("closed"), "{err}");
+    assert_eq!(idp.token_request_count().await, requests);
+    hub.stop();
+}
+
+#[tokio::test]
+async fn closing_the_provider_is_idempotent_and_stops_refreshes() {
+    let idp = Idp::start("svc", SECRET).await;
+    let provider = provider(&idp);
+    provider.token().await.unwrap();
+    provider.close();
+    provider.close();
+    assert!(provider.token().await.is_err());
+    assert!(provider.refresh().await.is_err());
+    assert_eq!(idp.token_request_count().await, 1);
+}
+
+#[tokio::test]
 async fn connections_that_start_together_fetch_one_token() {
     let idp = Idp::start("svc", SECRET).await;
     idp.set_delay(Duration::from_millis(300));

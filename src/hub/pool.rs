@@ -452,6 +452,11 @@ impl HubPool {
         }
         let members = self.members();
         futures::future::join_all(members.iter().map(|m| m.conn.shutdown())).await;
+        // The token provider is the application's, shared by every hub; a `Sender` that outlives
+        // the shutdown must not keep it polling the IdP.
+        if let Some(provider) = &self.settings.token_provider {
+            provider.close();
+        }
     }
 
     fn members(&self) -> Vec<Arc<Member>> {
