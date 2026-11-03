@@ -55,7 +55,7 @@ use crate::types::{Command, Query, StreamingQuery, SubscriptionQuery};
 use super::connection::{
     Handshake, HubConnection, Inbound, SCATTER_GATHER, STREAMING, SUBSCRIPTION, StreamId,
 };
-use super::pool::{HubPool, weak_probe};
+use super::pool::{Consumers, HubPool, weak_probe};
 
 /// The timeout sent to a hub older than protocol v2 when the caller chose none (today's default).
 pub const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -880,13 +880,14 @@ impl Sender {
         sender
     }
 
-    /// True while a request written to `stream` is unanswered.
-    fn pending_on(&self, stream: StreamId) -> bool {
-        self.pending
-            .lock()
-            .unwrap()
-            .values()
-            .any(|e| e.stream == stream)
+    /// True while a request written to `stream` is unanswered; with [`Consumers::Ignore`] the
+    /// streaming queries and subscriptions this instance consumes are not counted (they end when
+    /// their owners decide, and a roll or a drain cuts them anyway).
+    fn pending_on(&self, stream: StreamId, consumers: Consumers) -> bool {
+        self.pending.lock().unwrap().values().any(|e| {
+            e.stream == stream
+                && (consumers == Consumers::Count || !matches!(e.waiter, Waiter::Stream(_)))
+        })
     }
 
     pub async fn send_command<C: Command>(

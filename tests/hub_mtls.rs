@@ -9,11 +9,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kraken_messaging::hub::{
-    AuthKind, HubConnection, HubPool, HubSettings, Inbound, ReplyTo, SendOptions, Sender,
-    SenderSettings,
+    AuthKind, Dispatcher, HandlerRegistry, HubConnection, HubPool, HubSettings, Inbound, ReplyTo,
+    SendOptions, Sender, SenderSettings, SubscriptionOptions,
 };
+use kraken_messaging::identity::IdentityResolver;
 use kraken_messaging::proto::{self, ServerMessage, reply, server_message};
-use kraken_messaging::{Command, HubTls, SecretString, message_type};
+use kraken_messaging::{Command, HubTls, SecretString, SubscriptionQuery, message_type};
 use serde::{Deserialize, Serialize};
 use support::fake_hub::{Event, FakeHub, default_ack};
 use support::logs::Captured;
@@ -1133,5 +1134,85 @@ async fn a_send_stops_waiting_for_the_roll_at_its_own_deadline() {
         "waited {waited:?}"
     );
     c.shutdown().await;
+    w.hub.stop();
+}
+
+/// A subscription query this instance consumes (another service owns it).
+#[derive(Serialize, Deserialize)]
+struct Prices {}
+message_type!(Prices, "t.Prices");
+#[derive(Serialize, Deserialize, Debug)]
+struct Quote {}
+impl SubscriptionQuery for Prices {
+    type Initial = Quote;
+    type Update = Quote;
+}
+
+/// The instance of service `owner` that handles `t.Prices`, with its own certificate.
+async fn price_owner(w: &World) -> Arc<HubPool> {
+    let (tls, _) = w.issue("owner", &ClientSpec::service("owner"));
+    let mut registry = HandlerRegistry::new();
+    registry.subscription_query::<Prices, _, _>(|_, _| async move { Ok(Quote {}) });
+    let (tx, mut rx) = mpsc::channel::<Inbound>(64);
+    let pool = HubPool::new(
+        settings(w.hub.address(), tls),
+        "owner".into(),
+        "o1".into(),
+        tx,
+    )
+    .unwrap();
+    pool.set_registered_types(registry.registered_types());
+    let dispatcher = Arc::new(Dispatcher::new(
+        Arc::new(registry),
+        Arc::new(IdentityResolver::new(None)),
+        4,
+    ));
+    pool.start();
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                Inbound::Request { request, reply_to } => {
+                    tokio::spawn(dispatcher.serve(request, reply_to));
+                }
+                Inbound::Flow(f) => dispatcher.flow(&f.request_id, f.credits),
+                Inbound::Cancel(c) => dispatcher.cancel(&c.request_id, &c.reason),
+                _ => {}
+            }
+        }
+    });
+    assert!(pool.await_all_registered(Duration::from_secs(5)).await);
+    pool
+}
+
+#[tokio::test]
+async fn the_drain_does_not_wait_for_the_subscriptions_this_instance_consumes() {
+    let w = world(true).await;
+    w.hub.set_subscription(true);
+    let owner = price_owner(&w).await;
+    let (tls, first) = w.issue("svc", &ClientSpec::service("svc"));
+    let c = client(settings(w.hub.address(), tls.clone())).await;
+    assert!(c.pool.await_all_registered(Duration::from_secs(5)).await);
+    c.presenting(&first).await;
+    // An open subscription: it ends only when its owner completes it, which is not going to happen.
+    let subscription = c
+        .sender
+        .subscribe(&Prices {}, SubscriptionOptions::default())
+        .await
+        .expect("subscribed");
+    assert_eq!(c.sender.in_flight(), 1);
+    let second = w.renew(&tls, &ClientSpec::service("svc"));
+    let started = Instant::now();
+    c.presenting_within(&second, Duration::from_secs(20)).await;
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(5),
+        "the roll waited {took:?} for the subscription this instance itself consumes"
+    );
+    // The roll cut it, as always: the consumer sees the loss.
+    let mut updates = subscription.updates;
+    let last = tokio_stream::StreamExt::next(&mut updates).await;
+    assert!(matches!(last, Some(Err(_))), "{last:?}");
+    c.shutdown().await;
+    owner.shutdown().await;
     w.hub.stop();
 }

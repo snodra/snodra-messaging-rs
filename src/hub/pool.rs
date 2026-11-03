@@ -97,7 +97,16 @@ pub type Resolver = Arc<
 >;
 
 /// Tells whether requests written to a stream are still unanswered (registered by a [`super::Sender`]).
-type PendingProbe = Box<dyn Fn(StreamId) -> bool + Send + Sync>;
+type PendingProbe = Box<dyn Fn(StreamId, Consumers) -> bool + Send + Sync>;
+
+/// Whether the requests whose results this instance itself consumes (streaming queries and
+/// subscriptions: they end when their owners decide, not when the work is done) count as work
+/// to wait for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Consumers {
+    Count,
+    Ignore,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
@@ -873,7 +882,9 @@ impl HubPool {
                 if let Err(e) = member.conn.reregister().await {
                     tracing::debug!(address = %member.address(), "no stream to deregister on: {e}");
                 }
-                while !me.idle(&member.conn) && tokio::time::Instant::now() < deadline {
+                while !me.idle(&member.conn, Consumers::Count)
+                    && tokio::time::Instant::now() < deadline
+                {
                     tokio::select! {
                         _ = me.cancel.cancelled() => return,
                         _ = tokio::time::sleep(DRAIN_POLL) => {}
@@ -1097,7 +1108,7 @@ impl HubPool {
             _ = self.cancel.cancelled() => return false,
             _ = tokio::time::sleep(ROLL_SETTLE) => {}
         }
-        while !self.idle(&member.conn) {
+        while !self.idle(&member.conn, Consumers::Ignore) {
             if tokio::time::Instant::now() >= deadline {
                 tracing::warn!(service = %self.service_name, address = %member.address(), "requests still running after {ROLL_IDLE_LIMIT:?}, closing the hub stream for the certificate rollover anyway");
                 break;
@@ -1111,11 +1122,17 @@ impl HubPool {
     }
 
     /// No handler of its requests running and none of our requests written to it unanswered.
-    fn idle(&self, conn: &HubConnection) -> bool {
+    fn idle(&self, conn: &HubConnection, consumers: Consumers) -> bool {
         let Some(stream) = conn.current_stream() else {
             return true;
         };
-        conn.inbound_in_flight() == 0 && !self.probes.lock().unwrap().iter().any(|p| p(stream))
+        conn.inbound_in_flight() == 0
+            && !self
+                .probes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p(stream, consumers))
     }
 }
 
@@ -1139,9 +1156,13 @@ pub(crate) fn plan(current: &[String], resolved: &[String]) -> (Vec<String>, Vec
 /// Keeps a [`super::Sender`] out of the pool's lifetime.
 pub(crate) fn weak_probe<S: Send + Sync + 'static>(
     sender: Weak<S>,
-    pending_on: fn(&S, StreamId) -> bool,
+    pending_on: fn(&S, StreamId, Consumers) -> bool,
 ) -> PendingProbe {
-    Box::new(move |stream| sender.upgrade().is_some_and(|s| pending_on(&s, stream)))
+    Box::new(move |stream, consumers| {
+        sender
+            .upgrade()
+            .is_some_and(|s| pending_on(&s, stream, consumers))
+    })
 }
 
 #[cfg(test)]
