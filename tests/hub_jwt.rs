@@ -442,6 +442,72 @@ async fn a_token_past_its_margin_is_not_served_when_the_endpoint_is_down() {
     assert_eq!(err.result(), FetchResult::HttpError);
 }
 
+/// A provider whose wall clock runs `skew` seconds ahead of the real one (what a machine that
+/// slept sees: the monotonic clocks stood still, the wall clock moved).
+fn skewed_provider(
+    idp: &Idp,
+    wake: Duration,
+) -> (Arc<TokenProvider>, Arc<std::sync::atomic::AtomicU64>) {
+    let skew = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let clock_skew = Arc::clone(&skew);
+    let clock: kraken_messaging::hub::WallClock = Arc::new(move || {
+        std::time::SystemTime::now()
+            + Duration::from_secs(clock_skew.load(std::sync::atomic::Ordering::SeqCst))
+    });
+    let provider = TokenProvider::with_timing(oauth2(idp, "svc", SECRET), clock, wake).unwrap();
+    (provider, skew)
+}
+
+#[tokio::test]
+async fn a_token_past_its_wall_clock_expiry_is_refetched_although_the_monotonic_clock_says_fresh() {
+    let idp = Idp::start("svc", SECRET).await;
+    idp.set_lifetime(300);
+    let (provider, skew) = skewed_provider(&idp, Duration::from_secs(30));
+    let first = provider.token().await.unwrap();
+    assert_eq!(
+        provider.token().await.unwrap().generation(),
+        first.generation()
+    );
+    assert_eq!(idp.issued(), 1);
+
+    // The machine slept for 400 s: `Instant` saw a few milliseconds, the wall clock 400 s.
+    skew.store(400, std::sync::atomic::Ordering::SeqCst);
+    let second = provider.token().await.unwrap();
+    assert_ne!(second.value().expose(), first.value().expose());
+    assert_eq!(idp.issued(), 2, "the expired token was not handed out");
+}
+
+#[tokio::test]
+async fn a_token_inside_its_margin_by_the_wall_clock_is_refetched_too() {
+    let idp = Idp::start("svc", SECRET).await;
+    idp.set_lifetime(300); // margin 60 s
+    let (provider, skew) = skewed_provider(&idp, Duration::from_secs(30));
+    provider.token().await.unwrap();
+    skew.store(200, std::sync::atomic::Ordering::SeqCst); // 100 s left: fresh
+    provider.token().await.unwrap();
+    assert_eq!(idp.issued(), 1);
+    skew.store(250, std::sync::atomic::Ordering::SeqCst); // 50 s left: inside the margin
+    provider.token().await.unwrap();
+    assert_eq!(idp.issued(), 2);
+}
+
+#[tokio::test]
+async fn the_refresh_loop_notices_a_wall_clock_jump_without_waiting_for_the_monotonic_deadline() {
+    let idp = Idp::start("svc", SECRET).await;
+    idp.set_lifetime(300); // the monotonic refresh point is 240 s away
+    let (provider, skew) = skewed_provider(&idp, Duration::from_millis(100));
+    let mut tokens = provider.subscribe();
+    provider.token().await.unwrap();
+    tokens.changed().await.unwrap();
+    skew.store(400, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokens.changed().await.unwrap();
+    })
+    .await
+    .expect("the loop re-checked against the wall clock and refreshed");
+    assert_eq!(idp.issued(), 2);
+}
+
 // ---- the provider on the hub connections ----
 
 fn jwt_settings(address: String, provider: &Arc<TokenProvider>) -> HubSettings {

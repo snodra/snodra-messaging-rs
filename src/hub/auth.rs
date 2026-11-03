@@ -6,12 +6,14 @@
 //!   2.3.1), 10 s timeout, response body capped at 1 MiB. `access_token` is required; `expires_in`
 //!   missing means 60 s (one warning); `token_type`, when present, must be `Bearer`.
 //! - The token is cached while more than its refresh margin remains (20 % of its lifetime, at least
-//!   5 s, at most half of it); concurrent callers share one fetch ([`TokenProvider::token`],
+//!   5 s, at most half of it) by the monotonic clock **and** by the wall clock (a suspended machine
+//!   stops the monotonic clocks, not the wall clock); concurrent callers share one fetch ([`TokenProvider::token`],
 //!   [`TokenProvider::refresh`]).
 //! - A background task refreshes the token at that point and publishes it on a watch channel
 //!   ([`TokenProvider::subscribe`]), which every live hub stream follows to send
 //!   `ClientMessage.credentials`. A failed proactive refresh keeps the current token and retries
-//!   after 1 s, 2 s ... 30 s. A new stream never gets a token that is past its margin: when the
+//!   after 1 s, 2 s ... 30 s. The loop wakes at least every 30 s ([`WAKE_INTERVAL`]) and looks at the
+//!   wall clock again, so a wake from suspend refreshes at once. A new stream never gets a token that is past its margin: when the
 //!   endpoint cannot give a new one the stream is not opened.
 //!
 //! The client secret (re-read from `client_secret_file` on every fetch) and the access tokens are
@@ -44,6 +46,9 @@ pub const MIN_REFRESH_MARGIN: Duration = Duration::from_secs(5);
 /// The wait after the first failed proactive refresh; it doubles up to [`RETRY_MAX`].
 pub const RETRY_MIN: Duration = Duration::from_secs(1);
 pub const RETRY_MAX: Duration = Duration::from_secs(30);
+/// The refresh loop wakes at least this often and looks at the wall clock: the monotonic clocks
+/// (`Instant`, tokio's timers) stand still while a laptop sleeps, the wall clock does not.
+pub const WAKE_INTERVAL: Duration = Duration::from_secs(30);
 /// An error text is clipped to this many characters.
 pub const ERROR_CLIP: usize = 200;
 
@@ -183,18 +188,26 @@ impl AccessToken {
         self.generation
     }
 
-    fn remaining(&self) -> Duration {
-        self.lifetime.saturating_sub(self.issued.elapsed())
+    /// How long the token still lives: the lesser of what the monotonic clock says (immune to the
+    /// wall clock being set) and what the wall clock says (immune to a suspended machine, whose
+    /// monotonic clocks stand still: macOS, a paused VM).
+    fn remaining(&self, now: SystemTime) -> Duration {
+        let monotonic = self.lifetime.saturating_sub(self.issued.elapsed());
+        let wall = self
+            .expires_at
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO);
+        monotonic.min(wall)
     }
 
     /// More than the refresh margin remains.
-    fn fresh(&self) -> bool {
-        self.remaining() > refresh_margin(self.lifetime)
+    fn fresh(&self, now: SystemTime) -> bool {
+        self.remaining(now) > refresh_margin(self.lifetime)
     }
 
     /// How long until the margin starts.
-    fn until_refresh(&self) -> Duration {
-        self.remaining()
+    fn until_refresh(&self, now: SystemTime) -> Duration {
+        self.remaining(now)
             .saturating_sub(refresh_margin(self.lifetime))
     }
 }
@@ -236,6 +249,9 @@ pub struct AuthStatus {
     pub last_error: Option<String>,
 }
 
+/// The wall clock the provider reads (replaceable in tests).
+pub type WallClock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
+
 type Flight = Shared<BoxFuture<'static, Result<Arc<AccessToken>, TokenError>>>;
 
 /// The token provider of the process: see the module docs.
@@ -251,6 +267,8 @@ pub struct TokenProvider {
     expires_in_warned: AtomicBool,
     refresher_started: AtomicBool,
     cancel: CancellationToken,
+    clock: WallClock,
+    wake: Duration,
 }
 
 impl fmt::Debug for TokenProvider {
@@ -275,6 +293,16 @@ impl TokenProvider {
     /// same). A plain `http://` URI logs one warning unless its host is loopback or a single-label
     /// name (a compose service): the client secret then crosses the network unencrypted.
     pub fn new(settings: HubOAuth2) -> Result<Arc<TokenProvider>, MessagingError> {
+        Self::with_timing(settings, Arc::new(SystemTime::now), WAKE_INTERVAL)
+    }
+
+    /// [`new`](Self::new) with the wall clock and the refresh loop's wake interval given (tests).
+    #[doc(hidden)]
+    pub fn with_timing(
+        settings: HubOAuth2,
+        clock: WallClock,
+        wake: Duration,
+    ) -> Result<Arc<TokenProvider>, MessagingError> {
         let url = reqwest::Url::parse(settings.token_uri.trim()).map_err(|e| {
             MessagingError::InvalidMessage(format!(
                 "hub_oauth2.token_uri (KRAKEN_HUB_OAUTH2_TOKEN_URI) is not a URL: {e}"
@@ -326,6 +354,8 @@ impl TokenProvider {
             expires_in_warned: AtomicBool::new(false),
             refresher_started: AtomicBool::new(false),
             cancel: CancellationToken::new(),
+            clock,
+            wake,
         }))
     }
 
@@ -333,7 +363,7 @@ impl TokenProvider {
     /// new one (concurrent callers wait for one fetch). A token past its margin is never returned
     /// when the fetch fails: the error is.
     pub async fn token(self: &Arc<Self>) -> Result<Arc<AccessToken>, TokenError> {
-        if let Some(token) = self.cached().filter(|t| t.fresh()) {
+        if let Some(token) = self.cached().filter(|t| t.fresh((self.clock)())) {
             return Ok(token);
         }
         self.refresh().await
@@ -536,7 +566,7 @@ impl TokenProvider {
             value: SecretString::new(access_token),
             issued: Instant::now(),
             lifetime,
-            expires_at: SystemTime::now() + lifetime,
+            expires_at: (self.clock)() + lifetime,
             generation: self.generation.fetch_add(1, Ordering::SeqCst) + 1,
         }))
     }
@@ -587,21 +617,25 @@ async fn refresh_loop(provider: Weak<TokenProvider>, cancel: CancellationToken) 
     loop {
         let delay = {
             let Some(p) = provider.upgrade() else { return };
-            if failures == 0 {
+            let wait = if failures == 0 {
                 p.cached()
-                    .map_or(RETRY_MIN, |t| t.until_refresh())
+                    .map_or(RETRY_MIN, |t| t.until_refresh((p.clock)()))
                     .max(RETRY_MIN)
             } else {
                 retry_delay(failures)
-            }
+            };
+            // Never sleep through more than the wake interval: a suspended machine does not advance
+            // the timer, so the deadline is re-checked against the wall clock after every wake.
+            wait.min(p.wake)
         };
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
             _ = cancel.cancelled() => return,
         }
         let Some(p) = provider.upgrade() else { return };
-        // Replaced meanwhile (a stream's own fetch): wait for the new token's margin instead.
-        if failures == 0 && p.cached().is_some_and(|t| t.fresh()) {
+        // Not due yet (an early wake), or replaced meanwhile (a stream's own fetch): wait for the
+        // current token's margin instead.
+        if failures == 0 && p.cached().is_some_and(|t| t.fresh((p.clock)())) {
             continue;
         }
         match p.refresh().await {
