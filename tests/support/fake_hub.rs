@@ -396,6 +396,8 @@ pub struct State {
     ends: StdMutex<Vec<(usize, proto::ReplyEnd)>>,
     flows: StdMutex<Vec<(usize, proto::Flow)>>,
     cancels: StdMutex<Vec<(usize, proto::Cancel)>>,
+    /// `ClientMessage.credentials` (P5b): (stream number, the new credential).
+    refreshes: StdMutex<Vec<(usize, proto::Credentials)>>,
 }
 
 impl State {
@@ -1832,6 +1834,7 @@ impl Hub for Service {
                                 }
                             }
                             client_message::Message::Status(st) => state.statuses.lock().unwrap().push((stream_no, st)),
+                            client_message::Message::Credentials(c) => state.refreshes.lock().unwrap().push((stream_no, c)),
                             client_message::Message::Request(req) => {
                                 state.requests.lock().await.push(req.clone());
                                 if let Some(denied) = state.check_send(&principal, &req) {
@@ -1988,6 +1991,7 @@ impl FakeHub {
             ends: StdMutex::new(vec![]),
             flows: StdMutex::new(vec![]),
             cancels: StdMutex::new(vec![]),
+            refreshes: StdMutex::new(vec![]),
         });
         let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2260,6 +2264,11 @@ impl FakeHub {
     /// What a permissive hub would have refused.
     pub fn violations(&self) -> Vec<String> {
         self.state.violations.lock().unwrap().clone()
+    }
+
+    /// The credential refreshes (`ClientMessage.credentials`) received, with the stream number.
+    pub fn refreshes(&self) -> Vec<(usize, proto::Credentials)> {
+        self.state.refreshes.lock().unwrap().clone()
     }
 
     pub fn reject_next_with_already_exists(&self) {
