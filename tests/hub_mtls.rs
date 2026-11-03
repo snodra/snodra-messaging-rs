@@ -694,17 +694,21 @@ async fn a_trickle_of_requests_sees_no_failure_while_the_hubs_roll_over() {
     let failures = Arc::new(Mutex::new(Vec::<String>::new()));
     let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let last_ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let trickle = {
-        let (failures, sent, running) = (
+        let (failures, sent, running, last_ok) = (
             Arc::clone(&failures),
             Arc::clone(&sent),
             Arc::clone(&running),
+            Arc::clone(&last_ok),
         );
         tokio::spawn(async move {
             while running.load(std::sync::atomic::Ordering::SeqCst) {
-                match sender.send_command(&Ping {}, SendOptions::default()).await {
-                    Ok(()) => {}
-                    Err(e) => failures.lock().unwrap().push(e.to_string()),
+                // A reply from the hub, decoded: the answer itself, not only no error.
+                let answer = sender.send_command(&Ping {}, SendOptions::default()).await;
+                last_ok.store(answer.is_ok(), std::sync::atomic::Ordering::SeqCst);
+                if let Err(e) = answer {
+                    failures.lock().unwrap().push(e.to_string());
                 }
                 sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -719,6 +723,10 @@ async fn a_trickle_of_requests_sees_no_failure_while_the_hubs_roll_over() {
     trickle.await.unwrap();
     assert!(sent.load(std::sync::atomic::Ordering::SeqCst) > 100);
     assert_eq!(*failures.lock().unwrap(), Vec::<String>::new());
+    assert!(
+        last_ok.load(std::sync::atomic::Ordering::SeqCst),
+        "the last answer is a reply"
+    );
     assert_eq!(c.pool.auth().certificate.unwrap().rotations, 1);
     c.shutdown().await;
     a.stop();
@@ -942,15 +950,19 @@ async fn with_one_hub_the_roll_has_a_short_gap_that_a_retry_policy_covers() {
     assert!(pool.await_all_registered(Duration::from_secs(5)).await);
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let failures = Arc::new(Mutex::new(Vec::<String>::new()));
+    let last_ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let trickle = {
-        let (sender, running, failures) = (
+        let (sender, running, failures, last_ok) = (
             Arc::clone(&sender),
             Arc::clone(&running),
             Arc::clone(&failures),
+            Arc::clone(&last_ok),
         );
         tokio::spawn(async move {
             while running.load(std::sync::atomic::Ordering::SeqCst) {
-                if let Err(e) = sender.send_command(&Ping {}, SendOptions::default()).await {
+                let answer = sender.send_command(&Ping {}, SendOptions::default()).await;
+                last_ok.store(answer.is_ok(), std::sync::atomic::Ordering::SeqCst);
+                if let Err(e) = answer {
                     failures.lock().unwrap().push(e.to_string());
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -968,6 +980,10 @@ async fn with_one_hub_the_roll_has_a_short_gap_that_a_retry_policy_covers() {
     running.store(false, std::sync::atomic::Ordering::SeqCst);
     trickle.await.unwrap();
     assert_eq!(*failures.lock().unwrap(), Vec::<String>::new());
+    assert!(
+        last_ok.load(std::sync::atomic::Ordering::SeqCst),
+        "the last answer is a reply"
+    );
     pool.shutdown().await;
     w.hub.stop();
 }
@@ -1322,12 +1338,17 @@ async fn the_delay_never_exceeds_its_bound_and_is_capped_by_a_tenth_of_the_remai
 async fn the_pair_is_checked_again_after_the_delay() {
     let w = world(true).await;
     let (tls, first) = w.issue("svc", &ClientSpec::service("svc"));
+    let draws = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&draws);
     let c = client_delayed(
         HubSettings {
             certificate_roll_delay_max: Duration::from_secs(1),
             ..settings(w.hub.address(), tls.clone())
         },
-        |bound| bound,
+        move |bound| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            bound
+        },
     )
     .await;
     assert!(c.pool.await_all_registered(Duration::from_secs(5)).await);
@@ -1347,6 +1368,11 @@ async fn the_pair_is_checked_again_after_the_delay() {
         presented,
         [first, third],
         "the superseded pair was presented"
+    );
+    assert_eq!(
+        draws.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one delay for the renewal, none more for the pair that replaced it meanwhile"
     );
     c.shutdown().await;
     w.hub.stop();
@@ -1375,6 +1401,50 @@ async fn the_files_are_checked_on_their_own_interval_not_the_heartbeat_period() 
     c.presenting(&first).await;
     let second = w.renew(&tls, &ClientSpec::service("svc"));
     c.presenting_within(&second, Duration::from_secs(3)).await;
+    c.shutdown().await;
+    w.hub.stop();
+}
+
+#[tokio::test]
+async fn a_failure_in_the_rotation_tick_is_logged_once_and_the_watch_goes_on() {
+    let w = world(true).await;
+    let (tls, first) = w.issue("svc", &ClientSpec::service("svc"));
+    let captured = Captured::default();
+    let _logs = captured.install();
+    // The delay source panics on its first draws (an unexpected failure inside the tick).
+    let draws = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&draws);
+    let c = client_delayed(
+        HubSettings {
+            certificate_roll_delay_max: Duration::from_secs(1),
+            ..settings(w.hub.address(), tls.clone())
+        },
+        move |_| {
+            if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 1 {
+                panic!("boom in the tick");
+            }
+            Duration::ZERO
+        },
+    )
+    .await;
+    assert!(c.pool.await_all_registered(Duration::from_secs(5)).await);
+    c.presenting(&first).await;
+    w.renew(&tls, &ClientSpec::service("svc"));
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let errors: Vec<String> = captured
+        .lines()
+        .into_iter()
+        .filter(|l| l.contains(" ERROR ") && l.contains("boom in the tick"))
+        .collect();
+    assert_eq!(
+        errors.len(),
+        1,
+        "once per distinct failure: {}",
+        captured.text()
+    );
+    // The watch is alive: a later renewal is rolled to.
+    let third = w.renew(&tls, &ClientSpec::service("svc"));
+    c.presenting(&third).await;
     c.shutdown().await;
     w.hub.stop();
 }

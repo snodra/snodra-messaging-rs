@@ -67,6 +67,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
+use futures::FutureExt;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -182,6 +183,8 @@ struct CertificateWatch {
     waiting: Option<[u8; 32]>,
     /// The digest of the pair the random delay before a roll was waited for.
     delayed: Option<[u8; 32]>,
+    /// The failure of the last tick that failed as a whole (logged once).
+    tick_failure: Option<String>,
 }
 
 pub struct HubPool {
@@ -950,7 +953,13 @@ impl HubPool {
                 _ = self.cancel.cancelled() => return,
                 _ = ticker.tick() => {}
             }
-            self.check_certificate().await;
+            // An unexpected failure (a panic) in one tick must not end the watch silently.
+            if let Err(panic) = std::panic::AssertUnwindSafe(self.check_certificate())
+                .catch_unwind()
+                .await
+            {
+                self.note_tick_failure(&panic_message(panic.as_ref()));
+            }
         }
     }
 
@@ -1001,9 +1010,9 @@ impl HubPool {
         }
         // The replicas of a service all see a renewal within one tick; rolled together they would
         // all be out of the routing at once. Each waits its own random time first, once per pair.
-        if !self.wait_before_rolling(&disk, cert_file, key_file).await {
+        let Some(disk) = self.wait_before_rolling(disk, cert_file, key_file).await else {
             return;
-        }
+        };
         for member in self.members() {
             if self.cancel.is_cancelled() {
                 return;
@@ -1022,49 +1031,70 @@ impl HubPool {
         }
     }
 
-    /// Before the first roll to `disk`: waits a random time, uniform in `[0, min(the setting,
-    /// 10 % of what the presented certificate has left)]` (nothing when it has expired already),
-    /// and looks at the files again. False when the roll is not to go on: the pool is shutting
-    /// down, or the files no longer hold `disk` (the next tick decides about what they hold).
+    /// Before the first roll to `disk` (once per pair, and only while a live connection presents
+    /// another one): waits a random time, uniform in `[0, min(the setting, 10 % of what the
+    /// shortest-lived stale connection's certificate has left)]` (nothing when it has ended
+    /// already), then reads the files again and returns the pair they hold then (valid, and for
+    /// this service), to roll to without another delay. `None` when the roll is not to go on: the
+    /// pool is shutting down, or the files no longer hold a usable pair (the next tick decides).
+    /// Without a stale connection, or after the pair's delay, `disk` itself.
     async fn wait_before_rolling(
         &self,
-        disk: &ClientIdentity,
+        disk: ClientIdentity,
         cert_file: &std::path::Path,
         key_file: &std::path::Path,
-    ) -> bool {
+    ) -> Option<ClientIdentity> {
         let remaining = {
             let mut watch = self.certificate.lock().unwrap();
             if watch.delayed == Some(disk.digest) {
-                return true;
+                return Some(disk);
             }
-            let stale = self.members().into_iter().find_map(|m| {
-                m.conn
-                    .presented_certificate()
-                    .filter(|p| p.digest != disk.digest)
-            });
-            let Some(presented) = stale else {
-                return true; // nothing to roll
+            let presented: Vec<_> = self
+                .members()
+                .iter()
+                .filter_map(|m| m.conn.presented_certificate())
+                .map(|p| (p.digest, p.status.not_after))
+                .collect();
+            let Some(remaining) =
+                shortest_stale_remaining(&presented, disk.digest, SystemTime::now())
+            else {
+                return Some(disk); // nothing to roll
             };
             watch.delayed = Some(disk.digest);
-            presented
-                .status
-                .not_after
-                .duration_since(SystemTime::now())
-                .unwrap_or_default()
+            remaining
         };
         let bound = roll_delay_bound(self.settings.certificate_roll_delay_max, remaining);
         let source = self.roll_delay.lock().unwrap().clone();
         let delay = source(bound).min(bound);
         if delay.is_zero() {
-            return true;
+            return Some(disk);
         }
         tracing::info!(service = %self.service_name, fingerprint = %disk.fingerprint, delay = ?delay, "a renewed client certificate is in the files; rolling the hub connections over to it after a random delay");
         tokio::select! {
-            _ = self.cancel.cancelled() => return false,
+            _ = self.cancel.cancelled() => return None,
             _ = tokio::time::sleep(delay) => {}
         }
-        mtls::load(cert_file, key_file, &self.service_name)
-            .is_ok_and(|now| now.digest == disk.digest)
+        // Whatever the files hold now is what is rolled to, without a second delay.
+        let current = mtls::load(cert_file, key_file, &self.service_name)
+            .and_then(|identity| {
+                mtls::check_valid_at(&identity, SystemTime::now())?;
+                Ok(identity)
+            })
+            .ok()?;
+        self.certificate.lock().unwrap().delayed = Some(current.digest);
+        Some(current)
+    }
+
+    /// A failure of a whole tick is logged at `error` once per distinct message, then at `debug`;
+    /// the watch goes on with the next tick.
+    fn note_tick_failure(&self, message: &str) {
+        let mut watch = self.certificate.lock().unwrap();
+        if watch.tick_failure.as_deref() == Some(message) {
+            tracing::debug!(service = %self.service_name, reason = message, "the client certificate check failed again; trying again next tick");
+        } else {
+            tracing::error!(service = %self.service_name, reason = message, "the client certificate check failed; the connections keep the certificate they present and the check goes on with the next tick");
+            watch.tick_failure = Some(message.to_string());
+        }
     }
 
     /// A renewed pair that is not valid yet is waited for: logged at `info` once per pair.
@@ -1210,10 +1240,34 @@ impl HubPool {
     }
 }
 
+/// The text of a caught panic.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|m| m.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unexpected failure".into())
+}
+
 /// The upper bound of the random delay before a rollover starts: `max`, or a tenth of what the
 /// presented certificate has left, whichever is smaller (zero when it has expired).
 pub(crate) fn roll_delay_bound(max: Duration, remaining: Duration) -> Duration {
     max.min(remaining / 10)
+}
+
+/// What the shortest-lived of the connections that do not present the pair `disk` has left at
+/// `now`: `None` when no connection is stale. `presented` is each live connection's
+/// `(digest, notAfter)`.
+pub(crate) fn shortest_stale_remaining(
+    presented: &[([u8; 32], SystemTime)],
+    disk: [u8; 32],
+    now: SystemTime,
+) -> Option<Duration> {
+    presented
+        .iter()
+        .filter(|(digest, _)| *digest != disk)
+        .map(|(_, not_after)| not_after.duration_since(now).unwrap_or_default())
+        .min()
 }
 
 /// The delay for a uniform `unit` in `[0, 1)`: that share of `bound`.
@@ -1268,6 +1322,30 @@ mod tests {
         );
         assert_eq!(roll_delay_bound(max, Duration::ZERO), Duration::ZERO);
         assert_eq!(roll_delay_bound(Duration::ZERO, 7 * day), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_bound_follows_the_shortest_lived_stale_connection() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let at = |secs: u64| now + Duration::from_secs(secs);
+        let (new, old_a, old_b) = ([1; 32], [2; 32], [3; 32]);
+        // Nothing presented, or only the new pair: nobody is stale.
+        assert_eq!(shortest_stale_remaining(&[], new, now), None);
+        assert_eq!(shortest_stale_remaining(&[(new, at(50))], new, now), None);
+        // The connection that already presents the new pair does not count.
+        assert_eq!(
+            shortest_stale_remaining(
+                &[(old_a, at(500)), (new, at(5)), (old_b, at(200))],
+                new,
+                now
+            ),
+            Some(Duration::from_secs(200))
+        );
+        // Already ended: zero.
+        assert_eq!(
+            shortest_stale_remaining(&[(old_a, now - Duration::from_secs(1))], new, now),
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]
