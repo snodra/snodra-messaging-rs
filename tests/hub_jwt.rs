@@ -442,6 +442,30 @@ async fn a_token_past_its_margin_is_not_served_when_the_endpoint_is_down() {
     assert_eq!(err.result(), FetchResult::HttpError);
 }
 
+#[tokio::test]
+async fn a_token_fetched_during_a_failure_streak_is_not_fetched_again_by_the_retry() {
+    let idp = Idp::start("svc", SECRET).await;
+    idp.set_lifetime(4); // margin 2 s: the proactive refresh is due at ~2 s
+    let provider = provider(&idp);
+    provider.token().await.unwrap();
+    idp.set_mode(Mode::Status(503));
+    until("the failed refresh", Duration::from_secs(5), || {
+        provider.status().last_error.is_some()
+    })
+    .await;
+    // A stream's own fetch succeeds while the loop waits for its 1 s retry: the token is new and
+    // fresh for ~2 s more, so the retry has nothing to do.
+    idp.set_mode(Mode::Ok);
+    provider.refresh().await.unwrap();
+    assert_eq!(idp.issued(), 2);
+    tokio::time::sleep(Duration::from_millis(1400)).await; // past the retry, before the next margin
+    assert_eq!(
+        idp.issued(),
+        2,
+        "the retry saw the replaced token and did not fetch another"
+    );
+}
+
 /// A provider whose wall clock runs `skew` seconds ahead of the real one (what a machine that
 /// slept sees: the monotonic clocks stood still, the wall clock moved).
 fn skewed_provider(

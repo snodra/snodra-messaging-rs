@@ -635,7 +635,9 @@ async fn refresh_loop(provider: Weak<TokenProvider>, cancel: CancellationToken) 
         let Some(p) = provider.upgrade() else { return };
         // Not due yet (an early wake), or replaced meanwhile (a stream's own fetch): wait for the
         // current token's margin instead.
-        if failures == 0 && p.cached().is_some_and(|t| t.fresh((p.clock)())) {
+        if p.cached().is_some_and(|t| t.fresh((p.clock)())) {
+            failures = 0;
+            logged = None;
             continue;
         }
         match p.refresh().await {
