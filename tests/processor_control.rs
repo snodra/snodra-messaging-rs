@@ -1408,6 +1408,90 @@ async fn audit_app(
     app
 }
 
+/// A renewal that reaches the instance after the operation's finish is a prepare of an operation
+/// that ended here, and one whose lock was cleared meanwhile renews nothing: both are refused
+/// NOT_PREPARED and never take the lock (which would stop every instance for a whole lease).
+#[tokio::test]
+async fn a_late_renewal_never_takes_the_lock_again() {
+    require_docker!();
+    let hub = FakeHub::start().await;
+    let kafka = support::containers::kafka().await;
+    let mongo = support::containers::mongo().await;
+    let topic = "late.events";
+    let handler = Handler::default();
+    let uri = mongo.uri_for("late");
+    let app = audit_app(
+        &hub,
+        &kafka.bootstrap,
+        &uri,
+        "svc-late",
+        topic,
+        &handler,
+        None,
+    )
+    .await;
+    let db = app.database();
+    let group = "svc-late.audit";
+    produce(&producer(&kafka.bootstrap), topic, None, "n-0").await;
+    eventually("n-0 handled", WITHIN, || async {
+        handler.count("n-0") == 1
+    })
+    .await;
+    eventually("a member of the group", WITHIN, || async {
+        members(&kafka.bootstrap, group).len() == 1
+    })
+    .await;
+    let lock = || async {
+        control_doc(&db, "audit")
+            .await
+            .unwrap()
+            .get("operation")
+            .cloned()
+    };
+
+    ok(hub.control("audit", prepare("op-1", 30_000), ASK).await);
+    ok(hub.control("audit", finish("op-1", false), ASK).await);
+    let (code, message) = refused(hub.control("audit", prepare("op-1", 30_000), ASK).await);
+    assert_eq!(code, ControlRefusal::NotPrepared, "{message}");
+    assert!(message.contains("op-1 already finished"), "{message}");
+    assert_eq!(lock().await, Some(Bson::Null));
+    eventually("consuming after the finish", WITHIN, || async {
+        members(&kafka.bootstrap, group).len() == 1
+    })
+    .await;
+
+    // The lock is cleared under the held operation (another instance cleared its passed lease).
+    ok(hub.control("audit", prepare("op-2", 30_000), ASK).await);
+    db.collection::<Document>("processor_control")
+        .update_one(
+            doc! { "_id": "audit" },
+            doc! { "$set": { "operation": null } },
+        )
+        .await
+        .unwrap();
+    let (code, message) = refused(hub.control("audit", prepare("op-2", 30_000), ASK).await);
+    assert_eq!(code, ControlRefusal::NotPrepared, "{message}");
+    assert!(message.contains("lock lost"), "{message}");
+    assert_eq!(lock().await, Some(Bson::Null));
+    let (code, _) = refused(hub.control("audit", prepare("op-2", 30_000), ASK).await);
+    assert_eq!(
+        code,
+        ControlRefusal::NotPrepared,
+        "and so is every later one"
+    );
+    eventually("consuming again", WITHIN, || async {
+        members(&kafka.bootstrap, group).len() == 1
+    })
+    .await;
+
+    // A first prepare still takes the lock.
+    ok(hub.control("audit", prepare("op-3", 30_000), ASK).await);
+    let held = lock().await.unwrap();
+    assert_eq!(held.as_document().unwrap().get_str("id").unwrap(), "op-3");
+    ok(hub.control("audit", finish("op-3", false), ASK).await);
+    app.shutdown().await;
+}
+
 /// A renewal written between the poll's read of a passed lease and its conditional clear keeps
 /// the lock: the instance stays prepared and out of the group.
 #[tokio::test]

@@ -137,6 +137,7 @@ impl ProcessorControl {
         };
         let runner = self.inner.runners.get(processor);
         // A renewal of the reset this instance holds: at once (ADR 0023), never behind an execute.
+        // One whose lock is gone is refused, never turned into a prepare that takes the lock.
         if let (Action::ResetPrepare(p), Some(runner)) = (&action, runner)
             && let Some(renewed) = runner.renew(&p.operation_id, lease(p.lease_ms)).await
         {

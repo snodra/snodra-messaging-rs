@@ -12,9 +12,9 @@
 //! on a blocking thread: the commits in flight are written, the group is left); starting again
 //! creates a new consumer, which reads the group's committed offsets.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 
@@ -43,6 +43,10 @@ pub const LEASE_KEEP: Duration = Duration::from_secs(10);
 /// For how long at most it does (the hub's default `KRAKEN_HUB_RESET_TIMEOUT`): an execute that
 /// hangs longer lets the lease pass, so the other instances consume again.
 pub const LEASE_KEEP_MAX: Duration = Duration::from_secs(120);
+/// For how long at least an operation that ended here (finished, aborted, its lease passed or its
+/// lock lost) is remembered, twice its lease when that is longer: a prepare of it is then a late
+/// renewal and never takes the lock again.
+pub const FINISHED_KEPT: Duration = Duration::from_secs(60);
 /// How long a stopped consumer may still be referenced (an offset read in flight) before it is
 /// left to close when the last reference goes.
 const CLOSE_WAIT: Duration = Duration::from_secs(10);
@@ -105,6 +109,8 @@ pub struct ProcessorRunner {
     /// One control action of this processor at a time, the poll included (a renewal of the held
     /// operation excepted).
     serial: Arc<tokio::sync::Mutex<()>>,
+    /// The operations that ended here, until when they are remembered ([`FINISHED_KEPT`]).
+    finished: Mutex<HashMap<String, Instant>>,
     /// Test seam: awaited by the next poll that finds the held lease passed, between reading the
     /// document and clearing the lock.
     pause_before_expiry: Mutex<Option<BoxFuture<'static, ()>>>,
@@ -139,6 +145,7 @@ impl ProcessorRunner {
             run: tokio::sync::Mutex::new(None),
             held: Mutex::new(None),
             serial: Arc::new(tokio::sync::Mutex::new(())),
+            finished: Mutex::new(HashMap::new()),
             pause_before_expiry: Mutex::new(None),
             cancel,
         })
@@ -149,6 +156,23 @@ impl ProcessorRunner {
     #[doc(hidden)]
     pub fn pause_before_next_expiry(&self, pause: BoxFuture<'static, ()>) {
         *self.pause_before_expiry.lock().unwrap() = Some(pause);
+    }
+
+    /// Remembers that `operation` ended here (see [`FINISHED_KEPT`]).
+    fn ended(&self, operation: &str, lease: Duration) {
+        let now = Instant::now();
+        let mut finished = self.finished.lock().unwrap();
+        finished.retain(|_, until| *until > now);
+        finished.insert(operation.to_string(), now + FINISHED_KEPT.max(lease * 2));
+    }
+
+    /// Whether `operation` ended here recently.
+    fn has_ended(&self, operation: &str) -> bool {
+        self.finished
+            .lock()
+            .unwrap()
+            .get(operation)
+            .is_some_and(|until| *until > Instant::now())
     }
 
     pub fn name(&self) -> &str {
@@ -227,6 +251,7 @@ impl ProcessorRunner {
                 }
             };
             if lost {
+                self.ended(&h.id, h.lease);
                 held = None;
                 *self.held.lock().unwrap() = None;
             }
@@ -398,13 +423,30 @@ impl ProcessorRunner {
                 }
                 Some(Ok("lease renewed".into()))
             }
-            // The lock is gone (its lease passed): taken again by an ordinary prepare.
-            Ok(false) => None,
+            // The lock is gone (its lease passed and it was cleared, or the operation finished
+            // meanwhile): never taken again by a late renewal (ADR 0023).
+            Ok(false) => {
+                {
+                    let mut held = self.held.lock().unwrap();
+                    if held.as_ref().is_some_and(|h| h.id == operation) {
+                        *held = None;
+                    }
+                }
+                self.ended(operation, lease);
+                Some(Err(Refusal::new(
+                    ControlRefusal::NotPrepared,
+                    format!(
+                        "lock lost: operation {operation} no longer holds the lock of processor '{}'",
+                        self.name()
+                    ),
+                )))
+            }
             Err(e) => Some(Err(Refusal::failed(&e))),
         }
     }
 
-    /// `reset_prepare`: takes the lock (or renews it) and leaves the group. The caller holds
+    /// `reset_prepare`: takes the lock (or renews it) and leaves the group; an operation that
+    /// already ended here is a late renewal, refused without taking the lock. The caller holds
     /// `serial`.
     pub(crate) async fn prepare(
         &self,
@@ -415,6 +457,12 @@ impl ProcessorRunner {
             return Err(Refusal::new(
                 ControlRefusal::Invalid,
                 "a prepare needs an operation id and a positive lease",
+            ));
+        }
+        if self.has_ended(operation) {
+            return Err(Refusal::new(
+                ControlRefusal::NotPrepared,
+                format!("operation {operation} already finished on this instance"),
             ));
         }
         let now = DateTime::now();
@@ -628,6 +676,7 @@ impl ProcessorRunner {
             .await
             .map_err(|e| Refusal::failed(&e))?;
         *self.held.lock().unwrap() = None;
+        self.ended(operation, held.as_ref().map_or(Duration::ZERO, |h| h.lease));
         self.converge().await;
         Ok(match (held.is_some(), aborted) {
             (false, _) => format!("operation {operation} is not held here"),
