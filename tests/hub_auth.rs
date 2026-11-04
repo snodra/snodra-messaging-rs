@@ -84,6 +84,7 @@ fn connection(settings: HubSettings, service: &str) -> Arc<HubConnection> {
         uuid::Uuid::new_v4().to_string(),
         tx,
     )
+    .expect("valid hub settings")
 }
 
 fn temp_file(content: &str) -> (PathBuf, PathBuf) {
@@ -655,7 +656,7 @@ fn connection_with_id(settings: HubSettings, service: &str, instance: &str) -> A
         let mut rx = rx;
         while rx.recv().await.is_some() {}
     });
-    HubConnection::new(settings, service.into(), instance.into(), tx)
+    HubConnection::new(settings, service.into(), instance.into(), tx).expect("valid hub settings")
 }
 
 #[tokio::test]
@@ -798,7 +799,8 @@ async fn caller(
         "caller".into(),
         uuid::Uuid::new_v4().to_string(),
         tx,
-    );
+    )
+    .expect("valid hub settings");
     conn.set_registered_types(RegisteredTypes::default());
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);

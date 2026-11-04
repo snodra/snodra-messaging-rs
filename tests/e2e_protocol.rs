@@ -97,7 +97,8 @@ async fn peer(address: &str, service: &str, commands: &[&str]) -> Peer {
         service.to_string(),
         uuid::Uuid::new_v4().to_string(),
         tx,
-    );
+    )
+    .expect("valid hub settings");
     conn.set_registered_types(RegisteredTypes {
         commands: commands.iter().map(|c| c.to_string()).collect(),
         ..RegisteredTypes::default()
@@ -398,7 +399,8 @@ async fn flow_peer(
         service.to_string(),
         uuid::Uuid::new_v4().to_string(),
         tx,
-    );
+    )
+    .expect("valid hub settings");
     if handles {
         let names = |types: &[&str]| types.iter().map(|t| t.to_string()).collect();
         conn.set_types(names(FLOW_COMMANDS), names(FLOW_QUERIES));

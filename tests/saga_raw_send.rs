@@ -78,7 +78,8 @@ async fn sender(hub: &FakeHub, settings: SenderSettings) -> Arc<Sender> {
         "svc".into(),
         uuid::Uuid::new_v4().to_string(),
         tx,
-    );
+    )
+    .expect("valid hub settings");
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);
     let sender = Sender::with_settings(conn, settings);

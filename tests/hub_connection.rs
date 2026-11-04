@@ -27,7 +27,8 @@ fn settings(address: String, backoff_min_ms: u64, backoff_max_ms: u64) -> HubSet
 
 fn connection(settings: HubSettings) -> (Arc<HubConnection>, mpsc::Receiver<Inbound>) {
     let (tx, rx) = mpsc::channel(64);
-    let conn = HubConnection::new(settings, "svc".into(), uuid::Uuid::new_v4().to_string(), tx);
+    let conn = HubConnection::new(settings, "svc".into(), uuid::Uuid::new_v4().to_string(), tx)
+        .expect("valid hub settings");
     (conn, rx)
 }
 
@@ -164,6 +165,23 @@ async fn invalid_argument_is_retried_at_max_backoff() {
     assert!(started.elapsed() >= Duration::from_millis(240));
     conn.shutdown().await;
     hub.stop();
+}
+
+/// `max_concurrent_handlers` is the `Register`'s `initial_permits`, which the hub refuses at 0:
+/// settings built in code fail at once instead of retrying a refused registration forever.
+#[tokio::test]
+async fn max_concurrent_handlers_of_zero_is_refused() {
+    let (tx, _rx) = mpsc::channel(1);
+    let s = HubSettings {
+        max_concurrent_handlers: 0,
+        ..settings("static://127.0.0.1:1".into(), 50, 500)
+    };
+    let refused = HubConnection::new(s, "svc".into(), "i".into(), tx);
+    assert!(
+        matches!(refused, Err(MessagingError::InvalidMessage(ref m)) if m.contains("max_concurrent_handlers")),
+        "{:?}",
+        refused.err()
+    );
 }
 
 #[tokio::test]

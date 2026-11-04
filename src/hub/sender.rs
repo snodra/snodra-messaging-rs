@@ -2012,7 +2012,8 @@ mod tests {
             "svc".into(),
             "i".into(),
             tx,
-        );
+        )
+        .expect("valid hub settings");
         Sender::with_settings(conn, SenderSettings::default())
     }
 

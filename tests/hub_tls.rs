@@ -30,6 +30,7 @@ fn connection(settings: HubSettings) -> Arc<HubConnection> {
     let (tx, mut rx) = mpsc::channel::<Inbound>(16);
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
     HubConnection::new(settings, "svc".into(), uuid::Uuid::new_v4().to_string(), tx)
+        .expect("valid hub settings")
 }
 
 fn ca(dir: &TempDir, pki: &Pki) -> HubTls {

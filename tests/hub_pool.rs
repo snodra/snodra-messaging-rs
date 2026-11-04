@@ -145,6 +145,23 @@ async fn registers_identically_on_every_hub_and_splits_the_permits() {
     c.shutdown().await;
 }
 
+/// Every stream offers at least one permit (the hub refuses 0): a pool without handlers to share
+/// is refused when it is built.
+#[test]
+fn max_concurrent_handlers_of_zero_is_refused() {
+    let (tx, _rx) = mpsc::channel(1);
+    let s = HubSettings {
+        max_concurrent_handlers: 0,
+        ..settings("static://127.0.0.1:1,static://127.0.0.1:2".into())
+    };
+    let refused = HubPool::new(s, "svc".into(), "i".into(), tx);
+    assert!(
+        matches!(refused, Err(MessagingError::InvalidMessage(ref m)) if m.contains("max_concurrent_handlers")),
+        "{:?}",
+        refused.err()
+    );
+}
+
 /// N counts the hubs live (or on their first attempt) when the Register is written: a stream
 /// re-opened while the other hub is down offers all the permits; nothing is revoked.
 #[tokio::test]

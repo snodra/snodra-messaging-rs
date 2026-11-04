@@ -166,7 +166,8 @@ fn peer(
         service.to_string(),
         uuid::Uuid::new_v4().to_string(),
         tx,
-    );
+    )
+    .expect("valid hub settings");
     conn.set_registered_types(types);
     let sender = Sender::new(Arc::clone(&conn), Some(Duration::from_secs(5)), false);
     let forward = Arc::clone(&sender);

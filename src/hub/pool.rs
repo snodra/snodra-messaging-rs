@@ -223,13 +223,15 @@ pub struct HubPool {
 
 impl HubPool {
     /// One connection per target of `settings.address` (nothing starts yet). `InvalidMessage`
-    /// when the address names no hub or is malformed ([`HubTargets::parse`]).
+    /// when the address names no hub or is malformed ([`HubTargets::parse`]), or when
+    /// `settings.max_concurrent_handlers` is 0.
     pub fn new(
         settings: HubSettings,
         service_name: String,
         instance_id: String,
         inbound: mpsc::Sender<Inbound>,
     ) -> Result<Arc<HubPool>, MessagingError> {
+        settings.check()?;
         let targets = HubTargets::parse(&settings.address)?;
         let pool = Arc::new(Self::empty(
             settings,
@@ -678,7 +680,8 @@ impl HubPool {
             self.service_name.clone(),
             self.instance_id.clone(),
             self.inbound.clone(),
-        );
+        )
+        .expect("the settings were checked by HubPool::new");
         conn.set_registered_types(self.types.lock().unwrap().clone());
         let weak = Arc::downgrade(self);
         let max = self.settings.max_concurrent_handlers;

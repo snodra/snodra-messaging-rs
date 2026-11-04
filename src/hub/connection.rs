@@ -163,6 +163,19 @@ impl Default for HubSettings {
     }
 }
 
+impl HubSettings {
+    /// `InvalidMessage` when the settings cannot register: `max_concurrent_handlers` 0 would be a
+    /// `Register.initial_permits` of 0, which the hub refuses.
+    pub(crate) fn check(&self) -> Result<(), MessagingError> {
+        if self.max_concurrent_handlers == 0 {
+            return Err(MessagingError::InvalidMessage(
+                "HubSettings.max_concurrent_handlers must be at least 1 (the hub refuses a Register without permits)".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The id of the hub that sent `ack` on a stream to `address`: `RegisterAck.hub_id`, or, should
 /// it be empty, the target as `host:port` ([`super::targets::target_id`]).
 pub(crate) fn hub_id(ack: &RegisterAck, address: &str) -> String {
@@ -615,12 +628,15 @@ pub(crate) struct Hooks {
 }
 
 impl HubConnection {
+    /// A connection to `settings.address` (nothing starts yet). `InvalidMessage` when
+    /// `settings.max_concurrent_handlers` is 0.
     pub fn new(
         settings: HubSettings,
         service_name: String,
         instance_id: String,
         inbound: mpsc::Sender<Inbound>,
-    ) -> Arc<HubConnection> {
+    ) -> Result<Arc<HubConnection>, MessagingError> {
+        settings.check()?;
         let (handshake, _) = watch::channel(None);
         let mut settings = settings;
         if settings
@@ -635,7 +651,7 @@ impl HubConnection {
             settings.token_file = None;
             settings.token_provider = None;
         }
-        Arc::new(HubConnection {
+        Ok(Arc::new(HubConnection {
             settings,
             service_name,
             instance_id,
@@ -662,7 +678,7 @@ impl HubConnection {
             outbound: Mutex::new(None),
             cancel: CancellationToken::new(),
             task: Mutex::new(None),
-        })
+        }))
     }
 
     /// The command and exclusive query types announced in every `Register`, no shared query

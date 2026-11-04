@@ -106,7 +106,8 @@ async fn sender_with(
         backoff_max: Duration::from_millis(500),
         ..HubSettings::default()
     };
-    let conn = HubConnection::new(settings, "svc".into(), uuid::Uuid::new_v4().to_string(), tx);
+    let conn = HubConnection::new(settings, "svc".into(), uuid::Uuid::new_v4().to_string(), tx)
+        .expect("valid hub settings");
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);
     let sender = Sender::with_settings(Arc::clone(&conn), sender_settings);

@@ -59,6 +59,7 @@ fn connection(settings: HubSettings, service: &str) -> Arc<HubConnection> {
         uuid::Uuid::new_v4().to_string(),
         tx,
     )
+    .expect("valid hub settings")
 }
 
 #[tokio::test]
