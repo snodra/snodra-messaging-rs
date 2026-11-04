@@ -258,7 +258,8 @@ async fn register_declares_protocol_v2_and_client_version() {
             "scatter-gather",
             "streaming",
             "subscription",
-            "credentials-refresh"
+            "credentials-refresh",
+            "processors"
         ]
     );
     assert_eq!(r.client_version, CLIENT_VERSION);
@@ -289,6 +290,7 @@ async fn ack_completes_the_handshake_and_its_interval_replaces_the_fallback() {
             "scatter-gather".into(),
             "streaming".into(),
             "subscription".into(),
+            "processors".into(),
         ],
         ..ack
     };
