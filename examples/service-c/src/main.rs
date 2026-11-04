@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use kraken_messaging::external::{ExternalSource, IdempotencyKey};
+use kraken_messaging::processors::EventOptions;
 use kraken_messaging::{Config, KrakenMessaging, MessagingError};
 use messages::{
     BannerFailed, BannerPrinted, Counter, GreetingDelivered, IncrementCounter, Inventory,
@@ -79,7 +80,8 @@ async fn main() -> Result<(), MessagingError> {
     let config = Config::from_env()?;
     let banners = BannerSettings::from_env()?;
     let audit = audit::Audit::default();
-    let audit_handler = audit.clone();
+    let (audit_handler, audit_notifier, audit_resets) =
+        (audit.clone(), audit.clone(), audit.clone());
     let outcomes = banner::BannerOutcomes::default();
     let (printed_outcomes, failed_outcomes) = (outcomes.clone(), outcomes.clone());
     let print_printer = printer::Printer::new(&banners.printer_url, banners.reply.clone())?;
@@ -198,6 +200,20 @@ async fn main() -> Result<(), MessagingError> {
         .event_in::<ShoutAudit, _, _>(audit::PROCESSOR, move |e, _ctx| {
             let handled = audit_handler.handle(e);
             async move { handled }
+        })
+        // P6b: a second handler there that a replay never runs again, and the reset handler.
+        .event_with::<ShoutAudit, _, _>(
+            EventOptions::new()
+                .processor(audit::PROCESSOR)
+                .disallow_replay(),
+            move |e, _ctx| {
+                audit_notifier.notify(e);
+                async { Ok(()) }
+            },
+        )
+        .reset_handler(audit::PROCESSOR, move |ctx| {
+            audit_resets.reset(&ctx);
+            async { Ok(()) }
         })
         // The banner saga and its edge.
         .saga(banner::SAGA, banner::banner_saga)

@@ -12,6 +12,10 @@
 //! - `GET /audit/dead-letters[?processor=&limit=]`, `GET /audit/dead-letters/count[?processor=]`,
 //!   `POST /audit/dead-letters/{id}/retry`, `POST /audit/dead-letters/retry-all[?processor=audit]`,
 //!   `DELETE /audit/dead-letters/{id}` (404 for an unknown letter): the library's `DeadLetters`.
+//! - `GET /audit/resets`: the resets of the processor that replayed something (P6b, ADR 0023), as
+//!   its reset handler saw them: `[{"operationId","target","ranges":[{"partition","from","until"}]}]`.
+//! - `GET /audit/notified`: the notes the processor's second handler handled, the one registered
+//!   with `disallow_replay` (a replay adds nothing): `[{"key","text","at"}]`.
 //!
 //! The sandbox is closed; a real service puts its own authorization in front of such endpoints.
 
@@ -28,7 +32,9 @@ use chrono::Utc;
 use kraken_messaging::MessagingError;
 use kraken_messaging::kafka::EventBus;
 use kraken_messaging::processors::dead_letters::DeadLetterDocument;
-use kraken_messaging::processors::{DEFAULT_LIST_LIMIT, DeadLetters, RetryResult};
+use kraken_messaging::processors::{
+    DEFAULT_LIST_LIMIT, DeadLetters, ResetContext, ResetTarget, RetryResult,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::messages::ShoutAudit;
@@ -46,6 +52,55 @@ pub struct Audit(Arc<Inner>);
 struct Inner {
     failing: AtomicBool,
     handled: Mutex<Vec<ShoutAudit>>,
+    notified: Mutex<Vec<ShoutAudit>>,
+    resets: Mutex<Vec<ResetView>>,
+}
+
+/// One reset as the processor's reset handler saw it, the JSON service-b's `/audit/resets` has.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetView {
+    pub operation_id: String,
+    /// `earliest`, `latest`, `timestamp <ms>` or `offsets {<partition>=<offset>, ...}`.
+    pub target: String,
+    pub ranges: Vec<RangeView>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct RangeView {
+    pub partition: i32,
+    pub from: i64,
+    pub until: i64,
+}
+
+impl From<&ResetContext> for ResetView {
+    fn from(ctx: &ResetContext) -> ResetView {
+        let target = match &ctx.target {
+            ResetTarget::Earliest => "earliest".to_string(),
+            ResetTarget::Latest => "latest".to_string(),
+            ResetTarget::Timestamp(ms) => format!("timestamp {ms}"),
+            ResetTarget::Offsets(all) => format!(
+                "offsets {{{}}}",
+                all.iter()
+                    .map(|(p, o)| format!("{p}={o}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        ResetView {
+            operation_id: ctx.operation_id.clone(),
+            target,
+            ranges: ctx
+                .ranges
+                .iter()
+                .map(|r| RangeView {
+                    partition: r.partition,
+                    from: r.from,
+                    until: r.until,
+                })
+                .collect(),
+        }
+    }
 }
 
 impl Audit {
@@ -75,6 +130,49 @@ impl Audit {
     pub fn handled(&self) -> Vec<ShoutAudit> {
         self.0
             .handled
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// The processor's second handler, registered with `disallow_replay`: a note it "notifies"
+    /// (a stand-in for an e-mail) is never notified again by a replay.
+    pub fn notify(&self, note: ShoutAudit) {
+        tracing::info!("C: notified key={} text={}", note.key, note.text);
+        self.0
+            .notified
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(note);
+    }
+
+    pub fn notified(&self) -> Vec<ShoutAudit> {
+        self.0
+            .notified
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// The processor's reset handler: records the reset (it keeps no projection to clear).
+    pub fn reset(&self, ctx: &ResetContext) {
+        let view = ResetView::from(ctx);
+        tracing::info!(
+            "C: audit reset operation={} target={} ranges={}",
+            view.operation_id,
+            view.target,
+            view.ranges.len()
+        );
+        self.0
+            .resets
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(view);
+    }
+
+    pub fn resets(&self) -> Vec<ResetView> {
+        self.0
+            .resets
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
@@ -155,6 +253,8 @@ pub fn router(http: AuditHttp) -> Router {
         .route("/audit/notes", post(publish))
         .route("/audit/failing", post(failing))
         .route("/audit/handled", get(handled))
+        .route("/audit/notified", get(notified))
+        .route("/audit/resets", get(resets))
         .route("/audit/dead-letters", get(list))
         .route("/audit/dead-letters/count", get(count))
         .route("/audit/dead-letters/retry-all", post(retry_all))
@@ -220,6 +320,14 @@ async fn failing(State(http): State<AuditHttp>, RawQuery(query): RawQuery) -> Re
 
 async fn handled(State(http): State<AuditHttp>) -> Response {
     json(StatusCode::OK, &http.audit.handled())
+}
+
+async fn notified(State(http): State<AuditHttp>) -> Response {
+    json(StatusCode::OK, &http.audit.notified())
+}
+
+async fn resets(State(http): State<AuditHttp>) -> Response {
+    json(StatusCode::OK, &http.audit.resets())
 }
 
 async fn list(State(http): State<AuditHttp>, RawQuery(query): RawQuery) -> Response {
@@ -433,6 +541,41 @@ mod tests {
             .await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "limit={limit}");
         }
+    }
+
+    #[test]
+    fn a_reset_is_shown_the_way_service_b_shows_it() {
+        use kraken_messaging::processors::{ReplayRange, ResetContext, ResetTarget};
+        let audit = Audit::default();
+        let ctx = |target| ResetContext {
+            processor: "audit".into(),
+            operation_id: "op-1".into(),
+            target,
+            ranges: vec![ReplayRange {
+                topic: "kraken.events".into(),
+                partition: 1,
+                from: 3,
+                until: 9,
+            }],
+        };
+        audit.reset(&ctx(ResetTarget::Earliest));
+        audit.reset(&ctx(ResetTarget::Offsets(vec![(0, 12), (1, 3)])));
+        audit.reset(&ctx(ResetTarget::Timestamp(1700)));
+        let views = serde_json::to_value(audit.resets()).unwrap();
+        assert_eq!(
+            views[0],
+            json!({"operationId": "op-1", "target": "earliest", "ranges": [{"partition": 1, "from": 3, "until": 9}]})
+        );
+        assert_eq!(views[1]["target"], "offsets {0=12, 1=3}");
+        assert_eq!(views[2]["target"], "timestamp 1700");
+    }
+
+    #[test]
+    fn notified_notes_are_kept_apart_from_the_handled_ones() {
+        let audit = Audit::default();
+        audit.notify(note("k1", "hello"));
+        assert_eq!(audit.notified().len(), 1);
+        assert!(audit.handled().is_empty());
     }
 
     #[test]
