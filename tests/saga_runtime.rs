@@ -983,3 +983,67 @@ async fn the_clock_decides_created_at_and_deadline_due_times() {
     let timeout = deadlines.iter().find(|d| d.name == "timeout").unwrap();
     assert_eq!(timeout.due_at, dt(t0() + Duration::from_secs(3600 + 600)));
 }
+
+#[derive(Default, Serialize, Deserialize)]
+struct Handover {
+    order_id: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HandoverPlaced {
+    order_id: String,
+}
+kraken_messaging::message_type!(HandoverPlaced, "rt.HandoverPlaced");
+impl Event for HandoverPlaced {}
+
+/// Its start handler moves the instance from its start association to another one at once.
+fn handover_saga() -> SagaType {
+    SagaDefinition::<Handover>::new("rt.Handover")
+        .start_on::<HandoverPlaced>(
+            "orderId",
+            |e| Some(e.order_id.clone()),
+            |s, e, ctx| {
+                s.order_id = Some(e.order_id.clone());
+                ctx.associate_with("paymentRef", &format!("pay-{}", e.order_id));
+                ctx.remove_association_with("orderId", &e.order_id);
+                Ok(())
+            },
+        )
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_start_handler_that_removes_its_own_start_association_leaves_the_start_key_free() {
+    require_docker!();
+    let rt = Rt::start().await;
+    let runtime = rt.runtime_of(vec![handover_saga()]);
+    let placed = HandoverPlaced {
+        order_id: "h1".into(),
+    };
+
+    deliver_to(&runtime, &placed, "e-h1", &[]).await;
+    let first = rt.store.sagas("rt.Handover").await;
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        first[0].associations,
+        [Association::new("paymentRef", "pay-h1")]
+    );
+    assert_eq!(
+        first[0].start_key, None,
+        "the start key went with the start association, as on an update (ruling 35)"
+    );
+
+    deliver_to(&runtime, &placed, "e-h2", &[]).await;
+    assert_eq!(
+        rt.store.failures().await.len(),
+        0,
+        "the second start event was not parked on a duplicate start key"
+    );
+    assert_eq!(
+        rt.store.sagas("rt.Handover").await.len(),
+        2,
+        "the second start event started a new instance"
+    );
+}

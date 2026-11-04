@@ -472,3 +472,24 @@ fn when_command_failed_for_a_command_no_saga_sent_fails_the_step_saying_so() {
     assert!(message.contains("fx.RequestCharge"), "{message}");
     assert!(message.contains("pay-zzz"), "{message}");
 }
+
+/// Its start handler hands the instance over from its start association to a payment reference.
+#[derive(Default, Serialize, Deserialize)]
+struct Handover {}
+
+fn handover_saga(d: SagaDefinition<Handover>) -> SagaDefinition<Handover> {
+    d.start_on::<OrderPlaced>("orderId", order_id, |_, e, ctx| {
+        ctx.associate_with("paymentRef", &format!("pay-{}", e.order_id));
+        ctx.remove_association_with("orderId", &e.order_id);
+        Ok(())
+    })
+}
+
+#[test]
+fn a_start_handler_that_removes_its_own_start_association_lets_the_next_start_event_start_another_saga()
+ {
+    SagaTestFixture::new("fx.Handover", handover_saga)
+        .given_events(&[&order("o1", 5)])
+        .when_event(&order("o1", 5))
+        .expect_active_sagas(2);
+}

@@ -932,15 +932,16 @@ fn plan(
     }
     let ended = effects.end;
     // The start key lives and dies with its association: remove that one and the key is free for
-    // a new instance (ruling 35).
+    // a new instance (ruling 35), also when the start handler itself removes it (ruling 68).
     let start_key = match doc {
-        Some(d) => d.start_key.clone().filter(|key| {
-            associations
-                .iter()
-                .any(|a| format!("{}|{}={}", t.name, a.k, a.v) == *key)
-        }),
+        Some(d) => d.start_key.clone(),
         None => start_key,
-    };
+    }
+    .filter(|key| {
+        associations
+            .iter()
+            .any(|a| format!("{}|{}={}", t.name, a.k, a.v) == *key)
+    });
     let version = doc.map_or(0, |d| d.version + 1);
     let next = SagaDocument {
         id: saga_id.to_string(),
