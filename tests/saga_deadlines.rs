@@ -393,8 +393,8 @@ async fn a_deadline_of_an_ended_saga_is_marked_cancelled_when_found_due() {
     .await;
     let ended = dl.saga("o1").await;
     assert!(ended.ended);
-    // A deadline that survived the end (a race, or one written by an older version): found due,
-    // it is cancelled, not run.
+    // A deadline still scheduled for an ended saga (its write raced the saga's end) or for no
+    // saga: found due, it is cancelled, not run.
     let deadline = |id: &str, saga_id: &str| DeadlineDocument {
         id: id.into(),
         saga_type: "dl.Charge".into(),

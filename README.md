@@ -115,7 +115,7 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `KRAKEN_SERVICE_NAME` | required | hub `service_name`, Kafka consumer group, event `source` |
+| `KRAKEN_SERVICE_NAME` | required | hub `service_name`, base of every processor's consumer group (`<service>.<processor>`, `default` included), event `source` |
 | `KRAKEN_MONGODB_URI` | required | must name a database, e.g. `mongodb://mongodb:27017/service-c?replicaSet=rs0` |
 | `KRAKEN_HUB_ADDRESS` | `static://kraken-hub:7000` | the hub's gRPC target (`static://` optional), a comma-separated list of them, or one `dns:///name:port` re-resolved every 30 s (see [Multiple hubs](#multiple-hubs)); one target is the single-hub setup |
 | `KRAKEN_HUB_STATUS_INTERVAL_MS` | 5000 | how often `InstanceStatus` goes to every hub (at least 1) |
@@ -1315,11 +1315,10 @@ Differences from the Kotlin starter: the settings are `HubTls.client_cert_file` 
 is run by the `HubPool` (a `HubConnection` used on its own re-reads the files on reconnect only); the
 rotation count is in `CertificateStatus` and there is no metrics registry.
 
-**Rollout: permissive first.** Hubs, services and the ACL are released independently, so go in this
-order: (1) roll the hub out with `KRAKEN_HUB_AUTH_MODE=permissive` and the ACL; it logs and counts
-every violation (`kraken_hub_auth_violations_total`) and refuses nothing; (2) roll the services out
-with their token (and TLS, once the hub has a certificate); (3) when the hub's log and metric show no
-violation, switch it to `enforce`. A service without a token against an `enforce` hub is refused
+**Turning it on: permissive first.** (1) Run the hub with `KRAKEN_HUB_AUTH_MODE=permissive` and the
+ACL; it logs and counts every violation (`kraken_hub_auth_violations_total`) and refuses nothing;
+(2) give the services their token (and TLS, once the hub has a certificate); (3) when the hub's log
+and metric show no violation, switch it to `enforce`. A service without a token against an `enforce` hub is refused
 and shows up as the `UNAUTHENTICATED` rejection above.
 
 Tested in `tests/hub_auth.rs` and `tests/hub_tls.rs` against the in-process fake hub (which implements
