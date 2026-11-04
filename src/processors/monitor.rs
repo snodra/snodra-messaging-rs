@@ -2,9 +2,12 @@
 //! consumer, its rebalance callbacks and its offset refresher, and read by the hub pool's status
 //! tick under a short lock (never a Kafka or Mongo call).
 //!
-//! State: STOPPED once stopping; else FAILING for 60 s after a record exhausted its attempts, a
-//! letter could not be parked or the consumer reported an error; else STARTING before the first
-//! assignment (an empty one counts) and between a revoke and the next assign; else RUNNING.
+//! State: STOPPED while its consumer does not run (stopping at shutdown, or out of the group for a
+//! reset, ADR 0023); else PAUSED while its control document says so; else FAILING for 60 s after
+//! a record exhausted its attempts, a letter could not be parked or the consumer reported an
+//! error; else STARTING before the first assignment (an empty one counts) and between a revoke
+//! and the next assign; else RUNNING. `operation_id` names the reset holding the processor's
+//! lock, `replaying` and `replay_until` its open replay ranges on the assigned partitions.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -47,6 +50,10 @@ struct State {
     partitions: BTreeMap<i32, Offsets>,
     last_error: Option<(String, i64)>,
     failing_since: Option<Instant>,
+    paused: bool,
+    operation: Option<String>,
+    /// Partition → the `until` of its open replay range.
+    replay: BTreeMap<i32, i64>,
 }
 
 /// See the module docs.
@@ -107,6 +114,8 @@ impl ProcessorMonitor {
             .is_some_and(|at| now.saturating_duration_since(at) < FAILING_FOR);
         let state = if st.stopped {
             ProcessorState::ProcessorStopped
+        } else if st.paused {
+            ProcessorState::ProcessorPaused
         } else if failing {
             ProcessorState::ProcessorFailing
         } else if !st.assigned_once || st.rebalancing {
@@ -123,7 +132,7 @@ impl ProcessorMonitor {
                 committed: o.committed,
                 high_watermark: o.high_watermark,
                 lag: lag(o),
-                replay_until: 0,
+                replay_until: st.replay.get(&partition).copied().unwrap_or(0),
             })
             .collect();
         let (last_error, last_error_at_ms) = st.last_error.clone().unwrap_or_default();
@@ -144,8 +153,8 @@ impl ProcessorMonitor {
             last_error_at_ms,
             event_types: self.event_types.clone(),
             dead_letter_mode: self.mode.as_str().to_string(),
-            replaying: false,
-            operation_id: String::new(),
+            replaying: st.partitions.keys().any(|p| st.replay.contains_key(p)),
+            operation_id: st.operation.clone().unwrap_or_default(),
         }
     }
 
@@ -233,9 +242,43 @@ impl ProcessorMonitor {
         self.sample.notified().await
     }
 
-    /// The processor is stopping or stopped.
+    /// The processor is stopping or stopped; its partitions are forgotten.
     pub fn stopped(&self) {
-        self.state.lock().unwrap().stopped = true;
+        let mut st = self.state.lock().unwrap();
+        st.stopped = true;
+        st.partitions.clear();
+    }
+
+    /// Its consumer starts (again): STARTING until the first assignment.
+    pub fn starting(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.stopped = false;
+        st.assigned_once = false;
+        st.rebalancing = false;
+        st.partitions.clear();
+    }
+
+    /// The control document pauses it (PAUSED while its consumer runs) or not.
+    pub fn set_paused(&self, paused: bool) {
+        self.state.lock().unwrap().paused = paused;
+    }
+
+    /// The reset holding the processor's lock, if any (`operation_id`).
+    pub fn set_operation(&self, operation: Option<&str>) {
+        self.state.lock().unwrap().operation = operation.map(str::to_string);
+    }
+
+    /// The open replay ranges of its topic: partition → `until`.
+    pub fn set_replay(&self, ranges: BTreeMap<i32, i64>) {
+        self.state.lock().unwrap().replay = ranges;
+    }
+
+    /// How far this instance is on an assigned `partition`: the higher of the next offset after
+    /// the last record it acknowledged and the group's committed offset (`None` unknown).
+    pub fn progress(&self, partition: i32) -> Option<i64> {
+        let st = self.state.lock().unwrap();
+        let o = st.partitions.get(&partition)?;
+        Some(o.position.max(o.committed)).filter(|&at| at >= 0)
     }
 }
 
@@ -347,6 +390,53 @@ mod tests {
         assert_eq!(s.failed_total, 1, "an error is not a failed record");
         m.stopped();
         assert_eq!(state(&m, Instant::now()), ProcessorState::ProcessorStopped);
+    }
+
+    #[test]
+    fn stopped_beats_paused_which_beats_failing_and_starting() {
+        let m = monitor();
+        m.set_paused(true);
+        assert_eq!(state(&m, Instant::now()), ProcessorState::ProcessorPaused);
+        m.exhausted("boom");
+        assert_eq!(
+            state(&m, Instant::now()),
+            ProcessorState::ProcessorPaused,
+            "paused beats failing"
+        );
+        m.set_operation(Some("op-1"));
+        m.stopped();
+        let s = m.status();
+        assert_eq!(state(&m, Instant::now()), ProcessorState::ProcessorStopped);
+        assert_eq!(s.operation_id, "op-1");
+        m.set_operation(None);
+        m.starting();
+        m.set_paused(false);
+        assert_eq!(state(&m, Instant::now()), ProcessorState::ProcessorFailing);
+        assert_eq!(m.status().operation_id, "");
+    }
+
+    #[test]
+    fn replay_ranges_of_the_assigned_partitions_and_progress() {
+        let m = monitor();
+        m.assigned(&[0, 1]);
+        m.set_replay(BTreeMap::from([(1, 40), (5, 9)]));
+        let s = m.status();
+        assert!(s.replaying);
+        assert_eq!(
+            s.partitions
+                .iter()
+                .map(|p| (p.partition, p.replay_until))
+                .collect::<Vec<_>>(),
+            [(0, 0), (1, 40)]
+        );
+        m.set_replay(BTreeMap::from([(5, 9)]));
+        assert!(!m.status().replaying, "not one of its partitions");
+        assert_eq!(m.progress(1), None);
+        m.acknowledged(1, 9, true);
+        assert_eq!(m.progress(1), Some(10));
+        m.offsets(1, 30, 40);
+        assert_eq!(m.progress(1), Some(30));
+        assert_eq!(m.progress(7), None);
     }
 
     #[test]

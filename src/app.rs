@@ -42,13 +42,14 @@ use crate::hub::{
 };
 use crate::identity::{Guard, IdentityResolver, JwksVerifier};
 use crate::kafka::{
-    EventBus, EventConsumer, LocalEventDispatcher, NoSagas, OUTBOX_COLLECTION, OutboxPublisher,
+    EventBus, LocalEventDispatcher, NoSagas, OUTBOX_COLLECTION, OutboxPublisher,
     PROCESSED_EVENTS_COLLECTION, ProcessorSettings, SagaStage, ensure_indexes,
 };
 use crate::processors::dead_letters::ensure_dead_letter_indexes;
+use crate::processors::reset::ResetHandler;
 use crate::processors::{
-    DEFAULT_PROCESSOR, DeadLetters, ProcessorMonitor, group_id, marker_prefix,
-    validate_processor_name,
+    DEFAULT_PROCESSOR, DeadLetters, EventOptions, ProcessorControl, ProcessorMonitor,
+    ProcessorRunner, ResetContext, group_id, marker_prefix, validate_processor_name,
 };
 use crate::proto::ProcessorStatus;
 use crate::saga::{
@@ -88,6 +89,8 @@ pub struct KrakenMessagingBuilder {
     processors: std::collections::BTreeMap<String, HandlerRegistry>,
     /// Invalid processor names given to `event_in`, returned by `start()`.
     processor_errors: Vec<MessagingError>,
+    /// The reset handlers (ADR 0023), by processor name, in registration order.
+    reset_handlers: Vec<(String, ResetHandler)>,
 }
 
 pub struct KrakenMessaging {
@@ -112,6 +115,7 @@ pub struct KrakenMessaging {
     /// One per started event processor, `default` first.
     monitors: Vec<Arc<ProcessorMonitor>>,
     dead_letters: DeadLetters,
+    processor_control: ProcessorControl,
 }
 
 impl KrakenMessaging {
@@ -156,6 +160,7 @@ impl KrakenMessaging {
             clock: Clock::system(),
             processors: std::collections::BTreeMap::new(),
             processor_errors: Vec::new(),
+            reset_handlers: Vec::new(),
             config,
         })
     }
@@ -165,6 +170,13 @@ impl KrakenMessaging {
     /// every call is an error naming the mode. See [`DeadLetters`].
     pub fn dead_letters(&self) -> DeadLetters {
         self.dead_letters.clone()
+    }
+
+    /// Processor control (ADR 0023): pause and resume a processor on every instance (through its
+    /// `processor_control` document), and the handling of the hub's control requests. See
+    /// [`ProcessorControl`].
+    pub fn processor_control(&self) -> ProcessorControl {
+        self.processor_control.clone()
     }
 
     /// The status of every event processor this instance started (`default` first, then the
@@ -420,13 +432,67 @@ impl KrakenMessagingBuilder {
 
     /// An event handler in the unnamed processor `default` (with the sagas): the service's
     /// consumer group and the plain `<eventId>` markers.
-    pub fn event<E, F, Fut>(mut self, handler: F) -> Self
+    pub fn event<E, F, Fut>(self, handler: F) -> Self
     where
         E: Event,
         F: Fn(E, EventContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), MessagingError>> + Send + 'static,
     {
-        self.registry.event::<E, F, Fut>(handler);
+        self.event_with::<E, F, Fut>(EventOptions::new(), handler)
+    }
+
+    /// An event handler registered with `options`: its processor (`default` unless
+    /// [`EventOptions::processor`], as [`event_in`](Self::event_in)) and whether it runs again for
+    /// a record its processor replays after a reset ([`EventOptions::disallow_replay`], ADR 0023,
+    /// Kotlin's `@DisallowReplay`).
+    ///
+    /// ```ignore
+    /// builder.event_with::<OrderPlaced, _, _>(EventOptions::new().disallow_replay(), |e, ctx| async move { ... })
+    /// ```
+    pub fn event_with<E, F, Fut>(mut self, options: EventOptions, handler: F) -> Self
+    where
+        E: Event,
+        F: Fn(E, EventContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), MessagingError>> + Send + 'static,
+    {
+        let registry = match options.processor_name() {
+            None => &mut self.registry,
+            Some(processor) => {
+                match validate_processor_name(processor, &format!("event handler for {}", E::TYPE))
+                {
+                    Ok(()) => self.processors.entry(processor.to_string()).or_default(),
+                    Err(e) => {
+                        self.processor_errors.push(e);
+                        return self;
+                    }
+                }
+            }
+        };
+        if options.disallows_replay() {
+            registry.event_disallowing_replay::<E, F, Fut>(handler);
+        } else {
+            registry.event::<E, F, Fut>(handler);
+        }
+        self
+    }
+
+    /// A reset handler of processor `processor` (`default`, or a name given to `event_in`; ADR
+    /// 0023, Kotlin's `@ResetHandler`): runs once per reset that replays a range, on the instance
+    /// executing it, before the markers and the offsets change, with the target and the ranges.
+    /// The handlers of a processor run in registration order; an error (or a panic) refuses the
+    /// reset (`RESET_HANDLER_FAILED`) with nothing changed. A processor without event handlers
+    /// here fails [`start`](Self::start).
+    ///
+    /// ```ignore
+    /// builder.reset_handler("projections", |ctx: ResetContext| async move { clear_projection(&ctx).await })
+    /// ```
+    pub fn reset_handler<F, Fut>(mut self, processor: &str, handler: F) -> Self
+    where
+        F: Fn(ResetContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), MessagingError>> + Send + 'static,
+    {
+        let handler: ResetHandler = Arc::new(move |ctx| Box::pin(handler(ctx)));
+        self.reset_handlers.push((processor.to_string(), handler));
         self
     }
 
@@ -441,21 +507,13 @@ impl KrakenMessagingBuilder {
     /// ```ignore
     /// builder.event_in::<OrderPlaced, _, _>("projections", |e, ctx| async move { ... })
     /// ```
-    pub fn event_in<E, F, Fut>(mut self, processor: &str, handler: F) -> Self
+    pub fn event_in<E, F, Fut>(self, processor: &str, handler: F) -> Self
     where
         E: Event,
         F: Fn(E, EventContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), MessagingError>> + Send + 'static,
     {
-        match validate_processor_name(processor, &format!("event handler for {}", E::TYPE)) {
-            Ok(()) => self
-                .processors
-                .entry(processor.to_string())
-                .or_default()
-                .event::<E, F, Fut>(handler),
-            Err(e) => self.processor_errors.push(e),
-        }
-        self
+        self.event_with::<E, F, Fut>(EventOptions::new().processor(processor), handler)
     }
 
     /// A subscription query handler (ADR 0017, P4c): `handler` answers the initial result of
@@ -683,6 +741,7 @@ impl KrakenMessagingBuilder {
             clock,
             processors: named_registries,
             processor_errors,
+            reset_handlers,
         } = self;
         // Definition errors first: nothing is connected or created for a saga that cannot run.
         if let Some(e) = processor_errors.into_iter().next() {
@@ -790,13 +849,27 @@ impl KrakenMessagingBuilder {
         if config.dead_letter_mode == DeadLetterMode::Collection && !planned.is_empty() {
             ensure_dead_letter_indexes(&db).await?;
         }
+        if let Some((processor, _)) = reset_handlers
+            .iter()
+            .find(|(p, _)| !planned.iter().any(|(name, _)| name == p))
+        {
+            return Err(MessagingError::InvalidMessage(format!(
+                "reset handler of processor '{processor}': the processor has no event handler in this service"
+            )));
+        }
         // The admin API serves every processor with handlers here, whether or not this instance
         // consumes (`KRAKEN_CONSUMER_ENABLED=false`).
         let dead_letters = DeadLetters::new(db.clone(), config.dead_letter_mode, planned.clone());
-        let mut consumers = Vec::new();
+        // Each processor's consumer runs under its control document (ADR 0023).
+        let mut runners = Vec::new();
         if config.consumer_enabled {
             for (name, dispatcher) in planned {
-                let consumer = EventConsumer::processor(
+                let handlers = reset_handlers
+                    .iter()
+                    .filter(|(p, _)| *p == name)
+                    .map(|(_, h)| Arc::clone(h))
+                    .collect();
+                let runner = ProcessorRunner::new(
                     ProcessorSettings {
                         group_id: group_id(&config.service_name, &name),
                         name,
@@ -809,11 +882,15 @@ impl KrakenMessagingBuilder {
                         db: Some(db.clone()),
                     },
                     dispatcher,
-                )?;
-                consumers.push(consumer);
+                    &db,
+                    handlers,
+                    cancel.clone(),
+                );
+                runners.push(runner);
             }
         }
-        let monitors: Vec<Arc<ProcessorMonitor>> = consumers.iter().map(|c| c.monitor()).collect();
+        let monitors: Vec<Arc<ProcessorMonitor>> = runners.iter().map(|r| r.monitor()).collect();
+        let processor_control = ProcessorControl::new(runners.clone(), dead_letters.clone());
         let reported = monitors.clone();
         hubs.set_processor_status(Arc::new(move || {
             reported.iter().map(|m| m.status()).collect()
@@ -825,6 +902,7 @@ impl KrakenMessagingBuilder {
         let loop_cancel = cancel.clone();
         let loop_handlers = handlers.clone();
         let loop_dispatcher = Arc::clone(&dispatcher);
+        let loop_control = processor_control.clone();
         tasks.push(tokio::spawn(async move {
             loop {
                 let msg = tokio::select! {
@@ -837,6 +915,23 @@ impl KrakenMessagingBuilder {
                     // before the spawn, so that a Flow or Cancel right behind it finds it.
                     Inbound::Request { request, reply_to } => {
                         loop_handlers.spawn(loop_dispatcher.serve(request, reply_to));
+                    }
+                    // Off the read loop and this one (ADR 0023): a reset may take minutes. The
+                    // answer goes back on the stream the request arrived on.
+                    Inbound::Control { request, reply_to } => {
+                        let control = loop_control.clone();
+                        tokio::spawn(async move {
+                            let reply = control.handle(request).await;
+                            let control_id = reply.control_id.clone();
+                            if let Err(e) = reply_to
+                                .send(crate::proto::ClientMessage {
+                                    message: Some(crate::proto::client_message::Message::ControlReply(reply)),
+                                })
+                                .await
+                            {
+                                tracing::warn!(control_id = %control_id, stream = reply_to.stream(), "control reply dropped: {e}");
+                            }
+                        });
                     }
                     Inbound::Flow(f) => loop_dispatcher.flow(&f.request_id, f.credits),
                     Inbound::Cancel(c) => loop_dispatcher.cancel(&c.request_id, &c.reason),
@@ -863,8 +958,8 @@ impl KrakenMessagingBuilder {
             )?;
             tasks.push(publisher.start(cancel.clone()));
         }
-        for consumer in consumers {
-            tasks.push(consumer.start(cancel.clone()));
+        for runner in &runners {
+            tasks.push(runner.start());
         }
         // The relay, the deadline scheduler and the gauge sampler stop on their own token, before
         // the consumer and the hub streams (`shutdown`).
@@ -927,6 +1022,7 @@ impl KrakenMessagingBuilder {
             clock,
             monitors,
             dead_letters,
+            processor_control,
         })
     }
 }

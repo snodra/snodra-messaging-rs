@@ -6,8 +6,14 @@
 //! unreachable), the record is not committed: its partition is sought back to it and the consumer
 //! polls again, so the record comes back after a second while the poll loop keeps the group
 //! membership (and the other partitions flow).
+//!
+//! Processor control (ADR 0023) reaches it through its [`ConsumerControl`]: paused, it pauses
+//! its assigned partitions (and every partition assigned later) and keeps polling, so it stays in
+//! the group; a record of a replay range is handled without the handlers that disallow replay
+//! and without the sagas.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,6 +38,7 @@ use crate::context::MessageContext;
 use crate::error::MessagingError;
 use crate::hub::HandlerRegistry;
 use crate::processors::ProcessorMonitor;
+use crate::processors::control_store::ReplayRange;
 use crate::processors::dead_letters::{
     DeadLetterDocument, DeadLetterError, DeadLetterReason, DeadLetterRecord,
     MAX_ERROR_MESSAGE_CHARS, cut_chars,
@@ -106,8 +113,13 @@ pub const DEAD_LETTERS_SAMPLE: Duration = Duration::from_secs(30);
 /// failed) and its redelivery.
 const PARK_RETRY: Duration = Duration::from_secs(1);
 
+/// Between a record that arrived while the processor is paused (fetched before the pause) and the
+/// next poll.
+const PAUSED_POLL: Duration = Duration::from_millis(100);
+
 /// What a processor's consumer is (ADR 0022): its name, group, dead-letter mode and the database
 /// its letters go to.
+#[derive(Clone)]
 pub struct ProcessorSettings {
     /// `default` or the name given to `event_in`.
     pub name: String,
@@ -124,10 +136,41 @@ pub struct ProcessorSettings {
     pub db: Option<Database>,
 }
 
+/// What processor control (ADR 0023) tells a processor's consumer, shared by its every run: the
+/// pause and the open replay ranges.
+#[derive(Debug, Default)]
+pub struct ConsumerControl {
+    paused: AtomicBool,
+    replay: Mutex<Vec<ReplayRange>>,
+}
+
+impl ConsumerControl {
+    pub fn paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::SeqCst);
+    }
+
+    pub(crate) fn set_replay(&self, ranges: Vec<ReplayRange>) {
+        *self.replay.lock().unwrap() = ranges;
+    }
+
+    /// Whether the record at `offset` of `partition` of `topic` is in an open replay range.
+    pub fn replays(&self, topic: &str, partition: i32, offset: i64) -> bool {
+        self.replay.lock().unwrap().iter().any(|r| {
+            r.topic == topic && r.partition == partition && r.from <= offset && offset < r.until
+        })
+    }
+}
+
 /// The consumer's librdkafka callbacks: the assignment and errors go to the processor's monitor
-/// (never blocking: they run inside the consumer's poll).
+/// (never blocking: they run inside the consumer's poll); a partition assigned while the processor
+/// is paused is paused at once.
 pub struct ProcessorContext {
     monitor: Arc<ProcessorMonitor>,
+    control: Arc<ConsumerControl>,
 }
 
 impl ClientContext for ProcessorContext {
@@ -152,7 +195,7 @@ impl ClientContext for ProcessorContext {
 }
 
 impl ConsumerContext for ProcessorContext {
-    fn post_rebalance(&self, _consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
+    fn post_rebalance(&self, consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
         let partitions = |tpl: &TopicPartitionList| {
             tpl.elements()
                 .iter()
@@ -163,6 +206,12 @@ impl ConsumerContext for ProcessorContext {
             Rebalance::Assign(tpl) => {
                 let assigned = partitions(tpl);
                 tracing::info!(processor = %self.monitor.name(), partitions = ?assigned, "partitions assigned");
+                if self.control.paused()
+                    && !assigned.is_empty()
+                    && let Err(e) = consumer.pause(tpl)
+                {
+                    tracing::warn!(processor = %self.monitor.name(), "cannot pause the assigned partitions: {e}");
+                }
                 self.monitor.assigned(&assigned);
             }
             Rebalance::Revoke(tpl) => {
@@ -217,6 +266,7 @@ pub struct EventConsumer {
     backoff: Duration,
     sink: Sink,
     monitor: Arc<ProcessorMonitor>,
+    control: Arc<ConsumerControl>,
     parked: Mutex<ParkedKeys>,
     /// Per (partition, offset): what the dead letters still have to take.
     pending: Mutex<HashMap<(i32, i64), PendingLetter>>,
@@ -326,6 +376,22 @@ impl EventConsumer {
             settings.dead_letter_mode,
             dispatcher.event_types(),
         ));
+        Self::controlled(
+            settings,
+            dispatcher,
+            monitor,
+            Arc::new(ConsumerControl::default()),
+        )
+    }
+
+    /// One run of a controlled processor's consumer (ADR 0023): its monitor and its control
+    /// outlive the run, which ends (and leaves the group) when the consumer is dropped.
+    pub fn controlled(
+        settings: ProcessorSettings,
+        dispatcher: Arc<LocalEventDispatcher>,
+        monitor: Arc<ProcessorMonitor>,
+        control: Arc<ConsumerControl>,
+    ) -> Result<Arc<EventConsumer>, MessagingError> {
         let consumer: StreamConsumer<ProcessorContext> = ClientConfig::new()
             .set("bootstrap.servers", &settings.bootstrap_servers)
             .set("group.id", &settings.group_id)
@@ -334,6 +400,7 @@ impl EventConsumer {
             .set("allow.auto.create.topics", "true")
             .create_with_context(ProcessorContext {
                 monitor: Arc::clone(&monitor),
+                control: Arc::clone(&control),
             })?;
         let sink = match settings.dead_letter_mode {
             DeadLetterMode::Log => Sink::Log,
@@ -363,6 +430,7 @@ impl EventConsumer {
             backoff: settings.backoff,
             sink,
             monitor,
+            control,
             parked: Mutex::new(ParkedKeys::default()),
             pending: Mutex::new(HashMap::new()),
             rewound: Mutex::new(HashMap::new()),
@@ -372,6 +440,30 @@ impl EventConsumer {
     /// What this processor reports in `InstanceStatus.processors`.
     pub fn monitor(&self) -> Arc<ProcessorMonitor> {
         Arc::clone(&self.monitor)
+    }
+
+    /// Pauses (or resumes) every partition assigned now; a partition assigned later is paused
+    /// by the rebalance callback while [`ConsumerControl`] says paused.
+    pub fn apply_pause(&self) {
+        let paused = self.control.paused();
+        let assignment = match self.consumer.assignment() {
+            Ok(tpl) => tpl,
+            Err(e) => {
+                tracing::warn!(processor = %self.name, "cannot read the assignment: {e}");
+                return;
+            }
+        };
+        if assignment.count() == 0 {
+            return;
+        }
+        let applied = if paused {
+            self.consumer.pause(&assignment)
+        } else {
+            self.consumer.resume(&assignment)
+        };
+        if let Err(e) = applied {
+            tracing::warn!(processor = %self.name, paused, "cannot pause or resume the assigned partitions: {e}");
+        }
     }
 
     /// Consumes until `cancel`; also refreshes the committed offsets and high watermarks (on a
@@ -423,6 +515,16 @@ impl EventConsumer {
                     }
                     Ok(msg) => {
                         if self.overtakes(&msg) {
+                            continue;
+                        }
+                        // Fetched before the pause: not handled, and its partition sought back to
+                        // it, so the resume starts there.
+                        if self.control.paused() {
+                            self.rewind(msg.partition(), msg.offset());
+                            tokio::select! {
+                                _ = tokio::time::sleep(PAUSED_POLL) => {}
+                                _ = cancel.cancelled() => break,
+                            }
                             continue;
                         }
                         let processed = match self.handle_record(&msg, cancel).await {
@@ -570,6 +672,13 @@ impl EventConsumer {
                     if !parked {
                         return Done::Again;
                     }
+                    // A replay never reaches the sagas (ADR 0023).
+                    if self
+                        .control
+                        .replays(msg.topic(), msg.partition(), msg.offset())
+                    {
+                        return Done::Ack { processed: false };
+                    }
                     // Stage 2 still sees it (ADR 0021 ruling 26).
                     return self
                         .stage_two_only(&type_name, &id, payload, &ctx, cancel)
@@ -579,6 +688,9 @@ impl EventConsumer {
             }
         }
         let position = self.position(msg);
+        let replay = self
+            .control
+            .replays(msg.topic(), msg.partition(), msg.offset());
         for attempt in 1..=self.max_attempts {
             let stages = self
                 .dispatcher
@@ -590,7 +702,7 @@ impl EventConsumer {
                     RecordDispatch {
                         position: Some(&position),
                         stage_one: true,
-                        replay: false,
+                        replay,
                     },
                 )
                 .await;

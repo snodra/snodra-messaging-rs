@@ -78,6 +78,16 @@ impl DeadLetters {
         }
     }
 
+    /// The dead-letter mode of the service.
+    pub fn mode(&self) -> DeadLetterMode {
+        self.inner.mode
+    }
+
+    /// The processors whose letters this API serves (those with handlers here), by name.
+    pub fn processor_names(&self) -> Vec<String> {
+        self.inner.processors.keys().cloned().collect()
+    }
+
     /// Up to `limit` letters ([`DEFAULT_LIST_LIMIT`] is the usual), sorted by `parkedAt`, then
     /// `_id`: of `processor`, or of every processor of the service with `None`. A `limit` of 0 is
     /// an error (as Kotlin's `require(limit >= 1)`), never "no limit".
