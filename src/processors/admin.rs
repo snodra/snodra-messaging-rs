@@ -12,7 +12,7 @@ use super::dead_letters::{DeadLetterDocument, DeadLetterError, DeadLetterReason}
 use super::store::{DeadLetterStore, LetterSummary};
 use crate::config::DeadLetterMode;
 use crate::error::MessagingError;
-use crate::kafka::dispatch::{FinishInTransaction, StageOneThen};
+use crate::kafka::dispatch::{FinishInTransaction, MarkerPosition, StageOneThen};
 use crate::kafka::{LocalEventDispatcher, message_context};
 
 /// The default `limit` of [`DeadLetters::list`] (Kotlin's `limit: Int = 100`).
@@ -181,8 +181,22 @@ impl DeadLetters {
             })
         });
         let payload = letter.payload_bytes();
+        // The retry is the record's stage 1: its marker carries the record's position (ADR 0023).
+        let position = MarkerPosition {
+            processor: letter.processor.clone(),
+            topic: letter.topic.clone(),
+            partition: letter.partition,
+            offset: letter.offset,
+        };
         match dispatcher
-            .stage_one_then(&dedupe_id, &type_name, &payload, &ctx, finish)
+            .stage_one_then(
+                &dedupe_id,
+                &type_name,
+                &payload,
+                &ctx,
+                Some(&position),
+                finish,
+            )
             .await
         {
             Ok(StageOneThen::Committed) => Ok(RetryResult::Retried),

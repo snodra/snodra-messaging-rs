@@ -24,7 +24,7 @@ use rdkafka::{ClientContext, Message, Offset, TopicPartitionList};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::dispatch::{LocalEventDispatcher, NoSagas, SagaStage};
+use super::dispatch::{LocalEventDispatcher, MarkerPosition, NoSagas, RecordDispatch, SagaStage};
 use super::headers;
 use crate::codec;
 use crate::config::DeadLetterMode;
@@ -578,10 +578,21 @@ impl EventConsumer {
                 Some(None) => {}
             }
         }
+        let position = self.position(msg);
         for attempt in 1..=self.max_attempts {
             let stages = self
                 .dispatcher
-                .dispatch_stages(&id, &type_name, payload, &ctx, true)
+                .dispatch_record(
+                    &id,
+                    &type_name,
+                    payload,
+                    &ctx,
+                    RecordDispatch {
+                        position: Some(&position),
+                        stage_one: true,
+                        replay: false,
+                    },
+                )
                 .await;
             let (failure, in_stage_one) = match (stages.stage_one, stages.stage_two) {
                 (Some(Err(e)), _) => (e, true),
@@ -618,6 +629,16 @@ impl EventConsumer {
                 .await;
         }
         Done::Ack { processed: false }
+    }
+
+    /// What this processor's stage-1 marker of `msg` records (ADR 0023).
+    fn position(&self, msg: &BorrowedMessage<'_>) -> MarkerPosition {
+        MarkerPosition {
+            processor: self.name.clone(),
+            topic: msg.topic().to_string(),
+            partition: msg.partition(),
+            offset: msg.offset(),
+        }
     }
 
     /// The HANDLER_FAILED letter of a record whose attempts are done. When the dead letters cannot

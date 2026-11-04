@@ -113,6 +113,29 @@ pub struct Stages {
     pub stage_two: Option<Result<bool, MessagingError>>,
 }
 
+/// Where the record of a stage-1 marker sits (ADR 0023): the Kafka consumer's markers (and a dead
+/// letter's retry, which is that record's stage 1) carry it, so a replay deletes exactly the
+/// markers of its range. Markers of local dispatch, sagas, ingress and failure notices have none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkerPosition {
+    pub processor: String,
+    pub topic: String,
+    pub partition: i32,
+    pub offset: i64,
+}
+
+/// How the Kafka consumer dispatches one record ([`LocalEventDispatcher::dispatch_record`]).
+#[derive(Clone, Copy, Debug)]
+pub struct RecordDispatch<'a> {
+    /// Written into stage 1's marker.
+    pub position: Option<&'a MarkerPosition>,
+    /// Run stage 1 (false for a SEQUENCED record, which only the sagas see).
+    pub stage_one: bool,
+    /// The record is in a replay range (ADR 0023): stage 1 runs without the handlers registered
+    /// with `disallow_replay`, and stage 2 (the sagas) does not run.
+    pub replay: bool,
+}
+
 /// How a retried stage 1 ([`LocalEventDispatcher::stage_one_then`]) ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StageOneThen {
@@ -220,7 +243,10 @@ impl LocalEventDispatcher {
         let mut stage_ones: Vec<Result<StageOneDone, MessagingError>> = Vec::new();
         for d in std::iter::once(self).chain(self.fan_out.iter().map(Arc::as_ref)) {
             if d.registry.has_event_handler(type_name) {
-                stage_ones.push(d.stage_one_done(dedupe_id, type_name, payload, ctx).await);
+                stage_ones.push(
+                    d.stage_one_done(dedupe_id, type_name, payload, ctx, LOCAL)
+                        .await,
+                );
             }
         }
         let stage_two = if self.stage.interested(type_name) {
@@ -281,8 +307,9 @@ impl LocalEventDispatcher {
         type_name: &str,
         payload: &[u8],
         ctx: &MessageContext,
+        record: RecordDispatch<'_>,
     ) -> Result<StageOneDone, MessagingError> {
-        self.stage_one(dedupe_id, type_name, payload, ctx, None)
+        self.stage_one(dedupe_id, type_name, payload, ctx, record, None)
             .await
             .map(|done| match done {
                 StageOneThen::Duplicate => {
@@ -305,17 +332,41 @@ impl LocalEventDispatcher {
         ctx: &MessageContext,
         run_stage_one: bool,
     ) -> Stages {
-        let stage_one = if run_stage_one && self.registry.has_event_handler(type_name) {
+        self.dispatch_record(
+            dedupe_id,
+            type_name,
+            payload,
+            ctx,
+            RecordDispatch {
+                stage_one: run_stage_one,
+                ..LOCAL
+            },
+        )
+        .await
+    }
+
+    /// [`dispatch_stages`](Self::dispatch_stages) for a Kafka record: stage 1's marker carries
+    /// the record's position, and a record of a replay range runs stage 1 without the handlers
+    /// that disallow replay and skips stage 2 (ADR 0023).
+    pub async fn dispatch_record(
+        &self,
+        dedupe_id: &str,
+        type_name: &str,
+        payload: &[u8],
+        ctx: &MessageContext,
+        record: RecordDispatch<'_>,
+    ) -> Stages {
+        let stage_one = if record.stage_one && self.registry.has_event_handler(type_name) {
             Some(
-                self.stage_one_done(dedupe_id, type_name, payload, ctx)
+                self.stage_one_done(dedupe_id, type_name, payload, ctx, record)
                     .await,
             )
         } else {
             None
         };
         // Stage 1's failure is held until stage 2 ran: the sagas must not miss an event because an
-        // ordinary handler failed.
-        let stage_two = if self.stage.interested(type_name) {
+        // ordinary handler failed. A replay never reaches the sagas: they saw the record already.
+        let stage_two = if !record.replay && self.stage.interested(type_name) {
             Some(self.stage.process(type_name, payload, ctx).await)
         } else {
             None
@@ -335,9 +386,11 @@ impl LocalEventDispatcher {
         type_name: &str,
         payload: &[u8],
         ctx: &MessageContext,
+        position: Option<&MarkerPosition>,
         finish: FinishInTransaction<'_>,
     ) -> Result<StageOneThen, MessagingError> {
-        self.stage_one(dedupe_id, type_name, payload, ctx, Some(finish))
+        let record = RecordDispatch { position, ..LOCAL };
+        self.stage_one(dedupe_id, type_name, payload, ctx, record, Some(finish))
             .await
     }
 
@@ -349,12 +402,18 @@ impl LocalEventDispatcher {
         type_name: &str,
         payload: &[u8],
         ctx: &MessageContext,
+        record: RecordDispatch<'_>,
         finish: Option<FinishInTransaction<'_>>,
     ) -> Result<StageOneThen, MessagingError> {
         let mut session = self.client.start_session().await?;
         session.start_transaction().await?;
         match self
-            .mark_processed(&mut session, &self.marker_id(dedupe_id), type_name)
+            .mark_processed(
+                &mut session,
+                &self.marker_id(dedupe_id),
+                type_name,
+                record.position,
+            )
             .await
         {
             Ok(()) => {}
@@ -369,7 +428,7 @@ impl LocalEventDispatcher {
         }
         let session = Arc::new(Mutex::new(session));
         let result = self
-            .run_handlers(type_name, payload, ctx, Arc::clone(&session))
+            .run_handlers(type_name, payload, ctx, record.replay, Arc::clone(&session))
             .await;
         let mut guard = session.lock().await;
         let result = match (result, finish) {
@@ -400,9 +459,12 @@ impl LocalEventDispatcher {
         type_name: &str,
         payload: &[u8],
         ctx: &MessageContext,
+        replay: bool,
         session: Arc<Mutex<ClientSession>>,
     ) -> Result<(), MessagingError> {
-        let handlers: Vec<_> = self.registry.event_handlers(type_name).to_vec();
+        // In a replay the handlers that disallow it are left out; the marker is still written, so
+        // the record counts as handled for them too.
+        let handlers = self.registry.event_handlers_for(type_name, replay);
         for handler in handlers {
             let ectx = EventContext {
                 message: ctx.clone(),
@@ -436,8 +498,15 @@ impl LocalEventDispatcher {
         session: &mut ClientSession,
         id: &str,
         type_name: &str,
+        position: Option<&MarkerPosition>,
     ) -> Result<(), MarkError> {
-        let marker = doc! { "_id": id, "type": type_name, "processedAt": DateTime::now() };
+        let mut marker = doc! { "_id": id, "type": type_name, "processedAt": DateTime::now() };
+        if let Some(p) = position {
+            marker.insert("processor", &p.processor);
+            marker.insert("topic", &p.topic);
+            marker.insert("partition", p.partition);
+            marker.insert("offset", p.offset);
+        }
         match self
             .db
             .collection::<mongodb::bson::Document>(PROCESSED_EVENTS_COLLECTION)
@@ -451,6 +520,13 @@ impl LocalEventDispatcher {
         }
     }
 }
+
+/// A local dispatch: no position, stage 1 asked for, not a replay.
+const LOCAL: RecordDispatch<'static> = RecordDispatch {
+    position: None,
+    stage_one: true,
+    replay: false,
+};
 
 fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
     matches!(&*e.kind, ErrorKind::Write(WriteFailure::WriteError(w)) if w.code == 11000)

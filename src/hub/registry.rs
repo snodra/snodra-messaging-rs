@@ -67,7 +67,8 @@ pub struct HandlerRegistry {
     /// The query types registered as shared (their handlers are in `queries`, `streams` or
     /// `subscriptions`).
     shared: HashSet<&'static str>,
-    events: HashMap<&'static str, Vec<EventHandler>>,
+    /// Each with whether it runs in a replay (ADR 0023: false for `disallow_replay`).
+    events: HashMap<&'static str, Vec<(EventHandler, bool)>>,
     guards: HashMap<&'static str, Guard>,
     /// The labels (wire type names) of the idempotent handlers, sorted on read.
     idempotent: Vec<&'static str>,
@@ -217,6 +218,27 @@ impl HandlerRegistry {
         F: Fn(E, EventContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), MessagingError>> + Send + 'static,
     {
+        self.event_replayed::<E, F, Fut>(true, handler);
+    }
+
+    /// [`event`](Self::event) for a handler that does not run again when its processor replays a
+    /// range after a reset (ADR 0023, Kotlin's `@DisallowReplay`): a handler with effects outside
+    /// the service (an e-mail, a payment) that must happen once per record.
+    pub fn event_disallowing_replay<E, F, Fut>(&mut self, handler: F)
+    where
+        E: Event,
+        F: Fn(E, EventContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), MessagingError>> + Send + 'static,
+    {
+        self.event_replayed::<E, F, Fut>(false, handler);
+    }
+
+    fn event_replayed<E, F, Fut>(&mut self, replayed: bool, handler: F)
+    where
+        E: Event,
+        F: Fn(E, EventContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), MessagingError>> + Send + 'static,
+    {
         let handler = Arc::new(handler);
         let erased: EventHandler = Arc::new(move |payload: Vec<u8>, ctx: EventContext| {
             let handler = Arc::clone(&handler);
@@ -229,7 +251,10 @@ impl HandlerRegistry {
                 handler(event, ctx).await
             })
         });
-        self.events.entry(E::TYPE).or_default().push(erased);
+        self.events
+            .entry(E::TYPE)
+            .or_default()
+            .push((erased, replayed));
     }
 
     /// An idempotent command handler: an adapter to an external system (ADR 0021 ruling 17; the
@@ -402,8 +427,17 @@ impl HandlerRegistry {
         self.subscriptions.get(type_name)
     }
 
-    pub(crate) fn event_handlers(&self, type_name: &str) -> &[EventHandler] {
-        self.events.get(type_name).map(Vec::as_slice).unwrap_or(&[])
+    /// The handlers of `type_name` in registration order; in a `replay` without those that
+    /// disallow it.
+    pub(crate) fn event_handlers_for(&self, type_name: &str, replay: bool) -> Vec<EventHandler> {
+        self.events
+            .get(type_name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|(_, replayed)| !replay || *replayed)
+            .map(|(h, _)| Arc::clone(h))
+            .collect()
     }
 
     pub(crate) fn guard(&self, type_name: &str) -> Option<&Guard> {
