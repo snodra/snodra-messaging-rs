@@ -27,8 +27,7 @@ use super::ProcessorMonitor;
 use super::control_store::{ControlStore, Locked, ReplayRange};
 use super::monitor::cut_bytes;
 use super::reset::{
-    GroupAdmin, Plan, ResetContext, ResetFailure, ResetHandler, ResetTarget, legacy_filter,
-    range_filter,
+    GroupAdmin, Plan, ResetContext, ResetFailure, ResetHandler, ResetTarget, range_filter,
 };
 use crate::error::MessagingError;
 use crate::kafka::{
@@ -666,13 +665,6 @@ impl ProcessorRunner {
             for range in &ranges {
                 done.markers_deleted += markers
                     .delete_many(range_filter(&name, range))
-                    .await
-                    .map_err(|e| Refusal::failed(&e.into()))?
-                    .deleted_count;
-            }
-            if target == ResetTarget::Earliest {
-                done.markers_deleted += markers
-                    .delete_many(legacy_filter(&name))
                     .await
                     .map_err(|e| Refusal::failed(&e.into()))?
                     .deleted_count;

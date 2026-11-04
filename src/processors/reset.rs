@@ -14,13 +14,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use mongodb::bson::{Document, Regex, doc};
+use mongodb::bson::{Document, doc};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::{Offset, TopicPartitionList};
 
-use super::DEFAULT_PROCESSOR;
 use super::control_store::ReplayRange;
 use crate::error::MessagingError;
 use crate::proto;
@@ -166,24 +165,6 @@ pub fn range_filter(processor: &str, range: &ReplayRange) -> Document {
         "topic": &range.topic,
         "partition": range.partition,
         "offset": { "$gte": range.from, "$lt": range.until },
-    }
-}
-
-/// The markers of `processor` written before P6b (no `processor` field), deleted by a reset to
-/// `earliest` only: for `default`, an `_id` without a `:` (every other marker family has one:
-/// `processor:`, `saga:`, `ingress:`, `failed:`, a partner topic's `<source>:...`; a Kafka event id
-/// is a UUID or `<topic>-<partition>-<offset>`, and a topic name has no `:`); for a named
-/// processor `P`, `processor:P:` followed by such an id.
-pub fn legacy_filter(processor: &str) -> Document {
-    let pattern = if processor == DEFAULT_PROCESSOR {
-        "^[^:]+$".to_string()
-    } else {
-        // A processor name is `[a-z0-9-]`: nothing to escape.
-        format!("^processor:{processor}:[^:]+$")
-    };
-    doc! {
-        "processor": { "$exists": false },
-        "_id": Regex { pattern, options: String::new() },
     }
 }
 
@@ -435,18 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn the_legacy_filters_match_only_kafka_markers_without_a_position() {
-        let default = legacy_filter("default");
-        assert_eq!(
-            default.get_document("processor").unwrap(),
-            &doc! { "$exists": false }
-        );
-        let pattern = |d: &Document| match d.get("_id") {
-            Some(mongodb::bson::Bson::RegularExpression(r)) => r.pattern.clone(),
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(pattern(&default), "^[^:]+$");
-        assert_eq!(pattern(&legacy_filter("audit")), "^processor:audit:[^:]+$");
+    fn the_range_filter_matches_the_processors_markers_by_position() {
         assert_eq!(
             range_filter("audit", &range(3, 5, 9)),
             doc! { "processor": "audit", "topic": "t", "partition": 3, "offset": { "$gte": 5i64, "$lt": 9i64 } }

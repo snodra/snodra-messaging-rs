@@ -250,8 +250,9 @@ async fn marker_ids(db: &mongodb::Database) -> Vec<String> {
     all
 }
 
-/// A marker written before P6b: no position.
-async fn legacy_marker(db: &mongodb::Database, id: &str) {
+/// A marker without a position: another family's (a saga's, the webhook ingress', a partner
+/// topic's), which no reset deletes.
+async fn positionless_marker(db: &mongodb::Database, id: &str) {
     db.collection::<Document>("processed_events")
         .insert_one(
             doc! { "_id": id, "type": "c.Noted", "processedAt": mongodb::bson::DateTime::now() },
@@ -667,8 +668,7 @@ struct Seen {
 }
 
 /// A reset to `earliest` with two instances: both leave the group, one executes (its reset
-/// handler once, the markers of the range and the legacy ones of the processor deleted, the
-/// ranges written before the offsets), and after the finish every record of the range is handled
+/// handler once, the markers of the range deleted, the ranges written before the offsets), and after the finish every record of the range is handled
 /// again exactly once overall, without the handler that disallows replay and without the sagas;
 /// another processor's markers and the other marker families are untouched; the ranges are
 /// removed once passed.
@@ -742,21 +742,15 @@ async fn a_reset_to_earliest_replays_the_range_once_without_sagas_or_disallowed_
         .delete_many(doc! { "_id": { "$regex": "^saga:" } })
         .await
         .unwrap();
-    for id in [
-        "legacy-1",
-        "processor:audit:legacy-2",
-        "saga:c.Other:legacy-3",
-        "ingress:hook:k",
-        "partner:0:7",
-    ] {
-        legacy_marker(&db, id).await;
+    for id in ["saga:c.Other:x-3", "ingress:hook:k", "partner:0:7"] {
+        positionless_marker(&db, id).await;
     }
     let audit_markers: Vec<String> = marker_ids(&db)
         .await
         .into_iter()
         .filter(|m| m.starts_with("processor:audit:"))
         .collect();
-    assert_eq!(audit_markers.len(), 5, "{audit_markers:?}");
+    assert_eq!(audit_markers.len(), 4, "{audit_markers:?}");
 
     for app in [&first, &second] {
         ok(hub
@@ -779,7 +773,7 @@ async fn a_reset_to_earliest_replays_the_range_once_without_sagas_or_disallowed_
         .await,
     );
     assert_eq!(ranges(&outcome), [(0, 0, 2), (1, 0, 2)]);
-    assert_eq!(outcome.markers_deleted, 5, "four positioned, one legacy");
+    assert_eq!(outcome.markers_deleted, 4, "the four of the range");
     assert_eq!(outcome.reset_handlers, 1);
     let ctx = resets.lock().unwrap()[0].clone();
     assert_eq!(ctx.processor, "default");
@@ -801,17 +795,17 @@ async fn a_reset_to_earliest_replays_the_range_once_without_sagas_or_disallowed_
         doc! { "topic": topic, "partition": 1, "from": 0i64, "until": 2i64 }
     );
     let left = marker_ids(&db).await;
-    for gone in ["n-1", "n-2", "n-3", "n-4", "legacy-1"] {
+    for gone in ["n-1", "n-2", "n-3", "n-4"] {
         assert!(!left.contains(&gone.to_string()), "{left:?}");
     }
-    for kept in ["saga:c.Other:legacy-3", "ingress:hook:k", "partner:0:7"] {
+    for kept in ["saga:c.Other:x-3", "ingress:hook:k", "partner:0:7"] {
         assert!(left.contains(&kept.to_string()), "{left:?}");
     }
     assert_eq!(
         left.iter()
             .filter(|m| m.starts_with("processor:audit:"))
             .count(),
-        5,
+        4,
         "another processor's markers are untouched"
     );
     for p in 0..2 {
@@ -864,7 +858,7 @@ async fn a_reset_to_earliest_replays_the_range_once_without_sagas_or_disallowed_
 }
 
 /// The targets on one instance: `latest` replays nothing; a time and explicit offsets replay
-/// from there (legacy markers kept); an active member of the group is GROUP_NOT_EMPTY and a
+/// from there; an active member of the group is GROUP_NOT_EMPTY and a
 /// failing reset handler RESET_HANDLER_FAILED (saying it ran), both without a marker or an offset
 /// touched; a bad target is
 /// INVALID and an execute without a prepare NOT_PREPARED.
@@ -931,7 +925,6 @@ async fn reset_targets_and_refusals() {
         handler.count("n-4") == 1 && committed(&kafka.bootstrap, group, topic, 0) == 4
     })
     .await;
-    legacy_marker(&db, "processor:audit:legacy-9").await;
     let counts = |notes: [usize; 4]| {
         ["n-1", "n-2", "n-3", "n-4"]
             .iter()
@@ -973,7 +966,6 @@ async fn reset_targets_and_refusals() {
     assert!(message.contains("old-instance"), "{message}");
     assert_eq!(committed(&kafka.bootstrap, group, topic, 0), 4);
     assert!(marker(&db, "processor:audit:n-1").await.is_some());
-    assert!(marker(&db, "processor:audit:legacy-9").await.is_some());
     assert!(replay(&db, "audit").await.is_empty());
     assert_eq!(resets.load(Ordering::SeqCst), 0);
     tokio::task::spawn_blocking(move || drop(old))
@@ -1047,7 +1039,7 @@ async fn reset_targets_and_refusals() {
     assert!(counts([1, 1, 1, 1]));
     assert_eq!(resets.load(Ordering::SeqCst), 0);
 
-    // A time: the records from then on; the legacy marker stays (only earliest deletes them).
+    // A time: the records from then on.
     ok(hub.control("audit", prepare("op-d", 30_000), ASK).await);
     let outcome = reset(
         hub.control(
@@ -1059,7 +1051,6 @@ async fn reset_targets_and_refusals() {
     );
     assert_eq!(ranges(&outcome), [(0, 2, 4)]);
     assert_eq!((outcome.markers_deleted, outcome.reset_handlers), (2, 1));
-    assert!(marker(&db, "processor:audit:legacy-9").await.is_some());
     ok(hub.control("audit", finish("op-d", false), ASK).await);
     eventually("n-3 and n-4 again", WITHIN, || async {
         counts([1, 1, 2, 2]) && replay(&db, "audit").await.is_empty()
