@@ -15,6 +15,43 @@ use crate::security::{HubOAuth2, HubTls, SecretString};
 /// itself.
 pub const DEFAULT_STREAM_CREDIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
+/// What happens to a record an event processor cannot handle (ADR 0022,
+/// `KRAKEN_KAFKA_DEAD_LETTER_MODE`, case-insensitive).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum DeadLetterMode {
+    /// Parked in the `dead_letters` collection, sequenced per key, with the admin API
+    /// ([`KrakenMessaging::dead_letters`](crate::KrakenMessaging::dead_letters)). The default.
+    #[default]
+    Collection,
+    /// Produced to `<topic>.dlt` with `kraken-dlt-*` headers; the topic belongs to the operator's
+    /// tooling (it must exist, or broker auto-creation must be on).
+    Topic,
+    /// Logged and skipped (the behaviour before P6a).
+    Log,
+}
+
+impl DeadLetterMode {
+    /// The mode's configuration name, also `ProcessorStatus.dead_letter_mode`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeadLetterMode::Collection => "collection",
+            DeadLetterMode::Topic => "topic",
+            DeadLetterMode::Log => "log",
+        }
+    }
+
+    fn parse(name: &str, v: &str) -> Result<DeadLetterMode, MessagingError> {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "collection" => Ok(DeadLetterMode::Collection),
+            "topic" => Ok(DeadLetterMode::Topic),
+            "log" => Ok(DeadLetterMode::Log),
+            _ => Err(MessagingError::InvalidMessage(format!(
+                "{name} must be collection, topic or log, got '{v}'"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Hub `Register.service_name`, Kafka consumer group and event `source`.
@@ -90,6 +127,12 @@ pub struct Config {
     pub kafka_topic: String,
     pub consumer_enabled: bool,
     pub consumer_max_attempts: u32,
+    /// Where a record goes that an event processor cannot handle (ADR 0022;
+    /// `KRAKEN_KAFKA_DEAD_LETTER_MODE`, default `collection`).
+    pub dead_letter_mode: DeadLetterMode,
+    /// How long a dead letter is kept (`KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS`, default 30 d, at
+    /// least 1 s): the TTL index on `expireAt` removes it then, which unblocks its key.
+    pub dead_letter_retention: Duration,
     /// Must name a database: `mongodb://host:27017/<service>?replicaSet=rs0`.
     pub mongodb_uri: String,
     pub outbox_enabled: bool,
@@ -170,6 +213,8 @@ impl Config {
             kafka_topic: crate::kafka::EVENTS_TOPIC.to_string(),
             consumer_enabled: true,
             consumer_max_attempts: 5,
+            dead_letter_mode: DeadLetterMode::Collection,
+            dead_letter_retention: Duration::from_secs(30 * 86_400),
             mongodb_uri: mongodb_uri.to_string(),
             outbox_enabled: true,
             outbox_poll_interval: Duration::from_millis(200),
@@ -239,6 +284,8 @@ impl Config {
     /// `KRAKEN_KAFKA_TOPIC`, `KRAKEN_JWKS_URL`, `KRAKEN_ISSUER`, `KRAKEN_HUB_REQUEST_TIMEOUT_MS`,
     /// `KRAKEN_HUB_STATUS_INTERVAL_MS`, `KRAKEN_HEARTBEAT_INTERVAL_MS`, `KRAKEN_RECONNECT_BACKOFF_MIN_MS`, `KRAKEN_RECONNECT_BACKOFF_MAX_MS`,
     /// `KRAKEN_MAX_CONCURRENT_HANDLERS`, `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS`,
+    /// `KRAKEN_KAFKA_DEAD_LETTER_MODE` (`collection`, `topic` or `log`),
+    /// `KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS`,
     /// `KRAKEN_OUTBOX_ENABLED`, `KRAKEN_OUTBOX_POLL_INTERVAL_MS`, `KRAKEN_OUTBOX_BATCH_SIZE`,
     /// `KRAKEN_OUTBOX_MAX_ATTEMPTS`, `KRAKEN_FORWARD_JWT`, `KRAKEN_HUB_LOAD_FACTOR`,
     /// `KRAKEN_HUB_TAGS` (`k=v,k=v`), `KRAKEN_HUB_PRIORITIES` (`type=n,type=n`),
@@ -421,6 +468,12 @@ impl Config {
         if let Some(v) = optional("KRAKEN_CONSUMER_MAX_ATTEMPTS") {
             c.consumer_max_attempts = number("KRAKEN_CONSUMER_MAX_ATTEMPTS", &v)? as u32;
         }
+        if let Some(v) = optional("KRAKEN_KAFKA_DEAD_LETTER_MODE") {
+            c.dead_letter_mode = DeadLetterMode::parse("KRAKEN_KAFKA_DEAD_LETTER_MODE", &v)?;
+        }
+        if let Some(v) = optional("KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS") {
+            c.dead_letter_retention = millis("KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS", &v)?;
+        }
         if let Some(v) = optional("KRAKEN_OUTBOX_ENABLED") {
             c.outbox_enabled = flag("KRAKEN_OUTBOX_ENABLED", &v)?;
         }
@@ -567,6 +620,12 @@ impl Config {
             })?;
         }
         self.validate_sagas()?;
+        if self.dead_letter_retention < Duration::from_secs(1) {
+            return Err(MessagingError::InvalidMessage(
+                "dead_letter_retention (KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS) must be at least 1 s"
+                    .into(),
+            ));
+        }
         if let Some(oauth2) = &self.hub_oauth2 {
             self.validate_oauth2(oauth2)?;
         }
@@ -1702,5 +1761,54 @@ mod tests {
                 .to_string()
                 .contains("deadlines_lease")
         );
+    }
+
+    #[test]
+    fn dead_letter_mode_and_retention_default_to_a_collection_kept_30_days() {
+        let c = from(&[]);
+        assert_eq!(c.dead_letter_mode, DeadLetterMode::Collection);
+        assert_eq!(c.dead_letter_retention, Duration::from_secs(30 * 86_400));
+        assert_eq!(code_config().dead_letter_mode, DeadLetterMode::Collection);
+        assert_eq!(
+            code_config().dead_letter_retention,
+            Duration::from_secs(30 * 86_400)
+        );
+    }
+
+    #[test]
+    fn dead_letter_mode_and_retention_from_env() {
+        for (value, mode) in [
+            ("collection", DeadLetterMode::Collection),
+            ("topic", DeadLetterMode::Topic),
+            ("log", DeadLetterMode::Log),
+            (" TOPIC ", DeadLetterMode::Topic),
+            ("Log", DeadLetterMode::Log),
+        ] {
+            let c = from(&[("KRAKEN_KAFKA_DEAD_LETTER_MODE", value)]);
+            assert_eq!(c.dead_letter_mode, mode, "{value}");
+        }
+        assert_eq!(DeadLetterMode::Collection.as_str(), "collection");
+        assert_eq!(DeadLetterMode::Topic.as_str(), "topic");
+        assert_eq!(DeadLetterMode::Log.as_str(), "log");
+        let c = from(&[("KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS", "1000")]);
+        assert_eq!(c.dead_letter_retention, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn an_unknown_mode_or_a_retention_under_one_second_is_rejected() {
+        for (name, value) in [
+            ("KRAKEN_KAFKA_DEAD_LETTER_MODE", "queue"),
+            ("KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS", "999"),
+            ("KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS", "0"),
+            ("KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS", "later"),
+        ] {
+            let e = try_from(&[(name, value)]).unwrap_err().to_string();
+            assert!(e.contains(name), "{name}={value}: {e}");
+        }
+        let mut c = code_config();
+        c.dead_letter_retention = Duration::from_millis(500);
+        let e = c.validate().unwrap_err().to_string();
+        assert!(e.contains("dead_letter_retention"), "{e}");
+        assert!(e.contains("KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS"), "{e}");
     }
 }
