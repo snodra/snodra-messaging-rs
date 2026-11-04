@@ -7,7 +7,9 @@
 //! in `seq` order; different sagas go in parallel. An ended saga's entries are dispatched like any.
 //!
 //! - An EVENT entry is inserted into the outbox and marked dispatched **in one transaction**:
-//!   exactly once.
+//!   exactly once. One whose payload cannot become an outbox document (not a JSON object, a
+//!   number BSON cannot hold) fails for good (`failedAt`, `INVALID`, logged at error) and the
+//!   saga's later entries continue (ruling 69).
 //! - A COMMAND entry is sent as raw bytes by wire type name ([`RawCommandSender`]; the sender owns
 //!   the no-retry rule, ruling 29) with the headers `idempotency-key` = `<sagaId>:<seq>` (the
 //!   entry's id) and `saga-id`, the entry's routing key and the correlation id of the message that
@@ -358,12 +360,17 @@ impl SagaDispatchRelay {
             .get(DISPATCH_CORRELATION_HEADER)
             .cloned()
             .unwrap_or_else(|| entry.id.clone());
-        let outbox = self.events.raw_document(
+        let outbox = match self.events.raw_document(
             &entry.type_name,
             entry.routing_key.as_deref(),
             &entry.payload,
             &correlation,
-        )?;
+        ) {
+            Ok(outbox) => outbox,
+            // The payload can never become an outbox document: retrying would hold back the
+            // saga's later entries forever, so the entry fails for good (ruling 69).
+            Err(e) => return self.fail_event(entry, &e.to_string()).await,
+        };
         let mut session = self.client.start_session().await?;
         session.start_transaction().await?;
         let result: Result<(), MessagingError> = async {
@@ -384,6 +391,33 @@ impl SagaDispatchRelay {
             let _ = session.abort_transaction().await;
         }
         result
+    }
+
+    /// Gives up an EVENT entry whose payload cannot become an outbox document: `failedAt`, the
+    /// reason `INVALID` and the message, logged at error. No failure notice: `SagaCommandFailed`
+    /// is about commands. The saga's later entries continue, as after a failed command (ruling 9).
+    async fn fail_event(
+        &self,
+        entry: &SagaDispatchDocument,
+        message: &str,
+    ) -> Result<(), MessagingError> {
+        self.dispatch_collection()
+            .update_one(
+                doc! { "_id": &entry.id },
+                doc! { "$set": {
+                    "failedAt": self.now(),
+                    "failureReason": reason_name(FailureReason::Invalid),
+                    "failureMessage": message,
+                } },
+            )
+            .await?;
+        tracing::error!(
+            "Saga {} event {} ({}) can never be published, it is given up: {message}",
+            entry.saga_id,
+            entry.id,
+            entry.type_name
+        );
+        Ok(())
     }
 
     fn check_mark_injection(&self) -> Result<(), MessagingError> {

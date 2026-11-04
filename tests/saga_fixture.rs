@@ -493,3 +493,35 @@ fn a_start_handler_that_removes_its_own_start_association_lets_the_next_start_ev
         .when_event(&order("o1", 5))
         .expect_active_sagas(2);
 }
+
+/// An event that serializes to `null`, and one with a number BSON cannot hold.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Tick;
+message_type!(Tick, "fx.Tick");
+impl Event for Tick {}
+
+event!(Huge, "fx.Huge", { n: u64 });
+
+#[derive(Default, Serialize, Deserialize)]
+struct Ticking {}
+
+fn ticking_saga(d: SagaDefinition<Ticking>) -> SagaDefinition<Ticking> {
+    d.start_on::<OrderPlaced>("orderId", order_id, |_, e, ctx| {
+        if e.amount == 1 {
+            ctx.publish(&Tick, None)
+        } else {
+            ctx.publish(&Huge { n: u64::MAX }, None)
+        }
+    })
+}
+
+#[test]
+fn publishing_an_event_whose_payload_is_not_a_json_object_is_a_handler_error_naming_the_event() {
+    for (amount, wire) in [(1, "fx.Tick"), (2, "fx.Huge")] {
+        let message = panic_of(|| {
+            SagaTestFixture::new("fx.Ticking", ticking_saga).when_event(&order("o1", amount));
+        });
+        assert!(message.contains(wire), "{message}");
+        assert!(message.contains("outbox"), "{message}");
+    }
+}

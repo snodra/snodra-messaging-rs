@@ -71,6 +71,34 @@ pub fn new_outbox_document<E: Event>(
     })
 }
 
+/// The BSON document an event's JSON payload becomes in the outbox: it must be a JSON object
+/// whose numbers BSON can hold (an integer above `i64::MAX` it cannot). Anything else (a unit
+/// struct's `null`, an array, a bare value) is `InvalidMessage` naming the event type: no retry
+/// can change it.
+pub(crate) fn payload_document(
+    type_name: &str,
+    json: &serde_json::Value,
+) -> Result<Document, MessagingError> {
+    if !json.is_object() {
+        let found = match json {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "a boolean",
+            serde_json::Value::Number(_) => "a number",
+            serde_json::Value::String(_) => "a string",
+            serde_json::Value::Array(_) => "an array",
+            serde_json::Value::Object(_) => "an object",
+        };
+        return Err(MessagingError::InvalidMessage(format!(
+            "the payload of event {type_name} is {found}, not a JSON object, so it cannot be an outbox document"
+        )));
+    }
+    mongodb::bson::to_document(json).map_err(|e| {
+        MessagingError::InvalidMessage(format!(
+            "the payload of event {type_name} cannot be an outbox document: {e}"
+        ))
+    })
+}
+
 /// The publishing side of events: inserts into the outbox, inside the caller's session when given.
 #[derive(Clone, Debug)]
 pub struct EventBus {
@@ -129,12 +157,12 @@ impl EventBus {
         payload_json: &str,
         correlation_id: &str,
     ) -> Result<OutboxDocument, MessagingError> {
-        let json: serde_json::Value = serde_json::from_str(payload_json)?;
-        let payload: Document = mongodb::bson::to_document(&json).map_err(|e| {
-            MessagingError::Serialization(serde_json::Error::io(std::io::Error::other(
-                e.to_string(),
-            )))
+        let json: serde_json::Value = serde_json::from_str(payload_json).map_err(|e| {
+            MessagingError::InvalidMessage(format!(
+                "the payload of event {type_name} is not JSON, so it cannot be an outbox document: {e}"
+            ))
         })?;
+        let payload = payload_document(type_name, &json)?;
         let mut hdrs = HashMap::new();
         hdrs.insert(
             headers::CORRELATION_ID.to_string(),

@@ -132,6 +132,10 @@ impl SagaContext {
         event: &E,
         key: Option<&str>,
     ) -> Result<(), MessagingError> {
+        // The relay turns the entry into an outbox document: what cannot become one (a unit
+        // struct, a payload that is no JSON object, a number BSON cannot hold) fails the handler
+        // now, naming the event, instead of the entry later (ruling 69).
+        crate::kafka::payload_document(E::TYPE, &serde_json::to_value(event)?)?;
         self.record(DispatchKind::Event, E::TYPE, event, key)
     }
 

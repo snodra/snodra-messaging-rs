@@ -11,6 +11,7 @@ mod publisher;
 pub use consumer::{EventConsumer, RecordDisposition, classify, classify_with};
 pub use dispatch::{LocalEventDispatcher, NoSagas, SagaStage};
 pub use indexes::ensure_indexes;
+pub(crate) use outbox::payload_document;
 pub use outbox::{EventBus, OutboxDocument, new_outbox_document};
 pub use publisher::OutboxPublisher;
 

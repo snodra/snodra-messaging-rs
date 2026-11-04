@@ -818,6 +818,68 @@ async fn an_event_entry_reaches_the_outbox_exactly_once() {
 }
 
 #[tokio::test]
+async fn an_event_entry_that_cannot_become_an_outbox_document_fails_for_good_and_the_sagas_later_entries_go_out()
+ {
+    require_docker!();
+    let rl = Rl::start().await;
+    // A unit struct (null), an array and a number above i64::MAX: none is a BSON document.
+    for (seq, payload) in [
+        (1000, "null"),
+        (1001, "[1,2]"),
+        (1002, r#"{"n":18446744073709551615}"#),
+        (1003, r#"{"orderId":"o9"}"#),
+    ] {
+        rl.record_entry(
+            "s9",
+            seq,
+            "rl.Announced",
+            payload,
+            DispatchKind::Event,
+            None,
+        )
+        .await;
+    }
+    let captured = support::logs::Captured::default();
+    let _guard = captured.install();
+    let relay = rl.relay();
+
+    relay.poll_once().await.unwrap();
+
+    for id in ["s9:1000", "s9:1001", "s9:1002"] {
+        let entry = rl.entry(id).await;
+        assert!(entry.failed_at.is_some(), "{id} failed for good");
+        assert!(entry.dispatched_at.is_none(), "{id} was not dispatched");
+        assert_eq!(entry.failure_reason, Some(FailureReason::Invalid), "{id}");
+        assert!(
+            entry
+                .failure_message
+                .as_deref()
+                .is_some_and(|m| m.contains("rl.Announced")),
+            "{id}: {:?}",
+            entry.failure_message
+        );
+        assert_eq!(
+            entry.notice_pending, None,
+            "{id}: an event has no failure notice"
+        );
+    }
+    assert!(
+        rl.entry("s9:1003").await.dispatched_at.is_some(),
+        "the saga's later entry went out in the same pass"
+    );
+    let outbox: Vec<OutboxDocument> = rl.store.all("outbox").await;
+    assert_eq!(outbox.len(), 1);
+    assert_eq!(outbox[0].payload.get_str("orderId").unwrap(), "o9");
+    let errors: Vec<_> = captured
+        .lines()
+        .into_iter()
+        .filter(|l| l.contains("ERROR"))
+        .collect();
+    assert_eq!(errors.len(), 3, "{errors:?}");
+    assert!(errors[0].contains("s9:1000"), "{}", errors[0]);
+}
+
+#[tokio::test]
 async fn a_command_carries_the_idempotency_key_the_saga_id_and_the_correlation_id_of_its_cause() {
     require_docker!();
     let rl = Rl::start().await;
