@@ -943,3 +943,202 @@ async fn a_retryable_adapter_failure_through_the_local_sender_is_transient() {
         "{outcome:?}"
     );
 }
+
+// ---- ownership: a call whose lease ran out never writes over the call that came after it ------
+
+type Outcome = fn() -> Result<u32, MessagingError>;
+
+/// A call of `key` whose body waits for `go` and then returns `outcome()`, on a task of its own.
+fn slow_call(
+    calls: &Arc<ExternalCalls>,
+    key: &str,
+    external_idempotent: bool,
+    go: &Arc<tokio::sync::Notify>,
+    outcome: Outcome,
+) -> tokio::task::JoinHandle<Result<u32, MessagingError>> {
+    let calls = Arc::clone(calls);
+    let key = key.to_string();
+    let go = Arc::clone(go);
+    tokio::spawn(async move {
+        calls
+            .execute::<u32, _>("ex.Slow", &key, external_idempotent, async move {
+                go.notified().await;
+                outcome()
+            })
+            .await
+    })
+}
+
+impl Ex {
+    /// Waits until the record of `key` was taken `attempts` times.
+    async fn await_attempts(&self, key: &str, attempts: i32) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while self
+            .record(key)
+            .await
+            .is_none_or(|r| r.attempts != attempts)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for attempt {attempts} of {key}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_call_that_finds_an_expired_record_succeeded_meanwhile_answers_with_its_reply_not_unknown()
+ {
+    require_docker!();
+    let ex = Ex::start().await;
+    let go = Arc::new(tokio::sync::Notify::new());
+    let slow = slow_call(&ex.calls, "job-9", false, &go, || Ok(7));
+    ex.await_attempts("job-9", 1).await;
+    ex.store.clock.set(t0() + LEASE + Duration::from_secs(1));
+    // The second call reads the record past its lease; before it writes UNKNOWN the slow call
+    // finishes and records SUCCEEDED.
+    let slow_result = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&slow_result);
+    ex.calls
+        .pause_before_next_expired_write(Box::pin(async move {
+            go.notify_one();
+            *seen.lock().unwrap() = Some(slow.await.unwrap());
+        }));
+
+    let second = ex
+        .calls
+        .execute::<u32, _>("ex.Slow", "job-9", false, async { Ok(8) })
+        .await;
+
+    assert_eq!(slow_result.lock().unwrap().take().unwrap().unwrap(), 7);
+    assert_eq!(
+        second.unwrap(),
+        7,
+        "the record says SUCCEEDED: the second call reads it again and answers with its reply"
+    );
+    let stored = ex.record("job-9").await.unwrap();
+    assert_eq!(stored.status, ExternalCallStatus::Succeeded);
+    assert_eq!(stored.reply.as_deref(), Some("7"));
+}
+
+#[tokio::test]
+async fn a_call_whose_record_was_taken_over_cannot_overwrite_the_new_owners_success() {
+    require_docker!();
+    let ex = Ex::start().await;
+    let go = Arc::new(tokio::sync::Notify::new());
+    let slow = slow_call(&ex.calls, "job-9", true, &go, || Ok(7));
+    ex.await_attempts("job-9", 1).await;
+    ex.store.clock.set(t0() + LEASE + Duration::from_secs(1));
+    let taken = ex
+        .calls
+        .execute::<u32, _>("ex.Slow", "job-9", true, async { Ok(8) })
+        .await;
+    assert_eq!(taken.unwrap(), 8, "the second call took the record over");
+    let captured = support::logs::Captured::default();
+    let _guard = captured.install();
+
+    go.notify_one();
+    let late = slow.await.unwrap();
+
+    assert!(
+        matches!(late, Err(MessagingError::RetryableExternal(_))),
+        "the late call cannot prove its success was recorded: {late:?}"
+    );
+    let stored = ex.record("job-9").await.unwrap();
+    assert_eq!(stored.status, ExternalCallStatus::Succeeded);
+    assert_eq!(
+        stored.reply.as_deref(),
+        Some("8"),
+        "the new owner's reply stays"
+    );
+    assert_eq!(stored.attempts, 2);
+    assert!(
+        captured
+            .lines()
+            .iter()
+            .any(|l| l.contains("WARN") && l.contains("job-9")),
+        "{}",
+        captured.text()
+    );
+}
+
+#[tokio::test]
+async fn a_call_whose_record_was_taken_over_cannot_delete_or_settle_the_new_owners_record() {
+    require_docker!();
+    let ex = Ex::start().await;
+    let failures: [(&str, Outcome); 4] = [
+        ("retryable", || {
+            Err(MessagingError::RetryableExternal("partner busy".into()))
+        }),
+        ("failed", || {
+            Err(MessagingError::Storage("printer on fire".into()))
+        }),
+        ("unknown", || {
+            Err(MessagingError::UnknownOutcome("timed out".into()))
+        }),
+        ("panicked", || panic!("the adapter panicked")),
+    ];
+    for (round, (name, failure)) in failures.into_iter().enumerate() {
+        let key = format!("job-{name}");
+        let start = t0() + LEASE * 3 * round as u32;
+        ex.store.clock.set(start);
+        let go_first = Arc::new(tokio::sync::Notify::new());
+        let first = slow_call(&ex.calls, &key, true, &go_first, failure);
+        ex.await_attempts(&key, 1).await;
+        ex.store.clock.set(start + LEASE + Duration::from_secs(1));
+        let go_second = Arc::new(tokio::sync::Notify::new());
+        let second = slow_call(&ex.calls, &key, true, &go_second, || Ok(8));
+        ex.await_attempts(&key, 2).await; // the second call took the record over
+
+        go_first.notify_one();
+        let late = first.await.unwrap();
+        assert!(
+            late.is_err(),
+            "{name}: the late call reports its own failure"
+        );
+        let stored = ex.record(&key).await;
+        assert!(
+            stored
+                .as_ref()
+                .is_some_and(|r| r.status == ExternalCallStatus::InProgress && r.attempts == 2),
+            "{name}: the new owner's record is untouched: {stored:?}"
+        );
+
+        go_second.notify_one();
+        assert_eq!(second.await.unwrap().unwrap(), 8, "{name}");
+        let stored = ex.record(&key).await.unwrap();
+        assert_eq!(stored.status, ExternalCallStatus::Succeeded, "{name}");
+        assert_eq!(stored.reply.as_deref(), Some("8"), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_call_whose_record_another_call_gave_up_as_unknown_reports_an_unknown_outcome_not_success()
+ {
+    require_docker!();
+    let ex = Ex::start().await;
+    let go = Arc::new(tokio::sync::Notify::new());
+    let slow = slow_call(&ex.calls, "job-9", false, &go, || Ok(7));
+    ex.await_attempts("job-9", 1).await;
+    ex.store.clock.set(t0() + LEASE + Duration::from_secs(1));
+    let second = ex
+        .calls
+        .execute::<u32, _>("ex.Slow", "job-9", false, async { Ok(8) })
+        .await;
+    assert!(
+        matches!(second, Err(MessagingError::UnknownOutcome(_))),
+        "{second:?}"
+    );
+
+    go.notify_one();
+    let late = slow.await.unwrap();
+
+    assert!(
+        matches!(late, Err(MessagingError::UnknownOutcome(_))),
+        "the record says UNKNOWN, so the late call cannot report success: {late:?}"
+    );
+    let stored = ex.record("job-9").await.unwrap();
+    assert_eq!(stored.status, ExternalCallStatus::Unknown);
+    assert_eq!(stored.reply, None);
+}

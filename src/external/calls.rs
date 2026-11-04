@@ -18,6 +18,15 @@
 //!    the adapter itself leaves the record `UNKNOWN` (ruling 39); any other failure (a panic
 //!    included) is `FAILED` with `{"code","message"}`.
 //!
+//! 4. Ownership (ruling 70): every write after `begin` filters on the key, `IN_PROGRESS` and the
+//!    `attempts` value this call set (1 on insert, the takeover's count), so a call whose lease ran
+//!    out never overwrites or deletes the record of the call that took it over or gave it up as
+//!    `UNKNOWN`. A `SUCCEEDED` write that matches nothing is logged at warn and never reported as
+//!    success (`RetryableExternal` with `external_idempotent`, else `UnknownOutcome`); a failure
+//!    write that matches nothing is logged at warn and the call still returns its own error. The
+//!    expired-lease change to `UNKNOWN` reads the record again when it matched nothing (the slow
+//!    call finished meanwhile).
+//!
 //! Every write of the record is a single-document write of its own, outside any session: a
 //! rollback of the caller's transaction (an event handler runs inside stage 1's) never forgets a
 //! call that happened. The body itself runs where the caller runs it: an event handler's inside
@@ -29,10 +38,11 @@
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use futures::FutureExt;
+use futures::future::BoxFuture;
 use mongodb::bson::{Bson, DateTime, doc};
 use mongodb::options::ReturnDocument;
 use mongodb::{Collection, Database};
@@ -136,9 +146,10 @@ fn handler_error(label: &str, message: String) -> MessagingError {
     }
 }
 
-/// What `begin` decided: run the body, or the call is answered from the record.
+/// What `begin` decided: run the body under the ownership token `attempts` (the value this call
+/// set on the record), or the call is answered from the record.
 enum Begin {
-    Run,
+    Run { attempts: i32 },
     Replay(Option<String>),
 }
 
@@ -150,6 +161,7 @@ pub struct ExternalCalls {
     settings: ExternalCallSettings,
     metrics: Arc<dyn SagaMetrics>,
     fail_next_succeeded_write: AtomicBool,
+    pause_before_expired_write: Mutex<Option<BoxFuture<'static, ()>>>,
 }
 
 impl ExternalCalls {
@@ -166,6 +178,7 @@ impl ExternalCalls {
             settings,
             metrics,
             fail_next_succeeded_write: AtomicBool::new(false),
+            pause_before_expired_write: Mutex::new(None),
         }))
     }
 
@@ -184,6 +197,20 @@ impl ExternalCalls {
         self.fail_next_succeeded_write.store(true, Ordering::SeqCst);
     }
 
+    /// Test seam: the next call that finds an `IN_PROGRESS` record past its lease awaits `pause`
+    /// after reading the record and before writing it (another call acts in between).
+    #[doc(hidden)]
+    pub fn pause_before_next_expired_write(&self, pause: BoxFuture<'static, ()>) {
+        *self.pause_before_expired_write.lock().unwrap() = Some(pause);
+    }
+
+    async fn maybe_pause_before_expired_write(&self) {
+        let pause = self.pause_before_expired_write.lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.await;
+        }
+    }
+
     /// Runs `body` (the handler's call to the external system) under the idempotency rules for
     /// `key`; returns its result, or the stored reply. `label` names the handler (its message's
     /// wire type name) in errors, logs and metrics.
@@ -198,7 +225,7 @@ impl ExternalCalls {
         R: Serialize + DeserializeOwned + 'static,
         Fut: Future<Output = Result<R, MessagingError>>,
     {
-        match self.begin(key, external_idempotent, label).await? {
+        let attempts = match self.begin(key, external_idempotent, label).await? {
             Begin::Replay(reply) => {
                 self.metrics.external_call(label, ExternalOutcome::Replayed);
                 let reply = reply.unwrap_or_else(|| "{}".to_string());
@@ -209,27 +236,30 @@ impl ExternalCalls {
                     )
                 });
             }
-            Begin::Run => {}
-        }
+            Begin::Run { attempts } => attempts,
+        };
+        let owned = Owned { key, attempts };
         // A dropped future (the request was cancelled) leaves the record IN_PROGRESS: whether the
         // external system was reached is unknown, and its lease decides.
         let result = match AssertUnwindSafe(body).catch_unwind().await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
-                self.settle_failure(key, &e, label).await;
+                self.settle_failure(&owned, &e, label).await;
                 return Err(e);
             }
             Err(_) => {
                 let e = handler_error(label, format!("Handler {label}: handler panicked"));
-                self.settle_failure(key, &e, label).await;
+                self.settle_failure(&owned, &e, label).await;
                 return Err(e);
             }
         };
         let reply = codec::encode_reply(&result).and_then(|bytes| {
             String::from_utf8(bytes).map_err(|e| MessagingError::Storage(e.to_string()))
         });
-        if let Err(e) = self.record_success(key, reply).await {
-            return Err(self.unrecorded(key, label, external_idempotent, e).await);
+        match self.record_success(&owned, reply).await {
+            Ok(true) => {}
+            Ok(false) => return Err(self.taken_over(&owned, label, external_idempotent)),
+            Err(e) => return Err(self.unrecorded(&owned, label, external_idempotent, e).await),
         }
         self.metrics
             .external_call(label, ExternalOutcome::Succeeded);
@@ -270,7 +300,7 @@ impl ExternalCalls {
                 lease_until: Some(self.lease_from_now()),
             };
             match self.calls.insert_one(&record).await {
-                Ok(_) => return Ok(Begin::Run),
+                Ok(_) => return Ok(Begin::Run { attempts: 1 }),
                 Err(e) if crate::saga::ports::is_duplicate_key(&e) => {} // an earlier call exists
                 Err(e) => return Err(store_down(e)),
             }
@@ -298,9 +328,11 @@ impl ExternalCalls {
                             "The call with key '{key}' is already in progress (handler {label})"
                         )));
                     }
+                    self.maybe_pause_before_expired_write().await;
                     let same_record = doc! {
                         "_id": key,
                         "status": "IN_PROGRESS",
+                        "attempts": existing.attempts,
                         "leaseUntil": lease.map(Bson::DateTime).unwrap_or(Bson::Null),
                     };
                     if external_idempotent {
@@ -316,11 +348,14 @@ impl ExternalCalls {
                             .return_document(ReturnDocument::After)
                             .await
                             .map_err(store_down)?;
-                        if taken.is_some() {
-                            return Ok(Begin::Run);
+                        if let Some(taken) = taken {
+                            return Ok(Begin::Run {
+                                attempts: taken.attempts,
+                            });
                         }
                     } else {
-                        self.calls
+                        let changed = self
+                            .calls
                             .update_one(
                                 same_record,
                                 doc! {
@@ -330,8 +365,12 @@ impl ExternalCalls {
                             )
                             .await
                             .map_err(store_down)?;
-                        return Err(self.unknown(key, label));
+                        if changed.matched_count == 1 {
+                            return Err(self.unknown(key, label));
+                        }
                     }
+                    // The record changed since it was read (the slow call finished, another call
+                    // took it over or settled it): read it again.
                 }
             }
         }
@@ -342,28 +381,50 @@ impl ExternalCalls {
         )))
     }
 
-    /// Writes `SUCCEEDED` with `reply` (the encoded reply, or why it could not be encoded).
+    /// Writes `SUCCEEDED` with `reply` (the encoded reply, or why it could not be encoded) on the
+    /// record this call still owns; false when it owns it no longer (logged at warn).
     async fn record_success(
         &self,
-        key: &str,
+        owned: &Owned<'_>,
         reply: Result<String, MessagingError>,
-    ) -> Result<(), MessagingError> {
+    ) -> Result<bool, MessagingError> {
         if self.fail_next_succeeded_write.swap(false, Ordering::SeqCst) {
             return Err(MessagingError::Storage(
                 "injected: the SUCCEEDED write failed".into(),
             ));
         }
         let reply = reply?;
-        self.calls
+        let written = self
+            .calls
             .update_one(
-                doc! { "_id": key },
+                owned.filter(),
                 doc! {
                     "$set": { "status": "SUCCEEDED", "reply": reply, "updatedAt": self.now() },
                     "$unset": { "leaseUntil": "", "error": "" },
                 },
             )
             .await?;
-        Ok(())
+        Ok(owned.wrote(written.matched_count, "SUCCEEDED"))
+    }
+
+    /// The body succeeded but the record is no longer this call's (its lease ran out and another
+    /// call took it over or settled it): the success cannot be proven by the record, so it is not
+    /// reported. With `external_idempotent` a repeat is safe (retryable); otherwise unknown.
+    fn taken_over(
+        &self,
+        owned: &Owned<'_>,
+        label: &str,
+        external_idempotent: bool,
+    ) -> MessagingError {
+        let key = owned.key;
+        if external_idempotent {
+            self.metrics
+                .external_call(label, ExternalOutcome::Retryable);
+            return MessagingError::RetryableExternal(format!(
+                "The call with key '{key}' (handler {label}) ran past its lease and another call took its record over; a repeat is safe because the partner de-duplicates by the key"
+            ));
+        }
+        self.unknown(key, label)
     }
 
     fn unknown(&self, key: &str, label: &str) -> MessagingError {
@@ -380,11 +441,12 @@ impl ExternalCalls {
     /// effort: if that fails too the lease does it later).
     async fn unrecorded(
         &self,
-        key: &str,
+        owned: &Owned<'_>,
         label: &str,
         external_idempotent: bool,
         cause: MessagingError,
     ) -> MessagingError {
+        let key = owned.key;
         tracing::error!(key = %key, handler = %label, "the call ran but its outcome could not be recorded: {cause}");
         if external_idempotent {
             self.metrics
@@ -393,15 +455,15 @@ impl ExternalCalls {
                 "The call with key '{key}' (handler {label}) ran but its outcome could not be recorded; a repeat is safe because the partner de-duplicates by the key: {cause}"
             ));
         }
-        self.mark_unknown(key).await;
+        self.mark_unknown(owned).await;
         self.unknown(key, label)
     }
 
-    async fn mark_unknown(&self, key: &str) {
-        if let Err(e) = self
+    async fn mark_unknown(&self, owned: &Owned<'_>) {
+        match self
             .calls
             .update_one(
-                doc! { "_id": key },
+                owned.filter(),
                 doc! {
                     "$set": { "status": "UNKNOWN", "updatedAt": self.now() },
                     "$unset": { "leaseUntil": "" },
@@ -409,23 +471,30 @@ impl ExternalCalls {
             )
             .await
         {
-            tracing::warn!(key = %key, "could not mark the call UNKNOWN (its lease will): {e}");
+            Ok(written) => {
+                owned.wrote(written.matched_count, "UNKNOWN");
+            }
+            Err(e) => {
+                tracing::warn!(key = %owned.key, "could not mark the call UNKNOWN (its lease will): {e}")
+            }
         }
     }
 
     /// The record after the body failed: reset for a retryable failure, `UNKNOWN` for an unknown
     /// outcome, `FAILED` with the error for any other. Never masks the failure.
-    async fn settle_failure(&self, key: &str, e: &MessagingError, label: &str) {
+    async fn settle_failure(&self, owned: &Owned<'_>, e: &MessagingError, label: &str) {
         let written = match e {
             MessagingError::RetryableExternal(_) => {
                 self.metrics
                     .external_call(label, ExternalOutcome::Retryable);
-                self.calls.delete_one(doc! { "_id": key }).await.map(|_| ())
+                self.calls.delete_one(owned.filter()).await.map(|deleted| {
+                    owned.wrote(deleted.deleted_count, "deleted");
+                })
             }
             MessagingError::UnknownOutcome(_) => {
                 // The adapter cannot tell whether the partner acted: not FAILED (a redelivery would
                 // report a plain failure and a person would think it safe to call again).
-                self.mark_unknown(key).await;
+                self.mark_unknown(owned).await;
                 self.metrics.external_call(label, ExternalOutcome::Unknown);
                 Ok(())
             }
@@ -436,19 +505,48 @@ impl ExternalCalls {
                     serde_json::json!({ "code": "HANDLER_ERROR", "message": message }).to_string();
                 self.calls
                     .update_one(
-                        doc! { "_id": key },
+                        owned.filter(),
                         doc! {
                             "$set": { "status": "FAILED", "error": error, "updatedAt": self.now() },
                             "$unset": { "leaseUntil": "" },
                         },
                     )
                     .await
-                    .map(|_| ())
+                    .map(|written| {
+                        owned.wrote(written.matched_count, "FAILED");
+                    })
             }
         };
         if let Err(bookkeeping) = written {
-            tracing::warn!(key = %key, handler = %label, "could not record the failure of the call: {bookkeeping}");
+            tracing::warn!(key = %owned.key, handler = %label, "could not record the failure of the call: {bookkeeping}");
         }
+    }
+}
+
+/// The record a running call owns: its key and the `attempts` value the call set when it inserted
+/// or took the record over. Every write after `begin` filters on both and on `IN_PROGRESS`, so a
+/// call whose lease ran out never writes over (or deletes) the record of the call that took it
+/// over or settled it (ruling 70).
+struct Owned<'a> {
+    key: &'a str,
+    attempts: i32,
+}
+
+impl Owned<'_> {
+    fn filter(&self) -> mongodb::bson::Document {
+        doc! { "_id": self.key, "status": "IN_PROGRESS", "attempts": self.attempts }
+    }
+
+    /// Whether a write matched the owned record; when it did not, says so at warn.
+    fn wrote(&self, matched: u64, what: &str) -> bool {
+        if matched == 0 {
+            tracing::warn!(
+                key = %self.key,
+                attempts = self.attempts,
+                "the call's record is no longer its own (its lease ran out and another call took it over or settled it): not {what}"
+            );
+        }
+        matched > 0
     }
 }
 
