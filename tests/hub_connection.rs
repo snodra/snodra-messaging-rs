@@ -167,6 +167,43 @@ async fn invalid_argument_is_retried_at_max_backoff() {
     hub.stop();
 }
 
+/// Like kraken-hub, the fake hub closes a stream whose first `Register` offers no permits.
+#[tokio::test]
+async fn the_hub_refuses_a_register_without_permits() {
+    let hub = FakeHub::start().await;
+    let channel =
+        tonic::transport::Endpoint::from_shared(hub.address().replace("static://", "http://"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+    let mut client = proto::hub_client::HubClient::new(channel);
+    let (tx, rx) = mpsc::channel(4);
+    tx.send(ClientMessage {
+        message: Some(client_message::Message::Register(proto::Register {
+            service_name: "svc".into(),
+            instance_id: uuid::Uuid::new_v4().to_string(),
+            initial_permits: 0,
+            ..Default::default()
+        })),
+    })
+    .await
+    .unwrap();
+    let mut stream = client
+        .connect(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
+    let status = stream.message().await.expect_err("refused");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+    assert_eq!(
+        status.message(),
+        "Register.initial_permits must be at least 1"
+    );
+    assert!(hub.registers().await.is_empty());
+    hub.stop();
+}
+
 /// `max_concurrent_handlers` is the `Register`'s `initial_permits`, which the hub refuses at 0:
 /// settings built in code fail at once instead of retrying a refused registration forever.
 #[tokio::test]
@@ -182,6 +219,53 @@ async fn max_concurrent_handlers_of_zero_is_refused() {
         "{:?}",
         refused.err()
     );
+}
+
+/// The hub stops echoing a registered stream's heartbeats: after three heartbeat intervals of the
+/// ack without an echo the stream fails (`UNAVAILABLE`, not a rejection) and the connection opens
+/// a new one, which registers again.
+#[tokio::test]
+async fn a_registered_stream_whose_echoes_stop_reconnects() {
+    let hub = FakeHub::start().await;
+    hub.set_ack(Some(proto::RegisterAck {
+        heartbeat_interval_ms: 100,
+        ..default_ack()
+    }));
+    let (conn, mut rx) = connection(settings(hub.address(), 50, 100));
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    hub.set_echo_heartbeats(false);
+    let stopped = Instant::now();
+    let lost = timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(Inbound::Disconnected { .. }) = rx.recv().await {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(lost.is_ok(), "a stream without echoes must be abandoned");
+    assert!(
+        stopped.elapsed() >= Duration::from_millis(200),
+        "abandoned after {:?}, before three intervals without an echo",
+        stopped.elapsed()
+    );
+    assert_eq!(
+        conn.last_rejection(),
+        None,
+        "a missing echo is not a rejection"
+    );
+    hub.set_echo_heartbeats(true);
+    timeout(Duration::from_secs(3), async {
+        while hub.registers().await.len() < 2 {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a new stream registers");
+    assert!(conn.await_registered(Duration::from_secs(3)).await);
+    conn.shutdown().await;
+    hub.stop();
 }
 
 #[tokio::test]
@@ -276,6 +360,11 @@ async fn an_echo_without_an_ack_does_not_register_and_the_stream_is_abandoned() 
     assert!(hub.heartbeats() >= 1, "the hub echoed the heartbeat");
     assert_eq!(conn.handshake(), None);
     assert!(!conn.await_registered(Duration::from_millis(10)).await);
+    assert_eq!(
+        conn.last_rejection(),
+        None,
+        "a handshake timeout is not a rejection"
+    );
     hub.set_ack(Some(default_ack()));
     assert!(conn.await_registered(Duration::from_secs(3)).await);
     conn.shutdown().await;

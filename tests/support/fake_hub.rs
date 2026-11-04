@@ -9,11 +9,12 @@
 //! unless `set_replace_sessions(false)`. A stream that ends while it holds the session removes the
 //! instance. Registrations and stream ends are logged in order ([`FakeHub::events`]).
 //!
-//! Permit accounting like kraken-hub (it never holds requests back, it only counts): a stream
-//! whose first `Register` offers `initial_permits > 0` holds that many permits
+//! Permit accounting like kraken-hub (it never holds requests back, it only counts): a first
+//! `Register` with `initial_permits = 0` ends the stream with `INVALID_ARGUMENT` "Register.
+//! initial_permits must be at least 1"; otherwise the stream holds that many permits
 //! ([`FakeHub::permits_held`]); each request pushed to it spends one, each `Permits` adds `count`,
 //! never past the stream's cap. The cap starts at `initial_permits` and a `Permits.grant` above it
-//! raises it first (never lowers it). `set_permit_cap(false)` drops the cap.
+//! raises it first (never lowers it).
 //!
 //! Scatter-gather like kraken-hub (ADR 0017): a `Request` with `mode = SCATTER_GATHER` goes to
 //! every stream whose `Register` lists the type in `query_types` or
@@ -348,9 +349,8 @@ pub struct State {
     permits: StdMutex<Vec<(usize, u32, std::time::Instant)>>,
     /// Permits messages' grants: (stream number, grant).
     grants: StdMutex<Vec<(usize, u32)>>,
-    /// Flow-controlled streams: stream number → (permits held, cap).
+    /// Registered streams: stream number → (permits held, cap).
     held: StdMutex<HashMap<usize, (u32, u32)>>,
-    permit_cap: AtomicBool,
     /// ControlReply messages: (stream number, reply).
     control_replies: StdMutex<Vec<(usize, proto::ControlReply)>>,
     /// InstanceStatus messages: (stream number, report).
@@ -1749,6 +1749,11 @@ impl Hub for Service {
                         Some(Err(_)) => break,
                         Some(Ok(ClientMessage { message: Some(m) })) => match m {
                             client_message::Message::Register(r) => {
+                                if instance.is_none() && r.initial_permits == 0 {
+                                    // Like the hub: the stream ends, nothing of the registration stays.
+                                    let _ = tx.send(Err(tonic::Status::invalid_argument("Register.initial_permits must be at least 1"))).await;
+                                    break;
+                                }
                                 if let Err(status) = state.admit(stream_no, &r, &mut principal) {
                                     state.rejections.lock().unwrap().push(Rejection {
                                         code: status.code(),
@@ -1778,10 +1783,8 @@ impl Hub for Service {
                                     state.log(Event::Evicted { stream: old });
                                     token.cancel();
                                 }
-                                if r.initial_permits > 0 {
-                                    // Like the real hub: the first Register of a stream fixes its permits.
-                                    state.held.lock().unwrap().entry(stream_no).or_insert((r.initial_permits, r.initial_permits));
-                                }
+                                // Like the real hub: the first Register of a stream fixes its permits.
+                                state.held.lock().unwrap().entry(stream_no).or_insert((r.initial_permits, r.initial_permits));
                                 state.registers.lock().await.push(r);
                                 // Like the real hub: the ack is written before the echo of the next heartbeat.
                                 let ack = state.ack.lock().unwrap().clone();
@@ -1816,10 +1819,7 @@ impl Hub for Service {
                                 state.grants.lock().unwrap().push((stream_no, p.grant));
                                 if let Some((held, cap)) = state.held.lock().unwrap().get_mut(&stream_no) {
                                     *cap = (*cap).max(p.grant);
-                                    *held = held.saturating_add(p.count);
-                                    if state.permit_cap.load(Ordering::SeqCst) {
-                                        *held = (*held).min(*cap);
-                                    }
+                                    *held = held.saturating_add(p.count).min(*cap);
                                 }
                             }
                             client_message::Message::Status(st) => state.statuses.lock().unwrap().push((stream_no, st)),
@@ -2011,7 +2011,6 @@ impl FakeHub {
             permits: StdMutex::new(vec![]),
             grants: StdMutex::new(vec![]),
             held: StdMutex::new(HashMap::new()),
-            permit_cap: AtomicBool::new(true),
             control_replies: StdMutex::new(vec![]),
             statuses: StdMutex::new(vec![]),
             down: AtomicBool::new(false),
@@ -2309,8 +2308,7 @@ impl FakeHub {
         self.state.grants.lock().unwrap().clone()
     }
 
-    /// Permits the hub holds for stream `stream` (1-based); `None` unless that stream is
-    /// flow-controlled with `initial_permits > 0`.
+    /// Permits the hub holds for stream `stream` (1-based); `None` until that stream registered.
     pub fn permits_held(&self, stream: usize) -> Option<u32> {
         self.state
             .held
@@ -2318,11 +2316,6 @@ impl FakeHub {
             .unwrap()
             .get(&stream)
             .map(|(held, _)| *held)
-    }
-
-    /// Whether permits stop at the stream's cap (default `true`, as kraken-hub).
-    pub fn set_permit_cap(&self, on: bool) {
-        self.state.permit_cap.store(on, Ordering::SeqCst);
     }
 
     /// Permits messages with the instant each arrived.
@@ -2421,12 +2414,13 @@ impl FakeHub {
         self.state.reject_invalid_next.store(true, Ordering::SeqCst);
     }
 
+    /// Whether heartbeats are echoed (default `true`); `false` is a hub that stopped answering.
     pub fn set_echo_heartbeats(&self, echo: bool) {
         self.state.echo_heartbeats.store(echo, Ordering::SeqCst);
     }
 
     /// Pushes a server message (typically a Request) to every connected client.
-    /// A Request spends one permit of each flow-controlled stream it is pushed to.
+    /// A Request spends one permit of each registered stream it is pushed to.
     pub async fn send_to_clients(&self, msg: ServerMessage) {
         let request = matches!(msg.message, Some(server_message::Message::Request(_)));
         for (stream, c) in self.state.clients.lock().await.iter() {
