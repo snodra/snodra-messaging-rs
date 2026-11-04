@@ -48,7 +48,7 @@ secret), `PRINTER_REPLY_WEBHOOK` (default `http://localhost:<port>/printer/webho
 
 service-c runs a named event processor, `audit` (`src/audit.rs`): `builder.event_in::<ShoutAudit, _, _>("audit", ...)`, its own
 Kafka consumer in the group `service-c.audit` with the markers `processor:audit:<eventId>` and its own dead letters
-(`default` keeps the group `service-c`). `examples.ShoutAudit` (`{key, text, at}`) is service-c's own type: service-b's
+(`default`'s are `service-c.default` and `processor:default:<eventId>`). `examples.ShoutAudit` (`{key, text, at}`) is service-c's own type: service-b's
 `examples.AuditNote` is another, so each service audits only its own notes.
 
 - `POST /audit/notes` `{"key","text"}` publishes a note keyed by `key` (202); `GET /audit/handled` lists what the processor handled,
