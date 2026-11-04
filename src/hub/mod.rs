@@ -20,8 +20,9 @@ pub use auth::{
 };
 pub use connection::{
     CAPABILITIES, CLIENT_VERSION, CREDENTIALS_REFRESH, FLOW_CONTROL, Handshake, HubConnection,
-    HubSettings, INSTANCE_STATUS, Inbound, PERMIT_BATCH, PERMIT_FLUSH_AFTER, PROCESSORS,
-    PROTOCOL_VERSION, RegisteredTypes, ReplyTo, SCATTER_GATHER, STREAMING, SUBSCRIPTION, StreamId,
+    HubSettings, INSTANCE_STATUS, Inbound, PERMIT_BATCH, PERMIT_FLUSH_AFTER, PROCESSOR_CONTROL,
+    PROCESSORS, PROTOCOL_VERSION, RegisteredTypes, ReplyTo, SCATTER_GATHER, STREAMING,
+    SUBSCRIPTION, StreamId,
 };
 pub(crate) use dispatcher::{AbortOnDrop, invocation_error};
 pub use dispatcher::{AdmissionHook, Dispatcher};

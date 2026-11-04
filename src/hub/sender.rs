@@ -1012,7 +1012,10 @@ impl Sender {
                 }
             }
             // The dispatcher's business.
-            Inbound::Request { .. } | Inbound::Flow(_) | Inbound::Cancel(_) => {}
+            Inbound::Request { .. }
+            | Inbound::Flow(_)
+            | Inbound::Cancel(_)
+            | Inbound::Control { .. } => {}
         }
     }
 

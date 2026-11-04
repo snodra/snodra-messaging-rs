@@ -106,6 +106,10 @@ pub const CREDENTIALS_REFRESH: &str = "credentials-refresh";
 /// The event processor status capability (ADR 0022, P6a): `InstanceStatus.processors` is filled
 /// only on a stream whose ack lists it (and `instance-status`, which carries the message).
 pub const PROCESSORS: &str = "processors";
+/// The processor control capability (ADR 0023, P6b): the hub sends `ServerMessage.control` only
+/// to a session that declared it, and this client answers each with one
+/// `ClientMessage.control_reply` on the same stream, only to a hub whose ack lists it.
+pub const PROCESSOR_CONTROL: &str = "processor-control";
 /// Optional protocol features this client declares (`Register.capabilities`).
 pub const CAPABILITIES: &[&str] = &[
     FLOW_CONTROL,
@@ -115,6 +119,7 @@ pub const CAPABILITIES: &[&str] = &[
     SUBSCRIPTION,
     CREDENTIALS_REFRESH,
     PROCESSORS,
+    PROCESSOR_CONTROL,
 ];
 /// A `Permits` message is sent as soon as this many grants are pending, or as soon as the hub holds
 /// no more than `min(PERMIT_BATCH, initial_permits / 2)` permits for the stream (the low-water mark)...
@@ -252,6 +257,12 @@ impl Handshake {
     /// True when the hub shares `processors` (ADR 0022): our reports carry the processor status.
     pub fn processors(&self) -> bool {
         self.shares(PROCESSORS)
+    }
+
+    /// True when the hub shares `processor-control` (ADR 0023): it may ask us to act on our event
+    /// processors, and takes our answers.
+    pub fn processor_control(&self) -> bool {
+        self.shares(PROCESSOR_CONTROL)
     }
 
     /// True when the hub shares `scatter-gather`: it fans a scatter-gather query out and knows
@@ -583,6 +594,13 @@ pub enum Inbound {
     /// Credits for a streaming query this instance handles (P4b): `request_id` is the
     /// handler-side id (`<id>#1`).
     Flow(proto::Flow),
+    /// The hub asks this instance to act on one of its event processors (ADR 0023): answered
+    /// with one `ControlReply` on `reply_to`, the stream it arrived on. Forwarded only from a
+    /// stream whose ack lists `processor-control`.
+    Control {
+        request: proto::ControlRequest,
+        reply_to: ReplyTo,
+    },
     /// The hub cancels a request this instance handles (P4b): a streaming query (the sender
     /// left or stopped reading, the hub's limits), or a unary / scatter-gather target whose
     /// gather ended early. Nothing is to be sent for it any more.
@@ -618,6 +636,11 @@ impl std::fmt::Debug for Inbound {
                 f,
                 "Cancel(request_id={}, reason={})",
                 c.request_id, c.reason
+            ),
+            Inbound::Control { request, reply_to } => write!(
+                f,
+                "Control(control_id={}, processor={}, stream={})",
+                request.control_id, request.processor, reply_to.stream
             ),
             Inbound::Disconnected { stream, unsent } => {
                 write!(f, "Disconnected(stream={stream}, unsent={})", unsent.len())
@@ -1482,9 +1505,15 @@ impl HubConnection {
                         server_message::Message::End(e) => self.forward(Inbound::End(e)).await?,
                         server_message::Message::Flow(x) => self.forward(Inbound::Flow(x)).await?,
                         server_message::Message::Cancel(c) => self.forward(Inbound::Cancel(c)).await?,
-                        // Processor control (ADR 0023): never sent to a client that does not declare
-                        // "processor-control", which this one does not yet.
-                        server_message::Message::Control(_) => {}
+                        // Processor control (ADR 0023): answered on this stream, and only to a hub
+                        // that listed the capability (one that did not cannot take the answer).
+                        server_message::Message::Control(request) => {
+                            if handshake.as_ref().is_some_and(Handshake::processor_control) {
+                                self.forward(Inbound::Control { request, reply_to: reply_to.clone() }).await?
+                            } else {
+                                tracing::debug!(service = %self.service_name, address = %self.settings.address, control_id = %request.control_id, "a control request from a hub that did not list processor-control ignored");
+                            }
+                        }
                     },
                 },
             }
@@ -2112,7 +2141,8 @@ mod tests {
                 "streaming",
                 "subscription",
                 "credentials-refresh",
-                "processors"
+                "processors",
+                "processor-control"
             ]
         );
         assert!(CLIENT_VERSION.starts_with("kraken-messaging-rs/"));

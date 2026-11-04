@@ -377,6 +377,9 @@ pub struct State {
     permit_grants: AtomicBool,
     instance_status: AtomicBool,
     processors: AtomicBool,
+    processor_control: AtomicBool,
+    /// ControlReply messages: (stream number, reply).
+    control_replies: StdMutex<Vec<(usize, proto::ControlReply)>>,
     /// InstanceStatus messages: (stream number, report).
     statuses: StdMutex<Vec<(usize, proto::InstanceStatus)>>,
     down: AtomicBool,
@@ -1889,6 +1892,7 @@ impl Hub for Service {
                                 let wants_subscription = r.capabilities.iter().any(|c| c == "subscription");
                                 let wants_refresh = r.capabilities.iter().any(|c| c == "credentials-refresh");
                                 let wants_processors = r.capabilities.iter().any(|c| c == "processors");
+                                let wants_control = r.capabilities.iter().any(|c| c == "processor-control");
                                 state.log(Event::Register { stream: stream_no, types: r.command_types.len() + r.query_types.len() + r.shared_query_types.len() });
                                 let scatter = wants_scatter && v2 && state.scatter_gather.load(Ordering::SeqCst) && state.ack.lock().unwrap().is_some();
                                 let streaming = wants_streaming && v2 && state.streaming.load(Ordering::SeqCst) && state.ack.lock().unwrap().is_some();
@@ -1941,6 +1945,9 @@ impl Hub for Service {
                                     }
                                     if wants_processors && state.processors.load(Ordering::SeqCst) {
                                         ack.capabilities.push("processors".to_string());
+                                    }
+                                    if wants_control && state.processor_control.load(Ordering::SeqCst) {
+                                        ack.capabilities.push("processor-control".to_string());
                                     }
                                     ack
                                 });
@@ -2047,8 +2054,9 @@ impl Hub for Service {
                                 };
                                 deliver(msgs).await
                             }
-                            // Processor control (ADR 0023): this fake hub never asks for it.
-                            client_message::Message::ControlReply(_) => {}
+                            client_message::Message::ControlReply(r) => {
+                                state.control_replies.lock().unwrap().push((stream_no, r))
+                            }
                         },
                         Some(Ok(ClientMessage { message: None })) => {}
                     }
@@ -2172,6 +2180,8 @@ impl FakeHub {
             permit_grants: AtomicBool::new(true),
             instance_status: AtomicBool::new(true),
             processors: AtomicBool::new(true),
+            processor_control: AtomicBool::new(true),
+            control_replies: StdMutex::new(vec![]),
             statuses: StdMutex::new(vec![]),
             down: AtomicBool::new(false),
             replace_sessions: AtomicBool::new(true),
@@ -2302,6 +2312,82 @@ impl FakeHub {
     /// P6a).
     pub fn set_processors(&self, on: bool) {
         self.state.processors.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether the ack shares "processor-control" with clients that declare it (`false`: a hub
+    /// before P6b).
+    pub fn set_processor_control(&self, on: bool) {
+        self.state.processor_control.store(on, Ordering::SeqCst);
+    }
+
+    /// The `ControlReply`s received: (stream number, reply).
+    pub fn control_replies(&self) -> Vec<(usize, proto::ControlReply)> {
+        self.state.control_replies.lock().unwrap().clone()
+    }
+
+    /// Sends `action` for `processor` (a fresh `control_id`) to every connected client and waits
+    /// up to `within` for the first reply to it; `None` when none came.
+    pub async fn control(
+        &self,
+        processor: &str,
+        action: proto::control_request::Action,
+        within: Duration,
+    ) -> Option<proto::ControlReply> {
+        self.control_to(None, processor, action, within).await
+    }
+
+    /// [`control`](Self::control) to the stream of `instance` only (every client with `None`).
+    pub async fn control_to(
+        &self,
+        instance: Option<&str>,
+        processor: &str,
+        action: proto::control_request::Action,
+        within: Duration,
+    ) -> Option<proto::ControlReply> {
+        let control_id = uuid::Uuid::new_v4().to_string();
+        let msg = ServerMessage {
+            message: Some(server_message::Message::Control(proto::ControlRequest {
+                control_id: control_id.clone(),
+                processor: processor.to_string(),
+                action: Some(action),
+            })),
+        };
+        match instance {
+            None => self.send_to_clients(msg).await,
+            Some(instance) => {
+                let held = self
+                    .state
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .get(instance)
+                    .map(|(s, _)| *s);
+                let tx = held.and_then(|stream| {
+                    self.state
+                        .routes
+                        .lock()
+                        .unwrap()
+                        .get(&stream)
+                        .map(|r| r.tx.clone())
+                });
+                let tx = tx.unwrap_or_else(|| panic!("no session of instance {instance}"));
+                let _ = tx.send(Ok(msg)).await;
+            }
+        }
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            if let Some((_, reply)) = self
+                .control_replies()
+                .into_iter()
+                .find(|(_, r)| r.control_id == control_id)
+            {
+                return Some(reply);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// Whether the ack shares "scatter-gather" with clients that declare it (`false`: a P3 hub).
