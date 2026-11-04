@@ -30,6 +30,10 @@
 //!   (`KRAKEN_HUB_P4B_IMAGE`) a subscription fails with `UnsupportedByHub` (nothing is sent)
 //!   while a unary query, a scatter-gather and a streaming query keep working.
 //!
+//! - P6a (ADR 0022): `kraken-hub:p6a-hub` (`KRAKEN_HUB_P6A_IMAGE`) shares `processors` and shows
+//!   the processor status in its topology; to `kraken-hub:p5c` (`KRAKEN_HUB_P5C_IMAGE`) the
+//!   `InstanceStatus` reports carry no processors.
+//!
 //! A missing image fails the test with the command that builds it. No Kafka or MongoDB: the
 //! participants are a `HubConnection` and a `Sender` each; a pass-through (`PermitTap`) records the
 //! `Permits` and `InstanceStatus` messages a participant writes.
@@ -687,6 +691,8 @@ struct PermitTap {
     address: String,
     permits: Arc<AtomicU64>,
     statuses: Arc<AtomicU64>,
+    /// `InstanceStatus` messages that carried processors (ADR 0022).
+    with_processors: Arc<AtomicU64>,
 }
 
 impl PermitTap {
@@ -697,8 +703,13 @@ impl PermitTap {
             upstream: upstream.replace("static://", "http://"),
             permits: Arc::default(),
             statuses: Arc::default(),
+            with_processors: Arc::default(),
         };
-        let (permits, statuses) = (Arc::clone(&tap.permits), Arc::clone(&tap.statuses));
+        let (permits, statuses, with_processors) = (
+            Arc::clone(&tap.permits),
+            Arc::clone(&tap.statuses),
+            Arc::clone(&tap.with_processors),
+        );
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(proto::hub_server::HubServer::new(tap))
@@ -710,7 +721,13 @@ impl PermitTap {
             address: format!("static://{addr}"),
             permits,
             statuses,
+            with_processors,
         }
+    }
+
+    /// `InstanceStatus` messages with processors written so far.
+    fn with_processors(&self) -> u64 {
+        self.with_processors.load(Ordering::SeqCst)
     }
 
     /// Permits written so far (the sum of the counts).
@@ -729,6 +746,7 @@ struct Tap {
     upstream: String,
     permits: Arc<AtomicU64>,
     statuses: Arc<AtomicU64>,
+    with_processors: Arc<AtomicU64>,
 }
 
 impl Tap {
@@ -752,14 +770,21 @@ impl proto::hub_server::Hub for Tap {
         &self,
         request: tonic::Request<tonic::Streaming<ClientMessage>>,
     ) -> Result<tonic::Response<Self::ConnectStream>, Status> {
-        let (permits, statuses) = (Arc::clone(&self.permits), Arc::clone(&self.statuses));
+        let (permits, statuses, with_processors) = (
+            Arc::clone(&self.permits),
+            Arc::clone(&self.statuses),
+            Arc::clone(&self.with_processors),
+        );
         let outbound = request.into_inner().map_while(Result::ok).map(move |m| {
             match &m.message {
                 Some(client_message::Message::Permits(p)) => {
                     permits.fetch_add(p.count.into(), Ordering::SeqCst);
                 }
-                Some(client_message::Message::Status(_)) => {
+                Some(client_message::Message::Status(s)) => {
                     statuses.fetch_add(1, Ordering::SeqCst);
+                    if !s.processors.is_empty() {
+                        with_processors.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
                 _ => {}
             }
@@ -1224,6 +1249,75 @@ async fn single_target_pool(image: HubImage) {
     }
     pool.shutdown().await;
     b.shutdown().await;
+}
+
+// ---- P6a (ADR 0022): the processor status ----
+
+/// The processors' status rides on `InstanceStatus` only to a hub whose ack lists `processors`:
+/// the P6a hub keeps and shows it, the merged P5c hub never sees the field.
+async fn processor_status_to(image: HubImage) {
+    let hub = hub_with(HubOptions::new(image)).await;
+    let tap = PermitTap::start(&hub.address).await;
+    let (tx, mut rx) = mpsc::channel::<Inbound>(64);
+    let pool = HubPool::new(
+        HubSettings {
+            address: tap.address.clone(),
+            status_interval: Duration::from_millis(100),
+            ..HubSettings::default()
+        },
+        "compat-processors".into(),
+        uuid::Uuid::new_v4().to_string(),
+        tx,
+    )
+    .unwrap();
+    pool.set_processor_status(Arc::new(|| {
+        vec![proto::ProcessorStatus {
+            name: "orders".into(),
+            group_id: "compat-processors.orders".into(),
+            topic: "kraken.events".into(),
+            state: proto::ProcessorState::ProcessorRunning as i32,
+            partitions: vec![proto::PartitionStatus {
+                partition: 0,
+                position: 10,
+                committed: 8,
+                high_watermark: 20,
+                lag: 12,
+            }],
+            dead_letter_mode: "collection".into(),
+            ..Default::default()
+        }]
+    }));
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    pool.start();
+    assert!(pool.await_registered(Duration::from_secs(15)).await);
+    let handshake = pool.connections()[0].handshake().unwrap();
+    assert!(handshake.instance_status(), "{handshake:?}");
+    let shares = image == HubImage::P6a;
+    assert_eq!(handshake.processors(), shares, "{handshake:?}");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(tap.statuses() >= 3, "{} reports", tap.statuses());
+    if shares {
+        assert!(tap.with_processors() >= 3, "{}", tap.with_processors());
+        let view = instance_view(&hub, "compat-processors").await;
+        assert_eq!(view["processors"][0]["name"], "orders", "{view}");
+        assert_eq!(view["processors"][0]["state"], "RUNNING", "{view}");
+        assert_eq!(view["processors"][0]["partitions"][0]["lag"], 12, "{view}");
+    } else {
+        assert_eq!(tap.with_processors(), 0, "processors written to {image:?}");
+    }
+    pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn p6a_hub_gets_and_shows_the_processor_status() {
+    require_docker!();
+    processor_status_to(HubImage::P6a).await;
+}
+
+#[tokio::test]
+async fn p5c_hub_gets_instance_status_without_processors() {
+    require_docker!();
+    processor_status_to(HubImage::P5c).await;
 }
 
 #[tokio::test]

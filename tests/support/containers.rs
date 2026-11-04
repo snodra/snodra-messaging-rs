@@ -70,6 +70,12 @@ pub enum HubImage {
     /// The P5a hub (access control: static tokens, ACL, TLS): `KRAKEN_HUB_P5A_IMAGE`, default
     /// `kraken-hub:p5a-hub`.
     P5a,
+    /// The merged P5c hub (mutual TLS; no `processors`): `KRAKEN_HUB_P5C_IMAGE`, default
+    /// `kraken-hub:p5c`.
+    P5c,
+    /// The P6a hub (event processor status, `processors`): `KRAKEN_HUB_P6A_IMAGE`, default
+    /// `kraken-hub:p6a-hub`.
+    P6a,
 }
 
 impl HubImage {
@@ -96,6 +102,10 @@ impl HubImage {
                 .unwrap_or_else(|_| "kraken-hub:p4c-hub".to_string()),
             HubImage::P5a => std::env::var("KRAKEN_HUB_P5A_IMAGE")
                 .unwrap_or_else(|_| "kraken-hub:p5a-hub".to_string()),
+            HubImage::P5c => std::env::var("KRAKEN_HUB_P5C_IMAGE")
+                .unwrap_or_else(|_| "kraken-hub:p5c".to_string()),
+            HubImage::P6a => std::env::var("KRAKEN_HUB_P6A_IMAGE")
+                .unwrap_or_else(|_| "kraken-hub:p6a-hub".to_string()),
         }
     }
 
@@ -127,6 +137,12 @@ impl HubImage {
             }
             HubImage::P5a => {
                 "build the P5a hub and tag it `kraken-hub:p5a-hub` (or set KRAKEN_HUB_P5A_IMAGE)"
+            }
+            HubImage::P5c => {
+                "build the merged P5c hub and tag it `kraken-hub:p5c` (or set KRAKEN_HUB_P5C_IMAGE)"
+            }
+            HubImage::P6a => {
+                "build the P6a hub and tag it `kraken-hub:p6a-hub` (or set KRAKEN_HUB_P6A_IMAGE)"
             }
         }
     }
