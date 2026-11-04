@@ -1381,3 +1381,96 @@ struct Pong {
 impl kraken_messaging::Command for Ping {
     type Reply = Pong;
 }
+
+/// One `audit` processor of service `service` on `topic`, with `handler`, and `once` (when given)
+/// registered with `disallow_replay`.
+async fn audit_app(
+    hub: &FakeHub,
+    kafka: &str,
+    uri: &str,
+    service: &str,
+    topic: &str,
+    handler: &Handler,
+    once: Option<&Handler>,
+) -> KrakenMessaging {
+    let mut builder = KrakenMessaging::builder(config(service, &hub.address(), kafka, uri, topic))
+        .await
+        .unwrap()
+        .event_in::<Noted, _, _>("audit", handler.handle());
+    if let Some(once) = once {
+        builder = builder.event_with::<Noted, _, _>(
+            EventOptions::new().processor("audit").disallow_replay(),
+            once.handle(),
+        );
+    }
+    let app = builder.start().await.unwrap();
+    assert!(app.await_hub(Duration::from_secs(30)).await);
+    app
+}
+
+/// A renewal written between the poll's read of a passed lease and its conditional clear keeps
+/// the lock: the instance stays prepared and out of the group.
+#[tokio::test]
+async fn a_lease_renewed_before_its_clear_keeps_the_instance_prepared() {
+    require_docker!();
+    let hub = FakeHub::start().await;
+    let kafka = support::containers::kafka().await;
+    let mongo = support::containers::mongo().await;
+    let topic = "renewed.events";
+    let handler = Handler::default();
+    let uri = mongo.uri_for("renewed");
+    let app = audit_app(
+        &hub,
+        &kafka.bootstrap,
+        &uri,
+        "svc-renewed",
+        topic,
+        &handler,
+        None,
+    )
+    .await;
+    let db = app.database();
+    let group = "svc-renewed.audit";
+    produce(&producer(&kafka.bootstrap), topic, None, "n-0").await;
+    eventually("n-0 handled", WITHIN, || async {
+        handler.count("n-0") == 1
+    })
+    .await;
+    eventually("a member of the group", WITHIN, || async {
+        members(&kafka.bootstrap, group).len() == 1
+    })
+    .await;
+    ok(hub.control("audit", prepare("op-1", 1500), ASK).await);
+    let (renewed_tx, renewed) = tokio::sync::oneshot::channel();
+    let docs = db.collection::<Document>("processor_control");
+    app.processor_control().pause_before_next_expiry(
+        "audit",
+        Box::pin(async move {
+            let until = mongodb::bson::DateTime::from_millis(
+                mongodb::bson::DateTime::now().timestamp_millis() + 60_000,
+            );
+            docs.update_one(
+                doc! { "_id": "audit" },
+                doc! { "$set": { "operation.leaseUntil": until } },
+            )
+            .await
+            .unwrap();
+            let _ = renewed_tx.send(());
+        }),
+    );
+    tokio::time::timeout(Duration::from_secs(20), renewed)
+        .await
+        .expect("the poll found the lease passed")
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(state(&app, "audit"), ProcessorState::ProcessorStopped);
+    assert_eq!(status(&app, "audit").operation_id, "op-1");
+    assert!(members(&kafka.bootstrap, group).is_empty());
+    assert_eq!(
+        ok(hub.control("audit", prepare("op-1", 30_000), ASK).await),
+        "lease renewed",
+        "still held here"
+    );
+    ok(hub.control("audit", finish("op-1", false), ASK).await);
+    app.shutdown().await;
+}

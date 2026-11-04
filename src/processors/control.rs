@@ -98,6 +98,19 @@ impl ProcessorControl {
         Ok(())
     }
 
+    /// Test seam: the next poll of `processor` that finds its held lease passed awaits `pause`
+    /// between reading the control document and clearing the lock.
+    #[doc(hidden)]
+    pub fn pause_before_next_expiry(
+        &self,
+        processor: &str,
+        pause: futures::future::BoxFuture<'static, ()>,
+    ) {
+        if let Some(runner) = self.inner.runners.get(processor) {
+            runner.pause_before_next_expiry(pause);
+        }
+    }
+
     /// Answers one control request (exactly one reply, with its `control_id`).
     pub async fn handle(&self, request: ControlRequest) -> ControlReply {
         let ControlRequest {

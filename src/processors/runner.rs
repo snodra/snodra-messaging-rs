@@ -16,6 +16,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use futures::future::BoxFuture;
+
 use mongodb::bson::{DateTime, Document};
 use mongodb::{Collection, Database};
 use tokio::task::JoinHandle;
@@ -103,6 +105,9 @@ pub struct ProcessorRunner {
     /// One control action of this processor at a time, the poll included (a renewal of the held
     /// operation excepted).
     serial: Arc<tokio::sync::Mutex<()>>,
+    /// Test seam: awaited by the next poll that finds the held lease passed, between reading the
+    /// document and clearing the lock.
+    pause_before_expiry: Mutex<Option<BoxFuture<'static, ()>>>,
     cancel: CancellationToken,
 }
 
@@ -134,8 +139,16 @@ impl ProcessorRunner {
             run: tokio::sync::Mutex::new(None),
             held: Mutex::new(None),
             serial: Arc::new(tokio::sync::Mutex::new(())),
+            pause_before_expiry: Mutex::new(None),
             cancel,
         })
+    }
+
+    /// Test seam: the next poll that finds the held lease passed awaits `pause` after reading the
+    /// control document and before clearing the lock (a renewal lands in between).
+    #[doc(hidden)]
+    pub fn pause_before_next_expiry(&self, pause: BoxFuture<'static, ()>) {
+        *self.pause_before_expiry.lock().unwrap() = Some(pause);
     }
 
     pub fn name(&self) -> &str {
@@ -191,9 +204,18 @@ impl ProcessorRunner {
         if let Some(h) = &held {
             let lost = match &doc.operation {
                 Some(op) if op.id == h.id && !op.holds_at(now) => {
-                    if let Err(e) = self.store.expire(name, &h.id, now).await {
-                        tracing::warn!(processor = %name, operation = %h.id, "cannot clear the expired lock: {e}");
-                        return;
+                    let pause = self.pause_before_expiry.lock().unwrap().take();
+                    if let Some(pause) = pause {
+                        pause.await;
+                    }
+                    match self.store.expire(name, &h.id, now).await {
+                        Ok(true) => {}
+                        // Renewed meanwhile: still held; the next poll reads the new lease.
+                        Ok(false) => return,
+                        Err(e) => {
+                            tracing::warn!(processor = %name, operation = %h.id, "cannot clear the expired lock: {e}");
+                            return;
+                        }
                     }
                     tracing::warn!(processor = %name, operation = %h.id, "the reset's lease passed without a renewal: the lock is released and the processor consumes again");
                     true
