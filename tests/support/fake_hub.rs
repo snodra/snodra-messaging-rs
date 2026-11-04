@@ -133,8 +133,6 @@ type Target = (usize, String, String, Outbound);
 pub fn default_ack() -> proto::RegisterAck {
     proto::RegisterAck {
         hub_id: "fake-hub".into(),
-        protocol_version: 2,
-        capabilities: vec![],
         heartbeat_interval_ms: 3_000,
         heartbeat_timeout_ms: 10_000,
         default_timeout_ms: 5_000,
@@ -679,7 +677,7 @@ impl State {
         if !self.scatter_gather.load(Ordering::SeqCst) {
             let _ = tx
                 .send(Ok(reject(
-                    ErrorCode::Unsupported,
+                    ErrorCode::InvalidRequest,
                     "scatter-gather not supported",
                 )))
                 .await;
@@ -885,7 +883,7 @@ impl State {
         if !listed || !self.subscription.load(Ordering::SeqCst) {
             let _ = tx
                 .send(Ok(reject(
-                    ErrorCode::Unsupported,
+                    ErrorCode::InvalidRequest,
                     "subscription not negotiated",
                 )))
                 .await;
@@ -918,7 +916,7 @@ impl State {
             Some(reject(ErrorCode::NoHandler, "no handler"))
         } else if capable.is_empty() {
             Some(reject(
-                ErrorCode::Unsupported,
+                ErrorCode::InvalidRequest,
                 &format!("no instance of {owners:?} negotiated subscription"),
             ))
         } else if self.subscriptions.lock().unwrap().contains_key(&req.id)
@@ -1438,7 +1436,7 @@ impl State {
         if !listed || !self.streaming.load(Ordering::SeqCst) {
             let _ = tx
                 .send(Ok(reject(
-                    ErrorCode::Unsupported,
+                    ErrorCode::InvalidRequest,
                     "streaming not negotiated",
                 )))
                 .await;
@@ -1469,7 +1467,7 @@ impl State {
             Some(reject(ErrorCode::NoHandler, "no handler"))
         } else if capable.is_empty() {
             Some(reject(
-                ErrorCode::Unsupported,
+                ErrorCode::InvalidRequest,
                 &format!("no instance of {owners:?} negotiated streaming"),
             ))
         } else if self.open_streams.lock().unwrap().contains_key(&req.id)
@@ -1884,15 +1882,12 @@ impl Hub for Service {
                                     let _ = tx.send(Err(status)).await;
                                     break;
                                 }
-                                let v2 = r.protocol_version >= 2;
-                                let wants_flow = r.capabilities.iter().any(|c| c == "flow-control");
-                                let wants_status = r.capabilities.iter().any(|c| c == "instance-status");
-                                let wants_scatter = r.capabilities.iter().any(|c| c == "scatter-gather");
-                                let wants_streaming = r.capabilities.iter().any(|c| c == "streaming");
-                                let wants_subscription = r.capabilities.iter().any(|c| c == "subscription");
-                                let wants_refresh = r.capabilities.iter().any(|c| c == "credentials-refresh");
-                                let wants_processors = r.capabilities.iter().any(|c| c == "processors");
-                                let wants_control = r.capabilities.iter().any(|c| c == "processor-control");
+                                // Register no longer declares a version or capabilities: every one declares everything.
+                                let v2 = true;
+                                let wants_flow = true;
+                                let wants_scatter = true;
+                                let wants_streaming = true;
+                                let wants_subscription = true;
                                 state.log(Event::Register { stream: stream_no, types: r.command_types.len() + r.query_types.len() + r.shared_query_types.len() });
                                 let scatter = wants_scatter && v2 && state.scatter_gather.load(Ordering::SeqCst) && state.ack.lock().unwrap().is_some();
                                 let streaming = wants_streaming && v2 && state.streaming.load(Ordering::SeqCst) && state.ack.lock().unwrap().is_some();
@@ -1924,33 +1919,7 @@ impl Hub for Service {
                                 }
                                 state.registers.lock().await.push(r);
                                 // Like the real hub: the ack is written before the echo of the next heartbeat.
-                                let ack = state.ack.lock().unwrap().clone().map(|mut ack| {
-                                    if wants_flow && state.flow_control.load(Ordering::SeqCst) {
-                                        ack.capabilities.push("flow-control".to_string());
-                                    }
-                                    if wants_status && state.instance_status.load(Ordering::SeqCst) {
-                                        ack.capabilities.push("instance-status".to_string());
-                                    }
-                                    if wants_scatter && state.scatter_gather.load(Ordering::SeqCst) {
-                                        ack.capabilities.push("scatter-gather".to_string());
-                                    }
-                                    if wants_streaming && state.streaming.load(Ordering::SeqCst) {
-                                        ack.capabilities.push("streaming".to_string());
-                                    }
-                                    if wants_subscription && state.subscription.load(Ordering::SeqCst) {
-                                        ack.capabilities.push("subscription".to_string());
-                                    }
-                                    if wants_refresh && state.credentials_refresh.load(Ordering::SeqCst) {
-                                        ack.capabilities.push("credentials-refresh".to_string());
-                                    }
-                                    if wants_processors && state.processors.load(Ordering::SeqCst) {
-                                        ack.capabilities.push("processors".to_string());
-                                    }
-                                    if wants_control && state.processor_control.load(Ordering::SeqCst) {
-                                        ack.capabilities.push("processor-control".to_string());
-                                    }
-                                    ack
-                                });
+                                let ack = state.ack.lock().unwrap().clone();
                                 let delay = state.ack_delay_ms.load(Ordering::SeqCst);
                                 if delay > 0 {
                                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;

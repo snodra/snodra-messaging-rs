@@ -750,13 +750,6 @@ async fn processor_status_goes_only_to_hubs_sharing_the_processors_capability() 
     })
     .await;
     all_registered(&c, &["hub-a", "hub-b"]).await;
-    let registers = a.registers().await;
-    let declared = &registers[0].capabilities;
-    assert!(
-        declared.contains(&"processors".to_string())
-            && declared.contains(&"instance-status".to_string()),
-        "{declared:?}"
-    );
     assert!(c.pool.connections()[0].handshake().unwrap().processors());
     assert!(!c.pool.connections()[1].handshake().unwrap().processors());
     eventually("both hubs got reports", async || {

@@ -78,8 +78,6 @@ impl MessagingError {
             ErrorCode::InvalidRequest => Self::InvalidMessage(message.to_string()),
             ErrorCode::PermissionDenied => Self::AccessDenied(message.to_string()),
             ErrorCode::ResourceExhausted => Self::HandlerBusy(type_name.to_string()),
-            // A request mode the hub does not implement or share (ADR 0017).
-            ErrorCode::Unsupported => Self::UnsupportedByHub(format!("'{type_name}': {message}")),
             // The hub ended a streaming query (P4b).
             ErrorCode::Cancelled => Self::Cancelled(format!("'{type_name}': {message}")),
             ErrorCode::HandlerError | ErrorCode::Unspecified => Self::RemoteHandler {
@@ -202,22 +200,6 @@ mod tests {
         assert_eq!(e.to_string(), "Handler for 't.X' is busy");
         // A handler that returns it itself answers HANDLER_ERROR like any other failure.
         assert_eq!(e.to_reply_code(), ErrorCode::HandlerError);
-    }
-
-    #[test]
-    fn unsupported_is_unsupported_by_hub_and_never_retried() {
-        let e = MessagingError::from_hub(
-            "t.X",
-            ErrorCode::Unsupported as i32,
-            "request mode scatter_gather is not supported by this hub",
-            b"",
-        );
-        assert!(matches!(e, MessagingError::UnsupportedByHub(_)), "{e:?}");
-        assert!(e.to_string().contains("not supported"), "{e}");
-        assert!(!crate::retry::is_retryable(
-            crate::proto::RequestKind::Query,
-            &e
-        ));
     }
 
     #[test]

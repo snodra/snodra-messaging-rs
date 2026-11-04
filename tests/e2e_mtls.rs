@@ -349,7 +349,6 @@ async fn a_certificate_naming_another_service_is_refused() {
         message: Some(client_message::Message::Register(proto::Register {
             service_name: "billing".into(),
             instance_id: uuid::Uuid::new_v4().to_string(),
-            protocol_version: 2,
             ..Default::default()
         })),
     })

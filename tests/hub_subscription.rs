@@ -464,11 +464,6 @@ async fn the_register_declares_subscription_and_announces_the_types() {
     )
     .await;
     let register = &hub.registers().await[0];
-    assert!(
-        register.capabilities.iter().any(|c| c == "subscription"),
-        "{:?}",
-        register.capabilities
-    );
     assert_eq!(register.query_types, ["t.Lookup", "t.Prices"]);
     assert_eq!(register.shared_query_types, ["t.SharedPrices"]);
     let handshake = a.pool.handshake_for("").unwrap();

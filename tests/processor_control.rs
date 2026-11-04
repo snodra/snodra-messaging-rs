@@ -425,8 +425,6 @@ async fn a_pause_holds_the_records_everywhere_and_survives_a_restart_until_the_r
     };
     let app = start().await;
     assert!(app.await_hub(Duration::from_secs(30)).await);
-    let ack = hub.registers().await[0].capabilities.clone();
-    assert!(ack.contains(&"processor-control".to_string()), "{ack:?}");
     let db = app.database();
     let p = producer(&kafka.bootstrap);
     produce(&p, topic, None, "n-1").await;

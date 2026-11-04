@@ -1905,7 +1905,6 @@ mod tests {
     fn ack(overrides: &[(&str, u32)]) -> Handshake {
         Handshake::V2(RegisterAck {
             hub_id: "h".into(),
-            protocol_version: 2,
             heartbeat_interval_ms: 3_000,
             heartbeat_timeout_ms: 10_000,
             default_timeout_ms: 5_000,
@@ -1915,7 +1914,6 @@ mod tests {
                 .iter()
                 .map(|(t, ms)| (t.to_string(), *ms))
                 .collect(),
-            ..Default::default()
         })
     }
 

@@ -228,21 +228,6 @@ async fn new_hub_acks_with_its_configured_values_and_applies_type_overrides() {
         panic!("expected a v2 handshake, got {:?}", a.conn.handshake());
     };
     assert_eq!(ack.hub_id, "compat-hub");
-    assert_eq!(ack.protocol_version, 2);
-    assert_eq!(
-        ack.capabilities,
-        [
-            "flow-control",
-            "instance-status",
-            "scatter-gather",
-            "streaming",
-            "subscription",
-            "credentials-refresh",
-            "processors",
-            "processor-control"
-        ],
-        "the hub shares what we declared"
-    );
     assert_eq!(ack.heartbeat_interval_ms, 3_000);
     assert_eq!(ack.heartbeat_timeout_ms, 10_000);
     assert_eq!(ack.default_timeout_ms, 5_000);
@@ -1121,9 +1106,7 @@ async fn older_hub_works_as_before(image: HubImage) {
     match image {
         HubImage::Baseline => assert!(handshake.is_legacy(), "{handshake:?}"),
         _ => {
-            let ack = handshake.ack().expect("a v2 ack");
-            assert_eq!(ack.protocol_version, 2);
-            assert!(ack.capabilities.is_empty(), "{ack:?}");
+            handshake.ack().expect("a v2 ack");
         }
     }
 

@@ -288,9 +288,9 @@ impl Handshake {
         self.shares(CREDENTIALS_REFRESH)
     }
 
-    pub(crate) fn shares(&self, capability: &str) -> bool {
-        self.ack()
-            .is_some_and(|a| a.capabilities.iter().any(|c| c == capability))
+    /// The ack no longer lists capabilities: every feature is on once the hub acknowledged.
+    pub(crate) fn shares(&self, _capability: &str) -> bool {
+        self.ack().is_some()
     }
 }
 
@@ -1466,7 +1466,7 @@ impl HubConnection {
                                 }
                                 grants.decide(h.flow_control()).await;
                                 let ack = h.ack().expect("v2");
-                                tracing::info!(service = %self.service_name, instance = %self.instance_id, hub = %ack.hub_id, address = %self.settings.address, protocol = ack.protocol_version, heartbeat = ?interval, flow_control = h.flow_control(), "registered with the hub");
+                                tracing::info!(service = %self.service_name, instance = %self.instance_id, hub = %ack.hub_id, address = %self.settings.address, heartbeat = ?interval, flow_control = h.flow_control(), "registered with the hub");
                                 self.go_live(stream_id, &tx, &h, &grants, identity.as_ref());
                                 handshake = Some(h);
                                 // A token published since the Register went out.
@@ -1746,8 +1746,6 @@ impl HubConnection {
             instance_id: self.instance_id.clone(),
             command_types: types.commands.clone(),
             query_types: types.exclusive_query_types(),
-            protocol_version: PROTOCOL_VERSION,
-            capabilities: CAPABILITIES.iter().map(|c| c.to_string()).collect(),
             credentials: self.credentials(),
             client_version: CLIENT_VERSION.to_string(),
             initial_permits,

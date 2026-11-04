@@ -642,36 +642,7 @@ async fn the_register_carries_the_fetched_jwt_and_declares_credentials_refresh()
     let jwt = jwt_of(&register).expect("a jwt credential, not a token");
     assert_eq!(jwt, provider.token().await.unwrap().value().expose());
     assert_eq!(idp::claims(&jwt)["azp"], "svc");
-    assert!(
-        register
-            .capabilities
-            .iter()
-            .any(|c| c == "credentials-refresh")
-    );
     assert!(hub.rejections().is_empty());
-    conn.shutdown().await;
-    hub.stop();
-}
-
-#[tokio::test]
-async fn a_static_token_session_declares_credentials_refresh_too() {
-    let hub = FakeHub::start().await;
-    let conn = connection(
-        HubSettings {
-            address: hub.address(),
-            token: Some(SecretString::new("a-static-token")),
-            ..HubSettings::default()
-        },
-        "svc",
-    );
-    conn.start();
-    assert!(conn.await_registered(Duration::from_secs(5)).await);
-    assert!(
-        hub.registers().await[0]
-            .capabilities
-            .iter()
-            .any(|c| c == "credentials-refresh")
-    );
     conn.shutdown().await;
     hub.stop();
 }
