@@ -847,6 +847,12 @@ impl SagaStage for SagaRuntime {
         self.by_event.contains_key(type_name)
     }
 
+    fn event_types(&self) -> Vec<String> {
+        let mut all: Vec<String> = self.by_event.keys().map(|t| t.to_string()).collect();
+        all.sort();
+        all
+    }
+
     fn process<'a>(
         &'a self,
         type_name: &'a str,

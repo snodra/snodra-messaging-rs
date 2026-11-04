@@ -11,7 +11,9 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::kafka::dispatch::{LocalEventDispatcher, NoSagas, Outcome, SagaStage};
+use kraken_messaging::kafka::dispatch::{
+    LocalEventDispatcher, NoSagas, Outcome, SagaStage, StageOneDone,
+};
 use kraken_messaging::kafka::{
     EventConsumer, RecordDisposition, classify_with, ensure_indexes, headers,
 };
@@ -511,4 +513,81 @@ async fn the_consumer_hands_a_record_only_a_saga_wants_to_the_saga_stage() {
         calls[0].ctx.headers.get("type").map(String::as_str),
         Some("t.Happened")
     );
+}
+
+// ---- P6a (ADR 0022): a named processor's markers and the stages one by one ----
+
+/// A named processor's dispatcher keys its markers `processor:<name>:<eventId>`; the unnamed one
+/// keeps `<eventId>`, so the two never share a marker.
+#[tokio::test]
+async fn a_named_processors_markers_are_its_own_family() {
+    require_docker!();
+    let f = Fixture::start().await;
+    let named = f
+        .dispatcher(Arc::new(NoSagas), true)
+        .with_marker_prefix(Some("processor:orders:".into()));
+    let default = f.dispatcher(Arc::new(NoSagas), true);
+
+    assert_eq!(dispatch(&named, "e-1").await.unwrap(), Outcome::Handled);
+    assert_eq!(dispatch(&named, "e-1").await.unwrap(), Outcome::Duplicate);
+    assert_eq!(dispatch(&default, "e-1").await.unwrap(), Outcome::Handled);
+    let ids: Vec<String> = f
+        .db
+        .collection::<mongodb::bson::Document>("processed_events")
+        .distinct("_id", doc! {})
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|b| b.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&"processor:orders:e-1".to_string()), "{ids:?}");
+    assert!(ids.contains(&"e-1".to_string()), "{ids:?}");
+    assert_eq!(*f.handlers.lock().unwrap(), ["e-1", "e-1"]);
+}
+
+/// `dispatch_stages` tells each stage's result apart (the consumer parks only for stage 1), and
+/// without stage 1 (a SEQUENCED record) only the saga stage runs.
+#[tokio::test]
+async fn dispatch_stages_reports_each_stage_and_can_skip_stage_one() {
+    require_docker!();
+    let f = Fixture::start().await;
+    let stage = RecordingStage::new(true, &f.db, &f.handlers);
+    let dispatcher = f.dispatcher(stage.clone(), true);
+    assert!(dispatcher.has_stage_one("t.Happened"));
+    assert!(!dispatcher.has_stage_one("t.Other"));
+    assert_eq!(dispatcher.event_types(), ["t.Happened"]);
+
+    *f.fail_ordinary.lock().unwrap() = Some("e-1".into());
+    let stages = dispatcher
+        .dispatch_stages("e-1", "t.Happened", &payload("e-1"), &ctx("e-1", "t.Happened"), true)
+        .await;
+    assert!(matches!(stages.stage_one, Some(Err(MessagingError::Storage(_)))));
+    assert!(matches!(stages.stage_two, Some(Ok(true))));
+
+    let stages = dispatcher
+        .dispatch_stages("e-2", "t.Happened", &payload("e-2"), &ctx("e-2", "t.Happened"), false)
+        .await;
+    assert!(stages.stage_one.is_none(), "stage 1 not run");
+    assert!(matches!(stages.stage_two, Some(Ok(true))));
+    assert!(f.handlers.lock().unwrap().is_empty());
+    assert_eq!(f.markers().await, 0);
+    assert_eq!(stage.calls.lock().unwrap().len(), 2);
+
+    *stage.fail_with.lock().unwrap() = Some("saga store down".into());
+    let stages = dispatcher
+        .dispatch_stages("e-3", "t.Happened", &payload("e-3"), &ctx("e-3", "t.Happened"), true)
+        .await;
+    assert!(matches!(stages.stage_one, Some(Ok(StageOneDone::Handled))));
+    assert!(matches!(stages.stage_two, Some(Err(_))));
+    let stages = dispatcher
+        .dispatch_stages("e-3", "t.Happened", &payload("e-3"), &ctx("e-3", "t.Happened"), true)
+        .await;
+    assert!(matches!(stages.stage_one, Some(Ok(StageOneDone::Duplicate))));
+
+    let none = f.dispatcher(Arc::new(NoSagas), false);
+    let stages = none
+        .dispatch_stages("e-4", "t.Happened", &payload("e-4"), &ctx("e-4", "t.Happened"), true)
+        .await;
+    assert!(stages.stage_one.is_none() && stages.stage_two.is_none());
 }

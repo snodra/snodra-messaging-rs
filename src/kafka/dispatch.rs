@@ -50,6 +50,12 @@ pub enum Outcome {
 pub trait SagaStage: Send + Sync {
     fn interested(&self, type_name: &str) -> bool;
 
+    /// The event types some saga type reacts to, for the processor status (ADR 0022); none by
+    /// default.
+    fn event_types(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     fn process<'a>(
         &'a self,
         type_name: &'a str,
@@ -82,13 +88,46 @@ pub struct LocalEventDispatcher {
     db: Database,
     registry: Arc<HandlerRegistry>,
     stage: Arc<dyn SagaStage>,
+    /// Put before every stage-1 marker id: `processor:<name>:` for a named processor (ADR 0022).
+    marker_prefix: Option<String>,
 }
 
 /// How stage 1 ended when it did not fail.
-enum StageOne {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageOneDone {
+    /// The handlers ran and the marker was committed with their effects.
     Handled,
+    /// The marker already existed: nothing ran.
     Duplicate,
 }
+
+/// What each stage of one [`dispatch_stages`](LocalEventDispatcher::dispatch_stages) did.
+#[derive(Debug)]
+pub struct Stages {
+    /// `None`: stage 1 did not run (no ordinary handler for the type, or it was not asked for).
+    pub stage_one: Option<Result<StageOneDone, MessagingError>>,
+    /// `None`: no saga is interested in the type. `Ok(applied)` as [`SagaStage::process`].
+    pub stage_two: Option<Result<bool, MessagingError>>,
+}
+
+/// How a retried stage 1 ([`LocalEventDispatcher::stage_one_then`]) ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StageOneThen {
+    /// The handlers ran and the marker and `finish`'s writes were committed together.
+    Committed,
+    /// The marker already existed: nothing ran, `finish` was not called.
+    Duplicate,
+    /// `finish` declined: the transaction was aborted (no marker, no handler effect).
+    Declined,
+}
+
+/// The work a retried stage 1 does in its transaction after the handlers succeeded; `Ok(false)`
+/// aborts it.
+pub(crate) type FinishInTransaction<'a> = Box<
+    dyn for<'s> FnOnce(&'s mut ClientSession) -> BoxFuture<'s, Result<bool, MessagingError>>
+        + Send
+        + 'a,
+>;
 
 enum MarkError {
     Duplicate,
@@ -107,12 +146,41 @@ impl LocalEventDispatcher {
             db,
             registry,
             stage,
+            marker_prefix: None,
         }
+    }
+
+    /// Prefixes every stage-1 marker id (`processor:<name>:` for a named processor, ADR 0022);
+    /// `None` (the default) keeps `<dedupeId>`.
+    pub fn with_marker_prefix(mut self, prefix: Option<String>) -> LocalEventDispatcher {
+        self.marker_prefix = prefix;
+        self
     }
 
     /// Whether any ordinary handler or saga type wants events of `type_name`.
     pub fn interested(&self, type_name: &str) -> bool {
         self.registry.has_event_handler(type_name) || self.stage.interested(type_name)
+    }
+
+    /// Whether an ordinary handler (stage 1) wants events of `type_name`.
+    pub fn has_stage_one(&self, type_name: &str) -> bool {
+        self.registry.has_event_handler(type_name)
+    }
+
+    /// Every type this dispatcher handles (the ordinary handlers' and the sagas'), sorted.
+    pub fn event_types(&self) -> Vec<String> {
+        let mut all = self.registry.event_types();
+        all.extend(self.stage.event_types());
+        all.sort();
+        all.dedup();
+        all
+    }
+
+    fn marker_id(&self, dedupe_id: &str) -> String {
+        match &self.marker_prefix {
+            Some(prefix) => format!("{prefix}{dedupe_id}"),
+            None => dedupe_id.to_string(),
+        }
     }
 
     /// Dispatches the event of `type_name` with its JSON `payload`; `dedupe_id` keys stage 1's
@@ -125,38 +193,38 @@ impl LocalEventDispatcher {
         payload: &[u8],
         ctx: &MessageContext,
     ) -> Result<Outcome, MessagingError> {
-        let ordinary = self.registry.has_event_handler(type_name);
-        let saga = self.stage.interested(type_name);
-        if !ordinary && !saga {
+        let Stages {
+            stage_one,
+            stage_two,
+        } = self
+            .dispatch_stages(dedupe_id, type_name, payload, ctx, true)
+            .await;
+        if stage_one.is_none() && stage_two.is_none() {
             return Ok(Outcome::NoInterest);
         }
-
-        let mut duplicate = false;
-        let mut stage1_failure = None;
-        if ordinary {
-            match self.stage_one(dedupe_id, type_name, payload, ctx).await {
-                Ok(StageOne::Handled) => {}
-                Ok(StageOne::Duplicate) => {
-                    tracing::debug!(r#type = %type_name, id = %dedupe_id, "duplicate event skipped");
-                    duplicate = true;
-                }
-                // Held until stage 2 ran: the sagas must not miss an event because an ordinary
-                // handler failed.
-                Err(e) => stage1_failure = Some(e),
-            }
-        }
+        let saga = stage_two.is_some();
+        let ordinary = stage_one.is_some();
         let mut applied = false;
-        if saga {
-            match self.stage.process(type_name, payload, ctx).await {
-                Ok(done) => applied = done,
-                Err(e) if stage1_failure.is_none() => return Err(e),
-                // Both failed: the caller redelivers for stage 1's, stage 2's is kept in the log.
-                Err(e) => {
-                    tracing::error!(r#type = %type_name, id = %dedupe_id, "saga stage failed as well: {e}")
-                }
+        let stage_two_failure = match stage_two {
+            Some(Ok(done)) => {
+                applied = done;
+                None
             }
-        }
-        if let Some(e) = stage1_failure {
+            Some(Err(e)) => Some(e),
+            None => None,
+        };
+        let duplicate = match stage_one {
+            Some(Err(e)) => {
+                if let Some(also) = stage_two_failure {
+                    // Both failed: the caller redelivers for stage 1's, stage 2's is kept in the log.
+                    tracing::error!(r#type = %type_name, id = %dedupe_id, "saga stage failed as well: {also}");
+                }
+                return Err(e);
+            }
+            Some(Ok(done)) => done == StageOneDone::Duplicate,
+            None => false,
+        };
+        if let Some(e) = stage_two_failure {
             return Err(e);
         }
         Ok(if duplicate && !saga {
@@ -168,6 +236,61 @@ impl LocalEventDispatcher {
         })
     }
 
+    /// [`dispatch`](Self::dispatch) with each stage's result apart: stage 1 (the ordinary
+    /// handlers, when `run_stage_one` and one wants the type), then stage 2 (the sagas, when one is
+    /// interested), which runs whatever stage 1 did (ruling 26). The Kafka consumer parks a record
+    /// only for stage 1's failure, and runs a SEQUENCED record through stage 2 alone (ADR 0022).
+    pub async fn dispatch_stages(
+        &self,
+        dedupe_id: &str,
+        type_name: &str,
+        payload: &[u8],
+        ctx: &MessageContext,
+        run_stage_one: bool,
+    ) -> Stages {
+        let stage_one = if run_stage_one && self.registry.has_event_handler(type_name) {
+            let result = self
+                .stage_one(dedupe_id, type_name, payload, ctx, None)
+                .await
+                .map(|done| match done {
+                    StageOneThen::Duplicate => {
+                        tracing::debug!(r#type = %type_name, id = %dedupe_id, "duplicate event skipped");
+                        StageOneDone::Duplicate
+                    }
+                    StageOneThen::Committed | StageOneThen::Declined => StageOneDone::Handled,
+                });
+            Some(result)
+        } else {
+            None
+        };
+        // Stage 1's failure is held until stage 2 ran: the sagas must not miss an event because an
+        // ordinary handler failed.
+        let stage_two = if self.stage.interested(type_name) {
+            Some(self.stage.process(type_name, payload, ctx).await)
+        } else {
+            None
+        };
+        Stages {
+            stage_one,
+            stage_two,
+        }
+    }
+
+    /// Stage 1 alone, with `finish` run in its transaction after the handlers succeeded (a dead
+    /// letter's retry deletes the letter there, ADR 0022): the marker, the handlers' effects and
+    /// `finish`'s writes commit together or not at all. Stage 2 does not run.
+    pub(crate) async fn stage_one_then(
+        &self,
+        dedupe_id: &str,
+        type_name: &str,
+        payload: &[u8],
+        ctx: &MessageContext,
+        finish: FinishInTransaction<'_>,
+    ) -> Result<StageOneThen, MessagingError> {
+        self.stage_one(dedupe_id, type_name, payload, ctx, Some(finish))
+            .await
+    }
+
     /// The ordinary handlers: the marker first (a duplicate id never reaches a handler), then the
     /// handlers, all in one transaction; a handler failure rolls the marker back.
     async fn stage_one(
@@ -176,17 +299,18 @@ impl LocalEventDispatcher {
         type_name: &str,
         payload: &[u8],
         ctx: &MessageContext,
-    ) -> Result<StageOne, MessagingError> {
+        finish: Option<FinishInTransaction<'_>>,
+    ) -> Result<StageOneThen, MessagingError> {
         let mut session = self.client.start_session().await?;
         session.start_transaction().await?;
         match self
-            .mark_processed(&mut session, dedupe_id, type_name)
+            .mark_processed(&mut session, &self.marker_id(dedupe_id), type_name)
             .await
         {
             Ok(()) => {}
             Err(MarkError::Duplicate) => {
                 let _ = session.abort_transaction().await;
-                return Ok(StageOne::Duplicate);
+                return Ok(StageOneThen::Duplicate);
             }
             Err(MarkError::Other(e)) => {
                 let _ = session.abort_transaction().await;
@@ -198,10 +322,21 @@ impl LocalEventDispatcher {
             .run_handlers(type_name, payload, ctx, Arc::clone(&session))
             .await;
         let mut guard = session.lock().await;
+        let result = match (result, finish) {
+            (Ok(()), Some(finish)) => match finish(&mut guard).await {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    let _ = guard.abort_transaction().await;
+                    return Ok(StageOneThen::Declined);
+                }
+                Err(e) => Err(e),
+            },
+            (result, _) => result,
+        };
         match result {
             Ok(()) => {
                 guard.commit_transaction().await?;
-                Ok(StageOne::Handled)
+                Ok(StageOneThen::Committed)
             }
             Err(e) => {
                 let _ = guard.abort_transaction().await;
