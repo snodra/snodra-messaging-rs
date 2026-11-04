@@ -764,7 +764,16 @@ Partner sources (`ExternalSource { topic, bootstrap_servers, group_id, propertie
 (`ManualClock` in tests). The runtime, the relay, the scheduler and the gauge sampler run only with a registered saga, the
 `external_calls` indexes only with an idempotent handler, a partner consumer per source; `app.ingress()` always exists.
 Saga commands to a type the service handles itself go to its own handler without the hub. Shutdown stops the relay, the
-scheduler and the sampler first (at most 20 s), then the rest.
+scheduler and the sampler first (at most 20 s for the three together), then the rest.
+
+**Deploys and in-flight adapter calls.** At shutdown the relay abandons a send still running after 15 s; the saga's
+dispatch lease then lets another instance (or this one, restarted) send the command again with the same key. For a
+command delivered to a local idempotent adapter, abandoning the send drops the adapter's future mid-call, so its
+`external_calls` record stays `IN_PROGRESS`: the re-send is answered "in progress" (retryable, the relay backs off) until
+the record's lease ends (`KRAKEN_EXTERNAL_CALLS_LEASE_MS`, 5 min), and then, without `external_idempotent`, the outcome is
+unknown and the saga gets `SagaCommandFailed` with `UNKNOWN_OUTCOME` (with the default settings; a relay whose attempts
+run out first reports `EXHAUSTED`). With `external_idempotent` the call is run again after the lease. **Keep an adapter's
+I/O timeouts under 15 s**, so its calls finish (or fail cleanly) within a deploy's shutdown.
 
 **Statistics.** `app.saga_stats()` has the Kotlin meters as counters and gauges with the same names and labels
 (`kraken.sagas.started{type}`, `kraken.sagas.ended{type}`, `kraken.saga.events{type,outcome}`,
