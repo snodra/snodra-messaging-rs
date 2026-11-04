@@ -923,9 +923,12 @@ chooses where it goes:
 
 **Guarantees.** A letter is a single insert outside any transaction, keyed
 `<processor>:<topic>:<partition>:<offset>`, so a redelivered record is parked once. **The offset
-is committed only after the letter exists**: when MongoDB refuses it the consumer retries the
-insert every second (the processor turns FAILING) and the record stays unacknowledged until it is
-parked or the service stops. Sequencing keeps an in-memory set of the parked keys of the
+is committed only after the letter exists**: when MongoDB refuses it the record stays
+unacknowledged, its partition is sought back to it and the consumer polls on, so the record comes
+again about every second (the processor turns FAILING; its partition's later records wait, the
+other partitions flow, and the instance keeps its group membership however long the outage). The
+redelivery parks it without running the handlers again (the failure is remembered while the
+partition stays assigned). Sequencing keeps an in-memory set of the parked keys of the
 partitions this instance holds (loaded on every assignment, added to on every park); a record
 whose key is in the set is confirmed against the collection first, and a miss (another instance
 retried or discarded the letters) removes the key and handles the record normally. **A letter that

@@ -19,6 +19,8 @@ use kraken_messaging::proto::{ProcessorState, ProcessorStatus};
 use kraken_messaging::saga::store::SagaDocument;
 use kraken_messaging::{Config, Event, KrakenMessaging, MessagingError, message_type};
 use mongodb::bson::{Document, doc};
+use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer, StreamConsumer};
 use rdkafka::message::{Header, Headers, Message, OwnedHeaders};
@@ -681,6 +683,125 @@ async fn a_letter_is_written_before_its_offset_is_committed_and_parked_once_on_r
         handler.seen().len(),
         2,
         "its key is parked: stage 1 did not run again"
+    );
+    app.shutdown().await;
+}
+
+/// A letter that cannot be written (here: a validator that refuses every insert, as a store
+/// that is down would) does not hold the poll loop: the record is not committed and comes back
+/// (its partition sought back to it) about every second, while the other partition's records
+/// flow and the later records of its own partition wait. Once the store takes the letter it is
+/// parked once, from the remembered failure (the handler does not run again), and then the
+/// partition moves on.
+#[tokio::test]
+async fn a_letter_that_cannot_be_written_holds_its_record_but_not_the_poll_loop() {
+    require_docker!();
+    let hub = FakeHub::start().await;
+    let kafka = support::containers::kafka().await;
+    let mongo = support::containers::mongo().await;
+    let topic = "w.events";
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", &kafka.bootstrap)
+        .create()
+        .unwrap();
+    admin
+        .create_topics(
+            &[NewTopic::new(topic, 2, TopicReplication::Fixed(1))],
+            &AdminOptions::new(),
+        )
+        .await
+        .unwrap();
+    let uri = mongo.uri_for("w");
+    let client = mongodb::Client::with_uri_str(&uri).await.unwrap();
+    let db = client.default_database().unwrap();
+    db.create_collection("dead_letters")
+        .validator(doc! { "$jsonSchema": { "required": ["neverWritten"] } })
+        .await
+        .unwrap();
+    let handler = Handler::default();
+    handler.fail("o-1");
+    let app = KrakenMessaging::builder(config(
+        "svc-w",
+        &hub.address(),
+        &kafka.bootstrap,
+        &uri,
+        topic,
+    ))
+    .await
+    .unwrap()
+    .event::<Placed, _, _>(handler.handle())
+    .start()
+    .await
+    .unwrap();
+    let p = producer(&kafka.bootstrap);
+    let to = |partition: i32, key: &'static str, order: &'static str| {
+        let p = p.clone();
+        async move {
+            let value = serde_json::to_vec(&Placed {
+                order: order.to_string(),
+            })
+            .unwrap();
+            let headers = OwnedHeaders::new()
+                .insert(Header {
+                    key: "type",
+                    value: Some("p.Placed"),
+                })
+                .insert(Header {
+                    key: "id",
+                    value: Some(order),
+                });
+            let record: FutureRecord<'_, str, [u8]> = FutureRecord::to(topic)
+                .partition(partition)
+                .key(key)
+                .payload(value.as_slice())
+                .headers(headers);
+            p.send(record, Duration::from_secs(10)).await.unwrap();
+        }
+    };
+    let runs = |order: &str| handler.seen().iter().filter(|o| *o == order).count();
+
+    to(0, "k", "o-1").await;
+    eventually("o-1 exhausted its attempts", WITHIN, || async {
+        runs("o-1") == 2
+    })
+    .await;
+    to(0, "x", "o-3").await;
+    to(1, "j", "o-2").await;
+    eventually(
+        "the other partition flows while the letter cannot be written",
+        WITHIN,
+        || async { runs("o-2") == 1 },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(letters(&db).await.is_empty());
+    assert_eq!(runs("o-3"), 0, "a later record of the partition waits");
+    assert!(
+        committed(&kafka.bootstrap, "svc-w", topic) <= 0,
+        "not acknowledged"
+    );
+    assert_eq!(
+        state(status(&app.processors(), "default")),
+        ProcessorState::ProcessorFailing
+    );
+
+    db.run_command(doc! { "collMod": "dead_letters", "validator": {} })
+        .await
+        .unwrap();
+    eventually("then o-3 is handled", WITHIN, || async { runs("o-3") == 1 }).await;
+    eventually("and partition 0 acknowledged", WITHIN, || async {
+        committed(&kafka.bootstrap, "svc-w", topic) == 2
+    })
+    .await;
+    let parked = letters(&db).await;
+    assert_eq!(parked.len(), 1, "parked once");
+    assert_eq!(parked[0].id, "default:w.events:0:0");
+    assert_eq!(parked[0].reason, DeadLetterReason::HandlerFailed);
+    assert_eq!(parked[0].attempts, 2);
+    assert_eq!(
+        runs("o-1"),
+        2,
+        "the redeliveries did not run the handler again"
     );
     app.shutdown().await;
 }

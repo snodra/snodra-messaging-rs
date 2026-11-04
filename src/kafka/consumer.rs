@@ -2,7 +2,10 @@
 //! the dedupe marker is inserted first, then the handlers run, all in one Mongo transaction; the
 //! offset is committed after. A record whose handlers fail on every attempt, a malformed one and,
 //! in mode `collection`, one whose key has a parked letter go to the processor's dead letters
-//! before the offset is committed.
+//! before the offset is committed. When the dead letters cannot take it (MongoDB or the DLT
+//! unreachable), the record is not committed: its partition is sought back to it and the consumer
+//! polls again, so the record comes back after a second while the poll loop keeps the group
+//! membership (and the other partitions flow).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -99,7 +102,8 @@ pub const OFFSETS_REFRESH: Duration = Duration::from_secs(5);
 const OFFSETS_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often the processor's dead letters are counted (ADR 0022: every 30 s).
 pub const DEAD_LETTERS_SAMPLE: Duration = Duration::from_secs(30);
-/// Between two attempts to park a letter (or produce it to the DLT) that failed.
+/// Between a record the dead letters could not take (a park, a DLT produce or a sequencing read
+/// failed) and its redelivery.
 const PARK_RETRY: Duration = Duration::from_secs(1);
 
 /// What a processor's consumer is (ADR 0022): its name, group, dead-letter mode and the database
@@ -195,6 +199,15 @@ struct ParkedKeys {
     keys: HashSet<String>,
 }
 
+/// A record that failed on every attempt and whose letter could not be written yet, remembered
+/// for the assignment of `generation`: its redelivery goes straight to the dead letters, without
+/// running the handlers again (Kotlin's ruling 4).
+struct PendingLetter {
+    generation: u64,
+    error: DeadLetterError,
+    attempts: u32,
+}
+
 pub struct EventConsumer {
     consumer: StreamConsumer<ProcessorContext>,
     dispatcher: Arc<LocalEventDispatcher>,
@@ -205,12 +218,20 @@ pub struct EventConsumer {
     sink: Sink,
     monitor: Arc<ProcessorMonitor>,
     parked: Mutex<ParkedKeys>,
+    /// Per (partition, offset): what the dead letters still have to take.
+    pending: Mutex<HashMap<(i32, i64), PendingLetter>>,
+    /// Per partition: the generation and offset it was sought back to, until that record is
+    /// delivered again.
+    rewound: Mutex<HashMap<i32, (u64, i64)>>,
 }
 
 /// Whether a record was acknowledged, and how it counts in the status.
 enum Done {
     /// Acknowledge; `processed`: its dispatch completed without a stage-1 failure.
     Ack { processed: bool },
+    /// The dead letters could not take it (or the sequencing reads failed): leave the offset
+    /// uncommitted and deliver the record again after [`PARK_RETRY`].
+    Again,
     /// Shutting down: leave the offset uncommitted for the next run.
     Stop,
 }
@@ -343,6 +364,8 @@ impl EventConsumer {
             sink,
             monitor,
             parked: Mutex::new(ParkedKeys::default()),
+            pending: Mutex::new(HashMap::new()),
+            rewound: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -399,8 +422,21 @@ impl EventConsumer {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     }
                     Ok(msg) => {
+                        if self.overtakes(&msg) {
+                            continue;
+                        }
                         let processed = match self.handle_record(&msg, cancel).await {
                             Done::Ack { processed } => processed,
+                            // Not committed: back to the poll after a second, which delivers the
+                            // record again (never holding the poll loop for longer).
+                            Done::Again => {
+                                self.rewind(msg.partition(), msg.offset());
+                                tokio::select! {
+                                    _ = tokio::time::sleep(PARK_RETRY) => {}
+                                    _ = cancel.cancelled() => break,
+                                }
+                                continue;
+                            }
                             Done::Stop => break, // leave the offset uncommitted for the next run
                         };
                         if let Err(e) = self.consumer.commit_message(&msg, CommitMode::Async) {
@@ -414,9 +450,47 @@ impl EventConsumer {
         self.monitor.stopped();
     }
 
+    /// Seeks `partition` back to `offset`, the record that could not be acknowledged: the next
+    /// polls deliver it again (the partition's later records wait behind it).
+    fn rewind(&self, partition: i32, offset: i64) {
+        self.rewound
+            .lock()
+            .unwrap()
+            .insert(partition, (self.monitor.generation(), offset));
+        // Asynchronous: librdkafka drops the partition's records fetched before the seek at once.
+        if let Err(e) = self.consumer.seek(
+            &self.topic,
+            partition,
+            Offset::Offset(offset),
+            Duration::ZERO,
+        ) {
+            tracing::warn!(processor = %self.name, partition, offset, "cannot seek back to an unacknowledged record: {e}");
+        }
+    }
+
+    /// True for a record that comes after the one its partition was sought back to (a seek that
+    /// did not take effect): it is not handled, and the partition is sought back again. A
+    /// rebalance since forgets the rewind (the group's committed offset decides then).
+    fn overtakes(&self, msg: &BorrowedMessage<'_>) -> bool {
+        let rewound = self.rewound.lock().unwrap().get(&msg.partition()).copied();
+        match rewound {
+            Some((generation, offset))
+                if generation == self.monitor.generation() && msg.offset() > offset =>
+            {
+                self.rewind(msg.partition(), offset);
+                true
+            }
+            Some(_) => {
+                self.rewound.lock().unwrap().remove(&msg.partition());
+                false
+            }
+            None => false,
+        }
+    }
+
     async fn handle_record(&self, msg: &BorrowedMessage<'_>, cancel: &CancellationToken) -> Done {
-        if !self.load_parked_keys(cancel).await {
-            return Done::Stop;
+        if !self.load_parked_keys().await {
+            return Done::Again;
         }
         let raw_headers: Vec<(String, Vec<u8>)> = msg
             .headers()
@@ -430,6 +504,19 @@ impl EventConsumer {
             .iter()
             .map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).to_string()))
             .collect();
+        let generation = self.monitor.generation();
+        let pending = self
+            .pending
+            .lock()
+            .unwrap()
+            .remove(&(msg.partition(), msg.offset()))
+            .filter(|p| p.generation == generation);
+        if let Some(pending) = pending {
+            // Its attempts are done: only the letter is missing.
+            return self
+                .letter_after_attempts(msg, &raw_headers, pending.error, pending.attempts)
+                .await;
+        }
         let payload = msg.payload().unwrap_or(&[]);
         let (type_name, id) = match classify_with(
             &hdrs,
@@ -451,13 +538,12 @@ impl EventConsumer {
                         DeadLetterError::invalid(reason),
                         None,
                         0,
-                        cancel,
                     )
                     .await;
                 return if parked {
                     Done::Ack { processed: false }
                 } else {
-                    Done::Stop
+                    Done::Again
                 };
             }
             RecordDisposition::Handle { type_name, id } => (type_name, id),
@@ -468,8 +554,8 @@ impl EventConsumer {
         let ctx = message_context(&type_name, &id, &hdrs);
         let stage_one = self.dispatcher.has_stage_one(&type_name);
         if stage_one && let Some(key) = msg.key().map(|k| String::from_utf8_lossy(k).into_owned()) {
-            match self.head_of(&key, cancel).await {
-                None => return Done::Stop,
+            match self.head_of(&key).await {
+                None => return Done::Again,
                 Some(Some(head)) => {
                     let parked = self
                         .dead_letter(
@@ -479,11 +565,10 @@ impl EventConsumer {
                             DeadLetterError::sequenced(&head),
                             Some(head),
                             0,
-                            cancel,
                         )
                         .await;
                     if !parked {
-                        return Done::Stop;
+                        return Done::Again;
                     }
                     // Stage 2 still sees it (ADR 0021 ruling 26).
                     return self
@@ -523,24 +608,53 @@ impl EventConsumer {
                 return Done::Ack { processed: false };
             }
             tracing::error!(processor = %self.name, r#type = %type_name, id = %id, topic = msg.topic(), partition = msg.partition(), offset = msg.offset(), attempts = attempt, "event handler failed on every attempt: {failure}");
-            let parked = self
-                .dead_letter(
+            return self
+                .letter_after_attempts(
                     msg,
                     &raw_headers,
-                    DeadLetterReason::HandlerFailed,
                     DeadLetterError::from_error(&failure),
-                    None,
                     attempt,
-                    cancel,
                 )
                 .await;
-            return if parked {
-                Done::Ack { processed: false }
-            } else {
-                Done::Stop
-            };
         }
         Done::Ack { processed: false }
+    }
+
+    /// The HANDLER_FAILED letter of a record whose attempts are done. When the dead letters cannot
+    /// take it, the failure is remembered for the record's redelivery (which then comes straight
+    /// here) as long as the partition stays assigned.
+    async fn letter_after_attempts(
+        &self,
+        msg: &BorrowedMessage<'_>,
+        raw_headers: &[(String, Vec<u8>)],
+        error: DeadLetterError,
+        attempts: u32,
+    ) -> Done {
+        if self
+            .dead_letter(
+                msg,
+                raw_headers,
+                DeadLetterReason::HandlerFailed,
+                error.clone(),
+                None,
+                attempts,
+            )
+            .await
+        {
+            return Done::Ack { processed: false };
+        }
+        let generation = self.monitor.generation();
+        let mut pending = self.pending.lock().unwrap();
+        pending.retain(|_, p| p.generation == generation);
+        pending.insert(
+            (msg.partition(), msg.offset()),
+            PendingLetter {
+                generation,
+                error,
+                attempts,
+            },
+        );
+        Done::Again
     }
 
     /// A SEQUENCED record through the saga stage alone, with the usual attempts; a failure that
@@ -580,36 +694,32 @@ impl EventConsumer {
 
     /// In mode `collection`, the head letter of `key` when the key is in the parked set and the
     /// collection confirms it (a miss removes the key: another instance retried or discarded its
-    /// letters). `None` when shutting down while the store is unreachable.
-    async fn head_of(&self, key: &str, cancel: &CancellationToken) -> Option<Option<String>> {
+    /// letters). `None` when the store cannot be read (the record is delivered again).
+    async fn head_of(&self, key: &str) -> Option<Option<String>> {
         let Sink::Collection { store, .. } = &self.sink else {
             return Some(None);
         };
         if !self.parked.lock().unwrap().keys.contains(key) {
             return Some(None);
         }
-        loop {
-            match store.head(&self.name, key).await {
-                Ok(Some(head)) => return Some(Some(head)),
-                Ok(None) => {
-                    self.parked.lock().unwrap().keys.remove(key);
-                    return Some(None);
-                }
-                Err(e) => {
-                    tracing::warn!(processor = %self.name, "cannot check the dead letters of a key: {e}");
-                    self.monitor.error(&format!("dead letters: {e}"));
-                    tokio::select! {
-                        _ = tokio::time::sleep(PARK_RETRY) => {}
-                        _ = cancel.cancelled() => return None,
-                    }
-                }
+        match store.head(&self.name, key).await {
+            Ok(Some(head)) => Some(Some(head)),
+            Ok(None) => {
+                self.parked.lock().unwrap().keys.remove(key);
+                Some(None)
+            }
+            Err(e) => {
+                tracing::warn!(processor = %self.name, "cannot check the dead letters of a key, the record comes again: {e}");
+                self.monitor.error(&format!("dead letters: {e}"));
+                None
             }
         }
     }
 
     /// After an assignment (mode `collection`): the keys of the processor's letters on the
-    /// assigned partitions. False when shutting down before they could be read.
-    async fn load_parked_keys(&self, cancel: &CancellationToken) -> bool {
+    /// assigned partitions. False when they cannot be read (the record is delivered again, and
+    /// the load tried again).
+    async fn load_parked_keys(&self) -> bool {
         let Sink::Collection { store, .. } = &self.sink else {
             return true;
         };
@@ -618,35 +728,28 @@ impl EventConsumer {
             return true;
         }
         let partitions = self.monitor.assigned_partitions();
-        loop {
-            match store
-                .parked_keys(&self.name, &self.topic, &partitions)
-                .await
-            {
-                Ok(keys) => {
-                    *self.parked.lock().unwrap() = ParkedKeys {
-                        generation: Some(generation),
-                        keys,
-                    };
-                    return true;
-                }
-                Err(e) => {
-                    tracing::warn!(processor = %self.name, "cannot load the parked keys: {e}");
-                    self.monitor.error(&format!("dead letters: {e}"));
-                    tokio::select! {
-                        _ = tokio::time::sleep(PARK_RETRY) => {}
-                        _ = cancel.cancelled() => return false,
-                    }
-                }
+        match store
+            .parked_keys(&self.name, &self.topic, &partitions)
+            .await
+        {
+            Ok(keys) => {
+                *self.parked.lock().unwrap() = ParkedKeys {
+                    generation: Some(generation),
+                    keys,
+                };
+                true
+            }
+            Err(e) => {
+                tracing::warn!(processor = %self.name, "cannot load the parked keys, the record comes again: {e}");
+                self.monitor.error(&format!("dead letters: {e}"));
+                false
             }
         }
     }
 
     /// Hands the record to the sink: logged (mode `log`), produced to `<topic>.dlt` (mode `topic`,
-    /// SEQUENCED never happens there) or parked in `dead_letters` (mode `collection`). Retried
-    /// every second until it is done; false when shutting down first (the record is then not
-    /// acknowledged).
-    #[allow(clippy::too_many_arguments)]
+    /// SEQUENCED never happens there) or parked in `dead_letters` (mode `collection`). False when
+    /// the sink could not take it: the record is then not acknowledged and comes again.
     async fn dead_letter(
         &self,
         msg: &BorrowedMessage<'_>,
@@ -655,14 +758,13 @@ impl EventConsumer {
         error: DeadLetterError,
         blocked_by: Option<String>,
         attempts: u32,
-        cancel: &CancellationToken,
     ) -> bool {
         match &self.sink {
             Sink::Log => {
                 tracing::error!(processor = %self.name, topic = msg.topic(), partition = msg.partition(), offset = msg.offset(), reason = reason.as_str(), "record skipped: {}", error.message);
                 true
             }
-            Sink::Topic { producer, topic } => loop {
+            Sink::Topic { producer, topic } => {
                 let mut headers = OwnedHeaders::new();
                 for (k, v) in raw_headers
                     .iter()
@@ -701,18 +803,15 @@ impl EventConsumer {
                     .send(record, Timeout::After(Duration::from_secs(30)))
                     .await
                 {
-                    Ok(_) => return true,
+                    Ok(_) => true,
                     Err((e, _)) => {
-                        tracing::warn!(processor = %self.name, dlt = %topic, "cannot produce to the dead-letter topic, retrying: {e}");
+                        tracing::warn!(processor = %self.name, dlt = %topic, "cannot produce to the dead-letter topic, the record comes again: {e}");
                         self.monitor
                             .error(&format!("dead-letter topic {topic}: {e}"));
-                        tokio::select! {
-                            _ = tokio::time::sleep(PARK_RETRY) => {}
-                            _ = cancel.cancelled() => return false,
-                        }
+                        false
                     }
                 }
-            },
+            }
             Sink::Collection { store, retention } => {
                 let letter = DeadLetterDocument::park(
                     DeadLetterRecord {
@@ -731,31 +830,26 @@ impl EventConsumer {
                     mongodb::bson::DateTime::now(),
                     *retention,
                 );
-                loop {
-                    match store.park(&letter).await {
-                        Ok(parked) => {
-                            if parked == Parked::Already {
-                                tracing::info!(processor = %self.name, letter = %letter.id, "record already parked");
-                            } else {
-                                tracing::warn!(processor = %self.name, letter = %letter.id, reason = reason.as_str(), "record parked in dead_letters");
-                            }
-                            if reason != DeadLetterReason::Invalid
-                                && let Some(key) = &letter.key
-                            {
-                                self.parked.lock().unwrap().keys.insert(key.clone());
-                            }
-                            self.monitor.sample_dead_letters_soon();
-                            return true;
+                match store.park(&letter).await {
+                    Ok(parked) => {
+                        if parked == Parked::Already {
+                            tracing::info!(processor = %self.name, letter = %letter.id, "record already parked");
+                        } else {
+                            tracing::warn!(processor = %self.name, letter = %letter.id, reason = reason.as_str(), "record parked in dead_letters");
                         }
-                        Err(e) => {
-                            tracing::warn!(processor = %self.name, letter = %letter.id, "cannot park the record, retrying (its offset stays uncommitted): {e}");
-                            self.monitor
-                                .error(&format!("cannot park {}: {e}", letter.id));
-                            tokio::select! {
-                                _ = tokio::time::sleep(PARK_RETRY) => {}
-                                _ = cancel.cancelled() => return false,
-                            }
+                        if reason != DeadLetterReason::Invalid
+                            && let Some(key) = &letter.key
+                        {
+                            self.parked.lock().unwrap().keys.insert(key.clone());
                         }
+                        self.monitor.sample_dead_letters_soon();
+                        true
+                    }
+                    Err(e) => {
+                        tracing::warn!(processor = %self.name, letter = %letter.id, "cannot park the record, it comes again (its offset stays uncommitted): {e}");
+                        self.monitor
+                            .error(&format!("cannot park {}: {e}", letter.id));
+                        false
                     }
                 }
             }
