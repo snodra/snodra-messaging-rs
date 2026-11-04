@@ -879,8 +879,13 @@ async fn reset_targets_and_refusals() {
     let topic = "targets.events";
     let handler = Handler::default();
     let fail_reset = Arc::new(AtomicBool::new(false));
+    let panic_reset = Arc::new(AtomicBool::new(false));
     let resets = Arc::new(AtomicUsize::new(0));
-    let (fail, count) = (Arc::clone(&fail_reset), Arc::clone(&resets));
+    let (fail, panics, count) = (
+        Arc::clone(&fail_reset),
+        Arc::clone(&panic_reset),
+        Arc::clone(&resets),
+    );
     let app = KrakenMessaging::builder(config(
         "svc-targets",
         &hub.address(),
@@ -892,9 +897,12 @@ async fn reset_targets_and_refusals() {
     .unwrap()
     .event_in::<Noted, _, _>("audit", handler.handle())
     .reset_handler("audit", move |_| {
-        let (fail, count) = (Arc::clone(&fail), Arc::clone(&count));
+        let (fail, panics, count) = (Arc::clone(&fail), Arc::clone(&panics), Arc::clone(&count));
         async move {
             count.fetch_add(1, Ordering::SeqCst);
+            if panics.load(Ordering::SeqCst) {
+                panic!("the projection reset is not written yet");
+            }
             if fail.load(Ordering::SeqCst) {
                 return Err(MessagingError::Storage("projection store down".into()));
             }
@@ -990,6 +998,15 @@ async fn reset_targets_and_refusals() {
     assert!(replay(&db, "audit").await.is_empty());
     ok(hub.control("audit", finish("op-b", true), ASK).await);
     fail_reset.store(false, Ordering::SeqCst);
+    // A panicking one is answered the same way.
+    panic_reset.store(true, Ordering::SeqCst);
+    ok(hub.control("audit", prepare("op-p", 30_000), ASK).await);
+    let (code, message) = refused(hub.control("audit", execute("op-p", earliest()), ASK).await);
+    assert_eq!(code, ControlRefusal::ResetHandlerFailed, "{message}");
+    assert!(message.contains("panicked"), "{message}");
+    assert_eq!(committed(&kafka.bootstrap, group, topic, 0), 4);
+    ok(hub.control("audit", finish("op-p", true), ASK).await);
+    panic_reset.store(false, Ordering::SeqCst);
     resets.store(0, Ordering::SeqCst);
 
     // Bad targets.
