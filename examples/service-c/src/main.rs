@@ -3,21 +3,67 @@
 //! handling them, and logs `examples.GreetingDelivered` from service-b. Shares the query
 //! `examples.Inventory`, the streaming query `examples.Rows` and the subscription query
 //! `examples.WatchCounter` (and `examples.OpenSubscriptions`) with service-b (ADR 0017). Owns the
-//! command `examples.IncrementCounter`, which drives its counters. No HTTP.
+//! command `examples.IncrementCounter`, which drives its counters. Prints every shouted text as a
+//! banner on the sandbox's fake printer through a saga (`banner.rs`, sagas S2), with its own
+//! idempotent printer adapters, the printer's topic as an external source and a small HTTP side for
+//! the printer's webhook and the banner outcomes (`http.rs`).
 
+mod banner;
 mod handlers;
+mod http;
 mod messages;
+mod printer;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
+use kraken_messaging::external::{ExternalSource, IdempotencyKey};
 use kraken_messaging::{Config, KrakenMessaging, MessagingError};
 use messages::{
-    Counter, GreetingDelivered, IncrementCounter, Inventory, OpenSubscriptions, Reverse, Reversed,
-    Rows, Shout, Shouted, SubscriptionCount, TextReversed, TextShouted, WatchCounter,
+    BannerFailed, BannerPrinted, Counter, GreetingDelivered, IncrementCounter, Inventory,
+    OpenSubscriptions, PollBannerJob, PrintBanner, Reverse, Reversed, Rows, Shout, Shouted,
+    SubscriptionCount, TextReversed, TextShouted, WatchCounter,
 };
+
+/// The banner saga's settings, from the environment (compose.local.yaml sets them in-network):
+/// `SERVER_PORT` (8094), `PRINTER_URL` (http://localhost:8093), `PRINTER_WEBHOOK_SECRET` (the
+/// sandbox's dev-only value, shared with the fake printer; not a secret), `PRINTER_REPLY_WEBHOOK`
+/// (where the printer posts, default this service's own `/printer/webhook`) and
+/// `PRINTER_BANNER_TOPIC` (the printer's topic for service-c, `printer.banner.events`).
+struct BannerSettings {
+    port: u16,
+    printer_url: String,
+    secret: String,
+    reply: printer::ReplyTo,
+}
+
+impl BannerSettings {
+    fn from_env() -> Result<BannerSettings, MessagingError> {
+        let var = |name: &str, default: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| default.to_string())
+        };
+        let port: u16 = var("SERVER_PORT", "8094").parse().map_err(|e| {
+            MessagingError::InvalidMessage(format!("SERVER_PORT is not a port: {e}"))
+        })?;
+        Ok(BannerSettings {
+            port,
+            printer_url: var("PRINTER_URL", "http://localhost:8093"),
+            secret: var("PRINTER_WEBHOOK_SECRET", "dev-only-printer-webhook-secret"),
+            reply: printer::ReplyTo {
+                webhook: var(
+                    "PRINTER_REPLY_WEBHOOK",
+                    &format!("http://localhost:{port}/printer/webhook"),
+                ),
+                topic: var("PRINTER_BANNER_TOPIC", "printer.banner.events"),
+            },
+        })
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), MessagingError> {
@@ -28,6 +74,11 @@ async fn main() -> Result<(), MessagingError> {
         .init();
 
     let config = Config::from_env()?;
+    let banners = BannerSettings::from_env()?;
+    let outcomes = banner::BannerOutcomes::default();
+    let (printed_outcomes, failed_outcomes) = (outcomes.clone(), outcomes.clone());
+    let print_printer = printer::Printer::new(&banners.printer_url, banners.reply.clone())?;
+    let poll_printer = print_printer.clone();
     let service = config.service_name.clone();
     // The container id under Docker, like service-b's InventoryLevel.instance.
     let instance = std::env::var("HOSTNAME").unwrap_or_else(|_| "local".to_string());
@@ -42,6 +93,7 @@ async fn main() -> Result<(), MessagingError> {
     let count_emitter = emitter.clone();
     let shout_events = builder.events();
     let reverse_events = builder.events();
+    let poll_events = builder.events();
     let app = builder
         .command::<Shout, _, _>(move |cmd, ctx| {
             let events = shout_events.clone();
@@ -137,14 +189,100 @@ async fn main() -> Result<(), MessagingError> {
             tracing::info!("C: received GreetingDelivered id={} name={}", e.id, e.name);
             Ok(())
         })
+        // The banner saga and its edge.
+        .saga(banner::SAGA, banner::banner_saga)
+        // Submits the banner; the command's `idempotency-key` (`<sagaId>:<seq>`) goes to the
+        // printer too, which de-duplicates by it.
+        .idempotent_command::<PrintBanner, _, _>(
+            IdempotencyKey::default(),
+            false,
+            move |cmd, ctx| {
+                let printer = print_printer.clone();
+                async move {
+                    let key = ctx.headers.get("idempotency-key").cloned().ok_or_else(|| {
+                        MessagingError::InvalidMessage(format!(
+                            "PrintBanner {} arrived without an idempotency-key header",
+                            cmd.job_id
+                        ))
+                    })?;
+                    printer
+                        .submit(&printer.job(&cmd.job_id, &cmd.text), &key)
+                        .await?;
+                    tracing::info!("C: submitted banner {} to the printer", cmd.job_id);
+                    Ok(())
+                }
+            },
+        )
+        // Asks the printer about the job and publishes BannerPrinted when it is done: one call per
+        // attempt number, however often the relay sends it.
+        .idempotent_command::<PollBannerJob, _, _>(
+            IdempotencyKey::From(|cmd, _| format!("poll:{}:{}", cmd.job_id, cmd.attempt)),
+            false,
+            move |cmd, _ctx| {
+                let (printer, events) = (poll_printer.clone(), poll_events.clone());
+                async move {
+                    let Some(job) = printer.status(&cmd.job_id).await? else {
+                        return Ok(());
+                    };
+                    if job.status == "DONE" {
+                        let printed = BannerPrinted {
+                            job_id: job.job_id,
+                            text: job.name,
+                        };
+                        events.publish(&printed, Some(&printed.text)).await?;
+                    }
+                    Ok(())
+                }
+            },
+        )
+        .external_source(
+            printer::SOURCE,
+            ExternalSource::new(&banners.reply.topic),
+            printer::translate,
+        )
+        .event::<BannerPrinted, _, _>(move |e, _ctx| {
+            printed_outcomes.printed(&e);
+            async move {
+                tracing::info!("C: banner {} printed", e.job_id);
+                Ok(())
+            }
+        })
+        .event::<BannerFailed, _, _>(move |e, _ctx| {
+            failed_outcomes.failed(&e);
+            async move {
+                tracing::info!("C: banner {} failed: {}", e.job_id, e.reason);
+                Ok(())
+            }
+        })
         .start()
         .await?;
+
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", banners.port))
+        .await
+        .map_err(|e| MessagingError::Transport(format!("HTTP port {}: {e}", banners.port)))?;
+    let router = http::router(http::Http {
+        ingress: app.ingress(),
+        secret: banners.secret,
+        outcomes,
+    });
+    let (stop_http, http_stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let serve = axum::serve(listener, router).with_graceful_shutdown(async {
+            let _ = http_stopped.await;
+        });
+        if let Err(e) = serve.await {
+            tracing::error!("C: HTTP server failed: {e}");
+        }
+    });
+    tracing::info!("C: HTTP on port {}", banners.port);
 
     if !app.await_hub(Duration::from_secs(30)).await {
         tracing::warn!("hub not confirmed after 30 s; still retrying in the background");
     }
     shutdown_signal().await;
     tracing::info!("C: shutting down");
+    let _ = stop_http.send(());
+    let _ = server.await;
     app.shutdown().await;
     Ok(())
 }

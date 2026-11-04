@@ -184,6 +184,8 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "itoa",
  "matchit",
  "memchr",
@@ -192,6 +194,7 @@ dependencies = [
  "pin-project-lite",
  "serde_core",
  "sync_wrapper",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",
@@ -3406,9 +3409,11 @@ dependencies = [
 name = "service-c"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "chrono",
  "futures",
  "kraken-messaging-rs",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

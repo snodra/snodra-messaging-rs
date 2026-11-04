@@ -159,6 +159,56 @@ impl Query for OpenSubscriptions {
     type Reply = SubscriptionCount;
 }
 
+/// service-c's banner saga (sagas S2): print the shouted text as a banner on the fake printer.
+/// Owned by service-c alone (its own idempotent adapter handles it; the saga relay delivers it
+/// locally). `text` is what the printer prints and decides by (`webhook-*`, `topic-*`, `poll-*`,
+/// `silent-*`, `crash-*`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrintBanner {
+    pub job_id: String,
+    pub text: String,
+}
+message_type!(PrintBanner, "examples.PrintBanner");
+impl Command for PrintBanner {
+    type Reply = ();
+}
+
+/// The banner saga's poll of a `poll-*` job: attempt `attempt` (one printer call per attempt,
+/// however often the relay sends it).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PollBannerJob {
+    pub job_id: String,
+    pub attempt: u32,
+}
+message_type!(PollBannerJob, "examples.PollBannerJob");
+impl Command for PollBannerJob {
+    type Reply = ();
+}
+
+/// The printer printed the banner (from the webhook, the printer's topic or a poll).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BannerPrinted {
+    pub job_id: String,
+    pub text: String,
+}
+message_type!(BannerPrinted, "examples.BannerPrinted");
+impl Event for BannerPrinted {}
+
+/// The banner saga gave up: `reason` is `TIMEOUT` or the `SagaCommandFailed` reason
+/// (`UNKNOWN_OUTCOME`, `EXHAUSTED`, ...).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BannerFailed {
+    pub job_id: String,
+    pub text: String,
+    pub reason: String,
+}
+message_type!(BannerFailed, "examples.BannerFailed");
+impl Event for BannerFailed {}
+
 #[cfg(test)]
 mod tests {
     use super::{Counter, CounterChanged, IncrementCounter, OpenSubscriptions, WatchCounter};

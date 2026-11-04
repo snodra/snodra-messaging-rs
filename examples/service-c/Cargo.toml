@@ -3,7 +3,7 @@ name = "service-c"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
-description = "kraken example service C: handles Shout and Reverse, co-owns Inventory, the streaming Rows and the subscription WatchCounter, owns IncrementCounter, publishes text events, logs GreetingDelivered"
+description = "kraken example service C: handles Shout and Reverse, co-owns Inventory, the streaming Rows and the subscription WatchCounter, owns IncrementCounter, publishes text events, logs GreetingDelivered, prints every shout as a banner through a saga"
 license = "MIT"
 publish = false
 
@@ -15,6 +15,12 @@ serde = { version = "1.0.229", features = ["derive"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1.0.154"
+# The banner saga's edge (example-only, not the crate's): the printer webhook and GET /banners over
+# HTTP (axum, already in the lock through tonic) and the printer client (the crate's reqwest).
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 
 [dev-dependencies]
-serde_json = "1.0.154"
+# SagaTestFixture (feature `testing`) for the banner saga's unit tests.
+kraken-messaging-rs = { path = "../..", features = ["testing"] }

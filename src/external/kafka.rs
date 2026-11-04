@@ -29,10 +29,13 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rdkafka::Message;
+/// rdkafka's record type and the traits a translator reads it with (`record.payload()`,
+/// `record.key()`, `record.headers()`), re-exported so a service needs no rdkafka dependency of
+/// its own (and cannot end up with a second, incompatible rdkafka version).
+pub use rdkafka::Message;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
-use rdkafka::message::{BorrowedMessage, Headers};
+pub use rdkafka::message::{BorrowedMessage, Headers};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 

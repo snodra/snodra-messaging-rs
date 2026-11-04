@@ -8,6 +8,8 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY proto ./proto
 COPY src ./src
+# The manifest names a test target (saga_fixture, feature `testing`), which cargo resolves even for a build.
+COPY tests ./tests
 COPY examples ./examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
