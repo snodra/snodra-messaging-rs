@@ -54,6 +54,8 @@ use crate::types::{Command, Event, MessageType, Query, StreamingQuery, Subscript
 
 /// How long a shutdown waits for the subscriptions' `ReplyEnd`s to be written.
 const SUBSCRIPTION_END_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a shutdown waits for the saga relay, the deadline scheduler and the sampler (ruling 64).
+const SAGA_STOP_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct KrakenMessagingBuilder {
     config: Config,
@@ -272,14 +274,7 @@ impl KrakenMessaging {
         // run: the relay's sends in flight finish (or are abandoned after 15 s, their leases
         // expire and another instance takes the sagas over).
         self.saga_cancel.cancel();
-        for t in self.saga_tasks {
-            if tokio::time::timeout(Duration::from_secs(20), t)
-                .await
-                .is_err()
-            {
-                tracing::warn!("a saga task did not stop in 20 s");
-            }
-        }
+        stop_saga_tasks(self.saga_tasks, SAGA_STOP_TIMEOUT).await;
         self.handlers.close();
         if tokio::time::timeout(Duration::from_secs(10), self.handlers.wait())
             .await
@@ -308,6 +303,16 @@ impl KrakenMessaging {
                 tracing::warn!("background task did not stop in 5 s");
             }
         }
+    }
+}
+
+/// Waits for the (cancelled) saga tasks to stop, all of them within one `bound` (not one each).
+async fn stop_saga_tasks(tasks: Vec<JoinHandle<()>>, bound: Duration) {
+    if tokio::time::timeout(bound, futures::future::join_all(tasks))
+        .await
+        .is_err()
+    {
+        tracing::warn!("the saga tasks did not all stop in {} s", bound.as_secs());
     }
 }
 
@@ -888,5 +893,37 @@ mod hub_settings_tests {
         assert!(!format!("{settings:?}").contains("s3cr3t"));
         config.hub_oauth2.as_mut().unwrap().token_uri = "ftp://nope".into();
         assert!(hub_settings(&config).is_err());
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn stuck_saga_tasks_hold_a_shutdown_for_one_bound_in_all_not_one_each() {
+        // The relay, the scheduler and the sampler, none of which stops.
+        let tasks = (0..3)
+            .map(|_| tokio::spawn(std::future::pending::<()>()))
+            .collect();
+        let started = tokio::time::Instant::now();
+
+        stop_saga_tasks(tasks, SAGA_STOP_TIMEOUT).await;
+
+        assert_eq!(
+            started.elapsed(),
+            SAGA_STOP_TIMEOUT,
+            "one shared deadline (ruling 64)"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn saga_tasks_that_stop_end_the_wait_at_once() {
+        let tasks = (0..3).map(|_| tokio::spawn(async {})).collect();
+        let started = tokio::time::Instant::now();
+
+        stop_saga_tasks(tasks, SAGA_STOP_TIMEOUT).await;
+
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 }
