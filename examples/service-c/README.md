@@ -67,8 +67,24 @@ Kafka consumer in the group `service-c.audit` with the markers `processor:audit:
   `offsets {<partition>=<offset>, ...}`), `GET /audit/notified` the notes the second handler handled (`[{"key","text","at"}]`;
   a replay adds nothing there, while `GET /audit/handled` gets the replayed notes again). Same paths and JSON as service-b's.
 
-The pure parts (the switch, the views of a letter and of a retry result, the query parsing) are unit-tested in `src/audit.rs`;
-smoke steps 26 to 26h drive the HTTP side against the real hub, Kafka and MongoDB (`kraken-messaging/examples/README.md`, "Event
+Through the hub, with the sandbox's write token (`kraken/infra/scripts/dev-hub-pki.sh` writes it to
+`kraken/infra/.secrets/hub-control/dashboard-write.token`; every sandbox mode mounts it into both hubs), from `kraken-messaging-rs`:
+
+```bash
+W="Authorization: Bearer $(cat ../kraken/infra/.secrets/hub-control/dashboard-write.token)"
+HUB=http://localhost:7001/api/v1/services/service-c/processors/audit
+curl -s -X POST -H "$W" "$HUB/pause"             # service-c's audit PAUSED on /api/v1/processors; notes are held
+curl -s -X POST -H 'content-type: application/json' localhost:8094/audit/notes -d '{"key":"ada","text":"held"}'
+curl -s -X POST -H "$W" "$HUB/resume"            # "held" is handled
+curl -s -X POST -H "$W" -H 'Content-Type: application/json' -d '{"to":"earliest"}' "$HUB/reset"   # "resetHandlers":1
+curl -s localhost:8094/audit/resets              # the reset, target earliest, its ranges
+curl -s localhost:8094/audit/handled             # every note again; /audit/notified unchanged
+curl -s "$HUB/dead-letters"                      # the letters without payloads; retry: POST "$HUB/dead-letters/<id>/retry"
+```
+
+The pure parts (the switch, the views of a letter, of a retry result and of a reset, the query parsing) are unit-tested in
+`src/audit.rs`; smoke steps 26 to 26h drive the HTTP side against the real hub, Kafka and MongoDB, and steps 27 to 27e pause, resume
+and reset `audit` and retry and discard its letters through the hub's HTTP API (`kraken-messaging/examples/README.md`, "Event
 processors and dead letters").
 
 Configuration is the crate's `Config::from_env`: `KRAKEN_SERVICE_NAME` (`service-c`), `KRAKEN_HUB_ADDRESS`,
