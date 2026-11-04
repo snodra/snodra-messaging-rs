@@ -1,0 +1,19 @@
+{
+  "_id": "orders:kraken.events:1:44",
+  "processor": "orders",
+  "topic": "kraken.events",
+  "partition": 1,
+  "offset": {"$numberLong": "44"},
+  "key": "order-8",
+  "eventId": "evt-9",
+  "eventType": "examples.OrderPlaced",
+  "headers": {"type": "examples.OrderPlaced", "id": "evt-9"},
+  "payload": "{\"orderId\":\"o-8\"}",
+  "reason": "HANDLER_FAILED",
+  "error": {"type": "IllegalStateException", "message": "boom"},
+  "attempts": 5,
+  "parkedAt": {"$date": "2026-11-04T10:04:00Z"},
+  "lastAttemptAt": {"$date": "2026-11-04T10:04:00Z"},
+  "expireAt": {"$date": "2026-12-04T10:04:00Z"},
+  "replay": true
+}

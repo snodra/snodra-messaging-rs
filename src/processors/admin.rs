@@ -205,6 +205,7 @@ impl DeadLetters {
                 &payload,
                 &ctx,
                 Some(&position),
+                letter.replay,
                 finish,
             )
             .await

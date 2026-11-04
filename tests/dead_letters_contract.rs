@@ -4,7 +4,8 @@
 //! library writes each of them from its record and reads each of them back through its store and
 //! admin API, so a letter one library parks is one the other can list, retry and discard. Neither
 //! library writes `_class` or a null, an absent field stays absent, and a blank `id` or `type`
-//! header is an absent `eventId` or `eventType`.
+//! header is an absent `eventId` or `eventType`. `replay` (ADR 0023: parked while its processor
+//! replayed the record) is written only when true.
 
 mod support;
 
@@ -33,12 +34,13 @@ macro_rules! require_docker {
 }
 
 /// Every shared fixture.
-const FIXTURES: [&str; 5] = [
+const FIXTURES: [&str; 6] = [
     "handler_failed",
     "sequenced",
     "invalid_binary",
     "invalid_empty",
     "invalid_blank_headers",
+    "replayed",
 ];
 
 fn fixture(name: &str) -> Document {
@@ -80,6 +82,7 @@ fn bson_type(v: &Bson) -> &'static str {
         Bson::DateTime(_) => "date",
         Bson::Document(_) => "document",
         Bson::Binary(_) => "binData",
+        Bson::Boolean(_) => "bool",
         Bson::Null => "null",
         _ => "other",
     }
@@ -147,6 +150,7 @@ fn the_fixtures_of_each_reason_deserialise() {
         }
     );
     assert!(failed.blocked_by.is_none());
+    assert!(!failed.replay, "absent is false");
     assert_eq!(failed.attempts, 5);
     assert_eq!(failed.parked_at, at("2026-11-04T10:00:05Z"));
     assert_eq!(failed.last_attempt_at, at("2026-11-04T10:00:05Z"));
@@ -189,6 +193,11 @@ fn the_fixtures_of_each_reason_deserialise() {
     assert!(blank.event_id.is_none() && blank.event_type.is_none());
     assert_eq!(blank.headers["type"], "  ");
     assert_eq!(blank.dedupe_id(), "kraken.events-0-8");
+
+    let replayed = read("replayed");
+    assert_eq!(replayed.reason, DeadLetterReason::HandlerFailed);
+    assert!(replayed.replay);
+    assert_eq!(replayed.parked_at, at("2026-11-04T10:04:00Z"));
 }
 
 #[test]
@@ -405,11 +414,45 @@ fn rust_parks_each_shared_fixture_from_its_record() {
         at("2026-11-04T10:03:00Z"),
         retention,
     );
+    // Parked while its processor replayed the record.
+    let replayed = DeadLetterDocument {
+        replay: true,
+        ..DeadLetterDocument::park(
+            record_at(
+                "orders",
+                1,
+                44,
+                Some(b"order-8"),
+                &[("type", b"examples.OrderPlaced"), ("id", b"evt-9")],
+                br#"{"orderId":"o-8"}"#,
+            ),
+            DeadLetterReason::HandlerFailed,
+            DeadLetterError {
+                type_name: "IllegalStateException".into(),
+                message: "boom".into(),
+            },
+            None,
+            5,
+            at("2026-11-04T10:04:00Z"),
+            retention,
+        )
+    };
+    assert_shape(
+        &to_doc(&replayed),
+        &shape(&[
+            ("key", "string"),
+            ("eventId", "string"),
+            ("eventType", "string"),
+            ("payload", "string"),
+            ("replay", "bool"),
+        ]),
+    );
     for (name, letter) in [
         ("sequenced", sequenced),
         ("invalid_binary", binary),
         ("invalid_empty", empty),
         ("invalid_blank_headers", blank),
+        ("replayed", replayed),
     ] {
         assert_eq!(sorted(&to_doc(&letter)), sorted(&fixture(name)), "{name}");
     }
@@ -514,6 +557,7 @@ async fn every_shared_fixture_reads_back_through_the_store_and_the_admin_api() {
             "default:kraken.events:0:7",
             "orders:kraken.events:2:9",
             "default:kraken.events:0:8",
+            "orders:kraken.events:1:44",
         ],
         "by parkedAt"
     );
@@ -521,7 +565,7 @@ async fn every_shared_fixture_reads_back_through_the_store_and_the_admin_api() {
     for (letter, name) in listed.iter().zip(FIXTURES) {
         assert_eq!(sorted(&to_doc(letter)), sorted(&fixture(name)), "{name}");
     }
-    assert_eq!(admin.count(None).await.unwrap(), 5);
+    assert_eq!(admin.count(None).await.unwrap(), 6);
     assert_eq!(
         store.head("orders", "order-7").await.unwrap().as_deref(),
         Some("orders:kraken.events:1:42")

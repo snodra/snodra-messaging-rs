@@ -143,6 +143,10 @@ pub struct DeadLetterDocument {
     pub last_attempt_at: DateTime,
     /// `parked_at` + retention; the TTL index removes the letter then.
     pub expire_at: DateTime,
+    /// The record was parked while its processor replayed it (ADR 0023): its retry is a replay
+    /// too (no handler that disallows replay). Written only when true; absent is false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replay: bool,
 }
 
 impl DeadLetterDocument {
@@ -198,6 +202,7 @@ impl DeadLetterDocument {
             parked_at: now,
             last_attempt_at: now,
             expire_at: DateTime::from_millis(now.timestamp_millis().saturating_add(retention_ms)),
+            replay: false,
         }
     }
 

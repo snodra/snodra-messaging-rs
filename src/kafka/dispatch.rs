@@ -379,7 +379,9 @@ impl LocalEventDispatcher {
 
     /// Stage 1 alone, with `finish` run in its transaction after the handlers succeeded (a dead
     /// letter's retry deletes the letter there, ADR 0022): the marker, the handlers' effects and
-    /// `finish`'s writes commit together or not at all. Stage 2 does not run.
+    /// `finish`'s writes commit together or not at all. Stage 2 does not run. `replay`: the
+    /// record was parked while its processor replayed it, so the handlers that disallow replay
+    /// are left out (ADR 0023).
     pub(crate) async fn stage_one_then(
         &self,
         dedupe_id: &str,
@@ -387,9 +389,14 @@ impl LocalEventDispatcher {
         payload: &[u8],
         ctx: &MessageContext,
         position: Option<&MarkerPosition>,
+        replay: bool,
         finish: FinishInTransaction<'_>,
     ) -> Result<StageOneThen, MessagingError> {
-        let record = RecordDispatch { position, ..LOCAL };
+        let record = RecordDispatch {
+            position,
+            replay,
+            ..LOCAL
+        };
         self.stage_one(dedupe_id, type_name, payload, ctx, record, Some(finish))
             .await
     }

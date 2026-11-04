@@ -946,23 +946,30 @@ impl EventConsumer {
                 }
             }
             Sink::Collection { store, retention } => {
-                let letter = DeadLetterDocument::park(
-                    DeadLetterRecord {
-                        processor: self.name.clone(),
-                        topic: msg.topic().to_string(),
-                        partition: msg.partition(),
-                        offset: msg.offset(),
-                        key: msg.key().map(<[u8]>::to_vec),
-                        headers: raw_headers.to_vec(),
-                        payload: msg.payload().unwrap_or(&[]).to_vec(),
-                    },
-                    reason,
-                    error,
-                    blocked_by,
-                    attempts,
-                    mongodb::bson::DateTime::now(),
-                    *retention,
-                );
+                // Parked in a replay: its retry must be one too (ADR 0023).
+                let replay = self
+                    .control
+                    .replays(msg.topic(), msg.partition(), msg.offset());
+                let letter = DeadLetterDocument {
+                    replay,
+                    ..DeadLetterDocument::park(
+                        DeadLetterRecord {
+                            processor: self.name.clone(),
+                            topic: msg.topic().to_string(),
+                            partition: msg.partition(),
+                            offset: msg.offset(),
+                            key: msg.key().map(<[u8]>::to_vec),
+                            headers: raw_headers.to_vec(),
+                            payload: msg.payload().unwrap_or(&[]).to_vec(),
+                        },
+                        reason,
+                        error,
+                        blocked_by,
+                        attempts,
+                        mongodb::bson::DateTime::now(),
+                        *retention,
+                    )
+                };
                 match store.park(&letter).await {
                     Ok(parked) => {
                         if parked == Parked::Already {

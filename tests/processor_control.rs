@@ -1636,3 +1636,72 @@ async fn a_lease_lost_while_the_reset_handlers_run_stops_the_reset_before_the_ma
     assert!(replay(&db, "audit").await.is_empty());
     app.shutdown().await;
 }
+
+/// A record parked while its processor replays it keeps that in its letter (`replay: true`), so
+/// the letter's retry runs stage 1 as a replay: without the handlers that disallow replay.
+#[tokio::test]
+async fn a_letter_parked_during_a_replay_is_retried_as_a_replay() {
+    require_docker!();
+    let hub = FakeHub::start().await;
+    let kafka = support::containers::kafka().await;
+    let mongo = support::containers::mongo().await;
+    let topic = "replayed.events";
+    let (handler, once) = (Handler::default(), Handler::default());
+    let uri = mongo.uri_for("replayed");
+    let app = audit_app(
+        &hub,
+        &kafka.bootstrap,
+        &uri,
+        "svc-replayed",
+        topic,
+        &handler,
+        Some(&once),
+    )
+    .await;
+    let db = app.database();
+    let group = "svc-replayed.audit";
+    let p = producer(&kafka.bootstrap);
+    produce(&p, topic, None, "n-1").await;
+    eventually("handled and committed", WITHIN, || async {
+        once.count("n-1") == 1 && committed(&kafka.bootstrap, group, topic, 0) == 1
+    })
+    .await;
+    handler.fail("n-1");
+    ok(hub.control("audit", prepare("op-1", 30_000), ASK).await);
+    assert_eq!(
+        ranges(&reset(
+            hub.control("audit", execute("op-1", earliest()), ASK).await
+        )),
+        [(0, 0, 1)]
+    );
+    ok(hub.control("audit", finish("op-1", false), ASK).await);
+    let id = format!("audit:{topic}:0:0");
+    eventually("parked during the replay", WITHIN, || async {
+        app.dead_letters().count(Some("audit")).await.unwrap() == 1
+    })
+    .await;
+    let letter = db
+        .collection::<Document>("dead_letters")
+        .find_one(doc! { "_id": &id })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(letter.get_bool("replay"), Ok(true), "{letter}");
+    handler.heal();
+    let retry = Action::DeadLetterRetry(proto::DeadLetterRetry {
+        letter_id: id.clone(),
+    });
+    let (result, detail) = retried(hub.control("audit", retry, ASK).await);
+    assert_eq!(result, "Retried", "{detail}");
+    assert_eq!(
+        handler.count("n-1"),
+        3,
+        "handled, failed in the replay, retried"
+    );
+    assert_eq!(
+        once.count("n-1"),
+        1,
+        "the retry of a replayed record is a replay"
+    );
+    app.shutdown().await;
+}
