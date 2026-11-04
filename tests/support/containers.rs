@@ -76,6 +76,9 @@ pub enum HubImage {
     /// The P6a hub (event processor status, `processors`): `KRAKEN_HUB_P6A_IMAGE`, default
     /// `kraken-hub:p6a-hub`.
     P6a,
+    /// The P6b hub (processor control, `processor-control`): `KRAKEN_HUB_P6B_IMAGE`, default
+    /// `kraken-hub:p6b-hub`.
+    P6b,
 }
 
 impl HubImage {
@@ -106,6 +109,8 @@ impl HubImage {
                 .unwrap_or_else(|_| "kraken-hub:p5c".to_string()),
             HubImage::P6a => std::env::var("KRAKEN_HUB_P6A_IMAGE")
                 .unwrap_or_else(|_| "kraken-hub:p6a-hub".to_string()),
+            HubImage::P6b => std::env::var("KRAKEN_HUB_P6B_IMAGE")
+                .unwrap_or_else(|_| "kraken-hub:p6b-hub".to_string()),
         }
     }
 
@@ -143,6 +148,9 @@ impl HubImage {
             }
             HubImage::P6a => {
                 "build the P6a hub and tag it `kraken-hub:p6a-hub` (or set KRAKEN_HUB_P6A_IMAGE)"
+            }
+            HubImage::P6b => {
+                "build the P6b hub and tag it `kraken-hub:p6b-hub` (or set KRAKEN_HUB_P6B_IMAGE)"
             }
         }
     }
