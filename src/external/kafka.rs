@@ -131,6 +131,12 @@ pub fn validate_source(name: &str, source: &ExternalSource) -> Result<(), Messag
     if name.trim().is_empty() {
         return invalid("an external source needs a name".into());
     }
+    if super::is_reserved_source_name(name) {
+        return invalid(format!(
+            "external source '{name}': the name is reserved (the library's marker families: {})",
+            super::RESERVED_SOURCE_NAMES.join(", ")
+        ));
+    }
     if source.topic.trim().is_empty() {
         return invalid(format!("external source '{name}' needs a topic"));
     }

@@ -272,6 +272,24 @@ fn a_properties_entry_for_a_key_the_library_fixes_fails_the_startup_naming_the_s
     );
 }
 
+/// ADR 0022: the marker families `processor:`, `saga:`, `ingress:` and `failed:` are the
+/// library's own; a source of one of those names could collide with them.
+#[test]
+fn a_reserved_source_name_fails_the_startup_naming_it() {
+    for name in ["processor", "saga", "ingress", "failed"] {
+        let e = kraken_messaging::external::kafka::validate_source(
+            name,
+            &ExternalSource::new("partner.printer"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains(&format!("'{name}'")) && e.contains("reserved"), "{name}: {e}");
+        assert!(kraken_messaging::external::is_reserved_source_name(name));
+    }
+    assert!(!kraken_messaging::external::is_reserved_source_name("printer"));
+    assert!(!kraken_messaging::external::is_reserved_source_name("processors"));
+}
+
 #[tokio::test]
 async fn partner_records_become_local_events_deduplicated_never_published_and_retried_then_skipped()
 {

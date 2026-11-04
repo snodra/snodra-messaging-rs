@@ -63,7 +63,8 @@ impl ExternalEventIngress {
     /// (answer 5xx: the partner retries, and the markers of what already succeeded make the retry
     /// apply only the rest). An event nobody handles is `Accepted` with a warning and no marker.
     /// Two simultaneous deliveries of one key may both dispatch: the markers make the second a
-    /// no-op and only one is told `Accepted`. A blank source or key is `InvalidMessage`.
+    /// no-op and only one is told `Accepted`. A blank source or key, or a reserved source name
+    /// ([`RESERVED_SOURCE_NAMES`](super::RESERVED_SOURCE_NAMES)), is `InvalidMessage`.
     pub async fn accept<E: Event>(
         &self,
         source: &str,
@@ -75,6 +76,12 @@ impl ExternalEventIngress {
             return Err(MessagingError::InvalidMessage(
                 "a webhook event needs a source and a dedupe key".into(),
             ));
+        }
+        if super::is_reserved_source_name(source) {
+            return Err(MessagingError::InvalidMessage(format!(
+                "webhook source '{source}': the name is reserved (the library's marker families: {})",
+                super::RESERVED_SOURCE_NAMES.join(", ")
+            )));
         }
         let dedupe_id = format!("{source}:{dedupe_key}");
         let marker = format!("{INGRESS_MARKER_PREFIX}{dedupe_id}");

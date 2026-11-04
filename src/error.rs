@@ -101,6 +101,31 @@ impl MessagingError {
         }
     }
 
+    /// The variant's name (`"Storage"`, `"RemoteHandler"`, ...): a dead letter's `error.type`
+    /// (ADR 0022), the Rust form of Kotlin's exception simple name.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Self::NoHandler(_) => "NoHandler",
+            Self::Timeout(_) => "Timeout",
+            Self::HandlerDisconnected(_) => "HandlerDisconnected",
+            Self::HandlerBusy(_) => "HandlerBusy",
+            Self::RemoteHandler { .. } => "RemoteHandler",
+            Self::Unauthenticated(_) => "Unauthenticated",
+            Self::AccessDenied(_) => "AccessDenied",
+            Self::InvalidMessage(_) => "InvalidMessage",
+            Self::HubUnavailable(_) => "HubUnavailable",
+            Self::HubConnectionLost(_) => "HubConnectionLost",
+            Self::HubRegistrationRejected(_) => "HubRegistrationRejected",
+            Self::UnsupportedByHub(_) => "UnsupportedByHub",
+            Self::Cancelled(_) => "Cancelled",
+            Self::Serialization(_) => "Serialization",
+            Self::Storage(_) => "Storage",
+            Self::Transport(_) => "Transport",
+            Self::RetryableExternal(_) => "RetryableExternal",
+            Self::UnknownOutcome(_) => "UnknownOutcome",
+        }
+    }
+
     /// The code a handler's error becomes inside a `Reply`.
     pub fn to_reply_code(&self) -> ErrorCode {
         match self {
@@ -133,6 +158,30 @@ impl From<rdkafka::error::KafkaError> for MessagingError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_variant_name_is_the_dead_letter_error_type() {
+        assert_eq!(MessagingError::Storage("x".into()).variant_name(), "Storage");
+        assert_eq!(
+            MessagingError::InvalidMessage("x".into()).variant_name(),
+            "InvalidMessage"
+        );
+        assert_eq!(
+            MessagingError::RemoteHandler {
+                type_name: "t".into(),
+                message: "m".into(),
+                details: vec![],
+            }
+            .variant_name(),
+            "RemoteHandler"
+        );
+        let json = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        assert_eq!(MessagingError::from(json).variant_name(), "Serialization");
+        assert_eq!(
+            MessagingError::RetryableExternal("x".into()).variant_name(),
+            "RetryableExternal"
+        );
+    }
+
     use super::*;
 
     #[test]
