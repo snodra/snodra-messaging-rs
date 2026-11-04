@@ -44,6 +44,27 @@ The saga is unit-tested with `SagaTestFixture` (the crate's feature `testing`), 
 secret), `PRINTER_REPLY_WEBHOOK` (default `http://localhost:<port>/printer/webhook`), `PRINTER_BANNER_TOPIC`
 (`printer.banner.events`).
 
+## The audit processor and the dead letters (P6a)
+
+service-c runs a named event processor, `audit` (`src/audit.rs`): `builder.event_in::<ShoutAudit, _, _>("audit", ...)`, its own
+Kafka consumer in the group `service-c.audit` with the markers `processor:audit:<eventId>` and its own dead letters
+(`default` keeps the group `service-c`). `examples.ShoutAudit` (`{key, text, at}`) is service-c's own type: service-b's
+`examples.AuditNote` is another, so each service audits only its own notes.
+
+- `POST /audit/notes` `{"key","text"}` publishes a note keyed by `key` (202); `GET /audit/handled` lists what the processor handled,
+  in order (in memory, lost on restart).
+- `POST /audit/failing?on=true|false` is the example's failure switch: while on, a note whose text starts with `poison` fails
+  (`RetryableExternal`), so after the crate's attempts (5, one second apart) it is parked as `HANDLER_FAILED`, the later notes of its
+  key as `SEQUENCED`, while other keys flow.
+- `GET /audit/dead-letters[?processor=&limit=]`, `GET /audit/dead-letters/count[?processor=]`,
+  `POST /audit/dead-letters/{id}/retry` (`{"result","detail"}`), `POST /audit/dead-letters/retry-all[?processor=audit]` and
+  `DELETE /audit/dead-letters/{id}` call `app.dead_letters()`: `list`, `count`, `retry`, `retry_all` and `discard`. Same paths and
+  JSON as service-b's; the sandbox is closed, a real service puts its own authorization in front of such endpoints.
+
+The pure parts (the switch, the views of a letter and of a retry result, the query parsing) are unit-tested in `src/audit.rs`;
+smoke steps 26 to 26h drive the HTTP side against the real hub, Kafka and MongoDB (`kraken-messaging/examples/README.md`, "Event
+processors and dead letters").
+
 Configuration is the crate's `Config::from_env`: `KRAKEN_SERVICE_NAME` (`service-c`), `KRAKEN_HUB_ADDRESS`,
 `KRAKEN_KAFKA_BOOTSTRAP`, `KRAKEN_MONGODB_URI` (its own database), `RUST_LOG` (default `info`).
 
