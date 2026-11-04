@@ -9,7 +9,7 @@ use mongodb::Database;
 use mongodb::bson::{DateTime, doc};
 
 use super::dead_letters::{DeadLetterDocument, DeadLetterError, DeadLetterReason};
-use super::store::DeadLetterStore;
+use super::store::{DeadLetterStore, LetterSummary};
 use crate::config::DeadLetterMode;
 use crate::error::MessagingError;
 use crate::kafka::dispatch::{FinishInTransaction, StageOneThen};
@@ -223,14 +223,15 @@ impl DeadLetters {
     /// Retries every letter of `processor`: per key in offset order (the keys in the order of their
     /// head letters' `parkedAt`, then `_id`), a key stopping at its first failure (its later
     /// letters count as blocked); then the keyless letters in `parkedAt` order; INVALID letters
-    /// skipped.
+    /// skipped. The run is ordered from the letters' summaries (no record is loaded); each letter
+    /// is read just before its retry, and one gone by then is skipped.
     pub async fn retry_all(&self, processor: &str) -> Result<RetryAllResult, MessagingError> {
         self.collection_mode()?;
         self.dispatcher(processor)?;
         let mut result = RetryAllResult::default();
-        let mut keyed: BTreeMap<String, Vec<DeadLetterDocument>> = BTreeMap::new();
+        let mut keyed: BTreeMap<String, Vec<LetterSummary>> = BTreeMap::new();
         let mut keyless = Vec::new();
-        for letter in self.inner.store.list(Some(processor), None).await? {
+        for letter in self.inner.store.summaries(processor).await? {
             if letter.reason == DeadLetterReason::Invalid {
                 result.skipped += 1;
                 continue;
@@ -241,7 +242,7 @@ impl DeadLetters {
             }
         }
         // Keys in the order of their head letter (lowest offset) by (`parkedAt`, `_id`).
-        let mut keyed: Vec<Vec<DeadLetterDocument>> = keyed
+        let mut keyed: Vec<Vec<LetterSummary>> = keyed
             .into_values()
             .map(|mut letters| {
                 letters.sort_by(|a, b| (a.offset, &a.id).cmp(&(b.offset, &b.id)));
@@ -249,11 +250,12 @@ impl DeadLetters {
             })
             .collect();
         keyed.sort_by(|a, b| (a[0].parked_at, &a[0].id).cmp(&(b[0].parked_at, &b[0].id)));
+        keyless.sort_by(|a, b| (a.parked_at, &a.id).cmp(&(b.parked_at, &b.id)));
         for letters in keyed {
             let total = letters.len() as u64;
             for (done, letter) in letters.iter().enumerate() {
                 let rest = total - done as u64 - 1;
-                match self.retry_letter(letter).await? {
+                match self.retry_summary(letter).await? {
                     RetryResult::Retried | RetryResult::Duplicate => result.retried += 1,
                     RetryResult::NotFound | RetryResult::NotRetriable => result.skipped += 1,
                     RetryResult::Failed(_) => {
@@ -269,7 +271,7 @@ impl DeadLetters {
             }
         }
         for letter in &keyless {
-            match self.retry_letter(letter).await? {
+            match self.retry_summary(letter).await? {
                 RetryResult::Retried | RetryResult::Duplicate => result.retried += 1,
                 RetryResult::NotFound | RetryResult::NotRetriable => result.skipped += 1,
                 RetryResult::Failed(_) => result.failed += 1,
@@ -277,6 +279,14 @@ impl DeadLetters {
             }
         }
         Ok(result)
+    }
+
+    /// The letter of `summary` as it is now, retried; `NotFound` when it is gone.
+    async fn retry_summary(&self, summary: &LetterSummary) -> Result<RetryResult, MessagingError> {
+        match self.inner.store.get(&summary.id).await? {
+            Some(letter) => self.retry_letter(&letter).await,
+            None => Ok(RetryResult::NotFound),
+        }
     }
 
     /// Deletes the letter `id` (false when there is none); discarding a key's head unblocks its

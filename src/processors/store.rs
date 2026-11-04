@@ -6,6 +6,7 @@ use futures::TryStreamExt;
 use mongodb::bson::{Bson, DateTime, Document, doc};
 use mongodb::error::{ErrorKind, WriteFailure};
 use mongodb::{Collection, Database};
+use serde::Deserialize;
 
 use super::dead_letters::{
     DEAD_LETTERS_COLLECTION, DeadLetterDocument, DeadLetterError, DeadLetterReason,
@@ -17,6 +18,19 @@ use crate::error::MessagingError;
 pub enum Parked {
     New,
     Already,
+}
+
+/// What [`DeadLetterStore::summaries`] reads of a letter.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LetterSummary {
+    #[serde(rename = "_id")]
+    pub id: String,
+    #[serde(default)]
+    pub key: Option<String>,
+    pub offset: i64,
+    pub reason: DeadLetterReason,
+    pub parked_at: DateTime,
 }
 
 #[derive(Clone)]
@@ -138,6 +152,23 @@ impl DeadLetterStore {
             find = find.limit(i64::try_from(limit).unwrap_or(i64::MAX));
         }
         Ok(find.await?.try_collect().await?)
+    }
+
+    /// Every letter of `processor` without its record (`_id`, `key`, `offset`, `reason`,
+    /// `parkedAt` only): what orders a `retry_all`, which then reads each letter when its turn
+    /// comes.
+    pub(crate) async fn summaries(
+        &self,
+        processor: &str,
+    ) -> Result<Vec<LetterSummary>, MessagingError> {
+        Ok(self
+            .letters
+            .clone_with_type::<LetterSummary>()
+            .find(doc! { "processor": processor })
+            .projection(doc! { "_id": 1, "key": 1, "offset": 1, "reason": 1, "parkedAt": 1 })
+            .await?
+            .try_collect()
+            .await?)
     }
 
     pub async fn count(&self, processor: Option<&str>) -> Result<u64, MessagingError> {

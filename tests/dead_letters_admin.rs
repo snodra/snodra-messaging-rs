@@ -47,6 +47,9 @@ struct Fixture {
     seen: Arc<Mutex<Vec<String>>>,
     /// Deleted by the handler outside its transaction (another instance's discard).
     vanish: Arc<Mutex<Option<String>>>,
+    /// A letter whose payload the handler rewrites outside its transaction (`_id`, new order):
+    /// an operator fixing it while a `retry_all` runs.
+    rewrite: Arc<Mutex<Option<(String, String)>>>,
     _mongo: support::containers::MongoDb,
 }
 
@@ -72,23 +75,26 @@ impl Fixture {
             failing: Arc::default(),
             seen: Arc::default(),
             vanish: Arc::default(),
+            rewrite: Arc::default(),
             _mongo: mongo,
         }
     }
 
     fn registry(&self) -> Arc<HandlerRegistry> {
         let mut registry = HandlerRegistry::new();
-        let (failing, seen, vanish, db) = (
+        let (failing, seen, vanish, rewrite, db) = (
             Arc::clone(&self.failing),
             Arc::clone(&self.seen),
             Arc::clone(&self.vanish),
+            Arc::clone(&self.rewrite),
             self.db.clone(),
         );
         registry.event::<Placed, _, _>(move |e, ctx| {
-            let (failing, seen, vanish, db) = (
+            let (failing, seen, vanish, rewrite, db) = (
                 Arc::clone(&failing),
                 Arc::clone(&seen),
                 Arc::clone(&vanish),
+                Arc::clone(&rewrite),
                 db.clone(),
             );
             async move {
@@ -106,6 +112,13 @@ impl Fixture {
                 if let Some(id) = gone {
                     db.collection::<Document>(DEAD_LETTERS_COLLECTION)
                         .delete_one(doc! { "_id": id })
+                        .await?;
+                }
+                let fixed = rewrite.lock().unwrap().take();
+                if let Some((id, order)) = fixed {
+                    let payload = serde_json::to_string(&Placed { order }).unwrap();
+                    db.collection::<Document>(DEAD_LETTERS_COLLECTION)
+                        .update_one(doc! { "_id": id }, doc! { "$set": { "payload": payload } })
                         .await?;
                 }
                 seen.lock().unwrap().push(e.order);
@@ -631,6 +644,26 @@ async fn a_letter_removed_before_its_turn_in_retry_all_is_skipped_not_failed() {
         }
     );
     assert!(f.letter(&gone).await.is_none());
+}
+
+/// `retry_all` lists only what orders the run and reads each letter just before retrying it (as
+/// Kotlin does): a letter changed meanwhile is retried as it is then, not as it was listed.
+#[tokio::test]
+async fn retry_all_reads_each_letter_just_before_retrying_it() {
+    require_docker!();
+    let f = Fixture::start().await;
+    let admin = f.admin(DeadLetterMode::Collection);
+    f.park(&Letter::new("orders", 1, Some("k"), "o-1")).await;
+    let second = f.park(&Letter::new("orders", 2, Some("k"), "o-2")).await;
+    *f.rewrite.lock().unwrap() = Some((second, "o-2-fixed".into()));
+    assert_eq!(
+        admin.retry_all("orders").await.unwrap(),
+        RetryAllResult {
+            retried: 2,
+            ..RetryAllResult::default()
+        }
+    );
+    assert_eq!(*f.seen.lock().unwrap(), ["o-1", "o-2-fixed"]);
 }
 
 #[tokio::test]
