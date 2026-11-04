@@ -6,8 +6,11 @@
 //! command `examples.IncrementCounter`, which drives its counters. Prints every shouted text as a
 //! banner on the sandbox's fake printer through a saga (`banner.rs`, sagas S2), with its own
 //! idempotent printer adapters, the printer's topic as an external source and a small HTTP side for
-//! the printer's webhook and the banner outcomes (`http.rs`).
+//! the printer's webhook and the banner outcomes (`http.rs`). Runs a named event processor, `audit`
+//! (`audit.rs`, P6a), whose failures become dead letters the example's admin endpoints retry and
+//! discard.
 
+mod audit;
 mod banner;
 mod handlers;
 mod http;
@@ -23,8 +26,8 @@ use kraken_messaging::external::{ExternalSource, IdempotencyKey};
 use kraken_messaging::{Config, KrakenMessaging, MessagingError};
 use messages::{
     BannerFailed, BannerPrinted, Counter, GreetingDelivered, IncrementCounter, Inventory,
-    OpenSubscriptions, PollBannerJob, PrintBanner, Reverse, Reversed, Rows, Shout, Shouted,
-    SubscriptionCount, TextReversed, TextShouted, WatchCounter,
+    OpenSubscriptions, PollBannerJob, PrintBanner, Reverse, Reversed, Rows, Shout, ShoutAudit,
+    Shouted, SubscriptionCount, TextReversed, TextShouted, WatchCounter,
 };
 
 /// The banner saga's settings, from the environment (compose.local.yaml sets them in-network):
@@ -75,6 +78,8 @@ async fn main() -> Result<(), MessagingError> {
 
     let config = Config::from_env()?;
     let banners = BannerSettings::from_env()?;
+    let audit = audit::Audit::default();
+    let audit_handler = audit.clone();
     let outcomes = banner::BannerOutcomes::default();
     let (printed_outcomes, failed_outcomes) = (outcomes.clone(), outcomes.clone());
     let print_printer = printer::Printer::new(&banners.printer_url, banners.reply.clone())?;
@@ -189,6 +194,11 @@ async fn main() -> Result<(), MessagingError> {
             tracing::info!("C: received GreetingDelivered id={} name={}", e.id, e.name);
             Ok(())
         })
+        // The named processor `audit`: its own consumer, group and dead letters.
+        .event_in::<ShoutAudit, _, _>(audit::PROCESSOR, move |e, _ctx| {
+            let handled = audit_handler.handle(e);
+            async move { handled }
+        })
         // The banner saga and its edge.
         .saga(banner::SAGA, banner::banner_saga)
         // Submits the banner; the command's `idempotency-key` (`<sagaId>:<seq>`) goes to the
@@ -264,7 +274,12 @@ async fn main() -> Result<(), MessagingError> {
         ingress: app.ingress(),
         secret: banners.secret,
         outcomes,
-    });
+    })
+    .merge(audit::router(audit::AuditHttp {
+        audit,
+        events: app.events().clone(),
+        dead_letters: app.dead_letters(),
+    }));
     let (stop_http, http_stopped) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
         let serve = axum::serve(listener, router).with_graceful_shutdown(async {

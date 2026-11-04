@@ -209,6 +209,18 @@ pub struct BannerFailed {
 message_type!(BannerFailed, "examples.BannerFailed");
 impl Event for BannerFailed {}
 
+/// An audit note, published by `POST /audit/notes` with `key` as its Kafka key (notes of one key
+/// are handled in order) and handled by service-c's `audit` processor. Only service-c knows this
+/// type (service-b's own `examples.AuditNote` is another one, handled by its own `audit`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ShoutAudit {
+    pub key: String,
+    pub text: String,
+    pub at: DateTime<Utc>,
+}
+message_type!(ShoutAudit, "examples.ShoutAudit");
+impl Event for ShoutAudit {}
+
 #[cfg(test)]
 mod tests {
     use super::{Counter, CounterChanged, IncrementCounter, OpenSubscriptions, WatchCounter};

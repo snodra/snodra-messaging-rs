@@ -3,7 +3,7 @@ name = "service-c"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
-description = "kraken example service C: handles Shout and Reverse, co-owns Inventory, the streaming Rows and the subscription WatchCounter, owns IncrementCounter, publishes text events, logs GreetingDelivered, prints every shout as a banner through a saga"
+description = "kraken example service C: handles Shout and Reverse, co-owns Inventory, the streaming Rows and the subscription WatchCounter, owns IncrementCounter, publishes text events, logs GreetingDelivered, prints every shout as a banner through a saga, runs the named event processor audit with a dead-letter admin API"
 license = "MIT"
 publish = false
 
