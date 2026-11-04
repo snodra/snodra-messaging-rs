@@ -995,7 +995,8 @@ The document (the same from both libraries, contract fixtures in
 (Int64), `key` (absent without one), `eventId`, `eventType` (absent when missing), `headers`,
 `payload` (UTF-8 text) or `payloadBinary` (BinData, when not UTF-8; neither when empty), `reason`,
 `error {type, message}`, `blockedBy` (SEQUENCED), `attempts` (Int32), `parkedAt`, `lastAttemptAt`,
-`expireAt`. Indexes: `dead_letters_processor_key_offset`, `dead_letters_processor_parked`,
+`expireAt`, and `replay: true` when the record was parked while its processor replayed it (absent
+otherwise; its retry is then a replay too). Indexes: `dead_letters_processor_key_offset`, `dead_letters_processor_parked`,
 `dead_letters_expire` (TTL, `expireAfterSeconds: 0`).
 
 ## Processor control
@@ -1050,7 +1051,10 @@ in the document, leaves the consumer group and reports `PROCESSOR_STOPPED` with 
 one instance executes, then every instance is finished and consumes again (still paused if it was).
 The lock is a 30 s lease the hub renews every 10 s; a hub that dies mid-way stops renewing, the
 lease passes and the instances release it and consume again by themselves. An instance that starts
-(or polls) while an unexpired lock it was not prepared for is held stays out of the group too.
+(or polls) while an unexpired lock it was not prepared for is held stays out of the group too. A
+renewal that arrives after the finish never takes the lock again: an operation that ended on an
+instance (finished, aborted, its lease passed, its lock lost) is remembered for at least
+max(2 x lease, 60 s), and a prepare of it, or a renewal whose lock is gone, is `NOT_PREPARED`.
 
 The execute resolves the target (`earliest` the low watermarks, `latest` the high watermarks, a
 time the first offset at or after it, else the end), refuses while the group has members
@@ -1059,7 +1063,11 @@ committed offset makes a **replay range** `[target, committed)` (`latest` never 
 this order: the processor's reset handlers, the deletion of its markers in the ranges, the ranges
 written to the document, the offsets committed. rdkafka has no admin call to alter a group's
 offsets: the executor commits them with a consumer of the group that never subscribes (the broker
-refuses it while the group has members).
+refuses it while the group has members). Right after the reset handlers and again before the
+commit the executor must still extend its lease (and be within 120 s), else it stops with `FAILED`
+"lease lost: ..." before touching markers or offsets. **A refusal after the reset handlers ran is
+not "nothing changed"**: their effects stay, and the message says what else happened, e.g.
+`reset handlers ran (2), 37 markers deleted, offsets not moved: retry the reset`.
 
 ```rust,ignore
 use kraken_messaging::processors::{EventOptions, ResetContext};
@@ -1072,7 +1080,8 @@ KrakenMessaging::builder(config).await?
         |e, ctx| async move { send_confirmation(&e).await },
     )
     // Once per reset that replays something, on the executing instance, before markers and
-    // offsets change (Kotlin's @ResetHandler); an error refuses the reset, nothing changed.
+    // offsets change (Kotlin's @ResetHandler); an error or a panic refuses the reset before any
+    // marker or offset changes (what the handlers that ran did stays; the refusal says how many).
     .reset_handler("projections", |ctx: ResetContext| async move {
         clear_projection(&ctx.ranges).await
     })
@@ -1084,7 +1093,8 @@ KrakenMessaging::builder(config).await?
   the processor's stage 1 **without the handlers registered with `disallow_replay`** (its marker is
   still written) and **never the sagas** (stage 2 saw it already). Records at or past `until` are
   normal. A replayed record whose key has a parked letter is parked `SEQUENCED` as usual; a reset
-  never touches the dead letters.
+  never touches the dead letters. A record parked while it was replayed keeps that in its letter
+  (`replay: true`): its retry runs stage 1 without the `disallow_replay` handlers too.
 - **Markers carry a position.** From P6b on, every marker the Kafka consumer (or a dead letter's
   retry) writes in `processed_events` has `processor`, `topic`, `partition` (Int32) and `offset`
   (Int64); a replay deletes exactly `{processor, topic, partition, offset in [from, until)}`. Markers
