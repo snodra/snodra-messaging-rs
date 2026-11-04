@@ -49,10 +49,6 @@ thiserror = "2"
 # (`kraken-messaging-rs = { ..., features = ["testing"] }` under dev-dependencies).
 testing = []
 
-[[test]]
-name = "saga_fixture"
-required-features = ["testing"]
-
 [build-dependencies]
 tonic-prost-build = "0.14.8"
 prost-build = "0.14.4"
