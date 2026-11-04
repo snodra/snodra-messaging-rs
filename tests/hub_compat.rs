@@ -1283,6 +1283,7 @@ async fn processor_status_to(image: HubImage) {
                 committed: 8,
                 high_watermark: 20,
                 lag: 12,
+                replay_until: 0,
             }],
             dead_letter_mode: "collection".into(),
             ..Default::default()

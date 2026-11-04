@@ -123,6 +123,7 @@ impl ProcessorMonitor {
                 committed: o.committed,
                 high_watermark: o.high_watermark,
                 lag: lag(o),
+                replay_until: 0,
             })
             .collect();
         let (last_error, last_error_at_ms) = st.last_error.clone().unwrap_or_default();
@@ -143,6 +144,8 @@ impl ProcessorMonitor {
             last_error_at_ms,
             event_types: self.event_types.clone(),
             dead_letter_mode: self.mode.as_str().to_string(),
+            replaying: false,
+            operation_id: String::new(),
         }
     }
 

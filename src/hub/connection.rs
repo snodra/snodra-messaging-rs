@@ -1482,6 +1482,9 @@ impl HubConnection {
                         server_message::Message::End(e) => self.forward(Inbound::End(e)).await?,
                         server_message::Message::Flow(x) => self.forward(Inbound::Flow(x)).await?,
                         server_message::Message::Cancel(c) => self.forward(Inbound::Cancel(c)).await?,
+                        // Processor control (ADR 0023): never sent to a client that does not declare
+                        // "processor-control", which this one does not yet.
+                        server_message::Message::Control(_) => {}
                     },
                 },
             }
@@ -1610,7 +1613,9 @@ impl HubConnection {
                         tracing::debug!(service = %self.service_name, address = %self.settings.address, "a request arrived while the stream was closing; the hub fails it when the stream ends");
                         continue;
                     }
-                    server_message::Message::RegisterAck(_) | server_message::Message::Heartbeat(_) => continue,
+                    server_message::Message::RegisterAck(_)
+                    | server_message::Message::Heartbeat(_)
+                    | server_message::Message::Control(_) => continue,
                 };
                 if self.forward(inbound).await.is_err() {
                     break;

@@ -2047,6 +2047,8 @@ impl Hub for Service {
                                 };
                                 deliver(msgs).await
                             }
+                            // Processor control (ADR 0023): this fake hub never asks for it.
+                            client_message::Message::ControlReply(_) => {}
                         },
                         Some(Ok(ClientMessage { message: None })) => {}
                     }
