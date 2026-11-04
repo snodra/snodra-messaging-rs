@@ -261,7 +261,11 @@ impl EventConsumer {
 
 /// What the handlers of a record see: its id and type, the correlation id header (else the id) and
 /// every header.
-fn message_context(type_name: &str, id: &str, hdrs: &HashMap<String, String>) -> MessageContext {
+pub(crate) fn message_context(
+    type_name: &str,
+    id: &str,
+    hdrs: &HashMap<String, String>,
+) -> MessageContext {
     MessageContext {
         message_id: id.to_string(),
         type_name: type_name.to_string(),

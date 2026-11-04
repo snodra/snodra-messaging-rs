@@ -10,7 +10,13 @@
 
 use crate::error::MessagingError;
 
+mod admin;
 pub mod dead_letters;
+pub mod monitor;
+pub mod store;
+
+pub use admin::{DEFAULT_LIST_LIMIT, DeadLetters, RetryAllResult, RetryResult};
+pub use monitor::ProcessorMonitor;
 
 /// The unnamed processor's name.
 pub const DEFAULT_PROCESSOR: &str = "default";

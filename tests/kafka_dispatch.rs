@@ -531,15 +531,14 @@ async fn a_named_processors_markers_are_its_own_family() {
     assert_eq!(dispatch(&named, "e-1").await.unwrap(), Outcome::Handled);
     assert_eq!(dispatch(&named, "e-1").await.unwrap(), Outcome::Duplicate);
     assert_eq!(dispatch(&default, "e-1").await.unwrap(), Outcome::Handled);
-    let ids: Vec<String> = f
-        .db
-        .collection::<mongodb::bson::Document>("processed_events")
-        .distinct("_id", doc! {})
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|b| b.as_str().unwrap().to_string())
-        .collect();
+    let ids: Vec<String> =
+        f.db.collection::<mongodb::bson::Document>("processed_events")
+            .distinct("_id", doc! {})
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|b| b.as_str().unwrap().to_string())
+            .collect();
     assert_eq!(ids.len(), 2);
     assert!(ids.contains(&"processor:orders:e-1".to_string()), "{ids:?}");
     assert!(ids.contains(&"e-1".to_string()), "{ids:?}");
@@ -560,13 +559,28 @@ async fn dispatch_stages_reports_each_stage_and_can_skip_stage_one() {
 
     *f.fail_ordinary.lock().unwrap() = Some("e-1".into());
     let stages = dispatcher
-        .dispatch_stages("e-1", "t.Happened", &payload("e-1"), &ctx("e-1", "t.Happened"), true)
+        .dispatch_stages(
+            "e-1",
+            "t.Happened",
+            &payload("e-1"),
+            &ctx("e-1", "t.Happened"),
+            true,
+        )
         .await;
-    assert!(matches!(stages.stage_one, Some(Err(MessagingError::Storage(_)))));
+    assert!(matches!(
+        stages.stage_one,
+        Some(Err(MessagingError::Storage(_)))
+    ));
     assert!(matches!(stages.stage_two, Some(Ok(true))));
 
     let stages = dispatcher
-        .dispatch_stages("e-2", "t.Happened", &payload("e-2"), &ctx("e-2", "t.Happened"), false)
+        .dispatch_stages(
+            "e-2",
+            "t.Happened",
+            &payload("e-2"),
+            &ctx("e-2", "t.Happened"),
+            false,
+        )
         .await;
     assert!(stages.stage_one.is_none(), "stage 1 not run");
     assert!(matches!(stages.stage_two, Some(Ok(true))));
@@ -576,18 +590,39 @@ async fn dispatch_stages_reports_each_stage_and_can_skip_stage_one() {
 
     *stage.fail_with.lock().unwrap() = Some("saga store down".into());
     let stages = dispatcher
-        .dispatch_stages("e-3", "t.Happened", &payload("e-3"), &ctx("e-3", "t.Happened"), true)
+        .dispatch_stages(
+            "e-3",
+            "t.Happened",
+            &payload("e-3"),
+            &ctx("e-3", "t.Happened"),
+            true,
+        )
         .await;
     assert!(matches!(stages.stage_one, Some(Ok(StageOneDone::Handled))));
     assert!(matches!(stages.stage_two, Some(Err(_))));
     let stages = dispatcher
-        .dispatch_stages("e-3", "t.Happened", &payload("e-3"), &ctx("e-3", "t.Happened"), true)
+        .dispatch_stages(
+            "e-3",
+            "t.Happened",
+            &payload("e-3"),
+            &ctx("e-3", "t.Happened"),
+            true,
+        )
         .await;
-    assert!(matches!(stages.stage_one, Some(Ok(StageOneDone::Duplicate))));
+    assert!(matches!(
+        stages.stage_one,
+        Some(Ok(StageOneDone::Duplicate))
+    ));
 
     let none = f.dispatcher(Arc::new(NoSagas), false);
     let stages = none
-        .dispatch_stages("e-4", "t.Happened", &payload("e-4"), &ctx("e-4", "t.Happened"), true)
+        .dispatch_stages(
+            "e-4",
+            "t.Happened",
+            &payload("e-4"),
+            &ctx("e-4", "t.Happened"),
+            true,
+        )
         .await;
     assert!(stages.stage_one.is_none() && stages.stage_two.is_none());
 }

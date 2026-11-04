@@ -8,6 +8,7 @@ mod indexes;
 mod outbox;
 mod publisher;
 
+pub(crate) use consumer::message_context;
 pub use consumer::{EventConsumer, RecordDisposition, classify, classify_with};
 pub use dispatch::{LocalEventDispatcher, NoSagas, SagaStage};
 pub use indexes::ensure_indexes;
