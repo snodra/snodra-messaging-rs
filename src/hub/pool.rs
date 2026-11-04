@@ -247,7 +247,7 @@ impl HubPool {
         Ok(pool)
     }
 
-    /// A pool of exactly `conn`, which the caller starts and shuts down (as before multi-hub).
+    /// A pool of exactly `conn`, which the caller starts and shuts down.
     pub fn of(conn: Arc<HubConnection>) -> Arc<HubPool> {
         let (tx, _) = mpsc::channel(1);
         let settings = HubSettings {

@@ -233,7 +233,7 @@ impl Dispatcher {
     /// The hub stream `stream` was lost: the streaming queries that arrived on it are cancelled
     /// (the hub forgot them with the session; their handlers would otherwise wait for credit for
     /// ever, holding their permits) and the subscriptions that arrived on it are removed. Unary
-    /// handlers run on, their reply dropped, as before.
+    /// handlers run on, their replies dropped.
     pub fn stream_lost(&self, stream: StreamId) {
         let subscriptions = self.subscriptions.stream_lost(stream);
         if subscriptions > 0 {

@@ -633,7 +633,7 @@ async fn a_hub_cancel_aborts_a_unary_handler() {
 
 /// The hub stream a streaming request arrived on closes: its handler would wait for credit for
 /// ever, holding its permit, so it is aborted (the hub forgot the stream with the session). A
-/// unary handler keeps running; its reply is dropped, as before.
+/// unary handler keeps running; its reply is dropped.
 #[tokio::test]
 async fn a_lost_hub_stream_cancels_the_streaming_handlers_it_carried_but_not_the_unary_ones() {
     let hub = FakeHub::start().await;

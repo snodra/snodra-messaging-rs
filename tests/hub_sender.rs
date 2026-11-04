@@ -317,7 +317,7 @@ async fn no_reply_times_out() {
 }
 
 #[tokio::test]
-async fn v2_hub_gets_zero_unless_a_timeout_was_chosen() {
+async fn the_hub_gets_zero_unless_a_timeout_was_chosen() {
     let hub = FakeHub::start().await;
     hub.set_responder(|req| Some(reply_with(&req, "{}"))).await;
     let (sender, conn) = sender(&hub, None).await;

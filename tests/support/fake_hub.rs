@@ -813,25 +813,25 @@ impl State {
     ) {
         use proto::ErrorCode;
         let reject = |code, message: &str| hub_error(&req.id, code, message);
-        let (is_command, mut capable) = {
+        let (is_command, mut owners) = {
             let routes = self.routes.lock().unwrap();
             let is_command = req.kind == proto::RequestKind::Command as i32
                 || routes.values().any(|r| r.commands.contains(&req.r#type));
-            let capable: Vec<(usize, String, String, Outbound)> = routes
+            let owners: Vec<(usize, String, String, Outbound)> = routes
                 .iter()
                 .filter(|(_, r)| r.queries.contains(&req.r#type))
                 .map(|(n, r)| (*n, r.service.clone(), r.instance.clone(), r.tx.clone()))
                 .collect();
-            (is_command, capable)
+            (is_command, owners)
         };
-        capable.sort_by(|a, b| (&a.1, &a.2).cmp(&(&b.1, &b.2)));
+        owners.sort_by(|a, b| (&a.1, &a.2).cmp(&(&b.1, &b.2)));
         let max = self.max_subscriptions_per_instance.load(Ordering::SeqCst);
         let rejection = if is_command {
             Some(reject(
                 ErrorCode::InvalidRequest,
                 "invalid request: a command",
             ))
-        } else if capable.is_empty() {
+        } else if owners.is_empty() {
             Some(reject(ErrorCode::NoHandler, "no handler"))
         } else if self.subscriptions.lock().unwrap().contains_key(&req.id)
             || self.open_streams.lock().unwrap().contains_key(&req.id)
@@ -840,7 +840,7 @@ impl State {
             Some(reject(ErrorCode::InvalidRequest, "duplicate id"))
         } else if let Some((_, _, instance, _)) = {
             let subscriptions = self.subscriptions.lock().unwrap();
-            capable.iter().find(|(n, _, _, _)| {
+            owners.iter().find(|(n, _, _, _)| {
                 subscriptions
                     .values()
                     .flat_map(|s| s.targets.values())
@@ -863,14 +863,14 @@ impl State {
             let _ = tx.send(Ok(rejection)).await;
             return;
         }
-        let pick = self.sub_rotation.fetch_add(1, Ordering::SeqCst) % capable.len();
-        let (initial_no, initial_service, initial_instance, initial_tx) = capable[pick].clone();
+        let pick = self.sub_rotation.fetch_add(1, Ordering::SeqCst) % owners.len();
+        let (initial_no, initial_service, initial_instance, initial_tx) = owners[pick].clone();
         let credit = if req.initial_credit == 0 {
             64
         } else {
             req.initial_credit
         };
-        let ids: Vec<String> = (1..=capable.len())
+        let ids: Vec<String> = (1..=owners.len())
             .map(|n| format!("{}#{n}", req.id))
             .collect();
         let initial_id = format!("{}#0", req.id);
@@ -881,7 +881,7 @@ impl State {
                 SubState {
                     sender: tx.clone(),
                     sender_no: stream_no,
-                    targets: ids.iter().cloned().zip(capable.iter().cloned()).collect(),
+                    targets: ids.iter().cloned().zip(owners.iter().cloned()).collect(),
                     initial: Some((
                         initial_no,
                         initial_service,
@@ -949,7 +949,7 @@ impl State {
             });
         }
         // Written directly, no permit: the targets first, then the initial request.
-        for (id, (_, _, _, target)) in ids.iter().zip(&capable) {
+        for (id, (_, _, _, target)) in ids.iter().zip(&owners) {
             let forwarded = proto::Request {
                 id: id.clone(),
                 mode: proto::RequestMode::Subscription as i32,
@@ -1331,23 +1331,23 @@ impl State {
     async fn open_stream(self: &Arc<Self>, stream_no: usize, req: &proto::Request, tx: &Outbound) {
         use proto::ErrorCode;
         let reject = |code, message: &str| hub_error(&req.id, code, message);
-        let (is_command, mut capable) = {
+        let (is_command, mut owners) = {
             let routes = self.routes.lock().unwrap();
             let is_command = req.kind == proto::RequestKind::Command as i32
                 || routes.values().any(|r| r.commands.contains(&req.r#type));
-            let capable: Vec<(usize, String, String, Outbound)> = routes
+            let owners: Vec<(usize, String, String, Outbound)> = routes
                 .iter()
                 .filter(|(_, r)| r.queries.contains(&req.r#type))
                 .map(|(n, r)| (*n, r.service.clone(), r.instance.clone(), r.tx.clone()))
                 .collect();
-            (is_command, capable)
+            (is_command, owners)
         };
         let rejection = if is_command {
             Some(reject(
                 ErrorCode::InvalidRequest,
                 "invalid request: a command",
             ))
-        } else if capable.is_empty() {
+        } else if owners.is_empty() {
             Some(reject(ErrorCode::NoHandler, "no handler"))
         } else if self.open_streams.lock().unwrap().contains_key(&req.id)
             || self.gathers.lock().unwrap().contains_key(&req.id)
@@ -1360,9 +1360,9 @@ impl State {
             let _ = tx.send(Ok(rejection)).await;
             return;
         }
-        capable.sort_by(|a, b| (&a.1, &a.2).cmp(&(&b.1, &b.2)));
-        let pick = self.rotation.fetch_add(1, Ordering::SeqCst) % capable.len();
-        let (target_no, service, instance, target) = capable.swap_remove(pick);
+        owners.sort_by(|a, b| (&a.1, &a.2).cmp(&(&b.1, &b.2)));
+        let pick = self.rotation.fetch_add(1, Ordering::SeqCst) % owners.len();
+        let (target_no, service, instance, target) = owners.swap_remove(pick);
         let credit = if req.initial_credit == 0 {
             64
         } else {

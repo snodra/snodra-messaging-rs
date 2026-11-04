@@ -150,7 +150,7 @@ impl HandlerRegistry {
     }
 
     /// A shared streaming query (`Register.shared_query_types`): several services may own it;
-    /// a stream goes to one capable instance of any owner. See
+    /// a stream goes to one instance of any owner. See
     /// [`streaming_query`](Self::streaming_query) and [`shared_query`](Self::shared_query).
     ///
     /// # Panics
@@ -169,8 +169,8 @@ impl HandlerRegistry {
     }
 
     /// An exclusive subscription query (ADR 0017, P4c): `handler` answers the initial result
-    /// (the hub asks one capable instance with `Request{id = <id>#0, mode = UNARY}`, served like
-    /// any unary query, permit included); every capable instance listing the type also gets
+    /// (the hub asks one instance with `Request{id = <id>#0, mode = UNARY}`, served like
+    /// any unary query, permit included); every instance listing the type also gets
     /// `Request{id = <id>#n, mode = SUBSCRIPTION}`, which registers a subscription here (the
     /// decoded query, the request id, the arrival stream; no permit) that the
     /// [`QueryUpdateEmitter`](super::QueryUpdateEmitter) feeds: one `ReplyPart` per `emit`, a
@@ -193,7 +193,7 @@ impl HandlerRegistry {
     }
 
     /// A shared subscription query (`Register.shared_query_types`): several services may own
-    /// it; a subscription reaches every capable instance of every owner. See
+    /// it; a subscription reaches every instance of every owner. See
     /// [`subscription_query`](Self::subscription_query) and [`shared_query`](Self::shared_query).
     ///
     /// # Panics
