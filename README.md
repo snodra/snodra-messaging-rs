@@ -721,9 +721,10 @@ through its JSON text.
 
 **The context.** `saga_id()`, `message()` (the `MessageContext`; for a deadline its id, `deadline:<name>` and the correlation
 id of the message that scheduled it), `associate_with`, `remove_association_with` (removing the start association frees the
-start key), `end()`, `send(&command, routing_key)`, `publish(&event, key)`, `schedule_after(duration, name, payload)`,
+start key, also from the start handler), `end()`, `send(&command, routing_key)`, `publish(&event, key)`, `schedule_after(duration, name, payload)`,
 `schedule_at(time, name, payload)` (both return the deadline id), `cancel(id)`, `cancel_all(name)`; at most 999 messages per
-handling of an instance. A handler gets no `Sender` or `EventBus`, and **must not capture one**: it would send inside the
+handling of an instance. A published event must serialize to a JSON object BSON can hold (not a unit struct, no integer
+above `i64::MAX`): anything else fails the handler with `InvalidMessage` naming the event. A handler gets no `Sender` or `EventBus`, and **must not capture one**: it would send inside the
 saga's transaction, for a state that may roll back, with no order, retry or idempotency key.
 
 **Handlers block.** A saga handler runs on the consumer's task and holds a tokio worker and the partition while it runs:
