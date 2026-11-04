@@ -867,7 +867,8 @@ async fn a_reset_to_earliest_replays_the_range_once_without_sagas_or_disallowed_
 
 /// The targets on one instance: `latest` replays nothing; a time and explicit offsets replay
 /// from there (legacy markers kept); an active member of the group is GROUP_NOT_EMPTY and a
-/// failing reset handler RESET_HANDLER_FAILED, both with nothing changed; a bad target is
+/// failing reset handler RESET_HANDLER_FAILED (saying it ran), both without a marker or an offset
+/// touched; a bad target is
 /// INVALID and an execute without a prepare NOT_PREPARED.
 #[tokio::test]
 async fn reset_targets_and_refusals() {
@@ -974,12 +975,16 @@ async fn reset_targets_and_refusals() {
         .unwrap();
     ok(hub.control("audit", finish("op-a", true), ASK).await);
 
-    // A failing reset handler: nothing changes.
+    // A failing reset handler: it ran (the refusal says so), no marker or offset is touched.
     fail_reset.store(true, Ordering::SeqCst);
     ok(hub.control("audit", prepare("op-b", 30_000), ASK).await);
     let (code, message) = refused(hub.control("audit", execute("op-b", earliest()), ASK).await);
     assert_eq!(code, ControlRefusal::ResetHandlerFailed, "{message}");
     assert!(message.contains("projection store down"), "{message}");
+    assert!(
+        message.contains("reset handlers ran (1), no markers deleted, offsets not moved"),
+        "{message}"
+    );
     assert_eq!(committed(&kafka.bootstrap, group, topic, 0), 4);
     assert!(marker(&db, "processor:audit:n-1").await.is_some());
     assert!(replay(&db, "audit").await.is_empty());
@@ -1556,5 +1561,78 @@ async fn a_lease_renewed_before_its_clear_keeps_the_instance_prepared() {
         "still held here"
     );
     ok(hub.control("audit", finish("op-1", false), ASK).await);
+    app.shutdown().await;
+}
+
+/// The lease is checked again after the reset handlers: lost while they ran (another instance
+/// cleared it and took the lock), the execute stops before any marker or offset is touched, and
+/// its refusal says the reset handlers ran.
+#[tokio::test]
+async fn a_lease_lost_while_the_reset_handlers_run_stops_the_reset_before_the_markers() {
+    require_docker!();
+    let hub = FakeHub::start().await;
+    let kafka = support::containers::kafka().await;
+    let mongo = support::containers::mongo().await;
+    let topic = "lost.events";
+    let handler = Handler::default();
+    let uri = mongo.uri_for("lost");
+    let thief = mongodb::Client::with_uri_str(&uri)
+        .await
+        .unwrap()
+        .database("lost")
+        .collection::<Document>("processor_control");
+    let app = KrakenMessaging::builder(config(
+        "svc-lost",
+        &hub.address(),
+        &kafka.bootstrap,
+        &uri,
+        topic,
+    ))
+    .await
+    .unwrap()
+    .event_in::<Noted, _, _>("audit", handler.handle())
+    .reset_handler("audit", move |_| {
+        let thief = thief.clone();
+        async move {
+            let now = mongodb::bson::DateTime::now();
+            let until = mongodb::bson::DateTime::from_millis(now.timestamp_millis() + 60_000);
+            thief
+                .update_one(
+                    doc! { "_id": "audit" },
+                    doc! { "$set": { "operation": { "id": "op-other", "kind": "reset", "leaseUntil": until, "preparedAt": now } } },
+                )
+                .await
+                .unwrap();
+            Ok(())
+        }
+    })
+    .start()
+    .await
+    .unwrap();
+    assert!(app.await_hub(Duration::from_secs(30)).await);
+    let db = app.database();
+    let group = "svc-lost.audit";
+    let p = producer(&kafka.bootstrap);
+    for note in ["n-1", "n-2"] {
+        produce(&p, topic, None, note).await;
+    }
+    eventually("handled and committed", WITHIN, || async {
+        handler.count("n-2") == 1 && committed(&kafka.bootstrap, group, topic, 0) == 2
+    })
+    .await;
+    ok(hub.control("audit", prepare("op-1", 30_000), ASK).await);
+    let (code, message) = refused(hub.control("audit", execute("op-1", earliest()), ASK).await);
+    assert_eq!(code, ControlRefusal::Failed, "{message}");
+    for said in [
+        "lease lost",
+        "reset handlers ran (1)",
+        "no markers deleted",
+        "offsets not moved",
+    ] {
+        assert!(message.contains(said), "{said}: {message}");
+    }
+    assert_eq!(committed(&kafka.bootstrap, group, topic, 0), 2);
+    assert!(marker(&db, "processor:audit:n-1").await.is_some());
+    assert!(replay(&db, "audit").await.is_empty());
     app.shutdown().await;
 }

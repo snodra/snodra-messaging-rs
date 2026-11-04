@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::ProcessorMonitor;
 use super::control_store::{ControlStore, Locked, ReplayRange};
+use super::monitor::cut_bytes;
 use super::reset::{
     GroupAdmin, Plan, ResetContext, ResetFailure, ResetHandler, ResetTarget, legacy_filter,
     range_filter,
@@ -51,7 +52,8 @@ pub const FINISHED_KEPT: Duration = Duration::from_secs(60);
 /// left to close when the last reference goes.
 const CLOSE_WAIT: Duration = Duration::from_secs(10);
 
-/// Why a control action was refused; nothing changed.
+/// Why a control action was refused. Nothing changed unless the message says what did (an
+/// execute refused after its reset handlers ran).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refusal {
     pub code: ControlRefusal,
@@ -520,8 +522,11 @@ impl ProcessorRunner {
 
     /// `reset_execute` on the instance chosen to run it (it holds the operation): resolves the
     /// target, checks the group is empty, runs the reset handlers, deletes the markers of the
-    /// ranges, writes the ranges and commits the offsets, keeping its own lease all along. The
-    /// caller holds `serial`.
+    /// ranges, writes the ranges and commits the offsets, keeping its own lease all along. Right
+    /// after the reset handlers and again before the offsets are committed the lease must still
+    /// be extended (and the execute within [`LEASE_KEEP_MAX`]): otherwise another instance may
+    /// consume or reset already, and it stops (`FAILED`, "lease lost"). A refusal after the reset
+    /// handlers ran says what changed. The caller holds `serial`.
     pub(crate) async fn execute(
         &self,
         operation: &str,
@@ -552,16 +557,44 @@ impl ProcessorRunner {
                 }
             })
         };
-        let result = self.execute_held(operation, target).await;
+        let result = self.execute_held(&held, target, Instant::now()).await;
         keeper.abort();
         result
     }
 
+    /// The lease of `held` extended, `started` within [`LEASE_KEEP_MAX`]; else the refusal
+    /// "lease lost".
+    async fn keep_lease(&self, held: &Held, started: Instant) -> Result<(), Refusal> {
+        let lost = |why: String| Refusal::new(ControlRefusal::Failed, format!("lease lost: {why}"));
+        if started.elapsed() >= LEASE_KEEP_MAX {
+            return Err(lost(format!(
+                "the reset ran longer than {} s",
+                LEASE_KEEP_MAX.as_secs()
+            )));
+        }
+        let now = DateTime::now();
+        match self
+            .store
+            .extend(self.name(), &held.id, after(now, held.lease), now)
+            .await
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(lost(format!(
+                "operation {} no longer holds the lock of processor '{}'",
+                held.id,
+                self.name()
+            ))),
+            Err(e) => Err(lost(format!("cannot extend it: {e}"))),
+        }
+    }
+
     async fn execute_held(
         &self,
-        operation: &str,
+        held: &Held,
         target: ResetTarget,
+        started: Instant,
     ) -> Result<proto::ResetOutcome, Refusal> {
+        let operation = held.id.as_str();
         let name = self.name().to_string();
         let topic = self.settings.topic.clone();
         let admin = {
@@ -593,7 +626,7 @@ impl ProcessorRunner {
             .map_err(|e| Refusal::failed(&e))?
             .replay;
         let ranges = plan.ranges(&topic, &target, &open);
-        let mut reset_handlers = 0;
+        let mut done = Changed::default();
         if !ranges.is_empty() {
             let ctx = ResetContext {
                 processor: name.clone(),
@@ -603,6 +636,7 @@ impl ProcessorRunner {
             };
             for handler in &self.reset_handlers {
                 let run = tokio::spawn(handler(ctx.clone()));
+                done.reset_handlers += 1;
                 let failure = match run.await {
                     Ok(Ok(())) => None,
                     Ok(Err(e)) => Some(e.to_string()),
@@ -610,45 +644,58 @@ impl ProcessorRunner {
                     Err(join) => Some(format!("the reset handler did not finish: {join}")),
                 };
                 if let Some(failure) = failure {
-                    return Err(Refusal::new(
+                    let failure = Refusal::new(
                         ControlRefusal::ResetHandlerFailed,
                         format!(
-                            "reset handler {} of {}: {failure}",
-                            reset_handlers + 1,
-                            self.reset_handlers.len()
+                            "reset handler {} of {}: {}",
+                            done.reset_handlers,
+                            self.reset_handlers.len(),
+                            cut_bytes(&failure, MAX_CAUSE_BYTES)
                         ),
-                    ));
+                    );
+                    return Err(done.told(failure));
                 }
-                reset_handlers += 1;
             }
         }
-        let mut markers_deleted = 0;
-        for range in &ranges {
-            markers_deleted += self
-                .markers
-                .delete_many(range_filter(&name, range))
+        let markers = &self.markers;
+        let finished = async {
+            self.keep_lease(held, started).await?;
+            for range in &ranges {
+                done.markers_deleted += markers
+                    .delete_many(range_filter(&name, range))
+                    .await
+                    .map_err(|e| Refusal::failed(&e.into()))?
+                    .deleted_count;
+            }
+            if target == ResetTarget::Earliest {
+                done.markers_deleted += markers
+                    .delete_many(legacy_filter(&name))
+                    .await
+                    .map_err(|e| Refusal::failed(&e.into()))?
+                    .deleted_count;
+            }
+            self.store
+                .set_replay(&name, &Plan::merged(&open, &ranges), DateTime::now())
                 .await
-                .map_err(|e| Refusal::failed(&e.into()))?
-                .deleted_count;
+                .map_err(|e| Refusal::failed(&e))?;
+            done.ranges_written = !ranges.is_empty();
+            self.keep_lease(held, started).await?;
+            let offsets: Vec<(i32, i64)> = plan
+                .partitions
+                .iter()
+                .map(|(&p, &(to, _))| (p, to))
+                .collect();
+            blocking(move || admin.commit(&offsets)).await
         }
-        if target == ResetTarget::Earliest {
-            markers_deleted += self
-                .markers
-                .delete_many(legacy_filter(&name))
-                .await
-                .map_err(|e| Refusal::failed(&e.into()))?
-                .deleted_count;
+        .await;
+        if let Err(refusal) = finished {
+            return Err(done.told(refusal));
         }
-        self.store
-            .set_replay(&name, &Plan::merged(&open, &ranges), DateTime::now())
-            .await
-            .map_err(|e| Refusal::failed(&e))?;
-        let offsets: Vec<(i32, i64)> = plan
-            .partitions
-            .iter()
-            .map(|(&p, &(to, _))| (p, to))
-            .collect();
-        blocking(move || admin.commit(&offsets)).await?;
+        let Changed {
+            reset_handlers,
+            markers_deleted,
+            ..
+        } = done;
         tracing::info!(processor = %name, operation = %operation, target = %target.describe(), ranges = ?ranges, markers_deleted, reset_handlers, "processor reset");
         Ok(proto::ResetOutcome {
             ranges: ranges
@@ -683,6 +730,43 @@ impl ProcessorRunner {
             (true, true) => "aborted; the processor consumes again".into(),
             (true, false) => "the processor consumes again".into(),
         })
+    }
+}
+
+/// The most bytes of a reset handler's or Kafka's error in a refusal that also says what changed.
+const MAX_CAUSE_BYTES: usize = 300;
+
+/// What an execute changed before it stopped.
+#[derive(Default)]
+struct Changed {
+    reset_handlers: u32,
+    markers_deleted: u64,
+    ranges_written: bool,
+}
+
+impl Changed {
+    /// `refusal` with what changed, when anything did: "nothing changed" would be false then.
+    fn told(&self, refusal: Refusal) -> Refusal {
+        if self.reset_handlers == 0 && self.markers_deleted == 0 && !self.ranges_written {
+            return refusal;
+        }
+        let markers = match self.markers_deleted {
+            0 => "no markers deleted".to_string(),
+            n => format!("{n} markers deleted"),
+        };
+        let ranges = if self.ranges_written {
+            ", replay ranges written"
+        } else {
+            ""
+        };
+        Refusal {
+            message: format!(
+                "{}; reset handlers ran ({}), {markers}{ranges}, offsets not moved: retry the reset",
+                cut_bytes(&refusal.message, MAX_CAUSE_BYTES),
+                self.reset_handlers
+            ),
+            ..refusal
+        }
     }
 }
 
