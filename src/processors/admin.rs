@@ -12,7 +12,7 @@ use super::dead_letters::{DeadLetterDocument, DeadLetterError, DeadLetterReason}
 use super::store::{DeadLetterStore, LetterSummary};
 use crate::config::DeadLetterMode;
 use crate::error::MessagingError;
-use crate::kafka::dispatch::{FinishInTransaction, MarkerPosition, StageOneThen};
+use crate::kafka::dispatch::{FinishInTransaction, MarkerPosition, RecordDispatch, StageOneThen};
 use crate::kafka::{LocalEventDispatcher, message_context};
 
 /// The default `limit` of [`DeadLetters::list`] (Kotlin's `limit: Int = 100`).
@@ -204,8 +204,11 @@ impl DeadLetters {
                 &type_name,
                 &payload,
                 &ctx,
-                Some(&position),
-                letter.replay,
+                RecordDispatch {
+                    position: Some(&position),
+                    stage_one: true,
+                    replay: letter.replay,
+                },
                 finish,
             )
             .await

@@ -46,7 +46,7 @@ pub const LEASE_KEEP: Duration = Duration::from_secs(10);
 pub const LEASE_KEEP_MAX: Duration = Duration::from_secs(120);
 /// For how long at least an operation that ended here (finished, aborted, its lease passed or its
 /// lock lost) is remembered, twice its lease when that is longer: a prepare of it is then a late
-/// renewal and never takes the lock again.
+/// renewal and never takes the lock again. Never longer than a day.
 pub const FINISHED_KEPT: Duration = Duration::from_secs(60);
 /// How long a stopped consumer may still be referenced (an offset read in flight) before it is
 /// left to close when the last reference goes.
@@ -165,7 +165,10 @@ impl ProcessorRunner {
         let now = Instant::now();
         let mut finished = self.finished.lock().unwrap();
         finished.retain(|_, until| *until > now);
-        finished.insert(operation.to_string(), now + FINISHED_KEPT.max(lease * 2));
+        let kept = FINISHED_KEPT
+            .max(lease.saturating_mul(2))
+            .min(Duration::from_secs(86_400));
+        finished.insert(operation.to_string(), now + kept);
     }
 
     /// Whether `operation` ended here recently.
