@@ -60,6 +60,12 @@ Kafka consumer in the group `service-c.audit` with the markers `processor:audit:
   `POST /audit/dead-letters/{id}/retry` (`{"result","detail"}`), `POST /audit/dead-letters/retry-all[?processor=audit]` and
   `DELETE /audit/dead-letters/{id}` call `app.dead_letters()`: `list`, `count`, `retry`, `retry_all` and `discard`. Same paths and
   JSON as service-b's; the sandbox is closed, a real service puts its own authorization in front of such endpoints.
+- Processor control (P6b, ADR 0023): the hub pauses, resumes and resets `audit` (its HTTP API with the write token). The
+  processor has a second handler, registered with `EventOptions::new().processor("audit").disallow_replay()`, and a reset
+  handler: `GET /audit/resets` lists the resets that replayed something as the reset handler saw them
+  (`[{"operationId","target","ranges":[{"partition","from","until"}]}]`, `target` `earliest`, `latest`, `timestamp <ms>` or
+  `offsets {<partition>=<offset>, ...}`), `GET /audit/notified` the notes the second handler handled (`[{"key","text","at"}]`;
+  a replay adds nothing there, while `GET /audit/handled` gets the replayed notes again). Same paths and JSON as service-b's.
 
 The pure parts (the switch, the views of a letter and of a retry result, the query parsing) are unit-tested in `src/audit.rs`;
 smoke steps 26 to 26h drive the HTTP side against the real hub, Kafka and MongoDB (`kraken-messaging/examples/README.md`, "Event

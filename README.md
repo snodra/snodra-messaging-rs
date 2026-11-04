@@ -32,6 +32,7 @@ indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
 | Publish events through the Mongo outbox, relay to Kafka | `kafka::EventBus`, `kafka::OutboxPublisher` |
 | Consume events idempotently (marker + handler in one transaction) | `kafka::EventConsumer` |
 | Named event processors (own consumer group, markers, status), dead letters with an admin API | `event_in`, `app.dead_letters()`, `app.processors()` (see [Event processors](#event-processors), [Dead letters](#dead-letters)) |
+| Processor control from the hub: pause, resume, reset (replay) with reset handlers, dead letters | `event_with` + `EventOptions::disallow_replay`, `reset_handler`, `app.processor_control()` (see [Processor control](#processor-control)) |
 | Identity from the forwarded JWT: JWKS verification or unverified parsing; handler guards | `identity::{IdentityResolver, JwksVerifier, Guard}` |
 | Sagas and deadlines on the Kotlin starter's collections, the relay, parked events | `KrakenMessagingBuilder::saga`, `saga::SagaContext`, `app.saga_failures()` (see [Sagas](#sagas)) |
 | Idempotent adapters, partner Kafka topics, webhooks; saga statistics | `idempotent_command`, `external_source`, `app.ingress()`, `external::webhook::verify`, `app.saga_stats()` |
@@ -50,6 +51,7 @@ indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
 - [Sagas](#sagas)
 - [Event processors](#event-processors)
 - [Dead letters](#dead-letters)
+- [Processor control](#processor-control)
 - [Security](#security)
 - [Upgrading](#upgrading)
 - [Build and test](#build-and-test)
@@ -893,7 +895,8 @@ before you deploy it:
 `kafka-consumer-groups --bootstrap-server <broker> --group <service>.<name> --topic <events topic> --reset-offsets --to-latest --execute`
 (the group must have no running member). Records produced between that reset and the moment the
 old instances stop are handled twice, once by the old `default` and once by the new processor, so
-reset right before the rollout. A start position per processor is a candidate for P6b.
+reset right before the rollout. Since P6b the same is done from the hub: deploy the new processor
+paused, then [reset](#reset-and-replay) it to `latest` and resume it.
 
 ### Status
 
@@ -905,13 +908,15 @@ list locally.
 
 | Field | Source |
 |---|---|
-| `state` | STOPPED once stopping; else FAILING for 60 s after a record exhausted its attempts, a letter could not be parked (or produced to the DLT), or the consumer reported an error; else STARTING before the first assignment and between a revoke and the next assign (an empty assignment counts: such an instance is RUNNING); else RUNNING |
+| `state` | STOPPED while its consumer does not run (stopping, or out of the group for a [reset](#reset-and-replay), with `operation_id`); else PAUSED while [paused](#pause-and-resume); else FAILING for 60 s after a record exhausted its attempts, a letter could not be parked (or produced to the DLT), or the consumer reported an error; else STARTING before the first assignment and between a revoke and the next assign (an empty assignment counts: such an instance is RUNNING); else RUNNING |
 | `partitions` | the assignment (rebalance callbacks), sorted; per partition `position` (the next offset after the last record this instance acknowledged since the assignment, else -1), `committed` and `high_watermark` (-1 unknown) and `lag` (`high_watermark - committed`, without a commit `high_watermark - position`; -1 unknown; never negative) |
 | `committed`, `high_watermark` | read every 5 s **on a blocking thread** with librdkafka's `committed_offsets` and `fetch_watermarks` (2 s timeout each), so a busy handler or a slow broker never stalls the consumer task or the hub stream |
 | `processed_total`, `failed_total` | records whose dispatch completed without a stage-1 failure, and records that exhausted their attempts, since start (SEQUENCED and INVALID letters count in neither) |
 | `dead_letters` | `countDocuments({processor})` at start, every 30 s and right after this instance parked a letter; 0 unless mode `collection` |
 | `last_error`, `last_error_at_ms` | `<error variant>: <message>` of the last failure (never the payload), cut at 512 bytes |
 | `event_types`, `dead_letter_mode` | the processor's types (`default` with the saga types), sorted; the mode |
+| `operation_id` | the reset holding the processor's lock (empty when none) |
+| `replaying`, `partitions[].replay_until` | a replay range is open on one of its assigned partitions; per partition the range's `until` (0 when none) |
 
 ## Dead letters
 
@@ -992,6 +997,107 @@ The document (the same from both libraries, contract fixtures in
 `error {type, message}`, `blockedBy` (SEQUENCED), `attempts` (Int32), `parkedAt`, `lastAttemptAt`,
 `expireAt`. Indexes: `dead_letters_processor_key_offset`, `dead_letters_processor_parked`,
 `dead_letters_expire` (TTL, `expireAfterSeconds: 0`).
+
+## Processor control
+
+The hub is the control plane of the event processors (ADR 0023, P6b): its HTTP API and its
+dashboard pause, resume and reset a processor on every instance at once and work its dead letters
+(see the hub's `hub.md`, "Processor control", for the routes and the write token). The `Register`
+declares the capability `processor-control`; each `ControlRequest` is handled off the hub stream's
+read loop (heartbeats and requests never wait for it), one per processor at a time, answered on the
+stream it came on and logged at INFO (`control_id`, processor, action, result). Nothing is
+configured: no environment variable, no setting.
+
+**The state lives in the service's MongoDB**, collection `processor_control`, one document per
+processor (`_id` its name), which every instance reads before its consumer first polls and then
+every 5 s; a request is the fast path, the poll is how an instance that missed it (no hub at the
+time, started later) converges:
+
+```text
+{ _id: "audit", paused: false, pausedAt: null, pausedBy: null,
+  operation: { id: "<uuid>", kind: "reset", leaseUntil: Date, preparedAt: Date } | null,
+  replay: [ { topic: "kraken.events", partition: 0, from: 120, until: 450 } ],
+  updatedAt: Date }
+```
+
+Every field is always written (`null` or `[]`); a missing document is a processor that is not
+paused, not locked and not replaying. When the document cannot be read at start the consumer does
+not start (tried again every 5 s), so a paused processor never consumes because MongoDB was down
+for a moment.
+
+### Pause and resume
+
+A pause is written to the document (`pausedBy` the control id, or `local`), then the processor
+pauses every assigned partition (rdkafka `pause`) **and keeps polling**: it stays in its consumer
+group, no rebalance, and partitions assigned later are paused too. The record being handled
+finishes; a record fetched before the pause is sought back, so the resume starts there. Status
+`PROCESSOR_PAUSED`. A pause outlives the hubs and restarts: a new instance starts paused. Locally:
+
+```rust,ignore
+app.processor_control().pause("audit").await?;   // every instance, within its next poll
+app.processor_control().resume("audit").await?;
+```
+
+The admin API and dead-letter retries keep working while paused, and **local dispatch** (partner
+topics, webhooks, the relay's notices) still runs a paused processor's handlers: a pause is about
+Kafka consumption.
+
+### Reset and replay
+
+A reset moves the processor's consumer group to `earliest`, `latest`, a time or explicit partition
+offsets, as a **leased operation**: the hub prepares every instance (each takes the processor's lock
+in the document, leaves the consumer group and reports `PROCESSOR_STOPPED` with `operation_id`),
+one instance executes, then every instance is finished and consumes again (still paused if it was).
+The lock is a 30 s lease the hub renews every 10 s; a hub that dies mid-way stops renewing, the
+lease passes and the instances release it and consume again by themselves. An instance that starts
+(or polls) while an unexpired lock it was not prepared for is held stays out of the group too.
+
+The execute resolves the target (`earliest` the low watermarks, `latest` the high watermarks, a
+time the first offset at or after it, else the end), refuses while the group has members
+(`GROUP_NOT_EMPTY`, nothing changed), and for every partition whose target is below the group's
+committed offset makes a **replay range** `[target, committed)` (`latest` never makes one). Then, in
+this order: the processor's reset handlers, the deletion of its markers in the ranges, the ranges
+written to the document, the offsets committed. rdkafka has no admin call to alter a group's
+offsets: the executor commits them with a consumer of the group that never subscribes (the broker
+refuses it while the group has members).
+
+```rust,ignore
+use kraken_messaging::processors::{EventOptions, ResetContext};
+
+KrakenMessaging::builder(config).await?
+    .event_in::<OrderPlaced, _, _>("projections", |e, ctx| async move { /* replayed */ Ok(()) })
+    // Never runs again in a replay: an effect outside the service (Kotlin's @DisallowReplay).
+    .event_with::<OrderPlaced, _, _>(
+        EventOptions::new().processor("projections").disallow_replay(),
+        |e, ctx| async move { send_confirmation(&e).await },
+    )
+    // Once per reset that replays something, on the executing instance, before markers and
+    // offsets change (Kotlin's @ResetHandler); an error refuses the reset, nothing changed.
+    .reset_handler("projections", |ctx: ResetContext| async move {
+        clear_projection(&ctx.ranges).await
+    })
+    .start()
+    .await?;
+```
+
+- **What a replay runs.** A record of an open range (`from <= offset < until` on its partition) runs
+  the processor's stage 1 **without the handlers registered with `disallow_replay`** (its marker is
+  still written) and **never the sagas** (stage 2 saw it already). Records at or past `until` are
+  normal. A replayed record whose key has a parked letter is parked `SEQUENCED` as usual; a reset
+  never touches the dead letters.
+- **Markers carry a position.** From P6b on, every marker the Kafka consumer (or a dead letter's
+  retry) writes in `processed_events` has `processor`, `topic`, `partition` (Int32) and `offset`
+  (Int64); a replay deletes exactly `{processor, topic, partition, offset in [from, until)}`. Markers
+  of local dispatch, sagas, ingress and failure notices have none.
+- **Legacy markers (written before P6b, no position) limit a replay.** Only a reset to `earliest`
+  deletes them: for `default` the markers without a `processor` field whose `_id` has no `:`
+  (`{processor: {$exists: false}, _id: /^[^:]+$/}`: every other marker family has a colon), for a
+  named processor `P` `{processor: {$exists: false}, _id: /^processor:P:[^:]+$/}`. For any other
+  target their records are skipped as duplicates and not handled again; so is a record whose event
+  id contains a `:`.
+- **The ranges end.** Once this instance is past a range's `until` on its partition it removes the
+  range from the document; status `replaying` and `replay_until` show the open ones.
+- `reset_handler` for a processor without event handlers here fails `start()`.
 
 ## Security
 
@@ -1262,7 +1368,15 @@ presents the hub's own pair under `required`, stays healthy.
 
 ## Upgrading
 
-What changes for a service moving to this version (P6a, then S2, then P5c, then P5b, then P5a, then P4c, then P4b):
+What changes for a service moving to this version (P6b, then P6a, then S2, then P5c, then P5b, then P5a, then P4c, then P4b):
+
+- **Processor control (P6b).** The `Register` declares `processor-control`; a hub before P6b ignores it and sends no
+  control. Every processor's consumer now runs under its `processor_control` document (read at start and every 5 s; the
+  collection appears with the first pause or reset). New stage-1 markers carry `processor`, `topic`, `partition` and
+  `offset`; older ones stay as they are, which only a reset to `earliest` replays (see [Reset and replay](#reset-and-replay)).
+  `ProcessorStatus` reports `PROCESSOR_PAUSED`, `operation_id`, `replaying` and `replay_until`. New: `event_with` and
+  `processors::EventOptions`, `reset_handler`, `app.processor_control()`, `LocalEventDispatcher::dispatch_record`,
+  `EventConsumer::controlled`. Nothing else changes for a service that never pauses or resets.
 
 - **Event processors and dead letters (P6a).** The handlers registered with `event()` stay in processor `default` with the
   same consumer group (the service name) and the same `<eventId>` markers: an upgrade re-handles nothing. What changes for
