@@ -881,6 +881,20 @@ let app = KrakenMessaging::builder(config).await?
 - **External source names** `processor`, `saga`, `ingress` and `failed` are refused (they are the
   library's marker families).
 
+**Moving an existing handler into a named processor runs it again over the whole topic.** The
+group `<service>.<name>` is new, and a new group starts at the earliest offset the topic still
+holds (`auto.offset.reset=earliest`, as for `default` on its first run); its markers
+(`processor:<name>:<eventId>`) are a new family, so none of those records is a duplicate to it:
+the handler runs once more for every event in the topic's retention. A projection that rebuilds
+idempotently may want exactly that; a handler with effects outside MongoDB (an email, a payment
+call) repeats every one of them. For such code either leave the handler in `default` and put only
+new handlers in the named processor, or commit the new group's offsets at the end of the topic
+before you deploy it:
+`kafka-consumer-groups --bootstrap-server <broker> --group <service>.<name> --topic <events topic> --reset-offsets --to-latest --execute`
+(the group must have no running member). Records produced between that reset and the moment the
+old instances stop are handled twice, once by the old `default` and once by the new processor, so
+reset right before the rollout. A start position per processor is a candidate for P6b.
+
 ### Status
 
 Every status interval (`KRAKEN_HUB_STATUS_INTERVAL_MS`, 5 s) each instance reports one
