@@ -1,7 +1,10 @@
 //! The storage contract of ADR 0022 for dead letters: the `dead_letters` document and its indexes.
 //! The fixtures in `tests/fixtures/dead_letters_contract` are written by hand from the ADR's table
-//! (the Kotlin library writes its own from the same table); neither library writes `_class` or a
-//! null, and an absent field stays absent.
+//! and are byte for byte the Kotlin library's (`src/test/resources/dead_letters_contract`): this
+//! library writes each of them from its record and reads each of them back through its store and
+//! admin API, so a letter one library parks is one the other can list, retry and discard. Neither
+//! library writes `_class` or a null, an absent field stays absent, and a blank `id` or `type`
+//! header is an absent `eventId` or `eventType`.
 
 mod support;
 
@@ -10,10 +13,13 @@ use std::time::Duration;
 
 use futures::TryStreamExt;
 use kraken_messaging::MessagingError;
+use kraken_messaging::config::DeadLetterMode;
+use kraken_messaging::processors::DeadLetters;
 use kraken_messaging::processors::dead_letters::{
     DEAD_LETTERS_COLLECTION, DeadLetterDocument, DeadLetterError, DeadLetterReason,
     DeadLetterRecord, ensure_dead_letter_indexes,
 };
+use kraken_messaging::processors::store::DeadLetterStore;
 use mongodb::bson::{Bson, DateTime, Document, spec::BinarySubtype};
 use mongodb::{Database, IndexModel};
 
@@ -25,6 +31,15 @@ macro_rules! require_docker {
         }
     };
 }
+
+/// Every shared fixture.
+const FIXTURES: [&str; 5] = [
+    "handler_failed",
+    "sequenced",
+    "invalid_binary",
+    "invalid_empty",
+    "invalid_blank_headers",
+];
 
 fn fixture(name: &str) -> Document {
     let path = format!(
@@ -157,6 +172,7 @@ fn the_fixtures_of_each_reason_deserialise() {
     let binary = read("invalid_binary");
     assert_eq!(binary.reason, DeadLetterReason::Invalid);
     assert!(binary.key.is_none() && binary.event_id.is_none() && binary.event_type.is_none());
+    assert_eq!(binary.headers["source"], "legacy-\u{fffd}tool");
     assert!(binary.payload.is_none());
     assert_eq!(binary.payload_bytes(), vec![0xff, 0x00, 0xfe]);
     assert_eq!(
@@ -168,16 +184,16 @@ fn the_fixtures_of_each_reason_deserialise() {
     assert!(empty.payload.is_none() && empty.payload_binary.is_none());
     assert!(empty.payload_bytes().is_empty());
     assert!(empty.event_id.is_none());
+
+    let blank = read("invalid_blank_headers");
+    assert!(blank.event_id.is_none() && blank.event_type.is_none());
+    assert_eq!(blank.headers["type"], "  ");
+    assert_eq!(blank.dedupe_id(), "kraken.events-0-8");
 }
 
 #[test]
 fn rust_writes_each_fixture_back_field_for_field() {
-    for name in [
-        "handler_failed",
-        "sequenced",
-        "invalid_binary",
-        "invalid_empty",
-    ] {
+    for name in FIXTURES {
         assert_eq!(
             sorted(&to_doc(&read(name))),
             sorted(&fixture(name)),
@@ -187,11 +203,22 @@ fn rust_writes_each_fixture_back_field_for_field() {
 }
 
 fn record(key: Option<&[u8]>, headers: &[(&str, &[u8])], payload: &[u8]) -> DeadLetterRecord {
+    record_at("orders", 1, 42, key, headers, payload)
+}
+
+fn record_at(
+    processor: &str,
+    partition: i32,
+    offset: i64,
+    key: Option<&[u8]>,
+    headers: &[(&str, &[u8])],
+    payload: &[u8],
+) -> DeadLetterRecord {
     DeadLetterRecord {
-        processor: "orders".into(),
+        processor: processor.into(),
         topic: "kraken.events".into(),
-        partition: 1,
-        offset: 42,
+        partition,
+        offset,
         key: key.map(<[u8]>::to_vec),
         headers: headers
             .iter()
@@ -309,6 +336,96 @@ fn a_letter_rust_parks_has_exactly_the_contracts_fields_and_types() {
     assert_eq!(doc.get_str("_id"), Ok("orders:kraken.events:1:42"));
 }
 
+/// Every fixture but `handler_failed` (above), written by this library from its record.
+#[test]
+fn rust_parks_each_shared_fixture_from_its_record() {
+    let retention = Duration::from_secs(30 * 86_400);
+    let sequenced = DeadLetterDocument::park(
+        record_at(
+            "orders",
+            1,
+            43,
+            Some(b"order-7"),
+            &[("type", b"examples.OrderShipped"), ("id", b"evt-8")],
+            br#"{"orderId":"o-7"}"#,
+        ),
+        DeadLetterReason::Sequenced,
+        DeadLetterError::sequenced("orders:kraken.events:1:42"),
+        Some("orders:kraken.events:1:42".into()),
+        0,
+        at("2026-11-04T10:00:06.250Z"),
+        retention,
+    );
+    let binary = DeadLetterDocument::park(
+        record_at(
+            "default",
+            0,
+            7,
+            None,
+            &[("source", b"legacy-\xfftool")],
+            &[0xff, 0x00, 0xfe],
+        ),
+        DeadLetterReason::Invalid,
+        DeadLetterError::invalid("record without type header"),
+        None,
+        0,
+        at("2026-11-04T10:01:00Z"),
+        retention,
+    );
+    let empty = DeadLetterDocument::park(
+        record_at(
+            "orders",
+            2,
+            9,
+            Some(b"order-9"),
+            &[("type", b"examples.OrderPlaced")],
+            b"",
+        ),
+        DeadLetterReason::Invalid,
+        DeadLetterError::invalid("payload is not a JSON object"),
+        None,
+        0,
+        at("2026-11-04T10:02:00Z"),
+        retention,
+    );
+    // Blank `type` and `id` headers: kept in `headers`, absent as `eventType` and `eventId`.
+    let blank = DeadLetterDocument::park(
+        record_at(
+            "default",
+            0,
+            8,
+            None,
+            &[("type", b"  "), ("id", b"")],
+            b"{}",
+        ),
+        DeadLetterReason::Invalid,
+        DeadLetterError::invalid("record without type header"),
+        None,
+        0,
+        at("2026-11-04T10:03:00Z"),
+        retention,
+    );
+    for (name, letter) in [
+        ("sequenced", sequenced),
+        ("invalid_binary", binary),
+        ("invalid_empty", empty),
+        ("invalid_blank_headers", blank),
+    ] {
+        assert_eq!(sorted(&to_doc(&letter)), sorted(&fixture(name)), "{name}");
+    }
+}
+
+/// A blank `eventId` (a document from before the blank rule, or written by hand) is no id: the
+/// retry's marker uses the consumer's fallback, never a shared `""`.
+#[test]
+fn a_blank_event_id_dedupes_by_the_fallback_id() {
+    let mut letter = read("handler_failed");
+    for blank in ["", "   "] {
+        letter.event_id = Some(blank.to_string());
+        assert_eq!(letter.dedupe_id(), "kraken.events-1-42", "{blank:?}");
+    }
+}
+
 #[test]
 fn the_error_message_is_cut_at_2000_characters_and_a_repeated_header_keeps_its_last_value() {
     let long = "é".repeat(2500);
@@ -336,6 +453,78 @@ fn the_error_message_is_cut_at_2000_characters_and_a_repeated_header_keeps_its_l
     assert_eq!(
         letter.expire_at.timestamp_millis() - letter.parked_at.timestamp_millis(),
         1000
+    );
+}
+
+/// A document the other library wrote (each shared fixture, inserted as is) reads back through
+/// this library's store and admin API with every field the admin API returns.
+#[tokio::test]
+async fn every_shared_fixture_reads_back_through_the_store_and_the_admin_api() {
+    require_docker!();
+    let mongo = support::containers::mongo().await;
+    let client = mongodb::Client::with_uri_str(&mongo.uri).await.unwrap();
+    let db = client.default_database().unwrap();
+    let raw = db.collection::<Document>(DEAD_LETTERS_COLLECTION);
+    for name in FIXTURES {
+        raw.insert_one(fixture(name)).await.unwrap();
+    }
+    let store = DeadLetterStore::new(&db);
+    for name in FIXTURES {
+        let id = fixture(name).get_str("_id").unwrap().to_string();
+        let letter = store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name}"));
+        assert_eq!(letter, read(name), "{name}");
+        assert_eq!(
+            sorted(&to_doc(&letter)),
+            sorted(&fixture(name)),
+            "{name}: every field"
+        );
+    }
+    let failed = store
+        .get("orders:kraken.events:1:42")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.dedupe_id(), "evt-7");
+    assert_eq!(failed.error.type_name, "IllegalStateException");
+    let binary = store
+        .get("default:kraken.events:0:7")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(binary.payload_bytes(), vec![0xff, 0x00, 0xfe]);
+    let blank = store
+        .get("default:kraken.events:0:8")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(blank.event_id.is_none() && blank.event_type.is_none());
+
+    // The admin API's reads (list and count need no processor of this instance).
+    let admin = DeadLetters::new(db.clone(), DeadLetterMode::Collection, vec![]);
+    let listed = admin.list(None, 100).await.unwrap();
+    assert_eq!(
+        listed.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(),
+        [
+            "orders:kraken.events:1:42",
+            "orders:kraken.events:1:43",
+            "default:kraken.events:0:7",
+            "orders:kraken.events:2:9",
+            "default:kraken.events:0:8",
+        ],
+        "by parkedAt"
+    );
+    // FIXTURES is in parkedAt order too.
+    for (letter, name) in listed.iter().zip(FIXTURES) {
+        assert_eq!(sorted(&to_doc(letter)), sorted(&fixture(name)), "{name}");
+    }
+    assert_eq!(admin.count(None).await.unwrap(), 5);
+    assert_eq!(
+        store.head("orders", "order-7").await.unwrap().as_deref(),
+        Some("orders:kraken.events:1:42")
     );
 }
 

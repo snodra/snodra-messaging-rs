@@ -118,10 +118,10 @@ pub struct DeadLetterDocument {
     /// The record's key as lossy UTF-8; absent when the record had none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
-    /// The `id` header; absent when the record had none.
+    /// The `id` header; absent when the record had none or a blank one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
-    /// The `type` header; absent when the record had none.
+    /// The `type` header; absent when the record had none or a blank one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_type: Option<String>,
     /// Every record header, lossy UTF-8.
@@ -162,7 +162,8 @@ impl DeadLetterDocument {
             .into_iter()
             .map(|(k, v)| (k, String::from_utf8_lossy(&v).into_owned()))
             .collect();
-        let header = |name: &str| headers.get(name).filter(|v| !v.is_empty()).cloned();
+        // A blank `id` or `type` is no id or type (as the consumer reads it): absent, not "".
+        let header = |name: &str| headers.get(name).filter(|v| !v.trim().is_empty()).cloned();
         let (payload, payload_binary) = if record.payload.is_empty() {
             (None, None)
         } else {
@@ -209,11 +210,12 @@ impl DeadLetterDocument {
         }
     }
 
-    /// The id the record's stage 1 is deduplicated by: its `id` header, else
+    /// The id the record's stage 1 is deduplicated by: its `id` header, else (none or blank)
     /// `<topic>-<partition>-<offset>` (the consumer's fallback).
     pub fn dedupe_id(&self) -> String {
         self.event_id
             .clone()
+            .filter(|id| !id.trim().is_empty())
             .unwrap_or_else(|| format!("{}-{}-{}", self.topic, self.partition, self.offset))
     }
 }

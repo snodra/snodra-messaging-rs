@@ -113,6 +113,25 @@ fn classify_skips_missing_type() {
     assert!(matches!(d, RecordDisposition::Skip(reason) if reason.contains("type")));
 }
 
+/// A blank (empty or whitespace-only) `type` header is no type: INVALID, as in Kotlin.
+#[test]
+fn classify_skips_a_blank_type() {
+    for blank in ["", "  ", "\t"] {
+        let d = classify(
+            &hdrs(&[(headers::TYPE, blank), (headers::ID, "x")]),
+            b"{}",
+            "kraken.events",
+            0,
+            1,
+            &registry_with_happened(),
+        );
+        assert!(
+            matches!(d, RecordDisposition::Skip(reason) if reason == "record without type header"),
+            "{blank:?}: {d:?}"
+        );
+    }
+}
+
 #[test]
 fn classify_skips_unhandled_type() {
     let d = classify(
@@ -152,6 +171,26 @@ fn classify_uses_topic_partition_offset_when_id_missing() {
     assert!(
         matches!(d, RecordDisposition::Handle { ref type_name, ref id } if type_name == "t.Happened" && id == "kraken.events-3-17")
     );
+}
+
+/// A blank `id` header is no id: the fallback, as in Kotlin (and as the letter's absent `eventId`
+/// makes the retry use).
+#[test]
+fn classify_uses_topic_partition_offset_when_id_blank() {
+    for blank in ["", "   "] {
+        let d = classify(
+            &hdrs(&[(headers::TYPE, "t.Happened"), (headers::ID, blank)]),
+            b"{}",
+            "kraken.events",
+            3,
+            17,
+            &registry_with_happened(),
+        );
+        assert!(
+            matches!(d, RecordDisposition::Handle { ref id, .. } if id == "kraken.events-3-17"),
+            "{blank:?}: {d:?}"
+        );
+    }
 }
 
 #[test]

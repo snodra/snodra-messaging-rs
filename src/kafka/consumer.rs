@@ -46,8 +46,9 @@ pub enum RecordDisposition {
     },
 }
 
-/// Mirrors `EventConsumer.kt`: no `type` header, a type nobody handles, or a non-object payload are
-/// skipped; a missing `id` header falls back to `<topic>-<partition>-<offset>`.
+/// Mirrors `EventConsumer.kt`: no `type` header (or a blank one), a type nobody handles, or a
+/// non-object payload are skipped; a missing or blank `id` header falls back to
+/// `<topic>-<partition>-<offset>`.
 pub fn classify(
     hdrs: &HashMap<String, String>,
     payload: &[u8],
@@ -71,7 +72,7 @@ pub fn classify_with(
     offset: i64,
     interested: impl Fn(&str) -> bool,
 ) -> RecordDisposition {
-    let Some(type_name) = hdrs.get(headers::TYPE).filter(|t| !t.is_empty()) else {
+    let Some(type_name) = hdrs.get(headers::TYPE).filter(|t| !t.trim().is_empty()) else {
         return RecordDisposition::Skip("record without type header");
     };
     if !interested(type_name) {
@@ -82,7 +83,7 @@ pub fn classify_with(
     }
     let id = hdrs
         .get(headers::ID)
-        .filter(|i| !i.is_empty())
+        .filter(|i| !i.trim().is_empty())
         .cloned()
         .unwrap_or_else(|| format!("{topic}-{partition}-{offset}"));
     RecordDisposition::Handle {
@@ -461,7 +462,7 @@ impl EventConsumer {
             }
             RecordDisposition::Handle { type_name, id } => (type_name, id),
         };
-        if !hdrs.contains_key(headers::ID) {
+        if !hdrs.get(headers::ID).is_some_and(|i| *i == id) {
             tracing::warn!(processor = %self.name, r#type = %type_name, id = %id, "record has no id header, using topic-partition-offset for idempotency");
         }
         let ctx = message_context(&type_name, &id, &hdrs);

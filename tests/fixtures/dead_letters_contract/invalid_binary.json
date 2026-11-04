@@ -4,7 +4,7 @@
   "topic": "kraken.events",
   "partition": 0,
   "offset": {"$numberLong": "7"},
-  "headers": {"source": "legacy-tool"},
+  "headers": {"source": "legacy-�tool"},
   "payloadBinary": {"$binary": {"base64": "/wD+", "subType": "00"}},
   "reason": "INVALID",
   "error": {"type": "InvalidMessage", "message": "record without type header"},

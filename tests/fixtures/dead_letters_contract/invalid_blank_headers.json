@@ -1,0 +1,15 @@
+{
+  "_id": "default:kraken.events:0:8",
+  "processor": "default",
+  "topic": "kraken.events",
+  "partition": 0,
+  "offset": {"$numberLong": "8"},
+  "headers": {"type": "  ", "id": ""},
+  "payload": "{}",
+  "reason": "INVALID",
+  "error": {"type": "InvalidMessage", "message": "record without type header"},
+  "attempts": 0,
+  "parkedAt": {"$date": "2026-11-04T10:03:00Z"},
+  "lastAttemptAt": {"$date": "2026-11-04T10:03:00Z"},
+  "expireAt": {"$date": "2026-12-04T10:03:00Z"}
+}
