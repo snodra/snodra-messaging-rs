@@ -250,8 +250,9 @@ async fn marker_ids(db: &mongodb::Database) -> Vec<String> {
     all
 }
 
-/// A marker without a position: another family's (a saga's, the webhook ingress', a partner
-/// topic's), which no reset deletes.
+/// A marker without a position, which no reset deletes: another family's (a saga's, the webhook
+/// ingress') or a processor's own for a record not read from the events topic (a partner topic's,
+/// a failed notice's).
 async fn positionless_marker(db: &mongodb::Database, id: &str) {
     db.collection::<Document>("processed_events")
         .insert_one(
@@ -742,7 +743,13 @@ async fn a_reset_to_earliest_replays_the_range_once_without_sagas_or_disallowed_
         .delete_many(doc! { "_id": { "$regex": "^saga:" } })
         .await
         .unwrap();
-    for id in ["saga:c.Other:x-3", "ingress:hook:k", "partner:0:7"] {
+    let positionless = [
+        "saga:c.Other:x-3",
+        "ingress:hook:k",
+        "processor:default:partner:0:7",
+        "processor:default:failed:x",
+    ];
+    for id in positionless {
         positionless_marker(&db, id).await;
     }
     let audit_markers: Vec<String> = marker_ids(&db)
@@ -799,7 +806,7 @@ async fn a_reset_to_earliest_replays_the_range_once_without_sagas_or_disallowed_
         let gone = format!("processor:default:{gone}");
         assert!(!left.contains(&gone), "{left:?}");
     }
-    for kept in ["saga:c.Other:x-3", "ingress:hook:k", "partner:0:7"] {
+    for kept in positionless {
         assert!(left.contains(&kept.to_string()), "{left:?}");
     }
     assert_eq!(
