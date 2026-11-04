@@ -259,7 +259,8 @@ async fn register_declares_protocol_v2_and_client_version() {
             "streaming",
             "subscription",
             "credentials-refresh",
-            "processors"
+            "processors",
+            "processor-control"
         ]
     );
     assert_eq!(r.client_version, CLIENT_VERSION);
@@ -291,6 +292,7 @@ async fn ack_completes_the_handshake_and_its_interval_replaces_the_fallback() {
             "streaming".into(),
             "subscription".into(),
             "processors".into(),
+            "processor-control".into(),
         ],
         ..ack
     };

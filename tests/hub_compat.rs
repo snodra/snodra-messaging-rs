@@ -238,7 +238,8 @@ async fn new_hub_acks_with_its_configured_values_and_applies_type_overrides() {
             "streaming",
             "subscription",
             "credentials-refresh",
-            "processors"
+            "processors",
+            "processor-control"
         ],
         "the hub shares what we declared"
     );
