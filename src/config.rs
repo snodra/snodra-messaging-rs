@@ -54,7 +54,8 @@ impl DeadLetterMode {
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Hub `Register.service_name`, Kafka consumer group and event `source`.
+    /// Hub `Register.service_name`, event `source`, and the base of the event processors' Kafka
+    /// consumer groups (`<service_name>.<processor>`, `default` included).
     pub service_name: String,
     /// The hubs to connect to (ADR 0016): `host:port` (`static://` prefix optional), a
     /// comma-separated list of them, or one `dns:///name:port` whose addresses are re-resolved
@@ -1223,7 +1224,7 @@ mod tests {
     }
 
     #[test]
-    fn hub_defaults_follow_protocol_v2() {
+    fn hub_defaults() {
         let c = Config::new("svc", "static://hub:7000", "kafka:19092", "mongodb://m/db");
         // No chosen timeout: the hub decides (per-type override or its default).
         assert_eq!(c.hub_request_timeout, None);

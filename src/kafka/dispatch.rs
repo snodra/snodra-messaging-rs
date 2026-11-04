@@ -4,7 +4,7 @@
 //! consumers, the webhook ingress and the relay's `SagaCommandFailed` notices (ADR 0021 ruling 2).
 //!
 //! Stage 1 is the consumer's own behaviour: the idempotency marker (`processed_events`, id
-//! `dedupe_id`) is inserted and the handlers run inside one Mongo transaction; a duplicate marker
+//! `processor:<processor>:<dedupe_id>`) is inserted and the handlers run inside one Mongo transaction; a duplicate marker
 //! skips the stage, a handler failure rolls the marker back. Stage 2 runs after stage 1 committed,
 //! with markers and transactions of its own, so a redelivered record whose stage 1 is done goes
 //! straight to it. **Stage 2 runs even when stage 1 failed** (ruling 26): the failure is held,
@@ -88,8 +88,8 @@ pub struct LocalEventDispatcher {
     db: Database,
     registry: Arc<HandlerRegistry>,
     stage: Arc<dyn SagaStage>,
-    /// Put before every stage-1 marker id: `processor:<name>:` for a named processor (ADR 0022).
-    marker_prefix: Option<String>,
+    /// Put before every stage-1 marker id: `processor:<name>:` (ADR 0022).
+    marker_prefix: String,
     /// The named processors whose stage 1 a [`dispatch`](Self::dispatch) also runs (ADR 0022):
     /// the local entry points reach every processor's handlers.
     fan_out: Vec<Arc<LocalEventDispatcher>>,
@@ -172,7 +172,7 @@ impl LocalEventDispatcher {
             db,
             registry,
             stage,
-            marker_prefix: None,
+            marker_prefix: crate::processors::marker_prefix(crate::processors::DEFAULT_PROCESSOR),
             fan_out: Vec::new(),
         }
     }
@@ -186,9 +186,9 @@ impl LocalEventDispatcher {
         self
     }
 
-    /// Prefixes every stage-1 marker id (`processor:<name>:` for a named processor, ADR 0022);
-    /// `None` (the default) keeps `<dedupeId>`.
-    pub fn with_marker_prefix(mut self, prefix: Option<String>) -> LocalEventDispatcher {
+    /// Prefixes every stage-1 marker id with `prefix` (`processor:<name>:` of a named processor,
+    /// ADR 0022); `processor:default:` unless set.
+    pub fn with_marker_prefix(mut self, prefix: String) -> LocalEventDispatcher {
         self.marker_prefix = prefix;
         self
     }
@@ -220,10 +220,7 @@ impl LocalEventDispatcher {
     }
 
     fn marker_id(&self, dedupe_id: &str) -> String {
-        match &self.marker_prefix {
-            Some(prefix) => format!("{prefix}{dedupe_id}"),
-            None => dedupe_id.to_string(),
-        }
+        format!("{}{dedupe_id}", self.marker_prefix)
     }
 
     /// Dispatches the event of `type_name` with its JSON `payload`; `dedupe_id` keys stage 1's

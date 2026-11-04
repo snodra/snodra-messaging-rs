@@ -147,7 +147,7 @@ async fn the_hub_shows_the_processors_their_letters_and_their_lag() {
     assert_eq!(orders["instances"][0]["partitions"][0]["committed"], 2);
     assert_eq!(service["deadLetters"], 2, "{service}");
     let default = &processors[0];
-    assert_eq!(default["groupId"], "svc-e2e-proc");
+    assert_eq!(default["groupId"], "svc-e2e-proc.default");
     assert_eq!(default["state"], "RUNNING", "{default}");
     assert_eq!(default["processedTotal"], 2);
 

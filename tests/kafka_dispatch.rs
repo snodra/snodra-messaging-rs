@@ -10,11 +10,11 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
+use kraken_messaging::config::DeadLetterMode;
 use kraken_messaging::hub::HandlerRegistry;
 use kraken_messaging::kafka::dispatch::{
     LocalEventDispatcher, NoSagas, Outcome, SagaStage, StageOneDone,
 };
-use kraken_messaging::config::DeadLetterMode;
 use kraken_messaging::kafka::{
     EventConsumer, ProcessorSettings, RecordDisposition, classify_with, ensure_indexes, headers,
 };
@@ -123,7 +123,7 @@ impl SagaStage for RecordingStage {
             let committed = self
                 .db
                 .collection::<mongodb::bson::Document>("processed_events")
-                .count_documents(doc! { "_id": &ctx.message_id })
+                .count_documents(doc! { "_id": format!("processor:default:{}", ctx.message_id) })
                 .await
                 .unwrap()
                 == 1;
@@ -442,7 +442,7 @@ fn a_record_only_a_saga_wants_is_handled_not_skipped() {
             id: "e-1".into()
         }
     );
-    // `classify` is `classify_with` over the registry's handlers, as before.
+    // `classify` is `classify_with` over the registry's handlers.
     assert_eq!(
         kraken_messaging::kafka::classify(&hdrs, b"{}", "kraken.events", 0, 7, &none),
         RecordDisposition::Skip("no handler for this type")
@@ -459,7 +459,7 @@ async fn the_consumer_hands_a_record_only_a_saga_wants_to_the_saga_stage() {
         ProcessorSettings {
             name: "default".into(),
             bootstrap_servers: kafka.bootstrap.clone(),
-            group_id: "svc-saga".into(),
+            group_id: "svc-saga.default".into(),
             topic: "kraken.events".into(),
             max_attempts: 3,
             backoff: Duration::from_millis(50),
@@ -526,15 +526,15 @@ async fn the_consumer_hands_a_record_only_a_saga_wants_to_the_saga_stage() {
 
 // ---- P6a (ADR 0022): a named processor's markers and the stages one by one ----
 
-/// A named processor's dispatcher keys its markers `processor:<name>:<eventId>`; the unnamed one
-/// keeps `<eventId>`, so the two never share a marker.
+/// Every processor's dispatcher keys its markers `processor:<name>:<eventId>`, the unnamed one
+/// `processor:default:<eventId>`, so two processors never share a marker.
 #[tokio::test]
 async fn a_named_processors_markers_are_its_own_family() {
     require_docker!();
     let f = Fixture::start().await;
     let named = f
         .dispatcher(Arc::new(NoSagas), true)
-        .with_marker_prefix(Some("processor:orders:".into()));
+        .with_marker_prefix("processor:orders:".into());
     let default = f.dispatcher(Arc::new(NoSagas), true);
 
     assert_eq!(dispatch(&named, "e-1").await.unwrap(), Outcome::Handled);
@@ -550,7 +550,10 @@ async fn a_named_processors_markers_are_its_own_family() {
             .collect();
     assert_eq!(ids.len(), 2);
     assert!(ids.contains(&"processor:orders:e-1".to_string()), "{ids:?}");
-    assert!(ids.contains(&"e-1".to_string()), "{ids:?}");
+    assert!(
+        ids.contains(&"processor:default:e-1".to_string()),
+        "{ids:?}"
+    );
     assert_eq!(*f.handlers.lock().unwrap(), ["e-1", "e-1"]);
 }
 
@@ -647,7 +650,7 @@ async fn a_local_dispatch_fans_out_to_every_processors_stage_one_and_the_sagas_o
     let stage = RecordingStage::new(true, &f.db, &f.handlers);
     let named = Arc::new(
         f.dispatcher(Arc::new(NoSagas), true)
-            .with_marker_prefix(Some("processor:orders:".into())),
+            .with_marker_prefix("processor:orders:".into()),
     );
     let default = f
         .dispatcher(stage.clone(), true)
@@ -669,7 +672,7 @@ async fn a_local_dispatch_fans_out_to_every_processors_stage_one_and_the_sagas_o
             .map(|b| b.as_str().unwrap().to_string())
             .collect();
     ids.sort();
-    assert_eq!(ids, ["e-1", "processor:orders:e-1"]);
+    assert_eq!(ids, ["processor:default:e-1", "processor:orders:e-1"]);
     // Again: every stage 1 is a duplicate, the sagas decide by their own markers.
     dispatch(&default, "e-1").await.unwrap();
     assert_eq!(f.handlers.lock().unwrap().len(), 2);

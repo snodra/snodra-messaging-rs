@@ -324,7 +324,7 @@ async fn partner_records_become_local_events_deduplicated_never_published_and_re
     ek.await_saga("j1", 1).await;
     assert_eq!(ek.seen(), ["j1"], "the ordinary handler saw it too");
     // The dedupe id is the source, the partition and the offset; both stages' markers carry it.
-    assert!(ek.marker("printer:0:0").await);
+    assert!(ek.marker("processor:default:printer:0:0").await);
     assert!(ek.marker("saga:ek.Job:printer:0:0").await);
     let ctx = ek.handlers.contexts.lock().unwrap().remove(0);
     assert_eq!(ctx.message_id, "printer:0:0");
@@ -345,7 +345,7 @@ async fn partner_records_become_local_events_deduplicated_never_published_and_re
     assert_eq!(ek.seen(), ["j2"]);
     assert_eq!(ek.replies("skipped").await, None);
     assert!(
-        !ek.marker("printer:0:1").await,
+        !ek.marker("processor:default:printer:0:1").await,
         "an ignored record leaves no marker"
     );
 
@@ -370,7 +370,7 @@ async fn partner_records_become_local_events_deduplicated_never_published_and_re
     .await;
     ek.await_saga("j3", 2).await;
     assert_eq!(ek.seen(), ["j3", "j3"], "evt-1 once, evt-2 once");
-    assert!(ek.marker("printer:evt-1").await);
+    assert!(ek.marker("processor:default:printer:evt-1").await);
     assert!(ek.marker("saga:ek.Job:printer:evt-2").await);
 
     // -- a translator that fails is retried and then skipped; an invalid record and a panic too
@@ -423,7 +423,7 @@ async fn partner_records_become_local_events_deduplicated_never_published_and_re
     ek.send(&topic, r#"{"jobId":"j7","status":"done"}"#, &[])
         .await;
     ek.await_saga("j7", 1).await;
-    assert!(ek.marker("billing:0:0").await);
+    assert!(ek.marker("processor:default:billing:0:0").await);
     cancel.cancel();
     let _ = running.await;
 }

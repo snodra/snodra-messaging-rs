@@ -343,7 +343,7 @@ async fn named_processors_have_their_own_group_and_markers_and_never_hold_each_o
     // Each processor its own marker family; the failed one left none for o-2.
     let m = markers(&db).await;
     for order in ["o-1", "o-2", "o-3"] {
-        assert!(m.contains(&order.to_string()), "{m:?}");
+        assert!(m.contains(&format!("processor:default:{order}")), "{m:?}");
         assert!(m.contains(&format!("processor:mail:{order}")), "{m:?}");
     }
     assert!(m.contains(&"processor:audit:o-1".to_string()));
@@ -360,7 +360,7 @@ async fn named_processors_have_their_own_group_and_markers_and_never_hold_each_o
         .unwrap();
     assert_eq!(sagas.len(), 3);
     eventually("each group committed its three records", WITHIN, || async {
-        ["svc-p", "svc-p.audit", "svc-p.mail"]
+        ["svc-p.default", "svc-p.audit", "svc-p.mail"]
             .iter()
             .all(|g| committed(&kafka.bootstrap, g, topic) == 3)
     })
@@ -371,7 +371,7 @@ async fn named_processors_have_their_own_group_and_markers_and_never_hold_each_o
         all.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
         ["default", "audit", "mail"]
     );
-    assert_eq!(status(&all, "default").group_id, "svc-p");
+    assert_eq!(status(&all, "default").group_id, "svc-p.default");
     assert_eq!(status(&all, "audit").group_id, "svc-p.audit");
     assert_eq!(status(&all, "audit").topic, topic);
     assert_eq!(status(&all, "audit").event_types, ["p.Placed"]);
@@ -447,7 +447,7 @@ async fn a_failing_key_parks_its_later_records_while_other_keys_flow_until_it_is
     produce(&p, topic, Some("k3"), "o-k3").await; // 7: an INVALID letter never blocks its key
 
     eventually("all eight records acknowledged", WITHIN, || async {
-        committed(&kafka.bootstrap, "svc-s", topic) == 8
+        committed(&kafka.bootstrap, "svc-s.default", topic) == 8
     })
     .await;
     let parked = letters(&db).await;
@@ -633,7 +633,7 @@ async fn a_letter_is_written_before_its_offset_is_committed_and_parked_once_on_r
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(letters(&db).await.is_empty());
     assert!(
-        committed(&kafka.bootstrap, "svc-m", topic) <= 0,
+        committed(&kafka.bootstrap, "svc-m.default", topic) <= 0,
         "not acknowledged"
     );
     let s = app.processors();
@@ -651,7 +651,7 @@ async fn a_letter_is_written_before_its_offset_is_committed_and_parked_once_on_r
     })
     .await;
     eventually("then acknowledged", WITHIN, || async {
-        committed(&kafka.bootstrap, "svc-m", topic) == 1
+        committed(&kafka.bootstrap, "svc-m.default", topic) == 1
     })
     .await;
     assert_eq!(handler.seen().len(), 2, "the handler did not run again");
@@ -660,7 +660,7 @@ async fn a_letter_is_written_before_its_offset_is_committed_and_parked_once_on_r
     // Redelivery: the group starts over at offset 0.
     let reset: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", &kafka.bootstrap)
-        .set("group.id", "svc-m")
+        .set("group.id", "svc-m.default")
         .create()
         .unwrap();
     let mut tpl = TopicPartitionList::new();
@@ -670,10 +670,10 @@ async fn a_letter_is_written_before_its_offset_is_committed_and_parked_once_on_r
         .commit(&tpl, rdkafka::consumer::CommitMode::Sync)
         .unwrap();
     drop(reset);
-    assert_eq!(committed(&kafka.bootstrap, "svc-m", topic), 0);
+    assert_eq!(committed(&kafka.bootstrap, "svc-m.default", topic), 0);
     let app = start().await;
     eventually("acknowledged again", WITHIN, || async {
-        committed(&kafka.bootstrap, "svc-m", topic) == 1
+        committed(&kafka.bootstrap, "svc-m.default", topic) == 1
     })
     .await;
     let parked = letters(&db).await;
@@ -777,7 +777,7 @@ async fn a_letter_that_cannot_be_written_holds_its_record_but_not_the_poll_loop(
     assert!(letters(&db).await.is_empty());
     assert_eq!(runs("o-3"), 0, "a later record of the partition waits");
     assert!(
-        committed(&kafka.bootstrap, "svc-w", topic) <= 0,
+        committed(&kafka.bootstrap, "svc-w.default", topic) <= 0,
         "not acknowledged"
     );
     assert_eq!(
@@ -790,7 +790,7 @@ async fn a_letter_that_cannot_be_written_holds_its_record_but_not_the_poll_loop(
         .unwrap();
     eventually("then o-3 is handled", WITHIN, || async { runs("o-3") == 1 }).await;
     eventually("and partition 0 acknowledged", WITHIN, || async {
-        committed(&kafka.bootstrap, "svc-w", topic) == 2
+        committed(&kafka.bootstrap, "svc-w.default", topic) == 2
     })
     .await;
     let parked = letters(&db).await;
@@ -945,7 +945,7 @@ async fn mode_topic_produces_to_the_dlt_and_mode_log_skips() {
     produce(&p, "l.events", Some("k"), "o-1").await;
     produce(&p, "l.events", Some("k"), "o-2").await;
     eventually("both acknowledged", WITHIN, || async {
-        committed(&kafka.bootstrap, "svc-l", "l.events") == 2
+        committed(&kafka.bootstrap, "svc-l.default", "l.events") == 2
     })
     .await;
     assert_eq!(handler.seen(), ["o-1", "o-1", "o-2"]);

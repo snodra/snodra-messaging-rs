@@ -1,12 +1,12 @@
 //! Named event processors (ADR 0022, P6a): each processor is its own Kafka consumer, with its own
 //! consumer group, markers, dead letters and status.
 //!
+//! - Every processor's group is `<service>.<name>` and its markers `processor:<name>:<eventId>`,
+//!   `default` included.
 //! - The unnamed processor `default` holds the handlers registered with
-//!   [`event`](crate::KrakenMessagingBuilder::event) and the sagas; it keeps the service's group
-//!   (the service name) and the plain `<eventId>` markers, so an upgrade re-handles nothing.
+//!   [`event`](crate::KrakenMessagingBuilder::event) and the sagas.
 //! - A named processor holds the handlers registered with
-//!   [`event_in`](crate::KrakenMessagingBuilder::event_in); its group is `<service>.<name>` and
-//!   its markers `processor:<name>:<eventId>`. It runs stage 1 only (no sagas).
+//!   [`event_in`](crate::KrakenMessagingBuilder::event_in). It runs stage 1 only (no sagas).
 //!
 //! Processor control (ADR 0023, P6b): a processor is paused and resumed on every instance, and
 //! reset to a position as a leased operation (its range replayed), through its document in
@@ -77,7 +77,7 @@ impl EventOptions {
 
 /// The unnamed processor's name.
 pub const DEFAULT_PROCESSOR: &str = "default";
-/// The prefix of a named processor's markers in `processed_events`.
+/// The prefix of every processor's markers in `processed_events`.
 pub const PROCESSOR_MARKER_PREFIX: &str = "processor:";
 
 /// Checks a processor name given to `event_in`: `^[a-z0-9][a-z0-9-]{0,47}$`, and not `default`.
@@ -103,19 +103,14 @@ pub fn validate_processor_name(name: &str, what: &str) -> Result<(), MessagingEr
     }
 }
 
-/// The consumer group of processor `name` when the service's group is `base`: `base` itself for
-/// `default`, else `<base>.<name>`.
+/// The consumer group of processor `name` when the service's group is `base`: `<base>.<name>`.
 pub fn group_id(base: &str, name: &str) -> String {
-    if name == DEFAULT_PROCESSOR {
-        base.to_string()
-    } else {
-        format!("{base}.{name}")
-    }
+    format!("{base}.{name}")
 }
 
-/// The prefix of processor `name`'s markers: none for `default`, else `processor:<name>:`.
-pub fn marker_prefix(name: &str) -> Option<String> {
-    (name != DEFAULT_PROCESSOR).then(|| format!("{PROCESSOR_MARKER_PREFIX}{name}:"))
+/// The prefix of processor `name`'s markers: `processor:<name>:`.
+pub fn marker_prefix(name: &str) -> String {
+    format!("{PROCESSOR_MARKER_PREFIX}{name}:")
 }
 
 #[cfg(test)]
@@ -158,13 +153,10 @@ mod tests {
     }
 
     #[test]
-    fn groups_and_markers() {
-        assert_eq!(group_id("service-c", "default"), "service-c");
+    fn groups_and_markers_are_uniform_default_included() {
+        assert_eq!(group_id("service-c", "default"), "service-c.default");
         assert_eq!(group_id("service-c", "orders"), "service-c.orders");
-        assert_eq!(marker_prefix("default"), None);
-        assert_eq!(
-            marker_prefix("orders").as_deref(),
-            Some("processor:orders:")
-        );
+        assert_eq!(marker_prefix("default"), "processor:default:");
+        assert_eq!(marker_prefix("orders"), "processor:orders:");
     }
 }

@@ -65,7 +65,7 @@ fn raw_consumer(bootstrap: &str, group: &str) -> StreamConsumer {
     c
 }
 
-/// The `default` processor's consumer of `registry` in the group `service`, a failed record logged
+/// The `default` processor's consumer of `registry` in `service`'s group, a failed record logged
 /// and skipped (mode `log`).
 fn consumer(
     bootstrap: &str,
@@ -79,7 +79,7 @@ fn consumer(
         ProcessorSettings {
             name: "default".into(),
             bootstrap_servers: bootstrap.into(),
-            group_id: service.into(),
+            group_id: format!("{service}.default"),
             topic: TOPIC.into(),
             max_attempts,
             backoff: Duration::from_millis(50),

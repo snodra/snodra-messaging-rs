@@ -650,7 +650,10 @@ async fn the_call_record_is_written_apart_from_the_callers_transaction() {
         )
         .await;
     assert!(failed.is_err());
-    assert!(!ex.store.marker("e-1").await, "stage 1 rolled back");
+    assert!(
+        !ex.store.marker("processor:default:e-1").await,
+        "stage 1 rolled back"
+    );
     assert_eq!(
         ex.record("stamp:j9").await.unwrap().status,
         ExternalCallStatus::Succeeded,
@@ -666,7 +669,7 @@ async fn the_call_record_is_written_apart_from_the_callers_transaction() {
         )
         .await
         .unwrap();
-    assert!(ex.store.marker("e-1").await);
+    assert!(ex.store.marker("processor:default:e-1").await);
     assert_eq!(
         ex.adapter.stamps.load(Ordering::SeqCst),
         1,

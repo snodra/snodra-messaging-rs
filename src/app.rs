@@ -430,8 +430,8 @@ impl KrakenMessagingBuilder {
         self
     }
 
-    /// An event handler in the unnamed processor `default` (with the sagas): the service's
-    /// consumer group and the plain `<eventId>` markers.
+    /// An event handler in the unnamed processor `default` (with the sagas): the consumer group
+    /// `<service>.default` and the markers `processor:default:<eventId>`.
     pub fn event<E, F, Fut>(self, handler: F) -> Self
     where
         E: Event,

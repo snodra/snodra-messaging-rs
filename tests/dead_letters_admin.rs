@@ -488,9 +488,10 @@ async fn a_retry_whose_letter_vanishes_meanwhile_commits_nothing() {
     assert_eq!(f.effects().await, 0, "the handler's effect rolled back");
 }
 
-/// The unnamed processor's retry uses the plain `<eventId>` marker and does not re-run stage 2.
+/// The unnamed processor's retry uses its `processor:default:<eventId>` marker and does not re-run
+/// stage 2.
 #[tokio::test]
-async fn a_default_letter_retries_stage_one_only_with_the_plain_marker() {
+async fn a_default_letter_retries_stage_one_only_with_its_marker() {
     require_docker!();
     let f = Fixture::start().await;
     let stage = Arc::new(CountingStage::default());
@@ -504,7 +505,7 @@ async fn a_default_letter_retries_stage_one_only_with_the_plain_marker() {
     );
     let id = f.park(&Letter::new("default", 30, Some("k"), "o-30")).await;
     assert_eq!(admin.retry(&id).await.unwrap(), RetryResult::Retried);
-    assert_eq!(f.markers().await, ["o-30"]);
+    assert_eq!(f.markers().await, ["processor:default:o-30"]);
     assert_eq!(*stage.calls.lock().unwrap(), 0, "stage 2 is not re-run");
 }
 

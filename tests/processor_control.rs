@@ -363,14 +363,14 @@ async fn markers_carry_the_processor_and_the_records_position() {
         produce(&p, topic, None, note).await;
     }
     eventually("both handled and n-2 parked", WITHIN, || async {
-        marker(&db, "n-2").await.is_some()
+        marker(&db, "processor:default:n-2").await.is_some()
             && app.dead_letters().count(Some("audit")).await.unwrap() == 1
     })
     .await;
 
     for (id, processor, offset) in [
-        ("n-1", "default", 0i64),
-        ("n-2", "default", 1),
+        ("processor:default:n-1", "default", 0i64),
+        ("processor:default:n-2", "default", 1),
         ("processor:audit:n-1", "audit", 0),
     ] {
         let m = marker(&db, id).await.expect(id);
@@ -448,7 +448,7 @@ async fn a_pause_holds_the_records_everywhere_and_survives_a_restart_until_the_r
     tokio::time::sleep(Duration::from_secs(4)).await;
     assert_eq!(handler.count("n-2"), 0, "held while paused");
     assert_eq!(
-        members(&kafka.bootstrap, "svc-pause").len(),
+        members(&kafka.bootstrap, "svc-pause.default").len(),
         1,
         "still in the group"
     );
@@ -734,7 +734,7 @@ async fn a_reset_to_earliest_replays_the_range_once_without_sagas_or_disallowed_
             .iter()
             .all(|n| projection.count(n) == 1 && mailer.count(n) == 1 && audit.count(n) == 1)
             && saga_runs.load(Ordering::SeqCst) == 4
-            && (0..2).all(|p| committed(&kafka.bootstrap, "svc-replay", topic, p) == 2)
+            && (0..2).all(|p| committed(&kafka.bootstrap, "svc-replay.default", topic, p) == 2)
     })
     .await;
     // Were the sagas run again, their handler would count (their markers are gone).
@@ -762,7 +762,7 @@ async fn a_reset_to_earliest_replays_the_range_once_without_sagas_or_disallowed_
             )
             .await);
     }
-    assert!(members(&kafka.bootstrap, "svc-replay").is_empty());
+    assert!(members(&kafka.bootstrap, "svc-replay.default").is_empty());
     let outcome = reset(
         hub.control_to(
             Some(first.instance_id()),
@@ -796,7 +796,8 @@ async fn a_reset_to_earliest_replays_the_range_once_without_sagas_or_disallowed_
     );
     let left = marker_ids(&db).await;
     for gone in ["n-1", "n-2", "n-3", "n-4"] {
-        assert!(!left.contains(&gone.to_string()), "{left:?}");
+        let gone = format!("processor:default:{gone}");
+        assert!(!left.contains(&gone), "{left:?}");
     }
     for kept in ["saga:c.Other:x-3", "ingress:hook:k", "partner:0:7"] {
         assert!(left.contains(&kept.to_string()), "{left:?}");
@@ -809,7 +810,10 @@ async fn a_reset_to_earliest_replays_the_range_once_without_sagas_or_disallowed_
         "another processor's markers are untouched"
     );
     for p in 0..2 {
-        assert_eq!(committed(&kafka.bootstrap, "svc-replay", topic, p), 0);
+        assert_eq!(
+            committed(&kafka.bootstrap, "svc-replay.default", topic, p),
+            0
+        );
     }
 
     for app in [&first, &second] {
@@ -840,7 +844,9 @@ async fn a_reset_to_earliest_replays_the_range_once_without_sagas_or_disallowed_
         assert_eq!(projection.count(n), 2, "{n}: exactly once more overall");
         assert_eq!(mailer.count(n), 1, "{n}: disallows replay");
         assert_eq!(audit.count(n), 1, "{n}: another processor");
-        let m = marker(&db, n).await.expect("a new marker");
+        let m = marker(&db, &format!("processor:default:{n}"))
+            .await
+            .expect("a new marker");
         assert_eq!(m.get_str("processor").unwrap(), "default");
     }
     assert_eq!(
@@ -1291,7 +1297,8 @@ async fn control_requests_never_hold_the_hub_stream_and_renewals_never_wait() {
     let p = producer(&kafka.bootstrap);
     produce(&p, topic, None, "n-1").await;
     eventually("n-1 handled and committed", WITHIN, || async {
-        handler.count("n-1") == 1 && committed(&kafka.bootstrap, "svc-stream", topic, 0) == 1
+        handler.count("n-1") == 1
+            && committed(&kafka.bootstrap, "svc-stream.default", topic, 0) == 1
     })
     .await;
 

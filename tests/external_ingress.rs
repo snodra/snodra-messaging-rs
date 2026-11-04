@@ -179,7 +179,7 @@ async fn an_accepted_webhook_event_reaches_a_saga() {
     assert_eq!(wh.hooks("j1").await, Some(1));
     assert_eq!(*wh.handlers.seen.lock().unwrap(), ["j1"]);
     assert!(
-        wh.store.marker("printer:evt-1").await,
+        wh.store.marker("processor:default:printer:evt-1").await,
         "the dedupe id is <source>:<dedupeKey>"
     );
     assert!(wh.store.marker("saga:wh.Job:printer:evt-1").await);
