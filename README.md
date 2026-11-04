@@ -696,7 +696,9 @@ let app = KrakenMessaging::builder(Config::from_env()?).await?
     })
     // A partner's Kafka topic: records become local events (never republished to kraken.events).
     .external_source("printer-banner", ExternalSource::new("printer.banner.events"), |record| {
-        let n: Notification = serde_json::from_slice(record.payload().unwrap_or_default())?;
+        // Malformed never heals: InvalidMessage skips the record at once (a bare `?` is Serialization, retried first).
+        let n: Notification = serde_json::from_slice(record.payload().unwrap_or_default())
+            .map_err(|e| MessagingError::InvalidMessage(format!("not a printer notification: {e}")))?;
         Ok(Some(TranslatedEvent::new(&BannerPrinted { job_id: n.job_id }, Some(n.delivery_id))?))
     })
     .start()

@@ -530,7 +530,8 @@ impl KrakenMessagingBuilder {
 
     /// A partner's Kafka topic whose records become local kraken events (ADR 0021 ruling 20,
     /// spec "Inbound 1"): `translator` turns each record into an event (`Ok(None)` ignores it, an
-    /// error retries it up to `KRAKEN_CONSUMER_MAX_ATTEMPTS` times and then skips it), which is
+    /// error retries it up to `KRAKEN_CONSUMER_MAX_ATTEMPTS` times and then skips it, an
+    /// `InvalidMessage` skips it at once: map a record that cannot be read to it), which is
     /// dispatched locally to this service's event handlers and sagas, never published to
     /// `kraken.events`. The dedupe id is `<name>:<partition>:<offset>`, or `<name>:<dedupeKey>`
     /// when the translation carries one. A `properties` entry for a key the library fixes, an
@@ -539,7 +540,10 @@ impl KrakenMessagingBuilder {
     ///
     /// ```ignore
     /// builder.external_source("printer-banner", ExternalSource::new("partner.printer.banner"), |record| {
-    ///     let reply: PrinterReply = serde_json::from_slice(record.payload().unwrap_or_default())?;
+    ///     // A record that is not a reply never will be: InvalidMessage skips it at once (a bare
+    ///     // `?` would make it Serialization, retried up to the attempt limit first).
+    ///     let reply: PrinterReply = serde_json::from_slice(record.payload().unwrap_or_default())
+    ///         .map_err(|e| MessagingError::InvalidMessage(format!("not a printer reply: {e}")))?;
     ///     Ok(Some(TranslatedEvent::new(&BannerPrinted { job_id: reply.job_id }, Some(reply.event_id))?))
     /// })
     /// ```
