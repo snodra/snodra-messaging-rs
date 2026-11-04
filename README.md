@@ -31,6 +31,7 @@ indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
 | Subscription queries: an initial result, then updates pushed by every owner instance | `subscription_query`, `QueryUpdateEmitter`, `Sender::subscribe` (see [Subscription queries](#subscription-queries)) |
 | Publish events through the Mongo outbox, relay to Kafka | `kafka::EventBus`, `kafka::OutboxPublisher` |
 | Consume events idempotently (marker + handler in one transaction) | `kafka::EventConsumer` |
+| Named event processors (own consumer group, markers, status), dead letters with an admin API | `event_in`, `app.dead_letters()`, `app.processors()` (see [Event processors](#event-processors), [Dead letters](#dead-letters)) |
 | Identity from the forwarded JWT: JWKS verification or unverified parsing; handler guards | `identity::{IdentityResolver, JwksVerifier, Guard}` |
 | Sagas and deadlines on the Kotlin starter's collections, the relay, parked events | `KrakenMessagingBuilder::saga`, `saga::SagaContext`, `app.saga_failures()` (see [Sagas](#sagas)) |
 | Idempotent adapters, partner Kafka topics, webhooks; saga statistics | `idempotent_command`, `external_source`, `app.ingress()`, `external::webhook::verify`, `app.saga_stats()` |
@@ -47,6 +48,8 @@ indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
 - [Streaming queries](#streaming-queries)
 - [Subscription queries](#subscription-queries)
 - [Sagas](#sagas)
+- [Event processors](#event-processors)
+- [Dead letters](#dead-letters)
 - [Security](#security)
 - [Upgrading](#upgrading)
 - [Build and test](#build-and-test)
@@ -140,7 +143,9 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 | `KRAKEN_HUB_TLS_CA` | none (system roots) | PEM file with the CA that signs the hub's certificate (`HubTls.ca_file`), re-read on every connect; needs `KRAKEN_HUB_TLS=true` |
 | `KRAKEN_HUB_TLS_SERVER_NAME` | the host of the address (for `dns:///name:port`, `name`) | the name the hub's certificate must carry, also sent as SNI (`HubTls.server_name`); needs `KRAKEN_HUB_TLS=true` |
 | `KRAKEN_HUB_TLS_CLIENT_CERT`, `KRAKEN_HUB_TLS_CLIENT_KEY` | none | the client certificate chain (leaf first) and its PKCS#8 PEM private key for mutual TLS (`HubTls.client_cert_file`, `HubTls.client_key_file`); both or neither; **they turn TLS on** like `KRAKEN_HUB_TLS=true` (`KRAKEN_HUB_TLS=false` next to them is an error); exclude `KRAKEN_HUB_TOKEN*` and `KRAKEN_HUB_OAUTH2_*` (one credential kind per service; a startup error naming both); the files are checked at startup. See [Authenticating with a client certificate](#authenticating-with-a-client-certificate-mtls) |
-| `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS` | true, 5 | consumer starts only when event handlers are registered |
+| `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS` | true, 5 | one consumer per [event processor](#event-processors) with handlers (`default` also for sagas alone); the attempts and the 1 s backoff are shared by every processor |
+| `KRAKEN_KAFKA_DEAD_LETTER_MODE` | `collection` | where a record a processor cannot handle goes (see [Dead letters](#dead-letters)): `collection` (`dead_letters`, sequenced per key, admin API), `topic` (`<topic>.dlt`) or `log` (logged and skipped, the behaviour before P6a); case-insensitive, anything else is a startup error |
+| `KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS` | 2592000000 (30 d) | how long a letter is kept (`expireAt` = `parkedAt` + this; a TTL index removes it then, which unblocks its key); at least 1000 (a startup error otherwise, also when set in code) |
 | `KRAKEN_OUTBOX_ENABLED`, `KRAKEN_OUTBOX_POLL_INTERVAL_MS`, `KRAKEN_OUTBOX_BATCH_SIZE`, `KRAKEN_OUTBOX_MAX_ATTEMPTS` | true, 200, 100, 10 | |
 | `KRAKEN_FORWARD_JWT` | true | |
 
@@ -159,10 +164,14 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
   becomes `HANDLER_ERROR "handler panicked"`, never a dropped stream.
 - **Guards** run before the payload is decoded: anonymous → `UNAUTHENTICATED`, refused → `PERMISSION_DENIED`.
 - **Unit replies** travel as `{}`; an `Option::None` reply stays `null`.
-- **Consumer**: one record at a time; marker inserted first (a duplicate id never reaches the handler),
-  handlers run, commit, then the offset. A failing or panicking handler is retried `max_attempts`
-  times with 1 s backoff, then logged (type, id, topic-partition@offset, never the payload) and skipped.
-  Records without `type`, with an unhandled type, or with a non-object payload are skipped.
+- **Consumer** (one per [event processor](#event-processors)): one record at a time; marker
+  inserted first (a duplicate id never reaches the handler), handlers run, commit, then the offset.
+  A failing or panicking handler is retried `max_attempts` times with 1 s backoff (a payload the
+  event type cannot be read from, `InvalidMessage`, is not retried), then the record becomes a
+  [dead letter](#dead-letters) before its offset is committed (mode `log`: logged, type, id,
+  topic-partition@offset, never the payload, and skipped). Records with an unhandled type are
+  skipped; records without `type`, or with a non-object payload for a handled type, are INVALID
+  letters.
 - **Outbox**: `publish` inserts; the publisher relays in `createdAt, seq` order, stops the batch on a
   retriable failure, marks `failedAt` after 10 attempts, or at once for non-retriable failures (oversized record, invalid or
   unauthorized topic). Delivery budget per attempt is 30 s, as in the Kotlin producer. `userId` header is `""` when anonymous.
@@ -179,7 +188,7 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
   not count). `app.hub_ids()` lists the hubs registered on now. kraken-messaging (Kotlin) differs
   here: its `HubConnections.awaitRegistered` waits for every hub, like `await_all_hubs`.
 - **Handshake** (hub protocol v2, ADR 0013): `Register` carries `protocol_version = 2`, the
-  capabilities (`flow-control`, `instance-status`, `scatter-gather`, `streaming`, `subscription`) and `client_version = kraken-messaging-rs/<version>`. A v2 hub answers with a
+  capabilities (`flow-control`, `instance-status`, `scatter-gather`, `streaming`, `subscription`, `credentials-refresh`, `processors`) and `client_version = kraken-messaging-rs/<version>`. A v2 hub answers with a
   `RegisterAck` before it echoes the first heartbeat; the client then heartbeats at the announced
   interval (3 s; the hub evicts after 10 s) and sends `timeout_ms = 0` unless a timeout was chosen,
   guarding locally with the ack's per-type or maximum timeout plus 1 s. When the echo arrives without
@@ -839,6 +848,134 @@ The behaviour is ADR 0021's rulings 1 to 46; where Rust differs, the S2 ruling s
 - A deadline's `payloadType` is `std::any::type_name` of its payload (Kotlin: the `@MessageType` name or the FQCN).
 - `SagaTestFixture` is in the crate behind a feature (Kotlin: `kraken-messaging-test`) and panics instead of throwing.
 
+## Event processors
+
+Each **event processor** is its own Kafka consumer on the events topic, with its own consumer
+group, position, markers, dead letters and failure domain (ADR 0022; Axon's processing groups, the
+Kotlin starter's `@ProcessingGroup`). A slow or failing handler in one processor never holds
+another.
+
+```rust,ignore
+let app = KrakenMessaging::builder(config).await?
+    .event::<OrderPlaced, _, _>(|e, ctx| async move { /* default */ Ok(()) })
+    .event_in::<OrderPlaced, _, _>("projections", |e, ctx| async move { /* its own consumer */ Ok(()) })
+    .event_in::<OrderShipped, _, _>("projections", |e, ctx| async move { Ok(()) })
+    .start()
+    .await?;
+```
+
+| Processor | Registered with | Consumer group | Markers in `processed_events` | Sagas |
+|---|---|---|---|---|
+| `default` | `event`, `idempotent_event` | the service name (as before P6a) | `<eventId>` (as before) | yes |
+| `<name>` | `event_in(name, ..)` | `<service>.<name>` | `processor:<name>:<eventId>` | no (stage 1 only) |
+
+- **Names** match `^[a-z0-9][a-z0-9-]{0,47}$` and are not `default`; a violation fails `start()`
+  naming the handler (`event handler for <type>: processor name ...`).
+- **One event type in several processors**: each gets every record and handles it in its own
+  transaction with its own marker; a failure in one does not touch the other.
+- **A processor starts only when it has handlers** (`default` also when only sagas run there) and
+  `KRAKEN_CONSUMER_ENABLED` is not `false`. Attempts and back-off are the shared consumer settings.
+- **Other entry points** (partner topics, the webhook ingress, the relay's `SagaCommandFailed`
+  notices) dispatch locally to every processor's handlers, each in its own transaction and marker
+  family, and to the sagas once; they are never dead-lettered (their own retry rules stay).
+- **External source names** `processor`, `saga`, `ingress` and `failed` are refused (they are the
+  library's marker families).
+
+### Status
+
+Every status interval (`KRAKEN_HUB_STATUS_INTERVAL_MS`, 5 s) each instance reports one
+`ProcessorStatus` per started processor to every hub whose ack lists the capability `processors`
+(the P6a hub; an older hub never gets the field). The hub shows them in its topology,
+`GET /api/v1/processors` and the dashboard's Processors page. `app.processors()` returns the same
+list locally.
+
+| Field | Source |
+|---|---|
+| `state` | STOPPED once stopping; else FAILING for 60 s after a record exhausted its attempts, a letter could not be parked (or produced to the DLT), or the consumer reported an error; else STARTING before the first assignment and between a revoke and the next assign (an empty assignment counts: such an instance is RUNNING); else RUNNING |
+| `partitions` | the assignment (rebalance callbacks), sorted; per partition `position` (the next offset after the last record this instance acknowledged since the assignment, else -1), `committed` and `high_watermark` (-1 unknown) and `lag` (`high_watermark - committed`, without a commit `high_watermark - position`; -1 unknown; never negative) |
+| `committed`, `high_watermark` | read every 5 s **on a blocking thread** with librdkafka's `committed_offsets` and `fetch_watermarks` (2 s timeout each), so a busy handler or a slow broker never stalls the consumer task or the hub stream |
+| `processed_total`, `failed_total` | records whose dispatch completed without a stage-1 failure, and records that exhausted their attempts, since start (SEQUENCED and INVALID letters count in neither) |
+| `dead_letters` | `countDocuments({processor})` at start, every 30 s and right after this instance parked a letter; 0 unless mode `collection` |
+| `last_error`, `last_error_at_ms` | `<error variant>: <message>` of the last failure (never the payload), cut at 512 bytes |
+| `event_types`, `dead_letter_mode` | the processor's types (`default` with the saga types), sorted; the mode |
+
+## Dead letters
+
+A record a processor cannot handle is kept, not lost (ADR 0022). `KRAKEN_KAFKA_DEAD_LETTER_MODE`
+chooses where it goes:
+
+| Mode | What happens | Sequenced per key | Admin API |
+|---|---|---|---|
+| `collection` (default) | parked in the `dead_letters` collection, then the offset is committed | yes | `app.dead_letters()` |
+| `topic` | produced to `<topic>.dlt` (same key and value, the original headers plus `kraken-dlt-processor`, `kraken-dlt-reason`, `kraken-dlt-error` (`<type>: <message>`, at most 2000 characters), `kraken-dlt-original-topic`, `-partition`, `-offset`); the offset is committed once the broker acknowledged it. **The DLT must exist or broker auto-creation must be on** | no | none (the topic is the operator's) |
+| `log` | logged and skipped (the behaviour before P6a) | no | none |
+
+**Reasons** (per processor, stage 1 only; saga failures keep `saga_failures`):
+
+- `HANDLER_FAILED`: the processor's handlers failed on every attempt (`attempts` = the invocations
+  made; one for a payload the type cannot be read from).
+- `SEQUENCED`: the record's Kafka key has an earlier letter in this processor; it is parked
+  without running the handlers (`blockedBy` names the key's head letter). **The sagas still see
+  it.** A record without a key is never sequenced.
+- `INVALID`: no `type` header, or a value that is not a JSON object for a type the processor
+  handles. It blocks nothing and can only be discarded. A type no handler of the processor knows
+  is skipped, not a letter.
+
+**Guarantees.** A letter is a single insert outside any transaction, keyed
+`<processor>:<topic>:<partition>:<offset>`, so a redelivered record is parked once. **The offset
+is committed only after the letter exists**: when MongoDB refuses it the consumer retries the
+insert every second (the processor turns FAILING) and the record stays unacknowledged until it is
+parked or the service stops. Sequencing keeps an in-memory set of the parked keys of the
+partitions this instance holds (loaded on every assignment, added to on every park); a record
+whose key is in the set is confirmed against the collection first, and a miss (another instance
+retried or discarded the letters) removes the key and handles the record normally. **A letter that
+expires** (`KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS`, 30 d; TTL index on `expireAt`) **unblocks its
+key**.
+
+### The admin API
+
+```rust,ignore
+use kraken_messaging::processors::{RetryResult, DEFAULT_LIST_LIMIT};
+
+let letters = app.dead_letters();
+for letter in letters.list(Some("projections"), DEFAULT_LIST_LIMIT).await? { /* parkedAt, then _id */ }
+let one = letters.get("projections:kraken.events:1:42").await?;           // Option<DeadLetterDocument>
+let n = letters.count(None).await?;                                        // every processor
+match letters.retry("projections:kraken.events:1:42").await? {
+    RetryResult::Retried | RetryResult::Duplicate => {}                    // deleted
+    RetryResult::Failed(message) => {}                                     // attempts + 1, kept
+    RetryResult::Blocked(head_id) => {}                                    // retry or discard the head first
+    RetryResult::NotRetriable | RetryResult::NotFound => {}                // INVALID / no such letter
+}
+let all = letters.retry_all("projections").await?;                         // RetryAllResult { retried, failed, blocked, skipped }
+let gone = letters.discard("projections:kraken.events:1:43").await?;       // true when deleted
+```
+
+- **Any instance** of the service serves it, for the processors with handlers there (whether or
+  not it consumes); a processor it does not run is an error naming it (`list(None, ..)` and
+  `count(None)` cover every letter). In modes `topic` and `log` every call is an error naming the
+  mode.
+- **`retry` is exactly-once with respect to the handlers**: the processor's handlers for the type
+  run in the marker transaction, and the letter's deletion is in the same transaction, so a
+  failure leaves the letter (updated: `attempts + 1`, `error`, `lastAttemptAt`, reason
+  `HANDLER_FAILED`, no `blockedBy`) and a crash can neither handle it twice nor handle it and keep
+  it. One attempt per call, no back-off; the sagas are not re-run (they saw the record when it was
+  parked). A marker that exists already is `Duplicate` (the letter is deleted). A letter whose type
+  no handler of the processor handles any more is `Failed("no handler for <type> in processor
+  <name>")`.
+- **`retry_all`** goes per key in offset order (keys in their head letters' `parkedAt` order), a
+  key stopping at its first failure (its later letters count as `blocked`), then the keyless
+  letters in `parkedAt` order; INVALID letters are `skipped`.
+- **`discard`** deletes a letter; discarding a key's head unblocks its next letter.
+
+The document (the same from both libraries, contract fixtures in
+`tests/fixtures/dead_letters_contract`): `_id`, `processor`, `topic`, `partition` (Int32), `offset`
+(Int64), `key` (absent without one), `eventId`, `eventType` (absent when missing), `headers`,
+`payload` (UTF-8 text) or `payloadBinary` (BinData, when not UTF-8; neither when empty), `reason`,
+`error {type, message}`, `blockedBy` (SEQUENCED), `attempts` (Int32), `parkedAt`, `lastAttemptAt`,
+`expireAt`. Indexes: `dead_letters_processor_key_offset`, `dead_letters_processor_parked`,
+`dead_letters_expire` (TTL, `expireAfterSeconds: 0`).
+
 ## Security
 
 Access control and TLS for the hub connection (roadmap P5a, hub ADR 0018). Everything here is opt-in
@@ -1108,7 +1245,20 @@ presents the hub's own pair under `required`, stays healthy.
 
 ## Upgrading
 
-What changes for a service moving to this version (S2, then P5c, then P5b, then P5a, then P4c, then P4b):
+What changes for a service moving to this version (P6a, then S2, then P5c, then P5b, then P5a, then P4c, then P4b):
+
+- **Event processors and dead letters (P6a).** The handlers registered with `event()` stay in processor `default` with the
+  same consumer group (the service name) and the same `<eventId>` markers: an upgrade re-handles nothing. What changes for
+  every service: **a record whose handlers fail every attempt is no longer skipped but parked** in `dead_letters` (mode
+  `collection`, the default), and **later records of its Kafka key wait behind it** (SEQUENCED) until it is retried or
+  discarded; `KRAKEN_KAFKA_DEAD_LETTER_MODE=log` keeps the old log-and-skip. A record without a `type` header or with a
+  non-object payload is parked as INVALID (blocks nothing). A payload that does not fit the event type is now
+  `MessagingError::InvalidMessage` (was `Serialization`) and is not retried. `Config` gained `dead_letter_mode` and
+  `dead_letter_retention` (`Config::new` sets them); `start()` creates the three `dead_letters` indexes. External source
+  and webhook source names `processor`, `saga`, `ingress` and `failed` are refused. The `Register` declares the
+  capability `processors`; a hub before P6a ignores it and gets no processor status. `kafka::EventConsumer::new` /
+  `with_saga_stage` / `with_dispatcher` keep their old behaviour (mode `log`, processor `default`); the builder uses
+  `EventConsumer::processor`. See [Event processors](#event-processors) and [Dead letters](#dead-letters).
 
 - **Sagas (S2).** Nothing changes for a service that registers no saga, idempotent handler or partner source: none of the
   runtime, relay, scheduler, `external_calls` indexes or partner consumers is built. What every service sees: `Config` gained
