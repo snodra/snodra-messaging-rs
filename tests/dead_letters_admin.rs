@@ -187,6 +187,7 @@ struct Letter<'a> {
     key: Option<&'a str>,
     order: &'a str,
     event_id: Option<&'a str>,
+    type_name: &'a str,
     reason: DeadLetterReason,
     /// Milliseconds after a fixed base, for `parkedAt`.
     parked: i64,
@@ -200,6 +201,7 @@ impl<'a> Letter<'a> {
             key,
             order,
             event_id: Some(order),
+            type_name: "t.Placed",
             reason: DeadLetterReason::HandlerFailed,
             parked: offset,
         }
@@ -215,13 +217,18 @@ impl<'a> Letter<'a> {
         self
     }
 
+    fn typed(mut self, type_name: &'a str) -> Self {
+        self.type_name = type_name;
+        self
+    }
+
     fn without_id(mut self) -> Self {
         self.event_id = None;
         self
     }
 
     fn document(&self) -> DeadLetterDocument {
-        let mut headers = vec![("type".to_string(), b"t.Placed".to_vec())];
+        let mut headers = vec![("type".to_string(), self.type_name.as_bytes().to_vec())];
         if let Some(id) = self.event_id {
             headers.push(("id".to_string(), id.as_bytes().to_vec()));
         }
@@ -594,6 +601,36 @@ async fn retry_all_goes_per_key_in_offset_order_and_a_key_stops_at_its_first_fai
         "a-1..3, n-2, x"
     );
     assert_eq!(admin.count(Some("default")).await.unwrap(), 1);
+}
+
+/// A letter removed by someone else before its turn (another instance retried or discarded it)
+/// is `NotFound`, counted as skipped, never `Failed`: here on the "no handler" path, whose
+/// failure update matched nothing.
+#[tokio::test]
+async fn a_letter_removed_before_its_turn_in_retry_all_is_skipped_not_failed() {
+    require_docker!();
+    let f = Fixture::start().await;
+    let admin = f.admin(DeadLetterMode::Collection);
+    f.park(&Letter::new("orders", 1, None, "o-1").parked(1))
+        .await;
+    let gone = f
+        .park(
+            &Letter::new("orders", 2, None, "o-2")
+                .typed("t.Unknown")
+                .parked(2),
+        )
+        .await;
+    *f.vanish.lock().unwrap() = Some(gone.clone()); // removed while o-1 is retried
+    assert_eq!(
+        admin.retry_all("orders").await.unwrap(),
+        RetryAllResult {
+            retried: 1,
+            failed: 0,
+            blocked: 0,
+            skipped: 1
+        }
+    );
+    assert!(f.letter(&gone).await.is_none());
 }
 
 #[tokio::test]

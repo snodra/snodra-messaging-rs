@@ -158,14 +158,16 @@ impl DeadLetterStore {
     }
 
     /// A retry failed again: `attempts + 1`, the new error, `lastAttemptAt`, reason
-    /// HANDLER_FAILED, no `blockedBy` any more.
+    /// HANDLER_FAILED, no `blockedBy` any more. False when the letter is gone (retried or
+    /// discarded meanwhile, possibly on another instance).
     pub async fn record_failure(
         &self,
         id: &str,
         error: &DeadLetterError,
         now: DateTime,
-    ) -> Result<(), MessagingError> {
-        self.letters
+    ) -> Result<bool, MessagingError> {
+        Ok(self
+            .letters
             .update_one(
                 doc! { "_id": id },
                 doc! {
@@ -178,8 +180,9 @@ impl DeadLetterStore {
                     "$unset": { "blockedBy": "" },
                 },
             )
-            .await?;
-        Ok(())
+            .await?
+            .matched_count
+            == 1)
     }
 }
 

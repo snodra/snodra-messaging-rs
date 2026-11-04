@@ -154,15 +154,13 @@ impl DeadLetters {
                 "no handler for {type_name} in processor {}",
                 letter.processor
             );
-            self.inner
-                .store
-                .record_failure(
+            return self
+                .failed(
                     &letter.id,
-                    &DeadLetterError::new("NoHandler", &message),
-                    DateTime::now(),
+                    DeadLetterError::new("NoHandler", &message),
+                    message,
                 )
-                .await?;
-            return Ok(RetryResult::Failed(message));
+                .await;
         }
         let dedupe_id = letter.dedupe_id();
         let headers: HashMap<String, String> = letter
@@ -193,23 +191,33 @@ impl DeadLetters {
                 self.inner.store.delete(&letter.id).await?;
                 Ok(RetryResult::Duplicate)
             }
-            // A write conflict with another instance's removal of the letter, seen as an error.
-            Err(_) if self.inner.store.get(&letter.id).await?.is_none() => {
-                Ok(RetryResult::NotFound)
-            }
+            // Also a write conflict with another instance's removal of the letter, seen as an
+            // error: the failure update then matches nothing (NotFound).
             Err(e) => {
-                tracing::warn!(letter = %letter.id, r#type = %type_name, "dead letter retry failed: {e}");
-                self.inner
-                    .store
-                    .record_failure(
-                        &letter.id,
-                        &DeadLetterError::from_error(&e),
-                        DateTime::now(),
-                    )
-                    .await?;
-                Ok(RetryResult::Failed(e.to_string()))
+                self.failed(&letter.id, DeadLetterError::from_error(&e), e.to_string())
+                    .await
             }
         }
+    }
+
+    /// Records a failed retry on the letter: `Failed(message)`, or `NotFound` when the letter was
+    /// removed meanwhile (the update matched nothing), as Kotlin answers.
+    async fn failed(
+        &self,
+        id: &str,
+        error: DeadLetterError,
+        message: String,
+    ) -> Result<RetryResult, MessagingError> {
+        if !self
+            .inner
+            .store
+            .record_failure(id, &error, DateTime::now())
+            .await?
+        {
+            return Ok(RetryResult::NotFound);
+        }
+        tracing::warn!(letter = %id, "dead letter retry failed: {}: {}", error.type_name, error.message);
+        Ok(RetryResult::Failed(message))
     }
 
     /// Retries every letter of `processor`: per key in offset order (the keys in the order of their
