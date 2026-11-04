@@ -103,6 +103,9 @@ pub const SUBSCRIPTION: &str = "subscription";
 /// session's credential before a JWT expires; sent only to a hub whose ack lists it. Declared by
 /// every `Register`, token sessions included.
 pub const CREDENTIALS_REFRESH: &str = "credentials-refresh";
+/// The event processor status capability (ADR 0022, P6a): `InstanceStatus.processors` is filled
+/// only on a stream whose ack lists it (and `instance-status`, which carries the message).
+pub const PROCESSORS: &str = "processors";
 /// Optional protocol features this client declares (`Register.capabilities`).
 pub const CAPABILITIES: &[&str] = &[
     FLOW_CONTROL,
@@ -111,6 +114,7 @@ pub const CAPABILITIES: &[&str] = &[
     STREAMING,
     SUBSCRIPTION,
     CREDENTIALS_REFRESH,
+    PROCESSORS,
 ];
 /// A `Permits` message is sent as soon as this many grants are pending, or as soon as the hub holds
 /// no more than `min(PERMIT_BATCH, initial_permits / 2)` permits for the stream (the low-water mark)...
@@ -243,6 +247,11 @@ impl Handshake {
     /// True when the hub shares `instance-status`: it keeps our `InstanceStatus` reports.
     pub fn instance_status(&self) -> bool {
         self.shares(INSTANCE_STATUS)
+    }
+
+    /// True when the hub shares `processors` (ADR 0022): our reports carry the processor status.
+    pub fn processors(&self) -> bool {
+        self.shares(PROCESSORS)
     }
 
     /// True when the hub shares `scatter-gather`: it fans a scatter-gather query out and knows
@@ -2097,7 +2106,8 @@ mod tests {
                 "scatter-gather",
                 "streaming",
                 "subscription",
-                "credentials-refresh"
+                "credentials-refresh",
+                "processors"
             ]
         );
         assert!(CLIENT_VERSION.starts_with("kraken-messaging-rs/"));

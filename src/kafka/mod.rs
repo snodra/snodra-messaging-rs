@@ -9,7 +9,9 @@ mod outbox;
 mod publisher;
 
 pub(crate) use consumer::message_context;
-pub use consumer::{EventConsumer, RecordDisposition, classify, classify_with};
+pub use consumer::{
+    EventConsumer, ProcessorContext, ProcessorSettings, RecordDisposition, classify, classify_with,
+};
 pub use dispatch::{LocalEventDispatcher, NoSagas, SagaStage};
 pub use indexes::ensure_indexes;
 pub(crate) use outbox::payload_document;

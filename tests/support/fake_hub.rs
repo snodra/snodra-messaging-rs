@@ -1,8 +1,8 @@
 //! In-process stand-in for kraken-hub: records registrations, answers a v2 `Register` with a
 //! `RegisterAck` (new-hub behaviour, the default) or not at all (old-hub behaviour, `set_ack(None)`).
 //! The ack lists "flow-control" when the client declared it, unless `set_flow_control(false)`
-//! (the P0 hub), and "instance-status" likewise unless `set_instance_status(false)` (hubs before
-//! P3). Permits and InstanceStatus messages are recorded per stream. It
+//! (the P0 hub), "instance-status" likewise unless `set_instance_status(false)` (hubs before
+//! P3), and "processors" unless `set_processors(false)` (hubs before P6a). Permits and InstanceStatus messages are recorded per stream. It
 //! echoes heartbeats, can drop streams, reject a registration, push requests to clients and answer
 //! their requests.
 //!
@@ -376,6 +376,7 @@ pub struct State {
     permit_cap: AtomicBool,
     permit_grants: AtomicBool,
     instance_status: AtomicBool,
+    processors: AtomicBool,
     /// InstanceStatus messages: (stream number, report).
     statuses: StdMutex<Vec<(usize, proto::InstanceStatus)>>,
     down: AtomicBool,
@@ -1887,6 +1888,7 @@ impl Hub for Service {
                                 let wants_streaming = r.capabilities.iter().any(|c| c == "streaming");
                                 let wants_subscription = r.capabilities.iter().any(|c| c == "subscription");
                                 let wants_refresh = r.capabilities.iter().any(|c| c == "credentials-refresh");
+                                let wants_processors = r.capabilities.iter().any(|c| c == "processors");
                                 state.log(Event::Register { stream: stream_no, types: r.command_types.len() + r.query_types.len() + r.shared_query_types.len() });
                                 let scatter = wants_scatter && v2 && state.scatter_gather.load(Ordering::SeqCst) && state.ack.lock().unwrap().is_some();
                                 let streaming = wants_streaming && v2 && state.streaming.load(Ordering::SeqCst) && state.ack.lock().unwrap().is_some();
@@ -1936,6 +1938,9 @@ impl Hub for Service {
                                     }
                                     if wants_refresh && state.credentials_refresh.load(Ordering::SeqCst) {
                                         ack.capabilities.push("credentials-refresh".to_string());
+                                    }
+                                    if wants_processors && state.processors.load(Ordering::SeqCst) {
+                                        ack.capabilities.push("processors".to_string());
                                     }
                                     ack
                                 });
@@ -2164,6 +2169,7 @@ impl FakeHub {
             permit_cap: AtomicBool::new(true),
             permit_grants: AtomicBool::new(true),
             instance_status: AtomicBool::new(true),
+            processors: AtomicBool::new(true),
             statuses: StdMutex::new(vec![]),
             down: AtomicBool::new(false),
             replace_sessions: AtomicBool::new(true),
@@ -2288,6 +2294,12 @@ impl FakeHub {
     /// before P3).
     pub fn set_instance_status(&self, on: bool) {
         self.state.instance_status.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether the ack shares "processors" with clients that declare it (`false`: a hub before
+    /// P6a).
+    pub fn set_processors(&self, on: bool) {
+        self.state.processors.store(on, Ordering::SeqCst);
     }
 
     /// Whether the ack shares "scatter-gather" with clients that declare it (`false`: a P3 hub).

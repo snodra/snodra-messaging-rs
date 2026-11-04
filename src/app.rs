@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::config::Config;
+use crate::config::DeadLetterMode;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
 use crate::external::kafka::{SourceRegistration, validate_source};
@@ -42,8 +43,14 @@ use crate::hub::{
 use crate::identity::{Guard, IdentityResolver, JwksVerifier};
 use crate::kafka::{
     EventBus, EventConsumer, LocalEventDispatcher, NoSagas, OUTBOX_COLLECTION, OutboxPublisher,
-    PROCESSED_EVENTS_COLLECTION, SagaStage, ensure_indexes,
+    PROCESSED_EVENTS_COLLECTION, ProcessorSettings, SagaStage, ensure_indexes,
 };
+use crate::processors::dead_letters::ensure_dead_letter_indexes;
+use crate::processors::{
+    DEFAULT_PROCESSOR, DeadLetters, ProcessorMonitor, group_id, marker_prefix,
+    validate_processor_name,
+};
+use crate::proto::ProcessorStatus;
 use crate::saga::{
     Clock, DeadlineScheduler, LocalFirstSender, RawCommandSender, SagaDefinition,
     SagaDispatchRelay, SagaFailures, SagaPorts, SagaRetry, SagaRuntime, SagaStats, SagaType,
@@ -77,6 +84,10 @@ pub struct KrakenMessagingBuilder {
     stats: SagaStats,
     /// "Now" for the saga runtime, relay, scheduler, idempotent handlers and ingress.
     clock: Clock,
+    /// The named event processors' handlers (ADR 0022), by processor name.
+    processors: std::collections::BTreeMap<String, HandlerRegistry>,
+    /// Invalid processor names given to `event_in`, returned by `start()`.
+    processor_errors: Vec<MessagingError>,
 }
 
 pub struct KrakenMessaging {
@@ -98,6 +109,9 @@ pub struct KrakenMessaging {
     saga_cancel: CancellationToken,
     saga_tasks: Vec<JoinHandle<()>>,
     clock: Clock,
+    /// One per started event processor, `default` first.
+    monitors: Vec<Arc<ProcessorMonitor>>,
+    dead_letters: DeadLetters,
 }
 
 impl KrakenMessaging {
@@ -140,8 +154,24 @@ impl KrakenMessaging {
             sources: Vec::new(),
             stats: SagaStats::new(),
             clock: Clock::system(),
+            processors: std::collections::BTreeMap::new(),
+            processor_errors: Vec::new(),
             config,
         })
+    }
+
+    /// The dead-letter admin API (ADR 0022): list, get, count, retry, retry_all and discard the
+    /// letters in `dead_letters` of the processors this instance runs. In modes `topic` and `log`
+    /// every call is an error naming the mode. See [`DeadLetters`].
+    pub fn dead_letters(&self) -> DeadLetters {
+        self.dead_letters.clone()
+    }
+
+    /// The status of every event processor this instance started (`default` first, then the
+    /// named ones by name), as the hubs that share the `processors` capability get it every
+    /// status interval. Empty when the consumer is disabled or no processor has handlers.
+    pub fn processors(&self) -> Vec<ProcessorStatus> {
+        self.monitors.iter().map(|m| m.status()).collect()
     }
 
     /// Sends commands over the hub.
@@ -388,6 +418,8 @@ impl KrakenMessagingBuilder {
         self
     }
 
+    /// An event handler in the unnamed processor `default` (with the sagas): the service's
+    /// consumer group and the plain `<eventId>` markers.
     pub fn event<E, F, Fut>(mut self, handler: F) -> Self
     where
         E: Event,
@@ -395,6 +427,34 @@ impl KrakenMessagingBuilder {
         Fut: Future<Output = Result<(), MessagingError>> + Send + 'static,
     {
         self.registry.event::<E, F, Fut>(handler);
+        self
+    }
+
+    /// An event handler in the named processor `processor` (ADR 0022, Axon's processing group):
+    /// its own Kafka consumer in group `<service>.<processor>`, its own markers
+    /// (`processor:<processor>:<eventId>`), position, dead letters and failure domain, so a slow
+    /// or failing handler there never holds the other processors. Stage 1 only: sagas run in
+    /// `default`. The name matches `^[a-z0-9][a-z0-9-]{0,47}$` and is not `default`; otherwise
+    /// [`start`](Self::start) fails naming the handler. One event type may be handled in several
+    /// processors; each gets every record.
+    ///
+    /// ```ignore
+    /// builder.event_in::<OrderPlaced, _, _>("projections", |e, ctx| async move { ... })
+    /// ```
+    pub fn event_in<E, F, Fut>(mut self, processor: &str, handler: F) -> Self
+    where
+        E: Event,
+        F: Fn(E, EventContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), MessagingError>> + Send + 'static,
+    {
+        match validate_processor_name(processor, &format!("event handler for {}", E::TYPE)) {
+            Ok(()) => self
+                .processors
+                .entry(processor.to_string())
+                .or_default()
+                .event::<E, F, Fut>(handler),
+            Err(e) => self.processor_errors.push(e),
+        }
         self
     }
 
@@ -621,8 +681,13 @@ impl KrakenMessagingBuilder {
             sources,
             stats,
             clock,
+            processors: named_registries,
+            processor_errors,
         } = self;
         // Definition errors first: nothing is connected or created for a saga that cannot run.
+        if let Some(e) = processor_errors.into_iter().next() {
+            return Err(e);
+        }
         let saga_types = validate_registrations(sagas)?;
         for source in &sources {
             validate_source(&source.name, &source.source)?;
@@ -701,6 +766,64 @@ impl KrakenMessagingBuilder {
         let handlers = TaskTracker::new();
         let mut tasks = Vec::new();
 
+        // The event processors (ADR 0022): `default` (the ordinary handlers and the sagas; the
+        // consumer also runs for a service whose events only sagas handle), then the named ones.
+        let mut consumers = Vec::new();
+        if config.consumer_enabled {
+            let mut planned: Vec<(String, Arc<LocalEventDispatcher>)> = Vec::new();
+            if !registry.event_types().is_empty() || runtime.is_some() {
+                planned.push((DEFAULT_PROCESSOR.to_string(), Arc::clone(&local)));
+            }
+            for (name, named) in named_registries {
+                planned.push((
+                    name.clone(),
+                    Arc::new(
+                        LocalEventDispatcher::new(
+                            client.clone(),
+                            db.clone(),
+                            Arc::new(named),
+                            Arc::new(NoSagas),
+                        )
+                        .with_marker_prefix(marker_prefix(&name)),
+                    ),
+                ));
+            }
+            if config.dead_letter_mode == DeadLetterMode::Collection && !planned.is_empty() {
+                ensure_dead_letter_indexes(&db).await?;
+            }
+            for (name, dispatcher) in planned {
+                let consumer = EventConsumer::processor(
+                    ProcessorSettings {
+                        group_id: group_id(&config.service_name, &name),
+                        name: name.clone(),
+                        bootstrap_servers: config.kafka_bootstrap.clone(),
+                        topic: config.kafka_topic.clone(),
+                        max_attempts: config.consumer_max_attempts,
+                        backoff: Duration::from_secs(1),
+                        dead_letter_mode: config.dead_letter_mode,
+                        dead_letter_retention: config.dead_letter_retention,
+                        db: Some(db.clone()),
+                    },
+                    Arc::clone(&dispatcher),
+                )?;
+                consumers.push((name, dispatcher, consumer));
+            }
+        }
+        let monitors: Vec<Arc<ProcessorMonitor>> =
+            consumers.iter().map(|(_, _, c)| c.monitor()).collect();
+        let dead_letters = DeadLetters::new(
+            db.clone(),
+            config.dead_letter_mode,
+            consumers
+                .iter()
+                .map(|(name, dispatcher, _)| (name.clone(), Arc::clone(dispatcher)))
+                .collect(),
+        );
+        let reported = monitors.clone();
+        hubs.set_processor_status(Arc::new(move || {
+            reported.iter().map(|m| m.status()).collect()
+        }));
+
         hubs.set_registered_types(registry.registered_types());
         hubs.start();
         let loop_sender = Arc::clone(&sender);
@@ -745,16 +868,7 @@ impl KrakenMessagingBuilder {
             )?;
             tasks.push(publisher.start(cancel.clone()));
         }
-        // The consumer also runs for a service whose events only sagas handle.
-        if config.consumer_enabled && (!registry.event_types().is_empty() || runtime.is_some()) {
-            let consumer = EventConsumer::with_dispatcher(
-                &config.kafka_bootstrap,
-                &config.service_name,
-                &config.kafka_topic,
-                Arc::clone(&local),
-                config.consumer_max_attempts,
-                Duration::from_secs(1),
-            )?;
+        for (_, _, consumer) in consumers {
             tasks.push(consumer.start(cancel.clone()));
         }
         // The relay, the deadline scheduler and the gauge sampler stop on their own token, before
@@ -798,7 +912,7 @@ impl KrakenMessagingBuilder {
             )?;
             tasks.push(sources.start(cancel.clone()));
         }
-        tracing::info!(service = %config.service_name, instance = %hubs.instance_id(), hubs = ?hubs.targets(), commands = ?registry.command_types(), queries = ?registry.exclusive_query_types(), shared_queries = ?registry.shared_query_types(), streaming_queries = ?registry.streaming_query_types(), subscription_queries = ?registry.subscription_query_types(), events = ?registry.event_types(), sagas = ?runtime.as_ref().map(|r| r.saga_types()).unwrap_or_default(), idempotent = ?registry.idempotent_handlers(), "kraken messaging started");
+        tracing::info!(service = %config.service_name, instance = %hubs.instance_id(), hubs = ?hubs.targets(), commands = ?registry.command_types(), queries = ?registry.exclusive_query_types(), shared_queries = ?registry.shared_query_types(), streaming_queries = ?registry.streaming_query_types(), subscription_queries = ?registry.subscription_query_types(), events = ?registry.event_types(), sagas = ?runtime.as_ref().map(|r| r.saga_types()).unwrap_or_default(), idempotent = ?registry.idempotent_handlers(), processors = ?monitors.iter().map(|m| m.name().to_string()).collect::<Vec<_>>(), dead_letter_mode = config.dead_letter_mode.as_str(), "kraken messaging started");
         Ok(KrakenMessaging {
             hubs,
             sender,
@@ -816,6 +930,8 @@ impl KrakenMessagingBuilder {
             saga_cancel,
             saga_tasks,
             clock,
+            monitors,
+            dead_letters,
         })
     }
 }

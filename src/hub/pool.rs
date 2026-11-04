@@ -26,7 +26,8 @@
 //!   gets nothing. Permits are never revoked when N grows. The local concurrency guard stays the
 //!   total.
 //! - **Status.** Every `status_interval` an `InstanceStatus` (acknowledged hub ids, handlers in
-//!   flight) goes to every hub whose ack lists `instance-status`, and never to another.
+//!   flight) goes to every hub whose ack lists `instance-status`, and never to another; it carries
+//!   the event processors' status (ADR 0022) only to the hubs whose ack also lists `processors`.
 //! - **DNS.** A `dns:///name:port` target is resolved at start and every `dns_refresh` into
 //!   `ip:port` targets of one family (IPv4 when any, else IPv6, [`resolved_targets`]): a new
 //!   address gets a connection; a vanished one leaves the routing at once, gets an empty
@@ -73,7 +74,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::MessagingError;
-use crate::proto::{ClientMessage, InstanceStatus, client_message};
+use crate::proto::{ClientMessage, InstanceStatus, ProcessorStatus, client_message};
 use crate::retry::random_unit;
 use crate::security::HubTls;
 
@@ -187,6 +188,10 @@ struct CertificateWatch {
     tick_failure: Option<String>,
 }
 
+/// What the status tick reads the event processors' status from (ADR 0022): an in-memory
+/// snapshot, never a Kafka or Mongo call.
+pub type ProcessorStatusSource = Arc<dyn Fn() -> Vec<ProcessorStatus> + Send + Sync>;
+
 pub struct HubPool {
     settings: HubSettings,
     targets: HubTargets,
@@ -207,6 +212,8 @@ pub struct HubPool {
     probes: Mutex<Vec<PendingProbe>>,
     resolver: Mutex<Resolver>,
     roll_delay: Mutex<RollDelaySource>,
+    /// The event processors' status, for the hubs that share `processors`.
+    processor_status: Mutex<Option<ProcessorStatusSource>>,
     /// Built around one connection the caller owns ([`HubPool::of`]): no tasks of its own.
     external: bool,
     started: AtomicBool,
@@ -294,6 +301,7 @@ impl HubPool {
                 })
             })),
             roll_delay: Mutex::new(Arc::new(|bound| roll_delay(bound, random_unit()))),
+            processor_status: Mutex::new(None),
             external,
             started: AtomicBool::new(false),
             cancel: CancellationToken::new(),
@@ -325,6 +333,12 @@ impl HubPool {
         for m in self.members() {
             m.conn.set_registered_types(types.clone());
         }
+    }
+
+    /// Where every status tick reads the event processors' status (ADR 0022); it goes only to the
+    /// hubs whose ack lists `processors`. Without one (the default) the field is always empty.
+    pub fn set_processor_status(&self, source: ProcessorStatusSource) {
+        *self.processor_status.lock().unwrap() = Some(source);
     }
 
     /// Replaces the resolver of a `dns:///` target (tests); set before [`start`](Self::start).
@@ -810,19 +824,28 @@ impl HubPool {
                 ids.push(l.hub_id.clone());
             }
         }
-        let msg = ClientMessage {
-            message: Some(client_message::Message::Status(InstanceStatus {
-                connected_hub_ids: ids,
-                handlers_in_flight: self.handlers_in_flight().min(u32::MAX as usize) as u32,
-                // Event processor status (ADR 0022) comes with the P6a library slice.
-                processors: Vec::new(),
-            })),
+        let status = InstanceStatus {
+            connected_hub_ids: ids,
+            handlers_in_flight: self.handlers_in_flight().min(u32::MAX as usize) as u32,
+            processors: Vec::new(),
+        };
+        // The processors' status (ADR 0022), read once, only when some hub shares it.
+        let source = self.processor_status.lock().unwrap().clone();
+        let processors = match source {
+            Some(source) if live.iter().any(|l| l.handshake.processors()) => source(),
+            _ => Vec::new(),
         };
         let writes = live
             .iter()
             .filter(|l| l.handshake.instance_status())
             .map(|l| {
-                let msg = msg.clone();
+                let mut status = status.clone();
+                if l.handshake.processors() {
+                    status.processors = processors.clone();
+                }
+                let msg = ClientMessage {
+                    message: Some(client_message::Message::Status(status)),
+                };
                 async move {
                     let _ = tokio::time::timeout(STATUS_WRITE_TIMEOUT, l.conn.send(msg)).await;
                 }

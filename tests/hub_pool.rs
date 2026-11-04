@@ -732,6 +732,47 @@ async fn instance_status_goes_only_to_hubs_sharing_the_capability() {
     c.shutdown().await;
 }
 
+/// ADR 0022: the processor status rides on `InstanceStatus` only to hubs whose ack lists
+/// `processors`; a hub that shares `instance-status` alone gets the report with the field empty.
+#[tokio::test]
+async fn processor_status_goes_only_to_hubs_sharing_the_processors_capability() {
+    let (a, b) = (answering("hub-a").await, answering("hub-b").await);
+    b.set_processors(false); // a P5 hub
+    let c = client_with(settings(addresses(&[&a, &b])), |pool| {
+        pool.set_processor_status(Arc::new(|| {
+            vec![proto::ProcessorStatus {
+                name: "orders".into(),
+                group_id: "svc.orders".into(),
+                state: proto::ProcessorState::ProcessorRunning as i32,
+                ..Default::default()
+            }]
+        }));
+    })
+    .await;
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    let registers = a.registers().await;
+    let declared = &registers[0].capabilities;
+    assert!(
+        declared.contains(&"processors".to_string())
+            && declared.contains(&"instance-status".to_string()),
+        "{declared:?}"
+    );
+    assert!(c.pool.connections()[0].handshake().unwrap().processors());
+    assert!(!c.pool.connections()[1].handshake().unwrap().processors());
+    eventually("both hubs got reports", async || {
+        a.statuses().len() >= 2 && b.statuses().len() >= 2
+    })
+    .await;
+    let (_, last) = a.statuses().last().cloned().unwrap();
+    assert_eq!(last.processors.len(), 1);
+    assert_eq!(last.processors[0].name, "orders");
+    assert!(
+        b.statuses().iter().all(|(_, s)| s.processors.is_empty()),
+        "never to a hub without the capability"
+    );
+    c.shutdown().await;
+}
+
 type Resolved = Arc<Mutex<Vec<SocketAddr>>>;
 
 /// `dns:///`: new addresses get a connection; a vanished one leaves the routing at once and is

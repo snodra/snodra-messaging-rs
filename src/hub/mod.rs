@@ -20,13 +20,15 @@ pub use auth::{
 };
 pub use connection::{
     CAPABILITIES, CLIENT_VERSION, CREDENTIALS_REFRESH, FLOW_CONTROL, Handshake, HubConnection,
-    HubSettings, INSTANCE_STATUS, Inbound, PERMIT_BATCH, PERMIT_FLUSH_AFTER, PROTOCOL_VERSION,
-    RegisteredTypes, ReplyTo, SCATTER_GATHER, STREAMING, SUBSCRIPTION, StreamId,
+    HubSettings, INSTANCE_STATUS, Inbound, PERMIT_BATCH, PERMIT_FLUSH_AFTER, PROCESSORS,
+    PROTOCOL_VERSION, RegisteredTypes, ReplyTo, SCATTER_GATHER, STREAMING, SUBSCRIPTION, StreamId,
 };
 pub(crate) use dispatcher::{AbortOnDrop, invocation_error};
 pub use dispatcher::{AdmissionHook, Dispatcher};
 pub(crate) use mtls::{LoadError, check_valid_at, load as load_client_certificate};
-pub use pool::{DRAIN_LIMIT, HubPool, ROLL_IDLE_LIMIT, ROLL_RECONNECT_LIMIT, Resolver};
+pub use pool::{
+    DRAIN_LIMIT, HubPool, ProcessorStatusSource, ROLL_IDLE_LIMIT, ROLL_RECONNECT_LIMIT, Resolver,
+};
 pub use registry::{EventContext, HandlerRegistry};
 pub use sender::{
     DEFAULT_CREDIT, LEGACY_REQUEST_TIMEOUT, LOCAL_GUARD_MARGIN, RETRY_MIN_REMAINING, RemoteError,
