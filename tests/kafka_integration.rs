@@ -5,8 +5,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use kraken_messaging::config::DeadLetterMode;
 use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::kafka::{EventBus, EventConsumer, OutboxPublisher, ensure_indexes, headers};
+use kraken_messaging::kafka::{
+    EventBus, EventConsumer, LocalEventDispatcher, NoSagas, OutboxPublisher, ProcessorSettings,
+    ensure_indexes, headers,
+};
 use kraken_messaging::{Event, message_type};
 use mongodb::bson::doc;
 use rdkafka::Message;
@@ -59,6 +63,38 @@ fn raw_consumer(bootstrap: &str, group: &str) -> StreamConsumer {
         .unwrap();
     c.subscribe(&[TOPIC]).unwrap();
     c
+}
+
+/// The `default` processor's consumer of `registry` in the group `service`, a failed record logged
+/// and skipped (mode `log`).
+fn consumer(
+    bootstrap: &str,
+    service: &str,
+    client: mongodb::Client,
+    db: mongodb::Database,
+    registry: HandlerRegistry,
+    max_attempts: u32,
+) -> Arc<EventConsumer> {
+    EventConsumer::processor(
+        ProcessorSettings {
+            name: "default".into(),
+            bootstrap_servers: bootstrap.into(),
+            group_id: service.into(),
+            topic: TOPIC.into(),
+            max_attempts,
+            backoff: Duration::from_millis(50),
+            dead_letter_mode: DeadLetterMode::Log,
+            dead_letter_retention: Duration::from_secs(86_400),
+            db: None,
+        },
+        Arc::new(LocalEventDispatcher::new(
+            client,
+            db,
+            Arc::new(registry),
+            Arc::new(NoSagas),
+        )),
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -155,17 +191,7 @@ async fn consumer_handles_once_and_dedupes() {
             Ok(())
         }
     });
-    let consumer = EventConsumer::new(
-        &kafka.bootstrap,
-        "svc-b",
-        TOPIC,
-        client,
-        db.clone(),
-        Arc::new(registry),
-        3,
-        Duration::from_millis(50),
-    )
-    .unwrap();
+    let consumer = consumer(&kafka.bootstrap, "svc-b", client, db.clone(), registry, 3);
     let cancel = CancellationToken::new();
     let handle = consumer.start(cancel.clone());
 
@@ -250,17 +276,7 @@ async fn panicking_handler_is_retried_then_skipped() {
             Ok(())
         }
     });
-    let consumer = EventConsumer::new(
-        &kafka.bootstrap,
-        "svc-c",
-        TOPIC,
-        client,
-        db.clone(),
-        Arc::new(registry),
-        2,
-        Duration::from_millis(50),
-    )
-    .unwrap();
+    let consumer = consumer(&kafka.bootstrap, "svc-c", client, db.clone(), registry, 2);
     let cancel = CancellationToken::new();
     let handle = consumer.start(cancel.clone());
 

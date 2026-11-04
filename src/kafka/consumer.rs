@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mongodb::{Client, Database};
+use mongodb::Database;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{
     BaseConsumer, CommitMode, Consumer, ConsumerContext, Rebalance, StreamConsumer,
@@ -30,7 +30,7 @@ use rdkafka::{ClientContext, Message, Offset, TopicPartitionList};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::dispatch::{LocalEventDispatcher, MarkerPosition, NoSagas, RecordDispatch, SagaStage};
+use super::dispatch::{LocalEventDispatcher, MarkerPosition, RecordDispatch};
 use super::headers;
 use crate::codec;
 use crate::config::DeadLetterMode;
@@ -287,82 +287,6 @@ enum Done {
 }
 
 impl EventConsumer {
-    /// A consumer of the ordinary `event` handlers of `registry` (processor `default`, mode `log`).
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        bootstrap_servers: &str,
-        group_id: &str,
-        topic: &str,
-        client: Client,
-        db: Database,
-        registry: Arc<HandlerRegistry>,
-        max_attempts: u32,
-        backoff: Duration,
-    ) -> Result<Arc<EventConsumer>, MessagingError> {
-        Self::with_saga_stage(
-            bootstrap_servers,
-            group_id,
-            topic,
-            client,
-            db,
-            registry,
-            Arc::new(NoSagas),
-            max_attempts,
-            backoff,
-        )
-    }
-
-    /// [`new`](Self::new) with a saga stage: a record no ordinary handler wants but the saga stage
-    /// is interested in is handled too, and every record goes through the stage after the ordinary
-    /// handlers (see [`LocalEventDispatcher`]).
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_saga_stage(
-        bootstrap_servers: &str,
-        group_id: &str,
-        topic: &str,
-        client: Client,
-        db: Database,
-        registry: Arc<HandlerRegistry>,
-        stage: Arc<dyn SagaStage>,
-        max_attempts: u32,
-        backoff: Duration,
-    ) -> Result<Arc<EventConsumer>, MessagingError> {
-        Self::with_dispatcher(
-            bootstrap_servers,
-            group_id,
-            topic,
-            Arc::new(LocalEventDispatcher::new(client, db, registry, stage)),
-            max_attempts,
-            backoff,
-        )
-    }
-
-    /// A consumer that dispatches through `dispatcher` (processor `default`, mode `log`: a record
-    /// that fails every attempt is logged and skipped).
-    pub fn with_dispatcher(
-        bootstrap_servers: &str,
-        group_id: &str,
-        topic: &str,
-        dispatcher: Arc<LocalEventDispatcher>,
-        max_attempts: u32,
-        backoff: Duration,
-    ) -> Result<Arc<EventConsumer>, MessagingError> {
-        Self::processor(
-            ProcessorSettings {
-                name: crate::processors::DEFAULT_PROCESSOR.to_string(),
-                bootstrap_servers: bootstrap_servers.to_string(),
-                group_id: group_id.to_string(),
-                topic: topic.to_string(),
-                max_attempts,
-                backoff,
-                dead_letter_mode: DeadLetterMode::Log,
-                dead_letter_retention: Duration::from_secs(86_400),
-                db: None,
-            },
-            dispatcher,
-        )
-    }
-
     /// The consumer of one event processor (ADR 0022): its group, its dispatcher (whose marker
     /// prefix and handlers are the processor's) and its dead letters.
     pub fn processor(
@@ -726,7 +650,7 @@ impl EventConsumer {
                 .exhausted(&format!("{}: {failure}", failure.variant_name()));
             if !in_stage_one {
                 // Stage 1 is done; the saga stage could not even park its failure (ADR 0021): logged
-                // and skipped as before, no letter (a retry would find the marker and do nothing).
+                // and skipped, no letter (a retry would find the marker and do nothing).
                 tracing::error!(processor = %self.name, r#type = %type_name, id = %id, topic = msg.topic(), partition = msg.partition(), offset = msg.offset(), attempts = attempt, "saga stage failed, record skipped: {failure}");
                 return Done::Ack { processed: false };
             }

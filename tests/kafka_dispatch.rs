@@ -14,8 +14,9 @@ use kraken_messaging::hub::HandlerRegistry;
 use kraken_messaging::kafka::dispatch::{
     LocalEventDispatcher, NoSagas, Outcome, SagaStage, StageOneDone,
 };
+use kraken_messaging::config::DeadLetterMode;
 use kraken_messaging::kafka::{
-    EventConsumer, RecordDisposition, classify_with, ensure_indexes, headers,
+    EventConsumer, ProcessorSettings, RecordDisposition, classify_with, ensure_indexes, headers,
 };
 use kraken_messaging::{Event, MessageContext, MessagingError, message_type};
 use mongodb::Database;
@@ -454,16 +455,24 @@ async fn the_consumer_hands_a_record_only_a_saga_wants_to_the_saga_stage() {
     let kafka = support::containers::kafka().await;
     let f = Fixture::start().await;
     let stage = RecordingStage::new(true, &f.db, &f.handlers);
-    let consumer = EventConsumer::with_saga_stage(
-        &kafka.bootstrap,
-        "svc-saga",
-        "kraken.events",
-        f.client.clone(),
-        f.db.clone(),
-        f.registry(false),
-        stage.clone(),
-        3,
-        Duration::from_millis(50),
+    let consumer = EventConsumer::processor(
+        ProcessorSettings {
+            name: "default".into(),
+            bootstrap_servers: kafka.bootstrap.clone(),
+            group_id: "svc-saga".into(),
+            topic: "kraken.events".into(),
+            max_attempts: 3,
+            backoff: Duration::from_millis(50),
+            dead_letter_mode: DeadLetterMode::Log,
+            dead_letter_retention: Duration::from_secs(86_400),
+            db: None,
+        },
+        Arc::new(LocalEventDispatcher::new(
+            f.client.clone(),
+            f.db.clone(),
+            f.registry(false),
+            stage.clone(),
+        )),
     )
     .unwrap();
     let cancel = CancellationToken::new();
