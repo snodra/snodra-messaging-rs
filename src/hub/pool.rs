@@ -814,6 +814,8 @@ impl HubPool {
             message: Some(client_message::Message::Status(InstanceStatus {
                 connected_hub_ids: ids,
                 handlers_in_flight: self.handlers_in_flight().min(u32::MAX as usize) as u32,
+                // Event processor status (ADR 0022) comes with the P6a library slice.
+                processors: Vec::new(),
             })),
         };
         let writes = live
