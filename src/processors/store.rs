@@ -77,7 +77,7 @@ impl DeadLetterStore {
         let found = self
             .raw()
             .find_one(filter)
-            .sort(doc! { "offset": 1 })
+            .sort(doc! { "offset": 1, "_id": 1 })
             .projection(doc! { "_id": 1 })
             .await?;
         Ok(found.and_then(|d| d.get_str("_id").ok().map(str::to_string)))

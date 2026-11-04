@@ -740,14 +740,28 @@ impl KrakenMessagingBuilder {
             Some(runtime) => runtime.clone(),
             None => Arc::new(NoSagas),
         };
-        // One local dispatch for every entry point: the Kafka consumer, the partner topics, the
-        // webhook ingress and the relay's failure notices (the ordinary handlers, then the sagas).
-        let local = Arc::new(LocalEventDispatcher::new(
-            client.clone(),
-            db.clone(),
-            Arc::clone(&registry),
-            stage,
-        ));
+        // The named event processors' dispatchers (ADR 0022): their own handlers and marker
+        // family, no sagas.
+        let named: Vec<(String, Arc<LocalEventDispatcher>)> = named_registries
+            .into_iter()
+            .map(|(name, handlers)| {
+                let dispatcher = LocalEventDispatcher::new(
+                    client.clone(),
+                    db.clone(),
+                    Arc::new(handlers),
+                    Arc::new(NoSagas),
+                )
+                .with_marker_prefix(marker_prefix(&name));
+                (name, Arc::new(dispatcher))
+            })
+            .collect();
+        // One local dispatch for every entry point: the Kafka consumer of `default`, the partner
+        // topics, the webhook ingress and the relay's failure notices (the ordinary handlers, then
+        // the sagas). Outside the consumer it also runs every named processor's handlers.
+        let local = Arc::new(
+            LocalEventDispatcher::new(client.clone(), db.clone(), Arc::clone(&registry), stage)
+                .with_fan_out(named.iter().map(|(_, d)| Arc::clone(d)).collect()),
+        );
         let ingress = ExternalEventIngress::new(Arc::clone(&local), db.clone(), clock.clone());
         let verifier = match (&config.jwks_url, &config.issuer) {
             (Some(url), Some(issuer)) => Some(JwksVerifier::new(url.clone(), issuer.clone())),
@@ -768,34 +782,24 @@ impl KrakenMessagingBuilder {
 
         // The event processors (ADR 0022): `default` (the ordinary handlers and the sagas; the
         // consumer also runs for a service whose events only sagas handle), then the named ones.
+        let mut planned: Vec<(String, Arc<LocalEventDispatcher>)> = Vec::new();
+        if !registry.event_types().is_empty() || runtime.is_some() {
+            planned.push((DEFAULT_PROCESSOR.to_string(), Arc::clone(&local)));
+        }
+        planned.extend(named);
+        if config.dead_letter_mode == DeadLetterMode::Collection && !planned.is_empty() {
+            ensure_dead_letter_indexes(&db).await?;
+        }
+        // The admin API serves every processor with handlers here, whether or not this instance
+        // consumes (`KRAKEN_CONSUMER_ENABLED=false`).
+        let dead_letters = DeadLetters::new(db.clone(), config.dead_letter_mode, planned.clone());
         let mut consumers = Vec::new();
         if config.consumer_enabled {
-            let mut planned: Vec<(String, Arc<LocalEventDispatcher>)> = Vec::new();
-            if !registry.event_types().is_empty() || runtime.is_some() {
-                planned.push((DEFAULT_PROCESSOR.to_string(), Arc::clone(&local)));
-            }
-            for (name, named) in named_registries {
-                planned.push((
-                    name.clone(),
-                    Arc::new(
-                        LocalEventDispatcher::new(
-                            client.clone(),
-                            db.clone(),
-                            Arc::new(named),
-                            Arc::new(NoSagas),
-                        )
-                        .with_marker_prefix(marker_prefix(&name)),
-                    ),
-                ));
-            }
-            if config.dead_letter_mode == DeadLetterMode::Collection && !planned.is_empty() {
-                ensure_dead_letter_indexes(&db).await?;
-            }
             for (name, dispatcher) in planned {
                 let consumer = EventConsumer::processor(
                     ProcessorSettings {
                         group_id: group_id(&config.service_name, &name),
-                        name: name.clone(),
+                        name,
                         bootstrap_servers: config.kafka_bootstrap.clone(),
                         topic: config.kafka_topic.clone(),
                         max_attempts: config.consumer_max_attempts,
@@ -804,21 +808,12 @@ impl KrakenMessagingBuilder {
                         dead_letter_retention: config.dead_letter_retention,
                         db: Some(db.clone()),
                     },
-                    Arc::clone(&dispatcher),
+                    dispatcher,
                 )?;
-                consumers.push((name, dispatcher, consumer));
+                consumers.push(consumer);
             }
         }
-        let monitors: Vec<Arc<ProcessorMonitor>> =
-            consumers.iter().map(|(_, _, c)| c.monitor()).collect();
-        let dead_letters = DeadLetters::new(
-            db.clone(),
-            config.dead_letter_mode,
-            consumers
-                .iter()
-                .map(|(name, dispatcher, _)| (name.clone(), Arc::clone(dispatcher)))
-                .collect(),
-        );
+        let monitors: Vec<Arc<ProcessorMonitor>> = consumers.iter().map(|c| c.monitor()).collect();
         let reported = monitors.clone();
         hubs.set_processor_status(Arc::new(move || {
             reported.iter().map(|m| m.status()).collect()
@@ -868,7 +863,7 @@ impl KrakenMessagingBuilder {
             )?;
             tasks.push(publisher.start(cancel.clone()));
         }
-        for (_, _, consumer) in consumers {
+        for consumer in consumers {
             tasks.push(consumer.start(cancel.clone()));
         }
         // The relay, the deadline scheduler and the gauge sampler stop on their own token, before

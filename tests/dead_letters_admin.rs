@@ -532,6 +532,9 @@ async fn retry_all_goes_per_key_in_offset_order_and_a_key_stops_at_its_first_fai
         .await;
     f.park(&Letter::new("orders", 2, Some("b"), "b-1").parked(2))
         .await;
+    // Key z: its head was parked before key b's, so it goes first (keys in their heads' order).
+    f.park(&Letter::new("orders", 11, Some("z"), "z-1").parked(0))
+        .await;
     // Keyless: in parkedAt order, a failure stops nothing.
     f.failing.lock().unwrap().push("n-2".into());
     f.park(&Letter::new("orders", 9, None, "n-1").parked(3))
@@ -550,7 +553,7 @@ async fn retry_all_goes_per_key_in_offset_order_and_a_key_stops_at_its_first_fai
     assert_eq!(
         result,
         RetryAllResult {
-            retried: 4,
+            retried: 5,
             failed: 2,
             blocked: 2,
             skipped: 1
@@ -559,6 +562,9 @@ async fn retry_all_goes_per_key_in_offset_order_and_a_key_stops_at_its_first_fai
     let seen = f.seen.lock().unwrap().clone();
     let b: Vec<&String> = seen.iter().filter(|s| s.starts_with("b-")).collect();
     assert_eq!(b, ["b-1", "b-2"]);
+    let at = |o: &str| seen.iter().position(|s| s == o).unwrap();
+    assert!(at("z-1") < at("b-1"), "{seen:?}");
+    assert!(at("b-2") < at("n-1"), "keyless last: {seen:?}");
     let n: Vec<&String> = seen.iter().filter(|s| s.starts_with("n-")).collect();
     assert_eq!(n, ["n-1", "n-3"]);
     assert!(!seen.iter().any(|s| s.starts_with("a-") || s == "d-1"));

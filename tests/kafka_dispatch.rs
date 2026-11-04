@@ -626,3 +626,75 @@ async fn dispatch_stages_reports_each_stage_and_can_skip_stage_one() {
         .await;
     assert!(stages.stage_one.is_none() && stages.stage_two.is_none());
 }
+
+/// ADR 0022 (with the Kotlin slice's ruling): a local dispatch from another entry point (a partner
+/// topic, a webhook, a relay notice) reaches every processor's stage 1, each in its own
+/// transaction with its own marker, and the sagas once; the Kafka consumer's own path does not
+/// fan out.
+#[tokio::test]
+async fn a_local_dispatch_fans_out_to_every_processors_stage_one_and_the_sagas_once() {
+    require_docker!();
+    let f = Fixture::start().await;
+    let stage = RecordingStage::new(true, &f.db, &f.handlers);
+    let named = Arc::new(
+        f.dispatcher(Arc::new(NoSagas), true)
+            .with_marker_prefix(Some("processor:orders:".into())),
+    );
+    let default = f
+        .dispatcher(stage.clone(), true)
+        .with_fan_out(vec![Arc::clone(&named)]);
+
+    assert_eq!(dispatch(&default, "e-1").await.unwrap(), Outcome::Handled);
+    assert_eq!(
+        *f.handlers.lock().unwrap(),
+        ["e-1", "e-1"],
+        "both processors"
+    );
+    assert_eq!(stage.calls.lock().unwrap().len(), 1, "the sagas once");
+    let mut ids: Vec<String> =
+        f.db.collection::<mongodb::bson::Document>("processed_events")
+            .distinct("_id", doc! {})
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|b| b.as_str().unwrap().to_string())
+            .collect();
+    ids.sort();
+    assert_eq!(ids, ["e-1", "processor:orders:e-1"]);
+    // Again: every stage 1 is a duplicate, the sagas decide by their own markers.
+    dispatch(&default, "e-1").await.unwrap();
+    assert_eq!(f.handlers.lock().unwrap().len(), 2);
+
+    // A failure in the named processor's stage 1 is returned (the entry point retries); the
+    // default processor's marker makes the retry a no-op there.
+    *f.fail_ordinary.lock().unwrap() = Some("e-2".into());
+    let only_named = f
+        .dispatcher(Arc::new(NoSagas), false)
+        .with_fan_out(vec![Arc::clone(&named)]);
+    assert!(
+        only_named.interested("t.Happened"),
+        "a named processor's type"
+    );
+    assert!(dispatch(&only_named, "e-2").await.is_err());
+
+    // The consumer's path: its own processor only.
+    let stages = default
+        .dispatch_stages(
+            "e-3",
+            "t.Happened",
+            &payload("e-3"),
+            &ctx("e-3", "t.Happened"),
+            true,
+        )
+        .await;
+    assert!(matches!(stages.stage_one, Some(Ok(StageOneDone::Handled))));
+    let e3 = f
+        .handlers
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|h| *h == "e-3")
+        .count();
+    assert_eq!(e3, 1, "the consumer's own processor only");
+    assert_eq!(default.event_types(), ["t.Happened"]);
+}

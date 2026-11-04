@@ -206,9 +206,10 @@ impl DeadLetters {
         }
     }
 
-    /// Retries every letter of `processor`: per key in offset order, a key stopping at its first
-    /// failure (its later letters count as blocked); keyless letters in `parkedAt` order; INVALID
-    /// letters skipped.
+    /// Retries every letter of `processor`: per key in offset order (the keys in the order of their
+    /// head letters' `parkedAt`, then `_id`), a key stopping at its first failure (its later
+    /// letters count as blocked); then the keyless letters in `parkedAt` order; INVALID letters
+    /// skipped.
     pub async fn retry_all(&self, processor: &str) -> Result<RetryAllResult, MessagingError> {
         self.collection_mode()?;
         self.dispatcher(processor)?;
@@ -225,8 +226,16 @@ impl DeadLetters {
                 None => keyless.push(letter),
             }
         }
-        for (_, mut letters) in keyed {
-            letters.sort_by_key(|l| (l.offset, l.partition));
+        // Keys in the order of their head letter (lowest offset) by (`parkedAt`, `_id`).
+        let mut keyed: Vec<Vec<DeadLetterDocument>> = keyed
+            .into_values()
+            .map(|mut letters| {
+                letters.sort_by(|a, b| (a.offset, &a.id).cmp(&(b.offset, &b.id)));
+                letters
+            })
+            .collect();
+        keyed.sort_by(|a, b| (a[0].parked_at, &a[0].id).cmp(&(b[0].parked_at, &b[0].id)));
+        for letters in keyed {
             let total = letters.len() as u64;
             for (done, letter) in letters.iter().enumerate() {
                 let rest = total - done as u64 - 1;

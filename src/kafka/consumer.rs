@@ -436,7 +436,7 @@ impl EventConsumer {
             msg.topic(),
             msg.partition(),
             msg.offset(),
-            |t| self.dispatcher.interested(t),
+            |t| self.dispatcher.interested_here(t),
         ) {
             RecordDisposition::Skip(NO_HANDLER) => return Done::Ack { processed: false },
             // Malformed: a letter that blocks nothing (ADR 0022 INVALID).
@@ -502,7 +502,10 @@ impl EventConsumer {
                 (_, Some(Err(e))) => (e, false),
                 _ => return Done::Ack { processed: true },
             };
-            if attempt < self.max_attempts {
+            // A payload the handler cannot read (or a handler's own InvalidMessage) cannot get
+            // better by retrying: parked after this attempt.
+            let hopeless = in_stage_one && matches!(failure, MessagingError::InvalidMessage(_));
+            if attempt < self.max_attempts && !hopeless {
                 tracing::warn!(processor = %self.name, r#type = %type_name, id = %id, attempt, "event handler failed, retrying: {failure}");
                 tokio::select! {
                     _ = tokio::time::sleep(self.backoff) => {}
@@ -510,7 +513,8 @@ impl EventConsumer {
                 }
                 continue;
             }
-            self.monitor.exhausted(&failure.to_string());
+            self.monitor
+                .exhausted(&format!("{}: {failure}", failure.variant_name()));
             if !in_stage_one {
                 // Stage 1 is done; the saga stage could not even park its failure (ADR 0021): logged
                 // and skipped as before, no letter (a retry would find the marker and do nothing).
@@ -563,7 +567,8 @@ impl EventConsumer {
                 }
                 Some(Err(e)) => {
                     tracing::error!(processor = %self.name, r#type = %type_name, id = %id, "saga stage failed for a sequenced record: {e}");
-                    self.monitor.exhausted(&e.to_string());
+                    self.monitor
+                        .exhausted(&format!("{}: {e}", e.variant_name()));
                     break;
                 }
                 _ => break,
@@ -660,7 +665,7 @@ impl EventConsumer {
                 let mut headers = OwnedHeaders::new();
                 for (k, v) in raw_headers
                     .iter()
-                    .filter(|(k, _)| !k.starts_with(DLT_HEADER_PREFIX))
+                    .filter(|(k, _)| !DLT_HEADERS.contains(&k.as_str()))
                 {
                     headers = headers.insert(Header {
                         key: k,
@@ -672,14 +677,14 @@ impl EventConsumer {
                     &format!("{}: {}", error.type_name, error.message),
                     MAX_ERROR_MESSAGE_CHARS,
                 );
-                for (k, v) in [
-                    ("kraken-dlt-processor", self.name.as_str()),
-                    ("kraken-dlt-reason", reason.as_str()),
-                    ("kraken-dlt-error", dlt_error.as_str()),
-                    ("kraken-dlt-original-topic", msg.topic()),
-                    ("kraken-dlt-original-partition", partition.as_str()),
-                    ("kraken-dlt-original-offset", offset.as_str()),
-                ] {
+                for (k, v) in DLT_HEADERS.into_iter().zip([
+                    self.name.as_str(),
+                    reason.as_str(),
+                    dlt_error.as_str(),
+                    msg.topic(),
+                    partition.as_str(),
+                    offset.as_str(),
+                ]) {
                     headers = headers.insert(Header {
                         key: k,
                         value: Some(v),
@@ -834,8 +839,15 @@ impl EventConsumer {
 
 /// The reason [`classify_with`] gives for a type nobody handles: skipped, not a letter.
 const NO_HANDLER: &str = "no handler for this type";
-/// The headers mode `topic` adds; a record's own header of these names is replaced.
-const DLT_HEADER_PREFIX: &str = "kraken-dlt-";
+/// The headers mode `topic` adds; a record's own header of one of these names is replaced.
+const DLT_HEADERS: [&str; 6] = [
+    "kraken-dlt-processor",
+    "kraken-dlt-reason",
+    "kraken-dlt-error",
+    "kraken-dlt-original-topic",
+    "kraken-dlt-original-partition",
+    "kraken-dlt-original-offset",
+];
 
 /// What the handlers of a record see: its id and type, the correlation id header (else the id) and
 /// every header.

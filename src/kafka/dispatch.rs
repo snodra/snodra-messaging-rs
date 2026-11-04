@@ -90,6 +90,9 @@ pub struct LocalEventDispatcher {
     stage: Arc<dyn SagaStage>,
     /// Put before every stage-1 marker id: `processor:<name>:` for a named processor (ADR 0022).
     marker_prefix: Option<String>,
+    /// The named processors whose stage 1 a [`dispatch`](Self::dispatch) also runs (ADR 0022):
+    /// the local entry points reach every processor's handlers.
+    fan_out: Vec<Arc<LocalEventDispatcher>>,
 }
 
 /// How stage 1 ended when it did not fail.
@@ -147,7 +150,17 @@ impl LocalEventDispatcher {
             registry,
             stage,
             marker_prefix: None,
+            fan_out: Vec::new(),
         }
+    }
+
+    /// The named processors' dispatchers (ADR 0022): [`dispatch`](Self::dispatch), the path of
+    /// the partner topics, the webhook ingress and the relay's notices, runs each one's stage 1
+    /// too (its own transaction and marker family), the sagas still once. The Kafka consumer's
+    /// [`dispatch_stages`](Self::dispatch_stages) stays with this dispatcher's own handlers.
+    pub fn with_fan_out(mut self, named: Vec<Arc<LocalEventDispatcher>>) -> LocalEventDispatcher {
+        self.fan_out = named;
+        self
     }
 
     /// Prefixes every stage-1 marker id (`processor:<name>:` for a named processor, ADR 0022);
@@ -157,8 +170,15 @@ impl LocalEventDispatcher {
         self
     }
 
-    /// Whether any ordinary handler or saga type wants events of `type_name`.
+    /// Whether any ordinary handler or saga type wants events of `type_name` (the named
+    /// processors of [`with_fan_out`](Self::with_fan_out) included).
     pub fn interested(&self, type_name: &str) -> bool {
+        self.interested_here(type_name) || self.fan_out.iter().any(|d| d.interested(type_name))
+    }
+
+    /// [`interested`](Self::interested) for this dispatcher's own handlers and sagas only: what
+    /// its processor's consumer handles.
+    pub fn interested_here(&self, type_name: &str) -> bool {
         self.registry.has_event_handler(type_name) || self.stage.interested(type_name)
     }
 
@@ -193,17 +213,23 @@ impl LocalEventDispatcher {
         payload: &[u8],
         ctx: &MessageContext,
     ) -> Result<Outcome, MessagingError> {
-        let Stages {
-            stage_one,
-            stage_two,
-        } = self
-            .dispatch_stages(dedupe_id, type_name, payload, ctx, true)
-            .await;
-        if stage_one.is_none() && stage_two.is_none() {
+        if !self.interested(type_name) {
             return Ok(Outcome::NoInterest);
         }
+        // Every processor's stage 1, each in its own transaction, then the sagas once.
+        let mut stage_ones: Vec<Result<StageOneDone, MessagingError>> = Vec::new();
+        for d in std::iter::once(self).chain(self.fan_out.iter().map(Arc::as_ref)) {
+            if d.registry.has_event_handler(type_name) {
+                stage_ones.push(d.stage_one_done(dedupe_id, type_name, payload, ctx).await);
+            }
+        }
+        let stage_two = if self.stage.interested(type_name) {
+            Some(self.stage.process(type_name, payload, ctx).await)
+        } else {
+            None
+        };
         let saga = stage_two.is_some();
-        let ordinary = stage_one.is_some();
+        let ordinary = !stage_ones.is_empty();
         let mut applied = false;
         let stage_two_failure = match stage_two {
             Some(Ok(done)) => {
@@ -213,17 +239,30 @@ impl LocalEventDispatcher {
             Some(Err(e)) => Some(e),
             None => None,
         };
-        let duplicate = match stage_one {
-            Some(Err(e)) => {
-                if let Some(also) = stage_two_failure {
-                    // Both failed: the caller redelivers for stage 1's, stage 2's is kept in the log.
-                    tracing::error!(r#type = %type_name, id = %dedupe_id, "saga stage failed as well: {also}");
+        let mut duplicate = ordinary;
+        let mut stage_one_failure = None;
+        for result in stage_ones {
+            match result {
+                Ok(StageOneDone::Duplicate) => {}
+                Ok(StageOneDone::Handled) => duplicate = false,
+                Err(e) => {
+                    duplicate = false;
+                    match &stage_one_failure {
+                        None => stage_one_failure = Some(e),
+                        Some(_) => {
+                            tracing::error!(r#type = %type_name, id = %dedupe_id, "another processor's handlers failed as well: {e}")
+                        }
+                    }
                 }
-                return Err(e);
             }
-            Some(Ok(done)) => done == StageOneDone::Duplicate,
-            None => false,
-        };
+        }
+        if let Some(e) = stage_one_failure {
+            if let Some(also) = stage_two_failure {
+                // Both failed: the caller redelivers for stage 1's, stage 2's is kept in the log.
+                tracing::error!(r#type = %type_name, id = %dedupe_id, "saga stage failed as well: {also}");
+            }
+            return Err(e);
+        }
         if let Some(e) = stage_two_failure {
             return Err(e);
         }
@@ -234,6 +273,24 @@ impl LocalEventDispatcher {
         } else {
             Outcome::Handled
         })
+    }
+
+    async fn stage_one_done(
+        &self,
+        dedupe_id: &str,
+        type_name: &str,
+        payload: &[u8],
+        ctx: &MessageContext,
+    ) -> Result<StageOneDone, MessagingError> {
+        self.stage_one(dedupe_id, type_name, payload, ctx, None)
+            .await
+            .map(|done| match done {
+                StageOneThen::Duplicate => {
+                    tracing::debug!(r#type = %type_name, id = %dedupe_id, "duplicate event skipped");
+                    StageOneDone::Duplicate
+                }
+                StageOneThen::Committed | StageOneThen::Declined => StageOneDone::Handled,
+            })
     }
 
     /// [`dispatch`](Self::dispatch) with each stage's result apart: stage 1 (the ordinary
@@ -249,17 +306,10 @@ impl LocalEventDispatcher {
         run_stage_one: bool,
     ) -> Stages {
         let stage_one = if run_stage_one && self.registry.has_event_handler(type_name) {
-            let result = self
-                .stage_one(dedupe_id, type_name, payload, ctx, None)
-                .await
-                .map(|done| match done {
-                    StageOneThen::Duplicate => {
-                        tracing::debug!(r#type = %type_name, id = %dedupe_id, "duplicate event skipped");
-                        StageOneDone::Duplicate
-                    }
-                    StageOneThen::Committed | StageOneThen::Declined => StageOneDone::Handled,
-                });
-            Some(result)
+            Some(
+                self.stage_one_done(dedupe_id, type_name, payload, ctx)
+                    .await,
+            )
         } else {
             None
         };

@@ -221,7 +221,11 @@ impl HandlerRegistry {
         let erased: EventHandler = Arc::new(move |payload: Vec<u8>, ctx: EventContext| {
             let handler = Arc::clone(&handler);
             Box::pin(async move {
-                let event: E = codec::decode(&payload)?;
+                // A payload that does not fit the event's type cannot get better by retrying
+                // (Kotlin's InvalidMessageException): the consumer parks it after one attempt.
+                let event: E = codec::decode(&payload).map_err(|e| {
+                    MessagingError::InvalidMessage(format!("cannot read {}: {e}", E::TYPE))
+                })?;
                 handler(event, ctx).await
             })
         });

@@ -250,6 +250,36 @@ async fn an_invalid_processor_name_fails_the_start_naming_the_handler() {
     }
 }
 
+/// The admin API serves the processors that have handlers here, whether or not the consumer runs
+/// on this instance (an admin-only deployment with `KRAKEN_CONSUMER_ENABLED=false`).
+#[tokio::test]
+async fn the_admin_api_knows_the_processors_without_a_running_consumer() {
+    require_docker!();
+    let mongo = support::containers::mongo().await;
+    let mut c = config(
+        "svc-admin",
+        "static://127.0.0.1:1",
+        "127.0.0.1:1",
+        &mongo.uri_for("admin"),
+        "a.events",
+    );
+    c.consumer_enabled = false;
+    let app = KrakenMessaging::builder(c)
+        .await
+        .unwrap()
+        .event::<Placed, _, _>(|_, _| async { Ok(()) })
+        .event_in::<Placed, _, _>("audit", |_, _| async { Ok(()) })
+        .start()
+        .await
+        .unwrap();
+    let admin = app.dead_letters();
+    assert_eq!(admin.count(Some("audit")).await.unwrap(), 0);
+    assert_eq!(admin.count(Some("default")).await.unwrap(), 0);
+    assert!(admin.count(Some("other")).await.is_err());
+    assert!(app.processors().is_empty(), "no processor started");
+    app.shutdown().await;
+}
+
 #[tokio::test]
 async fn named_processors_have_their_own_group_and_markers_and_never_hold_each_other() {
     require_docker!();
@@ -521,9 +551,38 @@ async fn a_failing_key_parks_its_later_records_while_other_keys_flow_until_it_is
     })
     .await;
     assert_eq!(letters(&db).await.len(), 2);
+
+    // A payload the handler cannot decode is not retried: HANDLER_FAILED after one attempt.
+    let seen = handler.seen().len();
+    produce_raw(
+        &p,
+        topic,
+        Some("k6"),
+        Some("p.Placed"),
+        Some("x-6"),
+        br#"{"order":5}"#,
+    )
+    .await; // 12
+    eventually("the undecodable record parked", WITHIN, || async {
+        letters(&db).await.len() == 3
+    })
+    .await;
+    let undecodable = letters(&db)
+        .await
+        .into_iter()
+        .find(|l| l.offset == 12)
+        .unwrap();
+    assert_eq!(undecodable.reason, DeadLetterReason::HandlerFailed);
+    assert_eq!(undecodable.attempts, 1);
+    assert_eq!(undecodable.error.type_name, "InvalidMessage");
+    assert_eq!(
+        handler.seen().len(),
+        seen,
+        "decoding fails before the handler"
+    );
     let all = app.processors();
     assert_eq!(status(&all, "default").event_types, ["p.Placed"]);
-    assert_eq!(status(&all, "default").failed_total, 2);
+    assert_eq!(status(&all, "default").failed_total, 3);
     app.shutdown().await;
 }
 
