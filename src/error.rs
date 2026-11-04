@@ -160,7 +160,10 @@ impl From<rdkafka::error::KafkaError> for MessagingError {
 mod tests {
     #[test]
     fn the_variant_name_is_the_dead_letter_error_type() {
-        assert_eq!(MessagingError::Storage("x".into()).variant_name(), "Storage");
+        assert_eq!(
+            MessagingError::Storage("x".into()).variant_name(),
+            "Storage"
+        );
         assert_eq!(
             MessagingError::InvalidMessage("x".into()).variant_name(),
             "InvalidMessage"

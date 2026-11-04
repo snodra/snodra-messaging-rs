@@ -1,0 +1,19 @@
+{
+  "_id": "orders:kraken.events:1:43",
+  "processor": "orders",
+  "topic": "kraken.events",
+  "partition": 1,
+  "offset": {"$numberLong": "43"},
+  "key": "order-7",
+  "eventId": "evt-8",
+  "eventType": "examples.OrderShipped",
+  "headers": {"type": "examples.OrderShipped", "id": "evt-8"},
+  "payload": "{\"orderId\":\"o-7\"}",
+  "reason": "SEQUENCED",
+  "error": {"type": "Sequenced", "message": "an earlier letter for this key is parked: orders:kraken.events:1:42"},
+  "blockedBy": "orders:kraken.events:1:42",
+  "attempts": 0,
+  "parkedAt": {"$date": "2026-11-04T10:00:06.250Z"},
+  "lastAttemptAt": {"$date": "2026-11-04T10:00:06.250Z"},
+  "expireAt": {"$date": "2026-12-04T10:00:06.250Z"}
+}

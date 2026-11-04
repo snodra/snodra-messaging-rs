@@ -283,11 +283,18 @@ fn a_reserved_source_name_fails_the_startup_naming_it() {
         )
         .unwrap_err()
         .to_string();
-        assert!(e.contains(&format!("'{name}'")) && e.contains("reserved"), "{name}: {e}");
+        assert!(
+            e.contains(&format!("'{name}'")) && e.contains("reserved"),
+            "{name}: {e}"
+        );
         assert!(kraken_messaging::external::is_reserved_source_name(name));
     }
-    assert!(!kraken_messaging::external::is_reserved_source_name("printer"));
-    assert!(!kraken_messaging::external::is_reserved_source_name("processors"));
+    assert!(!kraken_messaging::external::is_reserved_source_name(
+        "printer"
+    ));
+    assert!(!kraken_messaging::external::is_reserved_source_name(
+        "processors"
+    ));
 }
 
 #[tokio::test]

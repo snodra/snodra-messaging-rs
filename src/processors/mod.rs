@@ -10,6 +10,8 @@
 
 use crate::error::MessagingError;
 
+pub mod dead_letters;
+
 /// The unnamed processor's name.
 pub const DEFAULT_PROCESSOR: &str = "default";
 /// The prefix of a named processor's markers in `processed_events`.
@@ -97,6 +99,9 @@ mod tests {
         assert_eq!(group_id("service-c", "default"), "service-c");
         assert_eq!(group_id("service-c", "orders"), "service-c.orders");
         assert_eq!(marker_prefix("default"), None);
-        assert_eq!(marker_prefix("orders").as_deref(), Some("processor:orders:"));
+        assert_eq!(
+            marker_prefix("orders").as_deref(),
+            Some("processor:orders:")
+        );
     }
 }
