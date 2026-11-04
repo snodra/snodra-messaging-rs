@@ -108,9 +108,9 @@ async fn get(hub: &HubContainer, path: &str) -> serde_json::Value {
         .unwrap()
 }
 
-/// `service`'s instance in the hub's `/topology`, if listed.
+/// `service`'s instance in the hub's `/api/v1/topology`, if listed.
 async fn instance(hub: &HubContainer, service: &str) -> Option<serde_json::Value> {
-    let t = get(hub, "/topology").await;
+    let t = get(hub, "/api/v1/topology").await;
     t["services"]
         .as_array()?
         .iter()

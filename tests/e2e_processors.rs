@@ -152,7 +152,7 @@ async fn the_hub_shows_the_processors_their_letters_and_their_lag() {
     assert_eq!(default["processedTotal"], 2);
 
     // The topology carries the instance's raw report.
-    let topology = json(&format!("{}/topology", hub.http)).await;
+    let topology = json(&format!("{}/api/v1/topology", hub.http)).await;
     let instance = topology["services"]
         .as_array()
         .unwrap()

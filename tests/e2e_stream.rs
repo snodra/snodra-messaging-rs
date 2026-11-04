@@ -141,7 +141,7 @@ async fn get(hub: &HubContainer, path: &str) -> serde_json::Value {
 
 /// `(inFlightAsSender, inFlightAsHandler)` of `service`'s instance on `hub` (0 while unlisted).
 async fn in_flight(hub: &HubContainer, service: &str) -> (u64, u64) {
-    let t = get(hub, "/topology").await;
+    let t = get(hub, "/api/v1/topology").await;
     let instance = t["services"]
         .as_array()
         .and_then(|s| s.iter().find(|s| s["serviceName"] == service))

@@ -147,7 +147,7 @@ async fn two_participants_round_trip() {
         .unwrap();
     assert_eq!(event.text, "hi");
 
-    let topology: serde_json::Value = reqwest::get(format!("{}/topology", hub.http))
+    let topology: serde_json::Value = reqwest::get(format!("{}/api/v1/topology", hub.http))
         .await
         .unwrap()
         .json()
@@ -157,7 +157,8 @@ async fn two_participants_round_trip() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|t| t["ownerService"].as_str().unwrap())
+        .flat_map(|t| t["ownerServices"].as_array().unwrap())
+        .map(|s| s.as_str().unwrap())
         .collect();
     assert!(owners.contains(&"svc-b"));
     a.shutdown().await;
