@@ -223,9 +223,14 @@ async fn handled(State(http): State<AuditHttp>) -> Response {
 }
 
 async fn list(State(http): State<AuditHttp>, RawQuery(query): RawQuery) -> Response {
-    let limit = param(&query, "limit")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_LIST_LIMIT);
+    // A limit that is not a number is a 400, as service-b's; 0 is the library's error (400 too).
+    let limit = match param(&query, "limit").map(str::parse) {
+        None => DEFAULT_LIST_LIMIT,
+        Some(Ok(limit)) => limit,
+        Some(Err(_)) => {
+            return (StatusCode::BAD_REQUEST, "limit must be a number >= 1").into_response();
+        }
+    };
     match http
         .dead_letters
         .list(param(&query, "processor"), limit)
@@ -289,7 +294,13 @@ mod tests {
     use kraken_messaging::processors::dead_letters::DeadLetterDocument;
     use serde_json::json;
 
-    use super::{Audit, LetterView, RetryView, param};
+    use axum::extract::{RawQuery, State};
+    use axum::http::StatusCode;
+    use kraken_messaging::config::DeadLetterMode;
+    use kraken_messaging::kafka::EventBus;
+    use kraken_messaging::processors::DeadLetters;
+
+    use super::{Audit, AuditHttp, LetterView, RetryView, list, param};
     use crate::messages::ShoutAudit;
 
     fn note(key: &str, text: &str) -> ShoutAudit {
@@ -397,6 +408,31 @@ mod tests {
                 "error": "Sequenced: an earlier letter", "blockedBy": "audit:kraken.events:0:7",
             })
         );
+    }
+
+    /// A limit below 1, or one that is not a number, is the caller's mistake (service-b's 400),
+    /// answered before any database work.
+    #[tokio::test]
+    async fn a_list_limit_below_one_or_not_a_number_is_a_bad_request() {
+        // Never connected to: the answer comes before any database work.
+        let client =
+            mongodb::Client::with_uri_str("mongodb://127.0.0.1:1/x?serverSelectionTimeoutMS=200")
+                .await
+                .unwrap();
+        let db = client.default_database().unwrap();
+        let http = AuditHttp {
+            audit: Audit::default(),
+            events: EventBus::new(db.clone()),
+            dead_letters: DeadLetters::new(db, DeadLetterMode::Collection, vec![]),
+        };
+        for limit in ["0", "-1", "ten"] {
+            let response = list(
+                State(http.clone()),
+                RawQuery(Some(format!("limit={limit}"))),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "limit={limit}");
+        }
     }
 
     #[test]

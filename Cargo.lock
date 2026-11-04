@@ -3413,6 +3413,7 @@ dependencies = [
  "chrono",
  "futures",
  "kraken-messaging-rs",
+ "mongodb",
  "reqwest",
  "serde",
  "serde_json",

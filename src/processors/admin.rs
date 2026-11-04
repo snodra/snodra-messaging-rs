@@ -79,13 +79,19 @@ impl DeadLetters {
     }
 
     /// Up to `limit` letters ([`DEFAULT_LIST_LIMIT`] is the usual), sorted by `parkedAt`, then
-    /// `_id`: of `processor`, or of every processor of the service with `None`.
+    /// `_id`: of `processor`, or of every processor of the service with `None`. A `limit` of 0 is
+    /// an error (as Kotlin's `require(limit >= 1)`), never "no limit".
     pub async fn list(
         &self,
         processor: Option<&str>,
         limit: usize,
     ) -> Result<Vec<DeadLetterDocument>, MessagingError> {
         self.collection_mode()?;
+        if limit < 1 {
+            return Err(MessagingError::InvalidMessage(format!(
+                "limit must be >= 1, was {limit}"
+            )));
+        }
         if let Some(p) = processor {
             self.dispatcher(p)?;
         }

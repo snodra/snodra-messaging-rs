@@ -285,6 +285,26 @@ async fn outside_mode_collection_every_call_is_an_error_naming_the_mode() {
     }
 }
 
+/// Kotlin's `require(limit >= 1)`: a limit of 0 is an error, never "no limit".
+#[tokio::test]
+async fn a_list_limit_below_one_is_an_error() {
+    // No database is reached: the URI is never connected to.
+    let client = Client::with_uri_str("mongodb://127.0.0.1:1/x")
+        .await
+        .unwrap();
+    let admin = DeadLetters::new(
+        client.default_database().unwrap(),
+        DeadLetterMode::Collection,
+        vec![],
+    );
+    for processor in [None, Some("orders")] {
+        match admin.list(processor, 0).await {
+            Err(MessagingError::InvalidMessage(m)) => assert!(m.contains("limit"), "{m}"),
+            other => panic!("{processor:?}: {other:?}"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn list_get_count_and_the_processor_check() {
     require_docker!();
