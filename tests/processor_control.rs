@@ -1261,8 +1261,7 @@ async fn the_dead_letters_through_control_requests() {
 
 /// Control requests never hold the hub stream: while a reset handler blocks the execute, the
 /// heartbeats and a command request flow and a renewal of the held operation is answered at once
-/// (never queued behind the execute); a hub that does not list `processor-control` gets no
-/// answer at all.
+/// (never queued behind the execute).
 #[tokio::test]
 async fn control_requests_never_hold_the_hub_stream_and_renewals_never_wait() {
     require_docker!();
@@ -1274,14 +1273,13 @@ async fn control_requests_never_hold_the_hub_stream_and_renewals_never_wait() {
     let release = Arc::new(tokio::sync::Notify::new());
     let entered = Arc::new(tokio::sync::Notify::new());
     let (wait, enter) = (Arc::clone(&release), Arc::clone(&entered));
-    let mut c = config(
+    let c = config(
         "svc-stream",
         &hub.address(),
         &kafka.bootstrap,
         &mongo.uri_for("stream"),
         topic,
     );
-    c.heartbeat_interval = Duration::from_millis(200);
     let app = KrakenMessaging::builder(c)
         .await
         .unwrap()
@@ -1362,32 +1360,6 @@ async fn control_requests_never_hold_the_hub_stream_and_renewals_never_wait() {
         handler.count("n-1") == 2
     })
     .await;
-    app.shutdown().await;
-
-    // A hub that does not list the capability is never answered.
-    let old = FakeHub::start().await;
-    old.set_processor_control(false);
-    let app = KrakenMessaging::builder(config(
-        "svc-stream",
-        &old.address(),
-        &kafka.bootstrap,
-        &mongo.uri_for("stream"),
-        topic,
-    ))
-    .await
-    .unwrap()
-    .event::<Noted, _, _>(handler.handle())
-    .start()
-    .await
-    .unwrap();
-    assert!(app.await_hub(Duration::from_secs(30)).await);
-    assert!(
-        old.control("default", pause(), Duration::from_secs(3))
-            .await
-            .is_none()
-    );
-    assert!(old.control_replies().is_empty());
-    assert_ne!(state(&app, "default"), ProcessorState::ProcessorPaused);
     app.shutdown().await;
 }
 

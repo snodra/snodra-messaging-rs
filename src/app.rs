@@ -180,8 +180,8 @@ impl KrakenMessaging {
     }
 
     /// The status of every event processor this instance started (`default` first, then the
-    /// named ones by name), as the hubs that share the `processors` capability get it every
-    /// status interval. Empty when the consumer is disabled or no processor has handlers.
+    /// named ones by name), as the hubs get it every status interval. Empty when the consumer is
+    /// disabled or no processor has handlers.
     pub fn processors(&self) -> Vec<ProcessorStatus> {
         self.monitors.iter().map(|m| m.status()).collect()
     }
@@ -261,7 +261,7 @@ impl KrakenMessaging {
         self.hubs.instance_id()
     }
 
-    /// The ids of the hubs this instance is registered on now (a legacy hub by its address).
+    /// The ids of the hubs this instance is registered on now.
     pub fn hub_ids(&self) -> Vec<String> {
         self.hubs.hub_ids()
     }
@@ -1039,7 +1039,6 @@ fn hub_settings(config: &Config) -> Result<HubSettings, MessagingError> {
         .transpose()?;
     Ok(HubSettings {
         address: config.hub_address.clone(),
-        heartbeat_interval: config.heartbeat_interval,
         backoff_min: config.reconnect_backoff_min,
         backoff_max: config.reconnect_backoff_max,
         handshake_timeout: Duration::from_secs(10),

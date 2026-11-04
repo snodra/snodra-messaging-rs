@@ -1,17 +1,12 @@
 //! The stream to the hub and its lifecycle: register, handshake, heartbeat, reconnect.
 //!
-//! Every stream starts with `Register` (protocol v2: `protocol_version`, `capabilities`,
-//! `client_version`) followed by a `Heartbeat`. The hub handles a stream's messages in order:
-//!
-//! - a hub that speaks protocol v2 answers the `Register` with a `RegisterAck` before it echoes the
-//!   heartbeat, so an ack seen first means a v2 hub ([`Handshake::V2`]): its heartbeat interval and
-//!   timeout limits apply to this stream;
-//! - an older hub never sends an ack, so the echo arriving first means a v1 hub
-//!   ([`Handshake::Legacy`]): the configured heartbeat interval and today's timeouts apply.
-//!
-//! Either one completes the handshake (the registration is confirmed); only then does the stream
-//! accept outgoing requests ([`HubConnection::send_with`]). A request that cannot be written to a
-//! handshaken stream fails with `HubUnavailable`.
+//! Every stream starts with `Register` (with `client_version`) followed by a `Heartbeat`. The hub
+//! answers the `Register` with a `RegisterAck` (before it echoes the heartbeat): the ack completes
+//! the handshake (the registration is confirmed), and its heartbeat interval and timeout limits
+//! apply to this stream. A stream without an ack within `handshake_timeout` is abandoned and opened
+//! again; an echo does not confirm anything. Only a handshaken stream accepts outgoing requests
+//! ([`HubConnection::send_with`]). A request that cannot be written to a handshaken stream fails
+//! with `HubUnavailable`.
 //!
 //! Any failure closes the stream, notifies the owner with [`Inbound::Disconnected`] (carrying the
 //! stream id and the requests still in its outbound buffer, never written) and reconnects with exponential backoff (`backoff_min` doubling up to `backoff_max`,
@@ -33,23 +28,20 @@
 //! provider for an access token before it connects and registers with it in
 //! `Register.credentials.jwt`; if the provider cannot get one the stream is not opened, the attempt
 //! fails locally with the endpoint's error (kept in [`HubConnection::last_rejection`], logged at
-//! `error` once per distinct message, then `debug`) and is retried with the normal backoff. Every
-//! `Register` declares `credentials-refresh`; when the hub's ack lists it, each token the provider
-//! publishes later is sent on the live stream as `ClientMessage.credentials`, so the session
-//! outlives the token (a hub closes it at `exp` plus its grace otherwise). A static token session
-//! whose `token_file` changes does the same.
+//! `error` once per distinct message, then `debug`) and is retried with the normal backoff. Each
+//! token the provider publishes later is sent on the handshaken stream as
+//! `ClientMessage.credentials`, so the session outlives the token (the hub closes it at `exp` plus
+//! its grace otherwise). A static token session whose `token_file` changes does the same.
 //!
-//! Flow control (capability `flow-control`): the `Register` offers `max_concurrent_handlers`
-//! permits; a hub whose ack shares the capability forwards only that many requests and queues the
-//! rest. Each completed inbound request gives one permit back ([`ReplyTo::grant`]), on the stream
-//! it arrived on. Per stream the client counts `initial` (the permits its `Register` offered),
-//! `received` (requests that arrived), `returned` (permits written) and `pending` (completed, not
-//! written yet); the hub still holds `initial - received + returned` permits for it. A completion
-//! writes the pending grants in one `Permits` message at once when that count is at or below the
-//! low-water mark `min(PERMIT_BATCH, initial / 2)` (with one permit: every completion) or when
-//! [`PERMIT_BATCH`] grants are pending; otherwise they go [`PERMIT_FLUSH_AFTER`] after the first
-//! one not sent yet. Grants of requests completed before the handshake follow the same rule once
-//! the ack shares the capability. To a hub without the capability (P0 or v1) nothing is sent.
+//! Flow control: the `Register` offers `max_concurrent_handlers` permits; the hub forwards only
+//! that many requests and queues the rest. Each completed inbound request gives one permit back
+//! ([`ReplyTo::grant`]), on the stream it arrived on. Per stream the client counts `initial` (the
+//! permits its `Register` offered), `received` (requests that arrived), `returned` (permits
+//! written) and `pending` (completed, not written yet); the hub still holds
+//! `initial - received + returned` permits for it. A completion writes the pending grants in one
+//! `Permits` message at once when that count is at or below the low-water mark
+//! `min(PERMIT_BATCH, initial / 2)` (with one permit: every completion) or when [`PERMIT_BATCH`]
+//! grants are pending; otherwise they go [`PERMIT_FLUSH_AFTER`] after the first one not sent yet. Requests may arrive before the ack; their grants follow the same rule.
 //!
 //! The channel sends HTTP/2 keepalive pings (every 10 s, 5 s to answer, also while idle) so a
 //! one-way partition is noticed by the transport too, not only by the missing heartbeat echoes.
@@ -80,47 +72,9 @@ use super::auth::{
 use super::mtls::{self, ClientIdentity, LoadError};
 use super::tls;
 
-/// The hub protocol version this client speaks (`Register.protocol_version`).
-pub const PROTOCOL_VERSION: u32 = 2;
-/// The flow-control capability: permits, per-instance queues at the hub, RESOURCE_EXHAUSTED.
-pub const FLOW_CONTROL: &str = "flow-control";
-/// The multi-hub status capability (ADR 0016): `InstanceStatus` reports go only to a hub whose ack
-/// lists it.
-pub const INSTANCE_STATUS: &str = "instance-status";
-/// The scatter-gather capability (ADR 0017): `Request.mode = SCATTER_GATHER`, answered with
-/// `ReplyPart`s and a `ReplyEnd`; sent only to a hub whose ack lists it.
-pub const SCATTER_GATHER: &str = "scatter-gather";
-/// The streaming capability (ADR 0017, P4b): `Request.mode = STREAMING` with credits, answered
-/// with `ReplyPart`s and a `ReplyEnd`; `Flow` and `Cancel` both ways. Declared by senders and by
-/// handlers alike: the hub streams only to an instance that negotiated it.
-pub const STREAMING: &str = "streaming";
-/// The subscription capability (ADR 0017, P4c): `Request.mode = SUBSCRIPTION`, answered with the
-/// initial result and every owner instance's updates as `ReplyPart`s and one `ReplyEnd`; `Flow`
-/// and `Cancel` both ways. Declared by senders and by handlers alike: the hub subscribes only
-/// instances that negotiated it.
-pub const SUBSCRIPTION: &str = "subscription";
-/// The credential refresh capability (ADR 0019, P5b): `ClientMessage.credentials` replaces the
-/// session's credential before a JWT expires; sent only to a hub whose ack lists it. Declared by
-/// every `Register`, token sessions included.
-pub const CREDENTIALS_REFRESH: &str = "credentials-refresh";
-/// The event processor status capability (ADR 0022, P6a): `InstanceStatus.processors` is filled
-/// only on a stream whose ack lists it (and `instance-status`, which carries the message).
-pub const PROCESSORS: &str = "processors";
-/// The processor control capability (ADR 0023, P6b): the hub sends `ServerMessage.control` only
-/// to a session that declared it, and this client answers each with one
-/// `ClientMessage.control_reply` on the same stream, only to a hub whose ack lists it.
-pub const PROCESSOR_CONTROL: &str = "processor-control";
-/// Optional protocol features this client declares (`Register.capabilities`).
-pub const CAPABILITIES: &[&str] = &[
-    FLOW_CONTROL,
-    INSTANCE_STATUS,
-    SCATTER_GATHER,
-    STREAMING,
-    SUBSCRIPTION,
-    CREDENTIALS_REFRESH,
-    PROCESSORS,
-    PROCESSOR_CONTROL,
-];
+/// The heartbeat period of a stream until its `RegisterAck` announces the hub's (the hub's
+/// default).
+pub const HEARTBEAT_INTERVAL_BEFORE_ACK: Duration = Duration::from_secs(3);
 /// A `Permits` message is sent as soon as this many grants are pending, or as soon as the hub holds
 /// no more than `min(PERMIT_BATCH, initial_permits / 2)` permits for the stream (the low-water mark)...
 pub const PERMIT_BATCH: u32 = 16;
@@ -147,22 +101,18 @@ pub struct HubSettings {
     /// `host:port`, optionally prefixed with `static://` or `http://`. For a [`super::HubPool`]:
     /// the whole `hub_address` (a list or `dns:///name:port`, see [`super::HubTargets`]).
     pub address: String,
-    /// Heartbeat period used until, and unless, the hub announces one in its `RegisterAck`
-    /// (old hubs do not; they evict after 30 s, so this must stay well below that).
-    pub heartbeat_interval: Duration,
     pub backoff_min: Duration,
     pub backoff_max: Duration,
-    /// How long a new stream may take to complete the handshake (ack or first echo).
+    /// How long a new stream may take to complete the handshake (the hub's `RegisterAck`).
     pub handshake_timeout: Duration,
-    /// Also `Register.initial_permits` (the hub forwards at most this many requests at once to a
-    /// flow-controlled instance).
+    /// Also `Register.initial_permits` (the hub forwards at most this many requests at once to
+    /// the instance).
     pub max_concurrent_handlers: usize,
     /// `Register.load_factor` (100 = normal capacity).
     pub load_factor: u32,
     /// `Register.tags`.
     pub tags: HashMap<String, String>,
-    /// [`super::HubPool`] only: how often `InstanceStatus` goes to every hub sharing
-    /// `instance-status`.
+    /// [`super::HubPool`] only: how often `InstanceStatus` goes to every hub.
     pub status_interval: Duration,
     /// [`super::HubPool`] only: how often a `dns:///` address is resolved again.
     pub dns_refresh: Duration,
@@ -177,7 +127,7 @@ pub struct HubSettings {
     pub tls: Option<HubTls>,
     /// The OAuth2 client-credentials token provider (`Config.hub_oauth2`, ADR 0019): every stream
     /// registers with a JWT from it in `Register.credentials.jwt`, and the tokens it refreshes go
-    /// to the hubs that offer `credentials-refresh`. Share one provider between every connection
+    /// to the hubs on the live streams. Share one provider between every connection
     /// of the process (a [`super::HubPool`] clones these settings for each of its hubs). Wins over
     /// `token` and `token_file`, which [`crate::Config::validate`] refuses to combine with it.
     pub token_provider: Option<Arc<TokenProvider>>,
@@ -195,7 +145,6 @@ impl Default for HubSettings {
     fn default() -> Self {
         HubSettings {
             address: "static://kraken-hub:7000".into(),
-            heartbeat_interval: Duration::from_secs(10),
             backoff_min: Duration::from_millis(500),
             backoff_max: Duration::from_secs(5),
             handshake_timeout: Duration::from_secs(10),
@@ -214,101 +163,22 @@ impl Default for HubSettings {
     }
 }
 
-/// What the hub told us about itself on the current stream.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Handshake {
-    /// The hub answered the `Register` with this ack before echoing the heartbeat (protocol v2).
-    V2(RegisterAck),
-    /// The echo arrived without an ack: a hub older than protocol v2.
-    Legacy,
-}
-
-impl Handshake {
-    pub fn is_legacy(&self) -> bool {
-        matches!(self, Handshake::Legacy)
+/// The id of the hub that sent `ack` on a stream to `address`: `RegisterAck.hub_id`, or, should
+/// it be empty, the target as `host:port` ([`super::targets::target_id`]).
+pub(crate) fn hub_id(ack: &RegisterAck, address: &str) -> String {
+    if ack.hub_id.is_empty() {
+        super::targets::target_id(address)
+    } else {
+        ack.hub_id.clone()
     }
-
-    /// The id of the hub reached at `address`: `RegisterAck.hub_id`, or, for a hub that names
-    /// none (legacy, or an empty id), the target as `host:port` ([`super::targets::target_id`]).
-    pub fn hub_id(&self, address: &str) -> String {
-        match self.ack() {
-            Some(ack) if !ack.hub_id.is_empty() => ack.hub_id.clone(),
-            _ => super::targets::target_id(address),
-        }
-    }
-
-    pub fn ack(&self) -> Option<&RegisterAck> {
-        match self {
-            Handshake::V2(ack) => Some(ack),
-            Handshake::Legacy => None,
-        }
-    }
-
-    /// True when the hub shares `flow-control`: it forwards only with permits.
-    pub fn flow_control(&self) -> bool {
-        self.shares(FLOW_CONTROL)
-    }
-
-    /// True when the hub shares `instance-status`: it keeps our `InstanceStatus` reports.
-    pub fn instance_status(&self) -> bool {
-        self.shares(INSTANCE_STATUS)
-    }
-
-    /// True when the hub shares `processors` (ADR 0022): our reports carry the processor status.
-    pub fn processors(&self) -> bool {
-        self.shares(PROCESSORS)
-    }
-
-    /// True when the hub shares `processor-control` (ADR 0023): it may ask us to act on our event
-    /// processors, and takes our answers.
-    pub fn processor_control(&self) -> bool {
-        self.shares(PROCESSOR_CONTROL)
-    }
-
-    /// True when the hub shares `scatter-gather`: it fans a scatter-gather query out and knows
-    /// `Register.shared_query_types` (an older hub ignores that field).
-    pub fn scatter_gather(&self) -> bool {
-        self.shares(SCATTER_GATHER)
-    }
-
-    /// True when the hub shares `streaming`: it routes streaming queries, relays their parts
-    /// under the sender's credits and sends `Flow` and `Cancel`.
-    pub fn streaming(&self) -> bool {
-        self.shares(STREAMING)
-    }
-
-    /// True when the hub shares `subscription`: it routes subscription queries to every capable
-    /// owner instance, relays their updates under the sender's credit and sends `Cancel`.
-    pub fn subscription(&self) -> bool {
-        self.shares(SUBSCRIPTION)
-    }
-
-    /// True when the hub shares `credentials-refresh`: it takes `ClientMessage.credentials`.
-    pub fn credentials_refresh(&self) -> bool {
-        self.shares(CREDENTIALS_REFRESH)
-    }
-
-    /// The ack no longer lists capabilities: every feature is on once the hub acknowledged.
-    pub(crate) fn shares(&self, _capability: &str) -> bool {
-        self.ack().is_some()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GrantMode {
-    /// Before the handshake: grants are held until the hub says whether it wants them.
-    Undecided,
-    On,
-    Off,
 }
 
 /// The permit accounting of one stream.
 #[derive(Debug)]
 struct GrantState {
-    mode: GrantMode,
     /// `Register.initial_permits` sent on this stream.
     initial: u32,
-    /// Requests that arrived on this stream (whatever the mode).
+    /// Requests that arrived on this stream.
     received: u64,
     /// Permits written in `Permits` messages on this stream.
     returned: u64,
@@ -318,7 +188,7 @@ struct GrantState {
     timer: bool,
 }
 
-/// What a grant (or the handshake) leaves to do once the lock is released.
+/// What a grant leaves to do once the lock is released.
 enum Flush {
     /// Write a `Permits` message with this count now.
     Now(u32),
@@ -383,7 +253,6 @@ impl Grants {
             in_flight,
             tx,
             state: Mutex::new(GrantState {
-                mode: GrantMode::Undecided,
                 initial,
                 received: 0,
                 returned: 0,
@@ -398,11 +267,11 @@ impl Grants {
         self.state.lock().unwrap().initial
     }
 
-    /// Raises the permits this stream offered to `share` when it offered fewer (a flow-controlled
-    /// stream only); returns the top-up to write. Never lowers them.
+    /// Raises the permits this stream offered to `share` when it offered fewer; returns the top-up
+    /// to write. Never lowers them.
     fn raise(&self, share: u32) -> u32 {
         let mut s = self.state.lock().unwrap();
-        if s.mode != GrantMode::On || share <= s.initial {
+        if share <= s.initial {
             return 0;
         }
         let count = share - s.initial;
@@ -425,41 +294,12 @@ impl Grants {
         }
     }
 
-    /// The hub decided (handshake): with flow control, grants held so far follow the flush rule;
-    /// without, they are dropped and later grants are no-ops.
-    async fn decide(self: &Arc<Self>, flow_control: bool) {
-        let next = {
-            let mut s = self.state.lock().unwrap();
-            if s.mode != GrantMode::Undecided {
-                return;
-            }
-            if flow_control {
-                s.mode = GrantMode::On;
-                s.next()
-            } else {
-                s.mode = GrantMode::Off;
-                s.pending = 0;
-                Flush::Nothing
-            }
-        };
-        self.run(next).await;
-    }
-
     async fn grant(self: &Arc<Self>) {
         self.finished();
         let next = {
             let mut s = self.state.lock().unwrap();
-            match s.mode {
-                GrantMode::Off => return,
-                GrantMode::Undecided => {
-                    s.pending += 1;
-                    return;
-                }
-                GrantMode::On => {
-                    s.pending += 1;
-                    s.next()
-                }
-            }
+            s.pending += 1;
+            s.next()
         };
         self.run(next).await;
     }
@@ -526,7 +366,7 @@ impl ReplyTo {
 
     /// One permit back to the arrival stream's hub, once the request is finished (its reply
     /// written or dropped). Written at once when the hub runs low on our permits, else batched
-    /// (see the module docs); a no-op when that hub has no flow control or the stream is gone.
+    /// (see the module docs); a no-op when the stream is gone.
     pub async fn grant(&self) {
         self.grants.grant().await;
     }
@@ -538,8 +378,8 @@ impl ReplyTo {
 /// (ADR 0017). Every registrant of a type must agree on exclusive vs shared: the hub rejects the
 /// later `Register` with `ALREADY_EXISTS` otherwise.
 ///
-/// A streaming query (P4b) is a query type to the hub: the mode is the sender's choice and the
-/// hub streams only to instances that negotiated `streaming`. `streaming_queries` are the
+/// A streaming query (P4b) is a query type to the hub: the mode is the sender's choice.
+/// `streaming_queries` are the
 /// exclusive ones, announced in `Register.query_types` next to `queries`; a shared streaming
 /// query is listed in `shared_queries` like any shared query. A subscription query (P4c) is the
 /// same: `subscription_queries` are the exclusive ones, a shared one is in `shared_queries`.
@@ -595,8 +435,7 @@ pub enum Inbound {
     /// handler-side id (`<id>#1`).
     Flow(proto::Flow),
     /// The hub asks this instance to act on one of its event processors (ADR 0023): answered
-    /// with one `ControlReply` on `reply_to`, the stream it arrived on. Forwarded only from a
-    /// stream whose ack lists `processor-control`.
+    /// with one `ControlReply` on `reply_to`, the stream it arrived on.
     Control {
         request: proto::ControlRequest,
         reply_to: ReplyTo,
@@ -653,7 +492,7 @@ impl std::fmt::Debug for Inbound {
 struct Live {
     stream: StreamId,
     tx: mpsc::Sender<ClientMessage>,
-    handshake: Handshake,
+    ack: RegisterAck,
     grants: Arc<Grants>,
 }
 
@@ -665,7 +504,7 @@ pub struct HubConnection {
     types: Mutex<RegisteredTypes>,
     live: Mutex<Option<Live>>,
     connected: AtomicBool,
-    handshake: watch::Sender<Option<Handshake>>,
+    handshake: watch::Sender<Option<RegisterAck>>,
     last_rejection: Mutex<Option<String>>,
     /// The token resolved for the stream being opened (the last one read from `token_file`); what
     /// every `Register` of the stream carries.
@@ -766,7 +605,7 @@ pub(crate) struct Hooks {
     pub initial_permits: Box<dyn Fn() -> u32 + Send + Sync>,
     /// Called with the handshake before the stream goes live; `false` closes the connection for
     /// good (another connection already reaches that hub).
-    pub accept: Box<dyn Fn(&Handshake) -> bool + Send + Sync>,
+    pub accept: Box<dyn Fn(&RegisterAck) -> bool + Send + Sync>,
     /// A stream went live or was lost, or the first connect attempt failed.
     pub changed: Box<dyn Fn() + Send + Sync>,
     /// Also counts requests that arrived and are not finished (all connections of the pool).
@@ -851,11 +690,11 @@ impl HubConnection {
         &self.settings.address
     }
 
-    /// The id of the hub behind the current handshaken stream ([`Handshake::hub_id`]): its
-    /// `RegisterAck.hub_id`, else its target as `host:port`. `None` while there is no handshaken
-    /// stream.
+    /// The id of the hub behind the current handshaken stream: its `RegisterAck.hub_id` (should
+    /// it be empty, its target as `host:port`). `None` while there is no handshaken stream.
     pub fn hub_id(&self) -> Option<String> {
-        self.handshake().map(|h| h.hub_id(&self.settings.address))
+        self.handshake()
+            .map(|ack| hub_id(&ack, &self.settings.address))
     }
 
     /// Requests that arrived on this connection and whose handler has not finished
@@ -887,8 +726,8 @@ impl HubConnection {
         *self.task.lock().unwrap() = Some(handle);
     }
 
-    /// True once the current stream completed its handshake (ack or first echo), which confirms
-    /// the registration.
+    /// True once the current stream completed its handshake (the hub's `RegisterAck`), which
+    /// confirms the registration.
     pub async fn await_registered(&self, timeout: Duration) -> bool {
         let mut rx = self.handshake.subscribe();
         if rx.borrow().is_some() {
@@ -906,8 +745,8 @@ impl HubConnection {
         .unwrap_or(false)
     }
 
-    /// The handshake of the current stream, `None` while there is no handshaken stream.
-    pub fn handshake(&self) -> Option<Handshake> {
+    /// The `RegisterAck` of the current stream, `None` while there is no handshaken stream.
+    pub fn handshake(&self) -> Option<RegisterAck> {
         self.handshake.borrow().clone()
     }
 
@@ -987,15 +826,15 @@ impl HubConnection {
     }
 
     /// Builds a message for the current handshaken stream and writes it there. `build` runs while
-    /// the stream is still current, with its id and handshake, so whatever it records (a pending
-    /// request tagged with the stream id) happens before that stream's
-    /// [`Inbound::Disconnected`] can be emitted; it may refuse the stream (its handshake lacks
-    /// what the message needs) with an error, which is returned and nothing is written. Returns
+    /// the stream is still current, with its id and the hub's ack, so whatever it records (a
+    /// pending request tagged with the stream id) happens before that stream's
+    /// [`Inbound::Disconnected`] can be emitted; it may refuse the stream with an error, which is
+    /// returned and nothing is written. Returns
     /// the stream id and `build`'s extra value; `HubUnavailable` when there is no handshaken
     /// stream or the write fails (nothing was written).
     pub async fn send_with<T>(
         &self,
-        build: impl FnOnce(StreamId, &Handshake) -> Result<(ClientMessage, T), MessagingError>,
+        build: impl FnOnce(StreamId, &RegisterAck) -> Result<(ClientMessage, T), MessagingError>,
     ) -> Result<(StreamId, T), MessagingError> {
         let (stream, tx, msg, extra) = {
             let live = self.live.lock().unwrap();
@@ -1004,7 +843,7 @@ impl HubConnection {
                     "not connected to the hub".into(),
                 ));
             };
-            let (msg, extra) = build(live.stream, &live.handshake)?;
+            let (msg, extra) = build(live.stream, &live.ack)?;
             (live.stream, live.tx.clone(), msg, extra)
         };
         tx.send(msg)
@@ -1039,11 +878,10 @@ impl HubConnection {
     }
 
     /// Tops the current stream up to `share` permits in all (the initial offer plus earlier
-    /// top-ups) with one `Permits` message, when its hub shares flow control and the stream
-    /// offered fewer; never lowers them ([`super::HubPool`]: a hub left, the others take its share).
-    /// The message is `Permits{count = share - offered, grant = share}`: the grant raises the
-    /// hub's permit cap on the session (`initial_permits` until then) so the hub keeps the top-up;
-    /// a hub that predates `Permits.grant` ignores it and clamps the top-up away.
+    /// top-ups) with one `Permits` message, when the stream offered fewer; never lowers them
+    /// ([`super::HubPool`]: a hub left, the others take its share). The message is
+    /// `Permits{count = share - offered, grant = share}`: the grant raises the hub's permit cap on
+    /// the session (`initial_permits` until then) so the hub keeps the top-up.
     pub(crate) async fn top_up(&self, share: u32) {
         let Some((stream, grants)) = self
             .live
@@ -1211,7 +1049,7 @@ impl HubConnection {
                     true,
                 ),
             };
-            // A hub that answered the Register (ack or echo) is healthy: come back quickly. One that
+            // A hub that acknowledged the Register is healthy: come back quickly. One that
             // accepts the stream and then rejects it never reaches the handshake.
             if reached_handshake {
                 backoff = self.settings.backoff_min;
@@ -1377,8 +1215,7 @@ impl HubConnection {
         .map_err(|s| hint.apply(s))?
         .into_inner();
 
-        // The Register is the first message of every stream; the ack or the echo of the heartbeat
-        // after it completes the handshake.
+        // The Register is the first message of every stream; its ack completes the handshake.
         let initial_permits = match self.hooks.get() {
             Some(h) => (h.initial_permits)(),
             None => self.settings.max_concurrent_handlers.min(u32::MAX as usize) as u32,
@@ -1400,11 +1237,11 @@ impl HubConnection {
         };
 
         let mut roll = self.roll.subscribe();
-        let mut interval = self.settings.heartbeat_interval;
+        let mut interval = HEARTBEAT_INTERVAL_BEFORE_ACK;
         let mut ticker = ticker(interval);
         let mut last_echo = tokio::time::Instant::now();
         let handshake_deadline = tokio::time::Instant::now() + self.settings.handshake_timeout;
-        let mut handshake: Option<Handshake> = None;
+        let mut handshake: Option<RegisterAck> = None;
         loop {
             tokio::select! {
                 _ = self.cancel.cancelled() => {
@@ -1436,7 +1273,7 @@ impl HubConnection {
                         return Err(Status::unavailable(format!("no heartbeat echo for {echo_timeout:?}")).into());
                     }
                     tx.send(heartbeat()).await.map_err(|_| Status::unavailable("stream closed"))?;
-                    self.follow_token_file(&tx, handshake.as_ref()).await?;
+                    self.follow_token_file(&tx, handshake.is_some()).await?;
                 }
                 changed = async {
                     match following.as_mut() {
@@ -1445,7 +1282,7 @@ impl HubConnection {
                     }
                 } => {
                     if changed {
-                        self.follow_token(&tx, handshake.as_ref(), following.as_mut()).await?;
+                        self.follow_token(&tx, handshake.is_some(), following.as_mut()).await?;
                     } else {
                         following = None;
                     }
@@ -1454,47 +1291,27 @@ impl HubConnection {
                     None => return Ok(()),
                     Some(proto::ServerMessage { message: None }) => {}
                     Some(proto::ServerMessage { message: Some(m) }) => match m {
-                        server_message::Message::RegisterAck(ack) => match &handshake {
-                            None => {
+                        server_message::Message::RegisterAck(ack) => {
+                            if handshake.is_none() {
                                 if ack.heartbeat_interval_ms > 0 {
                                     interval = Duration::from_millis(ack.heartbeat_interval_ms.into());
                                     ticker = self::ticker(interval);
                                 }
-                                let h = Handshake::V2(ack);
-                                if !self.accept(&h) {
+                                if !self.accept(&ack) {
                                     return Ok(());
                                 }
-                                grants.decide(h.flow_control()).await;
-                                let ack = h.ack().expect("v2");
-                                tracing::info!(service = %self.service_name, instance = %self.instance_id, hub = %ack.hub_id, address = %self.settings.address, heartbeat = ?interval, flow_control = h.flow_control(), "registered with the hub");
-                                self.go_live(stream_id, &tx, &h, &grants, identity.as_ref());
-                                handshake = Some(h);
+                                tracing::info!(service = %self.service_name, instance = %self.instance_id, hub = %ack.hub_id, address = %self.settings.address, heartbeat = ?interval, "registered with the hub");
+                                self.go_live(stream_id, &tx, &ack, &grants, identity.as_ref());
+                                handshake = Some(ack);
                                 // A token published since the Register went out.
-                                self.follow_token(&tx, handshake.as_ref(), following.as_mut()).await?;
-                            }
-                            // Every later Register is acked too; the values do not change.
-                            Some(Handshake::V2(_)) => {
-                                let h = Handshake::V2(ack);
-                                self.go_live(stream_id, &tx, &h, &grants, identity.as_ref());
-                                handshake = Some(h);
-                            }
-                            Some(Handshake::Legacy) => {
-                                tracing::debug!(service = %self.service_name, "RegisterAck after the echo on a legacy stream ignored");
-                            }
-                        },
-                        server_message::Message::Heartbeat(_) => {
-                            last_echo = tokio::time::Instant::now();
-                            if handshake.is_none() {
-                                tracing::info!(service = %self.service_name, instance = %self.instance_id, address = %self.settings.address, heartbeat = ?interval, "registered with the hub (legacy hub without protocol v2)");
-                                let h = Handshake::Legacy;
-                                if !self.accept(&h) {
-                                    return Ok(());
-                                }
-                                grants.decide(false).await;
-                                self.go_live(stream_id, &tx, &h, &grants, identity.as_ref());
-                                handshake = Some(h);
+                                self.follow_token(&tx, handshake.is_some(), following.as_mut()).await?;
+                            } else {
+                                // Every later Register is acked too; the values do not change.
+                                self.go_live(stream_id, &tx, &ack, &grants, identity.as_ref());
+                                handshake = Some(ack);
                             }
                         }
+                        server_message::Message::Heartbeat(_) => last_echo = tokio::time::Instant::now(),
                         server_message::Message::Request(request) => {
                             grants.received();
                             self.forward(Inbound::Request { request, reply_to: reply_to.clone() }).await?
@@ -1505,14 +1322,9 @@ impl HubConnection {
                         server_message::Message::End(e) => self.forward(Inbound::End(e)).await?,
                         server_message::Message::Flow(x) => self.forward(Inbound::Flow(x)).await?,
                         server_message::Message::Cancel(c) => self.forward(Inbound::Cancel(c)).await?,
-                        // Processor control (ADR 0023): answered on this stream, and only to a hub
-                        // that listed the capability (one that did not cannot take the answer).
+                        // Processor control (ADR 0023): answered on this stream.
                         server_message::Message::Control(request) => {
-                            if handshake.as_ref().is_some_and(Handshake::processor_control) {
-                                self.forward(Inbound::Control { request, reply_to: reply_to.clone() }).await?
-                            } else {
-                                tracing::debug!(service = %self.service_name, address = %self.settings.address, control_id = %request.control_id, "a control request from a hub that did not list processor-control ignored");
-                            }
+                            self.forward(Inbound::Control { request, reply_to: reply_to.clone() }).await?
                         }
                     },
                 },
@@ -1520,14 +1332,13 @@ impl HubConnection {
         }
     }
 
-    /// The provider published a token: it is what later `Register`s and streams carry; when the
-    /// hub's ack lists `credentials-refresh` and this stream has not sent it yet, it goes to the hub
-    /// as `ClientMessage.credentials`. A stream without the capability is left alone (its hub closes
-    /// it at the old token's expiry and the reconnect registers with the new one).
+    /// The provider published a token: it is what later `Register`s and streams carry; once the
+    /// stream is handshaken and has not sent it yet, it goes to the hub as
+    /// `ClientMessage.credentials` (before the ack it waits for the ack).
     async fn follow_token(
         &self,
         tx: &mpsc::Sender<ClientMessage>,
-        handshake: Option<&Handshake>,
+        handshaken: bool,
         following: Option<&mut Following>,
     ) -> Result<(), Status> {
         let Some(following) = following else {
@@ -1540,7 +1351,7 @@ impl HubConnection {
             return Ok(());
         }
         *self.jwt.lock().unwrap() = Some(token.value().clone());
-        if !handshake.is_some_and(Handshake::credentials_refresh) {
+        if !handshaken {
             return Ok(());
         }
         following.sent = token.generation();
@@ -1554,20 +1365,18 @@ impl HubConnection {
         Ok(())
     }
 
-    /// A static token session whose `token_file` changed: the new token goes to a hub that offers
-    /// `credentials-refresh` (rotation without a reconnect). A file that cannot be read or is
-    /// empty changes nothing, as at a reconnect.
+    /// A static token session whose `token_file` changed: the new token goes to the hub on the
+    /// handshaken stream (rotation without a reconnect). A file that cannot be read or is empty
+    /// changes nothing, as at a reconnect.
     async fn follow_token_file(
         &self,
         tx: &mpsc::Sender<ClientMessage>,
-        handshake: Option<&Handshake>,
+        handshaken: bool,
     ) -> Result<(), Status> {
         let Some(path) = self.settings.token_file.as_ref() else {
             return Ok(());
         };
-        if self.settings.token_provider.is_some()
-            || !handshake.is_some_and(Handshake::credentials_refresh)
-        {
+        if self.settings.token_provider.is_some() || !handshaken {
             return Ok(());
         }
         let Ok(Some(token)) = crate::security::read_token_file(path) else {
@@ -1859,7 +1668,7 @@ impl HubConnection {
         &self,
         stream: StreamId,
         tx: &mpsc::Sender<ClientMessage>,
-        handshake: &Handshake,
+        ack: &RegisterAck,
         grants: &Arc<Grants>,
         identity: Option<&ClientIdentity>,
     ) {
@@ -1869,23 +1678,20 @@ impl HubConnection {
         *self.live.lock().unwrap() = Some(Live {
             stream,
             tx: tx.clone(),
-            handshake: handshake.clone(),
+            ack: ack.clone(),
             grants: Arc::clone(grants),
         });
         // A registered stream is the end of any earlier rejection.
         *self.last_rejection.lock().unwrap() = None;
-        let first = self
-            .handshake
-            .send_replace(Some(handshake.clone()))
-            .is_none();
+        let first = self.handshake.send_replace(Some(ack.clone())).is_none();
         if first {
             self.changed();
         }
     }
 
     /// Asks the pool (if any) whether this stream may go live; a refusal stops the connection.
-    fn accept(&self, handshake: &Handshake) -> bool {
-        let accepted = self.hooks.get().is_none_or(|h| (h.accept)(handshake));
+    fn accept(&self, ack: &RegisterAck) -> bool {
+        let accepted = self.hooks.get().is_none_or(|h| (h.accept)(ack));
         if !accepted {
             self.cancel.cancel();
         }
@@ -2013,9 +1819,9 @@ mod tests {
     /// Just past the flush timer.
     const AFTER_TIMER: Duration = PERMIT_FLUSH_AFTER.saturating_add(Duration::from_millis(1));
 
-    /// Grants of a handshaken flow-controlled stream that offered `initial` permits and on which
-    /// `received` requests arrived. The sender keeps the stream open.
-    async fn decided(
+    /// Grants of a stream that offered `initial` permits and on which `received` requests arrived.
+    /// The sender keeps the stream open.
+    fn offered(
         initial: u32,
         received: u32,
     ) -> (
@@ -2025,7 +1831,6 @@ mod tests {
     ) {
         let (tx, rx) = mpsc::channel(64);
         let grants = Grants::new(tx.downgrade(), initial);
-        grants.decide(true).await;
         for _ in 0..received {
             grants.received();
         }
@@ -2036,7 +1841,7 @@ mod tests {
     /// completion, not after the flush timer (which would pace the instance at ~20 requests/s).
     #[tokio::test(start_paused = true)]
     async fn with_one_initial_permit_every_completion_is_returned_at_once() {
-        let (grants, _tx, mut rx) = decided(1, 0).await;
+        let (grants, _tx, mut rx) = offered(1, 0);
         for round in 0..3 {
             grants.received();
             grants.grant().await;
@@ -2049,7 +1854,7 @@ mod tests {
     /// completion goes back at once; what the rule leaves pending goes with the timer.
     #[tokio::test(start_paused = true)]
     async fn a_larger_initial_batches_until_the_hub_runs_low_or_16_are_pending() {
-        let (grants, _tx, mut rx) = decided(64, 20).await; // the hub holds 44
+        let (grants, _tx, mut rx) = offered(64, 20); // the hub holds 44
         for _ in 0..15 {
             grants.grant().await;
         }
@@ -2075,7 +1880,7 @@ mod tests {
     /// Below 32 permits the mark is half of them: 8 permits, mark 4.
     #[tokio::test(start_paused = true)]
     async fn the_low_water_mark_is_half_of_a_small_initial() {
-        let (grants, _tx, mut rx) = decided(8, 3).await; // the hub holds 5
+        let (grants, _tx, mut rx) = offered(8, 3); // the hub holds 5
         grants.grant().await;
         assert!(permits_in(&mut rx).is_empty(), "the hub holds 5, above 4");
         grants.received(); // the hub holds 4
@@ -2087,62 +1892,8 @@ mod tests {
         );
     }
 
-    /// Requests can arrive before the ack; their grants are held until the hub's answer says
-    /// whether it wants permits (the hub already counted those forwards against our permits). With
-    /// flow control the held grants follow the same rule as later ones; without, they are dropped
-    /// and later grants are no-ops.
-    #[tokio::test(start_paused = true)]
-    async fn grants_before_the_handshake_are_held_then_sent_or_dropped() {
-        /// (initial, requests completed before the ack, flow control, sent at the ack, by the timer)
-        type Case = (u32, u32, bool, &'static [u32], &'static [u32]);
-        let cases: [Case; 5] = [
-            (1, 1, true, &[1], &[]),    // the hub holds none: at once
-            (64, 2, true, &[], &[2]),   // the hub holds 62: the timer
-            (64, 20, true, &[20], &[]), // 16 or more pending: at once
-            (1, 1, false, &[], &[]),    // no flow control: dropped
-            (64, 20, false, &[], &[]),
-        ];
-        for (initial, held, flow_control, at_once, by_timer) in cases {
-            let case = format!("initial={initial} held={held} flow_control={flow_control}");
-            let (tx, mut rx) = mpsc::channel(8);
-            let grants = Grants::new(tx.downgrade(), initial);
-            for _ in 0..held {
-                grants.received();
-                grants.grant().await;
-            }
-            assert!(
-                permits_in(&mut rx).is_empty(),
-                "{case}: nothing before the handshake"
-            );
-            grants.decide(flow_control).await;
-            assert_eq!(permits_in(&mut rx), at_once, "{case}: at the ack");
-            tokio::time::sleep(AFTER_TIMER).await;
-            assert_eq!(permits_in(&mut rx), by_timer, "{case}: by the timer");
-            grants.received();
-            grants.grant().await;
-            tokio::time::sleep(AFTER_TIMER).await;
-            let want: &[u32] = if flow_control { &[1] } else { &[] };
-            assert_eq!(permits_in(&mut rx), want, "{case}: after the handshake");
-            drop(tx);
-        }
-    }
-
     #[test]
     fn client_identity_constants() {
-        assert_eq!(PROTOCOL_VERSION, 2);
-        assert_eq!(
-            CAPABILITIES,
-            [
-                "flow-control",
-                "instance-status",
-                "scatter-gather",
-                "streaming",
-                "subscription",
-                "credentials-refresh",
-                "processors",
-                "processor-control"
-            ]
-        );
         assert!(CLIENT_VERSION.starts_with("kraken-messaging-rs/"));
         assert_eq!(
             HubSettings::default().backoff_max,

@@ -1,8 +1,8 @@
-//! End to end against the real hub image (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`, the P5c
-//! hub) running `KRAKEN_HUB_AUTH_MODE=enforce` with `KRAKEN_HUB_TLS_CLIENT_AUTH=required`: the
-//! services authenticate with client certificates (`kraken://service/<name>` URI SAN) that a CA
-//! generated at test time signed, and their rights come from the ACL's `[[service]]` tables. The hub's
-//! own server certificate is issued from the same CA with the client usage too, so the image's
+//! End to end against the real hub image (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`) running
+//! `KRAKEN_HUB_AUTH_MODE=enforce` with `KRAKEN_HUB_TLS_CLIENT_AUTH=required`: the services
+//! authenticate with client certificates (`kraken://service/<name>` URI SAN) that a CA generated at
+//! test time signed, and their rights come from the ACL's `[[service]]` tables. The hub's own
+//! server certificate is issued from the same CA with the client usage too, so the image's
 //! `--health-check` (which presents the hub's own pair under `required`) stays green. No Kafka or
 //! MongoDB: the participants are a `HubConnection` or a `HubPool` and a `Sender`.
 mod support;
@@ -18,7 +18,7 @@ use kraken_messaging::hub::{
 use kraken_messaging::proto::{self, ClientMessage, client_message, reply};
 use kraken_messaging::{HubTls, MessagingError, Query, message_type};
 use serde::{Deserialize, Serialize};
-use support::containers::{HubContainer, HubImage, HubOptions, free_port, hub_with};
+use support::containers::{HubContainer, HubOptions, free_port, hub_with};
 use support::logs::Captured;
 use support::pki::{ClientSpec, Pki, TempDir, fingerprint_of_pem};
 use tokio::sync::mpsc;
@@ -84,7 +84,7 @@ fn fixture() -> Fixture {
 impl Fixture {
     /// A hub container; `client_auth` is `required` or `optional`; `port` and `id` for a pair.
     async fn hub(&self, client_auth: &str, port: Option<u16>, id: Option<&str>) -> HubContainer {
-        let mut options = HubOptions::new(HubImage::Current)
+        let mut options = HubOptions::new()
             .env("KRAKEN_HUB_AUTH_MODE", "enforce")
             .env("KRAKEN_HUB_ACL_FILE", "/etc/kraken/acl.toml")
             .env("KRAKEN_HUB_TLS_CERT", "/etc/kraken/hub-cert.pem")

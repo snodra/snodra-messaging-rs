@@ -12,21 +12,20 @@
 //! with the same id (it was never sent), so `HubUnavailable` means no hub took it.
 //!
 //! Scatter-gather (ADR 0017, [`Sender::scatter_gather`]): one `Request` with
-//! `mode = SCATTER_GATHER` to one hub whose ack lists `scatter-gather` (unkeyed round-robin over
-//! those), answered by `ReplyPart`s in arrival order and one `ReplyEnd`. Its pending entry collects
-//! the parts until the end; the local guard covers the whole gather. If its stream breaks before
+//! `mode = SCATTER_GATHER` to one hub (unkeyed round-robin), answered by `ReplyPart`s in arrival
+//! order and one `ReplyEnd`. Its pending entry collects the parts until the end; the local guard covers the whole gather. If its stream breaks before
 //! the end, the gather fails with `HubConnectionLost` (parts already received are not kept).
 //!
-//! Streaming queries (ADR 0017 P4b, [`Sender::stream`], [`Sender::stream_owned`]): one `Request` with `mode = STREAMING`
-//! and the initial credit to one hub whose ack lists `streaming`, answered by one handler's
-//! `ReplyPart`s and one `ReplyEnd`. The pending entry lives until the end; the caller's stream
+//! Streaming queries (ADR 0017 P4b, [`Sender::stream`], [`Sender::stream_owned`]): one `Request`
+//! with `mode = STREAMING` and the initial credit to one hub, answered by one handler's `ReplyPart`s
+//! and one `ReplyEnd`. The pending entry lives until the end; the caller's stream
 //! refills credit as it consumes (`Flow`), and dropping it before the end sends `Cancel`. The
 //! local guard is an idle guard (reset by every part), like the hub's idle timeout, with twice
 //! the bound for the first part (the hub bounds a queue wait by the timeout, then restarts the
 //! idle clock at the forward); when it fires the stream is cancelled at the hub, best effort.
 //!
 //! Subscription queries (ADR 0017 P4c, [`Sender::subscribe`]): the same machinery with
-//! `mode = SUBSCRIPTION` to one hub whose ack lists `subscription`. The first part is the initial
+//! `mode = SUBSCRIPTION` to one hub. The first part is the initial
 //! result (bounded by the timeout like a unary request, local guard: the hub's bound plus the
 //! margin); every later part is an update, with no idle timeout and no guard at all (a quiet
 //! subscription is not a broken one). The initial part takes one credit, so it counts toward the
@@ -47,22 +46,21 @@ use crate::codec;
 use crate::context::{MessageContext, hub_headers};
 use crate::error::MessagingError;
 use crate::proto::{
-    self, ClientMessage, ErrorCode, RequestKind, RequestMode, client_message, reply,
+    self, ClientMessage, ErrorCode, RegisterAck, RequestKind, RequestMode, client_message, reply,
 };
 use crate::retry::{self, RetryPolicy};
 use crate::saga::{RawOutcome, classify_failure};
 use crate::types::{Command, Query, StreamingQuery, SubscriptionQuery};
 
-use super::connection::{
-    Handshake, HubConnection, Inbound, SCATTER_GATHER, STREAMING, SUBSCRIPTION, StreamId,
-};
+use super::connection::{HubConnection, Inbound, StreamId};
 use super::pool::{Consumers, HubPool, weak_probe};
 
-/// The timeout sent to a hub older than protocol v2 when the caller chose none (today's default).
-pub const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// The budget of a call that chose no timeout while no hub has acknowledged this instance yet (the
+/// hub's default request timeout, which only its ack announces).
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Added to the hub's own deadline for the local guard, which only catches a hub that never answers.
 pub const LOCAL_GUARD_MARGIN: Duration = Duration::from_secs(1);
-/// Used for the guard when a v2 ack carries no maximum (never sent by the hub; defensive).
+/// Used for the guard when an ack carries no maximum (the hub always sends one; defensive).
 const FALLBACK_MAX_TIMEOUT_MS: u32 = 60_000;
 /// The least of a call's budget a retry must have left once its wait is over (or the policy's
 /// `initial_backoff`, when larger); with less the call ends with the last error at once.
@@ -74,48 +72,40 @@ pub const DEFAULT_CREDIT: u32 = 64;
 /// How long the `Cancel` of a dropped stream may wait for room in the hub stream's buffer.
 const CANCEL_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// `Request.timeout_ms` and the local guard for a request of `type_name` on a stream with
-/// `handshake`, when the caller chose `chosen` (per call, or the configured default).
-///
-/// - Protocol v2: send the chosen timeout or 0 (the hub then applies its per-type override or its
-///   default); guard with the hub's upper bound for the request, i.e. `min(chosen, override or
-///   max)` or, when 0 was sent, `override or max`, plus [`LOCAL_GUARD_MARGIN`].
-/// - Legacy hub: send the chosen timeout or [`LEGACY_REQUEST_TIMEOUT`]; guard with that plus the margin.
+/// `Request.timeout_ms` and the local guard for a request of `type_name` on a stream whose hub
+/// sent `ack`, when the caller chose `chosen` (per call, or the configured default): send the
+/// chosen timeout or 0 (the hub then applies its per-type override or its default); guard with the
+/// hub's upper bound for the request, i.e. `min(chosen, override or max)` or, when 0 was sent,
+/// `override or max`, plus [`LOCAL_GUARD_MARGIN`].
 ///
 /// A zero `chosen` counts as none; a chosen timeout under a millisecond is sent as 1 ms, never as 0.
 pub fn request_timing(
-    handshake: &Handshake,
+    ack: &RegisterAck,
     type_name: &str,
     chosen: Option<Duration>,
 ) -> (u32, Duration) {
     let ms = |d: Duration| d.as_millis().min(u32::MAX as u128) as u32;
-    let chosen = chosen.filter(|d| !d.is_zero()).map(|d| d.max(MIN_TIMEOUT));
-    match handshake {
-        Handshake::V2(ack) => {
-            let sent = chosen.map(ms).unwrap_or(0);
-            let max = if ack.max_timeout_ms == 0 {
-                FALLBACK_MAX_TIMEOUT_MS
-            } else {
-                ack.max_timeout_ms
-            };
-            // A zero override is meaningless (the hub rejects it); fall back to the maximum.
-            let limit = ack
-                .type_timeouts_ms
-                .get(type_name)
-                .copied()
-                .filter(|&ms| ms > 0)
-                .unwrap_or(max);
-            let bound = if sent > 0 { sent.min(limit) } else { limit };
-            (
-                sent,
-                Duration::from_millis(bound.into()) + LOCAL_GUARD_MARGIN,
-            )
-        }
-        Handshake::Legacy => {
-            let timeout = chosen.unwrap_or(LEGACY_REQUEST_TIMEOUT);
-            (ms(timeout), timeout + LOCAL_GUARD_MARGIN)
-        }
-    }
+    let sent = chosen
+        .filter(|d| !d.is_zero())
+        .map(|d| ms(d.max(MIN_TIMEOUT)))
+        .unwrap_or(0);
+    let max = if ack.max_timeout_ms == 0 {
+        FALLBACK_MAX_TIMEOUT_MS
+    } else {
+        ack.max_timeout_ms
+    };
+    // A zero override is meaningless (the hub rejects it); fall back to the maximum.
+    let limit = ack
+        .type_timeouts_ms
+        .get(type_name)
+        .copied()
+        .filter(|&ms| ms > 0)
+        .unwrap_or(max);
+    let bound = if sent > 0 { sent.min(limit) } else { limit };
+    (
+        sent,
+        Duration::from_millis(bound.into()) + LOCAL_GUARD_MARGIN,
+    )
 }
 
 /// The local guard of a streaming query's first part, from its idle guard (the hub's bound plus
@@ -165,8 +155,8 @@ pub struct SendOptions {
     /// Same key, same owning instance (consistent hashing on the hub); typically the aggregate id.
     pub routing_key: Option<String>,
     /// The request timeout for this call; sent to the hub as `timeout_ms`. Without one (and
-    /// without `Config.hub_request_timeout`) a protocol v2 hub applies its per-type override or
-    /// its default.
+    /// without `Config.hub_request_timeout`) the hub applies its per-type override or its
+    /// default.
     pub timeout: Option<Duration>,
     /// Full header value (`Bearer <jwt>`) to send instead of the one forwarded from the current handler context.
     pub authorization: Option<String>,
@@ -384,28 +374,26 @@ fn assemble<R: DeserializeOwned + 'static>(
     }
 }
 
-/// The time all attempts of one call share: the caller's chosen timeout; else, against a v2 hub,
-/// its bound for the type (the per-type override, else its default); else (legacy hub, or not
-/// connected yet) [`LEGACY_REQUEST_TIMEOUT`].
+/// The time all attempts of one call share: the caller's chosen timeout; else the hub's bound for
+/// the type from its `ack` (the per-type override, else its default); else (not connected yet)
+/// [`DEFAULT_REQUEST_TIMEOUT`].
 pub fn retry_budget(
-    handshake: Option<&Handshake>,
+    ack: Option<&RegisterAck>,
     type_name: &str,
     chosen: Option<Duration>,
 ) -> Duration {
     if let Some(chosen) = chosen.filter(|d| !d.is_zero()) {
         return chosen;
     }
-    handshake
-        .and_then(Handshake::ack)
-        .and_then(|ack| {
-            ack.type_timeouts_ms
-                .get(type_name)
-                .copied()
-                .filter(|&ms| ms > 0)
-                .or(Some(ack.default_timeout_ms).filter(|&ms| ms > 0))
-        })
-        .map(|ms| Duration::from_millis(ms.into()))
-        .unwrap_or(LEGACY_REQUEST_TIMEOUT)
+    ack.and_then(|ack| {
+        ack.type_timeouts_ms
+            .get(type_name)
+            .copied()
+            .filter(|&ms| ms > 0)
+            .or(Some(ack.default_timeout_ms).filter(|&ms| ms > 0))
+    })
+    .map(|ms| Duration::from_millis(ms.into()))
+    .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
 }
 
 /// The parts of a call that stay the same across its attempts.
@@ -579,12 +567,12 @@ struct StreamCall {
 }
 
 impl StreamCall {
-    /// The request mode, the capability the hub must list and the word the errors use.
-    fn mode(&self) -> (RequestMode, &'static str, &'static str) {
+    /// The request mode and the word the errors use.
+    fn mode(&self) -> (RequestMode, &'static str) {
         if self.subscription {
-            (RequestMode::Subscription, SUBSCRIPTION, "subscription")
+            (RequestMode::Subscription, "subscription")
         } else {
-            (RequestMode::Streaming, STREAMING, "stream")
+            (RequestMode::Streaming, "stream")
         }
     }
 
@@ -706,7 +694,7 @@ impl Streaming<'_> {
                                 "part out of order",
                                 MessagingError::InvalidMessage(format!(
                                     "{} {} part {} out of order (expected {expected})",
-                                    self.call.mode().2,
+                                    self.call.mode().1,
                                     self.call.type_name,
                                     part.seq
                                 )),
@@ -726,7 +714,7 @@ impl Streaming<'_> {
                     self.done = true;
                     return match end.error {
                         Some(e) => {
-                            tracing::debug!(request = %self.id, code = e.code, "{} ended by the hub: {}", self.call.mode().2, e.message);
+                            tracing::debug!(request = %self.id, code = e.code, "{} ended by the hub: {}", self.call.mode().1, e.message);
                             Some(Err(MessagingError::from_hub(
                                 self.call.type_name,
                                 e.code,
@@ -838,7 +826,7 @@ impl Streaming<'_> {
     fn lost(&self, n: u64) -> MessagingError {
         MessagingError::InvalidMessage(format!(
             "{} {} lost {n} part(s)",
-            self.call.mode().2,
+            self.call.mode().1,
             self.call.type_name
         ))
     }
@@ -1177,12 +1165,8 @@ impl Sender {
     /// failed parts and of targets that timed out. Partial answers are answers: a gather where
     /// some targets failed or timed out still succeeds.
     ///
-    /// Sent to one hub whose `RegisterAck` lists `scatter-gather` (unkeyed round-robin over
-    /// those; the capability is checked again on the stream the gather is written to, so a hub
-    /// re-handshaken without it in between is skipped). Fails at once, without sending anything,
-    /// with [`MessagingError::UnsupportedByHub`] when no hub lists it (a P3 or older hub, or a
-    /// legacy hub). Before any target: no live target is `NoHandler`, a command type `InvalidMessage`, a
-    /// hub `UNSUPPORTED` answer `UnsupportedByHub`. A hub stream lost before the end fails the
+    /// Sent to one hub (unkeyed round-robin). Before any target: no live target is `NoHandler`, a
+    /// command type `InvalidMessage`. A hub stream lost before the end fails the
     /// call with `HubConnectionLost` (the parts received are dropped), the local guard (the hub's
     /// bound plus [`LOCAL_GUARD_MARGIN`]) with `Timeout`.
     ///
@@ -1270,15 +1254,12 @@ impl Sender {
         })
     }
 
-    /// Streams the result of `Q` from one capable instance of an owner (ADR 0017, P4b): one
-    /// `Request` with `mode = STREAMING` to one hub whose `RegisterAck` lists `streaming` (unkeyed
-    /// round-robin over those; the capability is checked again on the stream the request is
-    /// written to), answered by the handler's parts under this caller's credits and one end.
+    /// Streams the result of `Q` from one instance of an owner (ADR 0017, P4b): one `Request` with
+    /// `mode = STREAMING` to one hub (unkeyed round-robin), answered by the handler's parts under
+    /// this caller's credits and one end.
     ///
     /// Opening waits for the first part (or the end, or a failure), so the errors before any part
-    /// are the call's: [`MessagingError::UnsupportedByHub`] when no hub lists the capability
-    /// (nothing is sent) or the hub answers `UNSUPPORTED` (no owner instance negotiated
-    /// `streaming`), `NoHandler` without an owner, `InvalidMessage` for a command type, `Timeout`
+    /// are the call's: `NoHandler` without an owner, `InvalidMessage` for a command type, `Timeout`
     /// when the first part is not in time, the handler's error when it fails at once,
     /// `HubUnavailable` / `HubConnectionLost` as for a unary query. `Config.hub_retry` applies
     /// until then, for the same errors as a unary query (a retry is a new stream with a fresh
@@ -1388,17 +1369,13 @@ impl Sender {
     }
 
     /// Subscribes to `Q` (ADR 0017, P4c): one `Request` with `mode = SUBSCRIPTION` to one hub
-    /// whose `RegisterAck` lists `subscription` (unkeyed round-robin over those; the capability
-    /// is checked again on the stream it is written to). The hub asks one capable owner instance
-    /// for the initial result and subscribes every capable instance of every owner to the
-    /// updates, as they are at this moment: an instance registering later is not added and one
+    /// (unkeyed round-robin). The hub asks one owner instance for the initial result and
+    /// subscribes every instance of every owner to the updates, as they are at this moment: an instance registering later is not added and one
     /// that leaves is not replaced (updates are delivered at most once; the hub never
     /// resubscribes, and neither does this library).
     ///
     /// Returns once the initial result arrived, so the errors before it are the call's:
-    /// [`MessagingError::UnsupportedByHub`] when no hub lists the capability (nothing is sent) or
-    /// the hub answers `UNSUPPORTED` (no owner instance negotiated `subscription`), `NoHandler`
-    /// without an owner, `InvalidMessage` for a command type or a handler that serves another
+    /// `NoHandler` without an owner, `InvalidMessage` for a command type or a handler that serves another
     /// mode, `Timeout` when the initial result is not in time, the handler's error when it fails
     /// (`RemoteHandler`), `HandlerBusy` when the hub or an owner instance refused it for
     /// capacity, `HubUnavailable` / `HubConnectionLost` as for a unary query.
@@ -1490,7 +1467,7 @@ impl Sender {
         })
     }
 
-    /// Writes a new streaming query of `call` (fresh id) to a hub that shares the capability.
+    /// Writes a new streaming query of `call` (fresh id) to a hub.
     async fn open_stream<'a>(
         sender: SenderRef<'a>,
         call: &Arc<StreamCall>,
@@ -1526,7 +1503,7 @@ impl Sender {
         Ok(streaming)
     }
 
-    /// Writes streaming query `id` to a hub whose ack lists `streaming`, its pending entry
+    /// Writes streaming query `id` to a hub, its pending entry
     /// recorded while the stream is current. Returns its events, the idle guard and the stream.
     async fn write_stream(
         &self,
@@ -1535,19 +1512,11 @@ impl Sender {
         chosen: Option<Duration>,
     ) -> Result<(mpsc::UnboundedReceiver<GatherEvent>, Duration, StreamId), MessagingError> {
         let mut events = None;
-        let (mode, capability, _) = call.mode();
+        let (mode, _) = call.mode();
         let sent = self
             .hubs
-            .send_where("", Some(capability), chosen, |stream, handshake| {
-                // Ranked on a snapshot: the stream current now may belong to a re-handshake with
-                // an older hub, which would answer UNSUPPORTED (a P4a hub) or serve the request
-                // as a unary query (older). Refused, nothing written: the next capable hub is tried.
-                if !handshake.shares(capability) {
-                    return Err(MessagingError::UnsupportedByHub(format!(
-                        "the hub stream {stream} no longer lists the \"{capability}\" capability"
-                    )));
-                }
-                let (timeout_ms, guard) = request_timing(handshake, call.type_name, chosen);
+            .send_where("", chosen, |stream, ack| {
+                let (timeout_ms, guard) = request_timing(ack, call.type_name, chosen);
                 let (tx, rx) = mpsc::unbounded_channel();
                 events = Some(rx);
                 self.pending.lock().unwrap().insert(
@@ -1625,7 +1594,7 @@ impl Sender {
         }
     }
 
-    /// Writes a new scatter-gather of `call` (fresh id) to a hub that shares the capability.
+    /// Writes a new scatter-gather of `call` (fresh id) to a hub.
     async fn open_gather(
         &self,
         call: &Arc<ScatterCall>,
@@ -1652,7 +1621,7 @@ impl Sender {
         Ok(gathering)
     }
 
-    /// Writes scatter-gather `id` to a hub whose ack lists `scatter-gather`, its pending entry
+    /// Writes scatter-gather `id` to a hub, its pending entry
     /// recorded while the stream is current. Returns its events and the local guard.
     async fn write_gather(
         &self,
@@ -1663,17 +1632,8 @@ impl Sender {
         let mut events = None;
         let sent = self
             .hubs
-            .send_where("", Some(SCATTER_GATHER), chosen, |stream, handshake| {
-                // The hubs were ranked on a snapshot: the stream current now may belong to a
-                // re-handshake with an older hub, which would serve the gather as a unary query
-                // (its reply ignored here, the local guard the only end). Refused, nothing
-                // written: the next capable hub is tried.
-                if !handshake.scatter_gather() {
-                    return Err(MessagingError::UnsupportedByHub(format!(
-                        "the hub stream {stream} no longer lists the \"{SCATTER_GATHER}\" capability"
-                    )));
-                }
-                let (timeout_ms, guard) = request_timing(handshake, call.type_name, chosen);
+            .send_where("", chosen, |stream, ack| {
+                let (timeout_ms, guard) = request_timing(ack, call.type_name, chosen);
                 let (tx, rx) = mpsc::unbounded_channel();
                 events = Some(rx);
                 self.pending.lock().unwrap().insert(
@@ -1790,8 +1750,8 @@ impl Sender {
             let mut answer = None;
             let sent = self
                 .hubs
-                .send_excluding(call.routing_key, &declined, chosen, |stream, handshake| {
-                    let (timeout_ms, guard) = request_timing(handshake, type_name, chosen);
+                .send_excluding(call.routing_key, &declined, chosen, |stream, ack| {
+                    let (timeout_ms, guard) = request_timing(ack, type_name, chosen);
                     let (tx, rx) = oneshot::channel();
                     answer = Some(rx);
                     self.pending.lock().unwrap().insert(
@@ -1902,8 +1862,8 @@ mod tests {
     use super::*;
     use crate::proto::RegisterAck;
 
-    fn ack(overrides: &[(&str, u32)]) -> Handshake {
-        Handshake::V2(RegisterAck {
+    fn ack(overrides: &[(&str, u32)]) -> RegisterAck {
+        RegisterAck {
             hub_id: "h".into(),
             heartbeat_interval_ms: 3_000,
             heartbeat_timeout_ms: 10_000,
@@ -1914,14 +1874,14 @@ mod tests {
                 .iter()
                 .map(|(t, ms)| (t.to_string(), *ms))
                 .collect(),
-        })
+        }
     }
 
     const S: fn(u64) -> Duration = Duration::from_secs;
     const MS: fn(u64) -> Duration = Duration::from_millis;
 
     #[test]
-    fn v2_sends_zero_unless_chosen_and_guards_with_the_hub_bound() {
+    fn sends_zero_unless_chosen_and_guards_with_the_hub_bound() {
         let h = ack(&[("t.Slow", 120_000), ("t.Quick", 1_500)]);
         // Nothing chosen: 0 on the wire, guard = override or max, plus the margin.
         assert_eq!(request_timing(&h, "t.Other", None), (0, S(61)));
@@ -1944,10 +1904,6 @@ mod tests {
         assert_eq!(chosen_timeout(None, Some(MS(0))), None);
         assert_eq!(chosen_timeout(Some(S(2)), Some(S(3))), Some(S(2)));
         // Defensive: a zero reaching the timing is treated as unset too.
-        assert_eq!(
-            request_timing(&Handshake::Legacy, "t.X", Some(MS(0))),
-            (5_000, S(6))
-        );
         assert_eq!(request_timing(&ack(&[]), "t.X", Some(MS(0))), (0, S(61)));
     }
 
@@ -1956,10 +1912,6 @@ mod tests {
         let us = Duration::from_micros;
         assert_eq!(
             request_timing(&ack(&[]), "t.X", Some(us(400))),
-            (1, MS(1) + LOCAL_GUARD_MARGIN)
-        );
-        assert_eq!(
-            request_timing(&Handshake::Legacy, "t.X", Some(us(400))),
             (1, MS(1) + LOCAL_GUARD_MARGIN)
         );
     }
@@ -1986,8 +1938,11 @@ mod tests {
             S(5),
             "the ack's default"
         );
-        assert_eq!(retry_budget(Some(&Handshake::Legacy), "t.X", None), S(5));
-        assert_eq!(retry_budget(None, "t.X", None), S(5));
+        assert_eq!(
+            retry_budget(None, "t.X", None),
+            DEFAULT_REQUEST_TIMEOUT,
+            "not connected yet"
+        );
         assert_eq!(
             retry_budget(Some(&h), "t.X", Some(MS(0))),
             S(5),
@@ -2224,12 +2179,5 @@ mod tests {
             ))))
         ));
         assert_eq!(sender.in_flight(), 0);
-    }
-
-    #[test]
-    fn legacy_keeps_todays_timeout_and_guard() {
-        let h = Handshake::Legacy;
-        assert_eq!(request_timing(&h, "t.X", None), (5_000, S(6)));
-        assert_eq!(request_timing(&h, "t.X", Some(MS(200))), (200, MS(1_200)));
     }
 }

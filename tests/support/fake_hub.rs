@@ -1,9 +1,7 @@
-//! In-process stand-in for kraken-hub: records registrations, answers a v2 `Register` with a
-//! `RegisterAck` (new-hub behaviour, the default) or not at all (old-hub behaviour, `set_ack(None)`).
-//! The ack lists "flow-control" when the client declared it, unless `set_flow_control(false)`
-//! (the P0 hub), "instance-status" likewise unless `set_instance_status(false)` (hubs before
-//! P3), and "processors" unless `set_processors(false)` (hubs before P6a). Permits and InstanceStatus messages are recorded per stream. It
-//! echoes heartbeats, can drop streams, reject a registration, push requests to clients and answer
+//! In-process stand-in for kraken-hub: records registrations, answers every `Register` with a
+//! `RegisterAck` (before the echo of the heartbeat that follows it; `set_ack(None)` withholds it,
+//! a hub that never confirms the registration). Permits and InstanceStatus messages are recorded
+//! per stream. It echoes heartbeats, can drop streams, reject a registration, push requests to clients and answer
 //! their requests.
 //!
 //! Like kraken-hub, a `Register` for an instance id that another open stream holds replaces that
@@ -11,34 +9,26 @@
 //! unless `set_replace_sessions(false)`. A stream that ends while it holds the session removes the
 //! instance. Registrations and stream ends are logged in order ([`FakeHub::events`]).
 //!
-//! Permit accounting like kraken-hub (it never holds requests back, it only counts): a stream whose
-//! ack shares "flow-control" and whose first `Register` offers `initial_permits > 0` holds that
-//! many permits ([`FakeHub::permits_held`]); each request pushed to it spends one, each `Permits`
-//! adds `count`, never past the stream's cap. The cap starts at `initial_permits` and a
-//! `Permits.grant` above it raises it first (never lowers it). `set_permit_cap(false)` drops the
-//! cap; `set_permit_grants(false)` emulates a hub that predates `Permits.grant`.
+//! Permit accounting like kraken-hub (it never holds requests back, it only counts): a stream
+//! whose first `Register` offers `initial_permits > 0` holds that many permits
+//! ([`FakeHub::permits_held`]); each request pushed to it spends one, each `Permits` adds `count`,
+//! never past the stream's cap. The cap starts at `initial_permits` and a `Permits.grant` above it
+//! raises it first (never lowers it). `set_permit_cap(false)` drops the cap.
 //!
-//! Scatter-gather like kraken-hub (ADR 0017): the ack lists "scatter-gather" when the client
-//! declared it, unless `set_scatter_gather(false)` (a P3 hub). A `Request` with
-//! `mode = SCATTER_GATHER` on a stream whose ack never listed it is served like a unary request
-//! (a P3 hub does not know `mode`: the responder answers, or nobody); on a stream whose ack listed
-//! it while the flag is off now it is rejected with `UNSUPPORTED`. Otherwise it
-//! goes to every stream whose `Register` lists the type in `query_types` or
+//! Scatter-gather like kraken-hub (ADR 0017): a `Request` with `mode = SCATTER_GATHER` goes to
+//! every stream whose `Register` lists the type in `query_types` or
 //! `shared_query_types` (ordered by service, then instance id) as a unary request `<id>#<n>`; each
 //! answer goes back to the sender as a `ReplyPart` in arrival order, then one `ReplyEnd` once every
 //! target answered, after `max_results` successful parts, or at the deadline (`timeout_ms`, else
 //! 5 s) with the unanswered targets as `timed_out`. A target whose stream ends is a failed part
-//! (`HANDLER_DISCONNECTED`). No target: `NO_HANDLER`; a command: `INVALID_REQUEST`; a session
-//! without the capability: `UNSUPPORTED`. Unary requests still go to the responder only. A gather
-//! that ends early (`max_results`, the deadline, the sender gone) sends `Cancel{<id>#<n>, reason}`
-//! to each still-outstanding target whose session negotiated "streaming".
+//! (`HANDLER_DISCONNECTED`). No target: `NO_HANDLER`; a command: `INVALID_REQUEST`. Unary
+//! requests go to the responder only; a mode the protocol does not define is `INVALID_REQUEST`
+//! "invalid request: unknown request mode N". A gather that ends early (`max_results`, the
+//! deadline, the sender gone) sends `Cancel{<id>#<n>, reason}` to each still-outstanding target.
 //!
-//! Streaming like kraken-hub (ADR 0017, P4b): the ack lists "streaming" when the client declared
-//! it, unless `set_streaming(false)` (a P4a hub). A `Request` with `mode = STREAMING` on a session
-//! without it is `UNSUPPORTED` (unary on a session that never saw `scatter-gather` either: a P3
-//! hub does not know `mode`). Otherwise: a command `INVALID_REQUEST`, no owner `NO_HANDLER`, no
-//! owner instance that negotiated "streaming" `UNSUPPORTED`, a duplicate id `INVALID_REQUEST`;
-//! else one capable instance (round-robin over them, by service then instance id) gets
+//! Streaming like kraken-hub (ADR 0017, P4b): a `Request` with `mode = STREAMING`: a command
+//! `INVALID_REQUEST`, no owner `NO_HANDLER`, a duplicate id `INVALID_REQUEST`; else one owner
+//! instance (round-robin over them, by service then instance id) gets
 //! `Request{<id>#1, mode = STREAMING, initial_credit (0 reads as 64), max_results 0}`. Its
 //! `ReplyPart`s are relayed under the credit (`request_id` rewritten, responder set, `seq` kept;
 //! one beyond the credit ends the stream with `INVALID_REQUEST "part without credit"` and cancels
@@ -51,13 +41,10 @@
 //! `HANDLER_DISCONNECTED`, the sender leaving cancels the handler (`"sender disconnected"`).
 //! Client-sent parts, ends, flows and cancels are recorded per stream.
 //!
-//! Subscriptions like kraken-hub (ADR 0017, P4c): the ack lists "subscription" when the client
-//! declared it, unless `set_subscription(false)` (a P4b hub). A `Request` with
-//! `mode = SUBSCRIPTION` on a session without it is `UNSUPPORTED` (unary on a session that knows
-//! no modes); then a command `INVALID_REQUEST`, no owner `NO_HANDLER`, no owner instance that
-//! negotiated "subscription" `UNSUPPORTED`, a duplicate id `INVALID_REQUEST`, a target already
-//! serving `set_max_subscriptions_per_instance` (1024) subscriptions `RESOURCE_EXHAUSTED`. Else
-//! every capable instance listing the type (by service, then instance id) gets
+//! Subscriptions like kraken-hub (ADR 0017, P4c): a `Request` with `mode = SUBSCRIPTION`: a
+//! command `INVALID_REQUEST`, no owner `NO_HANDLER`, a duplicate id `INVALID_REQUEST`, a target
+//! already serving `set_max_subscriptions_per_instance` (1024) subscriptions
+//! `RESOURCE_EXHAUSTED`. Else every instance listing the type (by service, then instance id) gets
 //! `Request{<id>#n, mode = SUBSCRIPTION}` (`n` from 1; `initial_credit` and `max_results` 0) and
 //! one of them (round-robin) `Request{<id>#0, mode = UNARY}` for the initial result, whose
 //! `Reply{payload}` is `ReplyPart{seq 1}` to the sender (`Reply{error}`, no reply within
@@ -93,13 +80,12 @@
 //! `Register.service_name` (else `PERMISSION_DENIED` "token azp ... is not service ...") and name
 //! an entry of that table (else `PERMISSION_DENIED` "no ACL entry for service ..."); until
 //! `set_jwks_loaded(true)` (the default) the hub answers a JWT `Register` with `UNAVAILABLE` "jwks
-//! not loaded yet". `set_credentials_refresh(true)` offers the capability `credentials-refresh` to
-//! a client that declares it; a `ClientMessage.credentials` is recorded ([`FakeHub::refreshes`])
-//! and, in `Enforce`, must resolve to the session's own service (else the stream ends with the
+//! not loaded yet". A `ClientMessage.credentials` is recorded ([`FakeHub::refreshes`]) and, in
+//! `Enforce`, must resolve to the session's own service (else the stream ends with the
 //! status, like a refused `Register`); the session then holds the new credential's entry.
 //! Whatever the mode but `Off`, a `Register` whose instance id an open session of another service
 //! holds is closed with `PERMISSION_DENIED "instance id <first 8 chars> belongs to another
-//! service"` and nothing changes (the holder keeps its session); `Off` replaces it as before.
+//! service"` and nothing changes (the holder keeps its session); `Off` replaces it.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -149,12 +135,6 @@ struct Route {
     commands: Vec<String>,
     /// Exclusive and shared query types.
     queries: Vec<String>,
-    /// The session declared "scatter-gather" and the hub shares it.
-    scatter: bool,
-    /// The session declared "streaming" and the hub shares it.
-    streaming: bool,
-    /// The session declared "subscription" and the hub shares it.
-    subscription: bool,
     tx: Outbound,
 }
 
@@ -364,7 +344,6 @@ pub struct State {
     responder: Mutex<Option<Responder>>,
     ack: StdMutex<Option<proto::RegisterAck>>,
     streams: AtomicUsize,
-    flow_control: AtomicBool,
     /// Permits messages: (stream number, count, when).
     permits: StdMutex<Vec<(usize, u32, std::time::Instant)>>,
     /// Permits messages' grants: (stream number, grant).
@@ -372,10 +351,6 @@ pub struct State {
     /// Flow-controlled streams: stream number → (permits held, cap).
     held: StdMutex<HashMap<usize, (u32, u32)>>,
     permit_cap: AtomicBool,
-    permit_grants: AtomicBool,
-    instance_status: AtomicBool,
-    processors: AtomicBool,
-    processor_control: AtomicBool,
     /// ControlReply messages: (stream number, reply).
     control_replies: StdMutex<Vec<(usize, proto::ControlReply)>>,
     /// InstanceStatus messages: (stream number, report).
@@ -388,8 +363,6 @@ pub struct State {
     sessions: StdMutex<HashMap<String, (usize, CancellationToken)>>,
     evictions: AtomicUsize,
     events: StdMutex<Vec<(Event, std::time::Instant)>>,
-    scatter_gather: AtomicBool,
-    streaming: AtomicBool,
     /// Whether idle streams end with TIMEOUT (`false`: a hub that never does, for local-guard tests).
     stream_timeouts: AtomicBool,
     /// stream number → its registration.
@@ -400,9 +373,8 @@ pub struct State {
     /// stream id → the stream; `<id>#1` → stream id.
     open_streams: StdMutex<HashMap<String, StreamState>>,
     stream_target_of: StdMutex<HashMap<String, String>>,
-    /// Round-robin over the capable instances of a streaming query.
+    /// Round-robin over the owner instances of a streaming query.
     rotation: AtomicUsize,
-    subscription: AtomicBool,
     /// subscription id → the subscription; `<id>#n` / `<id>#0` → subscription id.
     subscriptions: StdMutex<HashMap<String, SubState>>,
     sub_target_of: StdMutex<HashMap<String, String>>,
@@ -425,8 +397,6 @@ pub struct State {
     jwt_refusal: StdMutex<Option<(tonic::Code, String)>>,
     /// The status the next [`FakeHub::close_streams_with`] ends the open streams with.
     close_with: StdMutex<Option<(tonic::Code, String)>>,
-    /// Offer `credentials-refresh` to clients that declare it.
-    credentials_refresh: AtomicBool,
     /// `ClientMessage.credentials` (P5b): (stream number, the new credential).
     refreshes: StdMutex<Vec<(usize, proto::Credentials)>>,
     /// The leaf certificate each stream presented in the TLS handshake (DER), mutual TLS only.
@@ -654,35 +624,10 @@ impl State {
             .push((event, std::time::Instant::now()));
     }
 
-    /// A scatter-gather `Request` from stream `stream_no`: rejected, or fanned out. `false` when
-    /// that stream's ack never listed the capability: the request is to be served as unary (an
-    /// older hub does not know `mode`).
-    async fn scatter(
-        self: &Arc<Self>,
-        stream_no: usize,
-        req: &proto::Request,
-        tx: &Outbound,
-    ) -> bool {
+    /// A scatter-gather `Request`: rejected, or fanned out.
+    async fn scatter(self: &Arc<Self>, req: &proto::Request, tx: &Outbound) {
         use proto::ErrorCode;
         let reject = |code, message: &str| hub_error(&req.id, code, message);
-        let listed = self
-            .routes
-            .lock()
-            .unwrap()
-            .get(&stream_no)
-            .is_some_and(|r| r.scatter);
-        if !listed {
-            return false;
-        }
-        if !self.scatter_gather.load(Ordering::SeqCst) {
-            let _ = tx
-                .send(Ok(reject(
-                    ErrorCode::InvalidRequest,
-                    "scatter-gather not supported",
-                )))
-                .await;
-            return true;
-        }
         let (is_command, mut targets) = {
             let routes = self.routes.lock().unwrap();
             let is_command = req.kind == proto::RequestKind::Command as i32
@@ -701,13 +646,13 @@ impl State {
                     "invalid request: a command",
                 )))
                 .await;
-            return true;
+            return;
         }
         if targets.is_empty() {
             let _ = tx
                 .send(Ok(reject(ErrorCode::NoHandler, "no handler")))
                 .await;
-            return true;
+            return;
         }
         targets.sort_by(|a, b| (&a.1, &a.2).cmp(&(&b.1, &b.2)));
         let ids: Vec<String> = (0..targets.len())
@@ -757,7 +702,6 @@ impl State {
                 .send(Ok(server(server_message::Message::Request(forwarded))))
                 .await;
         }
-        true
     }
 
     /// The answer of scatter-gather target `id`, if it is one: its part, and the end when done.
@@ -814,7 +758,7 @@ impl State {
 
     /// Ends gather `id` (if still open): its `ReplyEnd` (unless the sender is gone), the
     /// unanswered targets timed out at the deadline, and a `Cancel` to each still-outstanding
-    /// target whose session negotiated "streaming" when the gather ends early.
+    /// target when the gather ends early.
     fn close(&self, id: &str, how: Closed) -> Vec<(Outbound, ServerMessage)> {
         let Some(g) = self.gathers.lock().unwrap().remove(id) else {
             return vec![];
@@ -852,58 +796,33 @@ impl State {
         let mut targets: Vec<(&String, &(usize, String, String))> = g.outstanding.iter().collect();
         targets.sort();
         for (target_id, (n, _, _)) in targets {
-            if let Some(r) = routes.get(n).filter(|r| r.streaming || r.subscription) {
+            if let Some(r) = routes.get(n) {
                 out.push((r.tx.clone(), cancel_msg(target_id, reason)));
             }
         }
         out
     }
 
-    /// A subscription `Request` from stream `stream_no`: rejected, or forwarded to every capable
-    /// instance (and the initial request to one of them). `false` when the session knows no
-    /// query modes at all (served as unary).
+    /// A subscription `Request` from stream `stream_no`: rejected, or forwarded to every owner
+    /// instance (and the initial request to one of them).
     async fn open_subscription(
         self: &Arc<Self>,
         stream_no: usize,
         req: &proto::Request,
         tx: &Outbound,
-    ) -> bool {
+    ) {
         use proto::ErrorCode;
         let reject = |code, message: &str| hub_error(&req.id, code, message);
-        let (knows_modes, listed) = self
-            .routes
-            .lock()
-            .unwrap()
-            .get(&stream_no)
-            .map(|r| (r.scatter || r.streaming || r.subscription, r.subscription))
-            .unwrap_or((false, false));
-        if !knows_modes {
-            return false;
-        }
-        if !listed || !self.subscription.load(Ordering::SeqCst) {
-            let _ = tx
-                .send(Ok(reject(
-                    ErrorCode::InvalidRequest,
-                    "subscription not negotiated",
-                )))
-                .await;
-            return true;
-        }
-        let (is_command, owners, mut capable) = {
+        let (is_command, mut capable) = {
             let routes = self.routes.lock().unwrap();
             let is_command = req.kind == proto::RequestKind::Command as i32
                 || routes.values().any(|r| r.commands.contains(&req.r#type));
-            let owners: Vec<String> = routes
-                .values()
-                .filter(|r| r.queries.contains(&req.r#type))
-                .map(|r| r.service.clone())
-                .collect();
             let capable: Vec<(usize, String, String, Outbound)> = routes
                 .iter()
-                .filter(|(_, r)| r.queries.contains(&req.r#type) && r.subscription)
+                .filter(|(_, r)| r.queries.contains(&req.r#type))
                 .map(|(n, r)| (*n, r.service.clone(), r.instance.clone(), r.tx.clone()))
                 .collect();
-            (is_command, owners, capable)
+            (is_command, capable)
         };
         capable.sort_by(|a, b| (&a.1, &a.2).cmp(&(&b.1, &b.2)));
         let max = self.max_subscriptions_per_instance.load(Ordering::SeqCst);
@@ -912,13 +831,8 @@ impl State {
                 ErrorCode::InvalidRequest,
                 "invalid request: a command",
             ))
-        } else if owners.is_empty() {
-            Some(reject(ErrorCode::NoHandler, "no handler"))
         } else if capable.is_empty() {
-            Some(reject(
-                ErrorCode::InvalidRequest,
-                &format!("no instance of {owners:?} negotiated subscription"),
-            ))
+            Some(reject(ErrorCode::NoHandler, "no handler"))
         } else if self.subscriptions.lock().unwrap().contains_key(&req.id)
             || self.open_streams.lock().unwrap().contains_key(&req.id)
             || self.gathers.lock().unwrap().contains_key(&req.id)
@@ -947,7 +861,7 @@ impl State {
         };
         if let Some(rejection) = rejection {
             let _ = tx.send(Ok(rejection)).await;
-            return true;
+            return;
         }
         let pick = self.sub_rotation.fetch_add(1, Ordering::SeqCst) % capable.len();
         let (initial_no, initial_service, initial_instance, initial_tx) = capable[pick].clone();
@@ -1057,7 +971,6 @@ impl State {
         let _ = initial_tx
             .send(Ok(server(server_message::Message::Request(initial))))
             .await;
-        true
     }
 
     /// The `Reply` to `<id>#0` from stream `stream_no`, if it is a subscription's initial
@@ -1413,63 +1326,29 @@ impl State {
         out
     }
 
-    /// A streaming `Request` from stream `stream_no`: rejected, or forwarded to one capable
-    /// instance. `false` when the session knows no query modes at all (served as unary).
-    async fn open_stream(
-        self: &Arc<Self>,
-        stream_no: usize,
-        req: &proto::Request,
-        tx: &Outbound,
-    ) -> bool {
+    /// A streaming `Request` from stream `stream_no`: rejected, or forwarded to one owner
+    /// instance.
+    async fn open_stream(self: &Arc<Self>, stream_no: usize, req: &proto::Request, tx: &Outbound) {
         use proto::ErrorCode;
         let reject = |code, message: &str| hub_error(&req.id, code, message);
-        let (knows_modes, listed) = self
-            .routes
-            .lock()
-            .unwrap()
-            .get(&stream_no)
-            .map(|r| (r.scatter || r.streaming, r.streaming))
-            .unwrap_or((false, false));
-        if !knows_modes {
-            return false;
-        }
-        if !listed || !self.streaming.load(Ordering::SeqCst) {
-            let _ = tx
-                .send(Ok(reject(
-                    ErrorCode::InvalidRequest,
-                    "streaming not negotiated",
-                )))
-                .await;
-            return true;
-        }
-        let (is_command, owners, mut capable) = {
+        let (is_command, mut capable) = {
             let routes = self.routes.lock().unwrap();
             let is_command = req.kind == proto::RequestKind::Command as i32
                 || routes.values().any(|r| r.commands.contains(&req.r#type));
-            let owners: Vec<String> = routes
-                .values()
-                .filter(|r| r.queries.contains(&req.r#type))
-                .map(|r| r.service.clone())
-                .collect();
             let capable: Vec<(usize, String, String, Outbound)> = routes
                 .iter()
-                .filter(|(_, r)| r.queries.contains(&req.r#type) && r.streaming)
+                .filter(|(_, r)| r.queries.contains(&req.r#type))
                 .map(|(n, r)| (*n, r.service.clone(), r.instance.clone(), r.tx.clone()))
                 .collect();
-            (is_command, owners, capable)
+            (is_command, capable)
         };
         let rejection = if is_command {
             Some(reject(
                 ErrorCode::InvalidRequest,
                 "invalid request: a command",
             ))
-        } else if owners.is_empty() {
-            Some(reject(ErrorCode::NoHandler, "no handler"))
         } else if capable.is_empty() {
-            Some(reject(
-                ErrorCode::InvalidRequest,
-                &format!("no instance of {owners:?} negotiated streaming"),
-            ))
+            Some(reject(ErrorCode::NoHandler, "no handler"))
         } else if self.open_streams.lock().unwrap().contains_key(&req.id)
             || self.gathers.lock().unwrap().contains_key(&req.id)
         {
@@ -1479,7 +1358,7 @@ impl State {
         };
         if let Some(rejection) = rejection {
             let _ = tx.send(Ok(rejection)).await;
-            return true;
+            return;
         }
         capable.sort_by(|a, b| (&a.1, &a.2).cmp(&(&b.1, &b.2)));
         let pick = self.rotation.fetch_add(1, Ordering::SeqCst) % capable.len();
@@ -1556,7 +1435,6 @@ impl State {
         let _ = target
             .send(Ok(server(server_message::Message::Request(forwarded))))
             .await;
-        true
     }
 
     /// Ends stream `id` (if still open): `end` is `Some(error)` for a `ReplyEnd` to the sender
@@ -1882,24 +1760,12 @@ impl Hub for Service {
                                     let _ = tx.send(Err(status)).await;
                                     break;
                                 }
-                                // Register no longer declares a version or capabilities: every one declares everything.
-                                let v2 = true;
-                                let wants_flow = true;
-                                let wants_scatter = true;
-                                let wants_streaming = true;
-                                let wants_subscription = true;
                                 state.log(Event::Register { stream: stream_no, types: r.command_types.len() + r.query_types.len() + r.shared_query_types.len() });
-                                let scatter = wants_scatter && v2 && state.scatter_gather.load(Ordering::SeqCst) && state.ack.lock().unwrap().is_some();
-                                let streaming = wants_streaming && v2 && state.streaming.load(Ordering::SeqCst) && state.ack.lock().unwrap().is_some();
-                                let subscription = wants_subscription && v2 && state.subscription.load(Ordering::SeqCst) && state.ack.lock().unwrap().is_some();
                                 state.routes.lock().unwrap().insert(stream_no, Route {
                                     service: r.service_name.clone(),
                                     instance: r.instance_id.clone(),
                                     commands: r.command_types.clone(),
                                     queries: r.query_types.iter().chain(&r.shared_query_types).cloned().collect(),
-                                    scatter,
-                                    streaming,
-                                    subscription,
                                     tx: tx.clone(),
                                 });
                                 instance = Some(r.instance_id.clone());
@@ -1912,8 +1778,7 @@ impl Hub for Service {
                                     state.log(Event::Evicted { stream: old });
                                     token.cancel();
                                 }
-                                let flow = wants_flow && state.flow_control.load(Ordering::SeqCst) && state.ack.lock().unwrap().is_some() && v2;
-                                if flow && r.initial_permits > 0 {
+                                if r.initial_permits > 0 {
                                     // Like the real hub: the first Register of a stream fixes its permits.
                                     state.held.lock().unwrap().entry(stream_no).or_insert((r.initial_permits, r.initial_permits));
                                 }
@@ -1924,7 +1789,7 @@ impl Hub for Service {
                                 if delay > 0 {
                                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                                 }
-                                if let (true, Some(ack)) = (v2, ack) {
+                                if let Some(ack) = ack {
                                     let msg = ServerMessage { message: Some(server_message::Message::RegisterAck(ack)) };
                                     if tx.send(Ok(msg)).await.is_err() { break; }
                                 }
@@ -1950,9 +1815,7 @@ impl Hub for Service {
                                 state.permits.lock().unwrap().push((stream_no, p.count, std::time::Instant::now()));
                                 state.grants.lock().unwrap().push((stream_no, p.grant));
                                 if let Some((held, cap)) = state.held.lock().unwrap().get_mut(&stream_no) {
-                                    if state.permit_grants.load(Ordering::SeqCst) {
-                                        *cap = (*cap).max(p.grant);
-                                    }
+                                    *cap = (*cap).max(p.grant);
                                     *held = held.saturating_add(p.count);
                                     if state.permit_cap.load(Ordering::SeqCst) {
                                         *held = (*held).min(*cap);
@@ -1979,15 +1842,19 @@ impl Hub for Service {
                                     if tx.send(Ok(denied)).await.is_err() { break; }
                                     continue;
                                 }
-                                let scattered = req.mode == proto::RequestMode::ScatterGather as i32
-                                    && state.scatter(stream_no, &req, &tx).await;
-                                let streamed = req.mode == proto::RequestMode::Streaming as i32
-                                    && state.open_stream(stream_no, &req, &tx).await;
-                                let subscribed = req.mode == proto::RequestMode::Subscription as i32
-                                    && state.open_subscription(stream_no, &req, &tx).await;
-                                if !scattered && !streamed && !subscribed {
-                                    let response = state.responder.lock().await.as_ref().and_then(|f| f(req));
-                                    if let Some(resp) = response && tx.send(Ok(resp)).await.is_err() { break; }
+                                match proto::RequestMode::try_from(req.mode) {
+                                    Ok(proto::RequestMode::ScatterGather) => state.scatter(&req, &tx).await,
+                                    Ok(proto::RequestMode::Streaming) => state.open_stream(stream_no, &req, &tx).await,
+                                    Ok(proto::RequestMode::Subscription) => state.open_subscription(stream_no, &req, &tx).await,
+                                    Ok(proto::RequestMode::Unary) => {
+                                        let response = state.responder.lock().await.as_ref().and_then(|f| f(req));
+                                        if let Some(resp) = response && tx.send(Ok(resp)).await.is_err() { break; }
+                                    }
+                                    Err(_) => {
+                                        let message = format!("invalid request: unknown request mode {}", req.mode);
+                                        let rejected = hub_error(&req.id, proto::ErrorCode::InvalidRequest, &message);
+                                        if tx.send(Ok(rejected)).await.is_err() { break; }
+                                    }
                                 }
                             }
                             // Multi-part messages of streaming queries (P4b) and subscriptions (P4c).
@@ -2141,15 +2008,10 @@ impl FakeHub {
             responder: Mutex::new(None),
             ack: StdMutex::new(Some(default_ack())),
             streams: AtomicUsize::new(0),
-            flow_control: AtomicBool::new(true),
             permits: StdMutex::new(vec![]),
             grants: StdMutex::new(vec![]),
             held: StdMutex::new(HashMap::new()),
             permit_cap: AtomicBool::new(true),
-            permit_grants: AtomicBool::new(true),
-            instance_status: AtomicBool::new(true),
-            processors: AtomicBool::new(true),
-            processor_control: AtomicBool::new(true),
             control_replies: StdMutex::new(vec![]),
             statuses: StdMutex::new(vec![]),
             down: AtomicBool::new(false),
@@ -2159,8 +2021,6 @@ impl FakeHub {
             sessions: StdMutex::new(HashMap::new()),
             evictions: AtomicUsize::new(0),
             events: StdMutex::new(vec![]),
-            scatter_gather: AtomicBool::new(true),
-            streaming: AtomicBool::new(true),
             stream_timeouts: AtomicBool::new(true),
             routes: StdMutex::new(HashMap::new()),
             gathers: StdMutex::new(HashMap::new()),
@@ -2168,7 +2028,6 @@ impl FakeHub {
             open_streams: StdMutex::new(HashMap::new()),
             stream_target_of: StdMutex::new(HashMap::new()),
             rotation: AtomicUsize::new(0),
-            subscription: AtomicBool::new(true),
             subscriptions: StdMutex::new(HashMap::new()),
             sub_target_of: StdMutex::new(HashMap::new()),
             sub_rotation: AtomicUsize::new(0),
@@ -2184,7 +2043,6 @@ impl FakeHub {
             ack_delay_ms: AtomicU64::new(0),
             jwt_refusal: StdMutex::new(None),
             close_with: StdMutex::new(None),
-            credentials_refresh: AtomicBool::new(false),
             peers: StdMutex::new(vec![]),
         });
         let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
@@ -2251,14 +2109,10 @@ impl FakeHub {
         self.state.streams.load(Ordering::SeqCst)
     }
 
-    /// The ack sent for every v2 `Register`; `None` behaves like a hub older than protocol v2.
+    /// The ack sent for every `Register`; `None` withholds it (a hub that never confirms the
+    /// registration).
     pub fn set_ack(&self, ack: Option<proto::RegisterAck>) {
         *self.state.ack.lock().unwrap() = ack;
-    }
-
-    /// Whether the ack shares "flow-control" with clients that declare it (`false`: the P0 hub).
-    pub fn set_flow_control(&self, on: bool) {
-        self.state.flow_control.store(on, Ordering::SeqCst);
     }
 
     /// A hub whose ack carries `hub_id` (the default ack otherwise).
@@ -2269,24 +2123,6 @@ impl FakeHub {
             ..default_ack()
         }));
         hub
-    }
-
-    /// Whether the ack shares "instance-status" with clients that declare it (`false`: a hub
-    /// before P3).
-    pub fn set_instance_status(&self, on: bool) {
-        self.state.instance_status.store(on, Ordering::SeqCst);
-    }
-
-    /// Whether the ack shares "processors" with clients that declare it (`false`: a hub before
-    /// P6a).
-    pub fn set_processors(&self, on: bool) {
-        self.state.processors.store(on, Ordering::SeqCst);
-    }
-
-    /// Whether the ack shares "processor-control" with clients that declare it (`false`: a hub
-    /// before P6b).
-    pub fn set_processor_control(&self, on: bool) {
-        self.state.processor_control.store(on, Ordering::SeqCst);
     }
 
     /// The `ControlReply`s received: (stream number, reply).
@@ -2357,21 +2193,6 @@ impl FakeHub {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    }
-
-    /// Whether the ack shares "scatter-gather" with clients that declare it (`false`: a P3 hub).
-    pub fn set_scatter_gather(&self, on: bool) {
-        self.state.scatter_gather.store(on, Ordering::SeqCst);
-    }
-
-    /// Whether the ack shares "streaming" with clients that declare it (`false`: a P4a hub).
-    pub fn set_streaming(&self, on: bool) {
-        self.state.streaming.store(on, Ordering::SeqCst);
-    }
-
-    /// Whether the ack shares "subscription" with clients that declare it (`false`: a P4b hub).
-    pub fn set_subscription(&self, on: bool) {
-        self.state.subscription.store(on, Ordering::SeqCst);
     }
 
     /// Updates held per subscription while its sender owes credit (default 256, as kraken-hub).
@@ -2504,11 +2325,6 @@ impl FakeHub {
         self.state.permit_cap.store(on, Ordering::SeqCst);
     }
 
-    /// Whether `Permits.grant` raises the cap (default `true`; `false`: a hub that predates it).
-    pub fn set_permit_grants(&self, on: bool) {
-        self.state.permit_grants.store(on, Ordering::SeqCst);
-    }
-
     /// Permits messages with the instant each arrived.
     pub fn permits_timed(&self) -> Vec<(usize, u32, std::time::Instant)> {
         self.state.permits.lock().unwrap().clone()
@@ -2568,11 +2384,6 @@ impl FakeHub {
     /// `false`: a JWT `Register` is answered with `UNAVAILABLE` "jwks not loaded yet".
     pub fn set_jwks_loaded(&self, loaded: bool) {
         self.state.jwks_loaded.store(loaded, Ordering::SeqCst);
-    }
-
-    /// Offer the `credentials-refresh` capability to clients that declare it.
-    pub fn set_credentials_refresh(&self, on: bool) {
-        self.state.credentials_refresh.store(on, Ordering::SeqCst);
     }
 
     /// The leaf certificate each stream presented in the TLS handshake, as its fingerprint (the

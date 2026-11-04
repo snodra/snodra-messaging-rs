@@ -85,8 +85,8 @@ impl HubTargets {
     }
 }
 
-/// The id of a hub that names none (a legacy hub, or an empty `RegisterAck.hub_id`): its target
-/// as `host:port`, the `static://` or `http(s)://` prefix stripped (shared with kraken-messaging).
+/// The id of a hub whose `RegisterAck.hub_id` is empty (a real hub always names itself;
+/// defensive): its target as `host:port`, the `static://` or `http(s)://` prefix stripped (shared with kraken-messaging).
 pub fn target_id(address: &str) -> String {
     let address = address.strip_prefix("static://").unwrap_or(address);
     ["http://", "https://"]
@@ -222,8 +222,8 @@ mod tests {
         );
     }
 
-    /// Shared with kraken-messaging (Kotlin): the id of a hub without one (a legacy hub, or an
-    /// empty `RegisterAck.hub_id`) is its target as `host:port`, prefix stripped.
+    /// Shared with kraken-messaging (Kotlin): the id of a hub with an empty `RegisterAck.hub_id`
+    /// is its target as `host:port`, prefix stripped.
     #[test]
     fn a_target_id_is_the_bare_host_and_port() {
         for (address, id) in [

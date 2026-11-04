@@ -2,7 +2,8 @@
 //! credit, the end, error items, the hub's `Cancel` for streams and for unary handlers, the
 //! permit held for the whole stream) and the sender side (`Sender::stream`: items in order,
 //! credit refills, `max_results`, the idle timeout, errors, the drop guard's `Cancel`, retries
-//! until the first part, the capability gates, shared streaming types).
+//! until the first part, errors before the first part, shared streaming types, the multi-hub
+//! pool).
 mod support;
 
 use std::pin::Pin;
@@ -13,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use futures::stream::BoxStream;
 use kraken_messaging::hub::{
-    Dispatcher, HandlerRegistry, HubPool, HubSettings, Inbound, RegisteredTypes, SendOptions,
-    Sender, SenderSettings, StreamOptions, rendezvous_score,
+    Dispatcher, HandlerRegistry, HubPool, HubSettings, Inbound, RegisteredTypes, Sender,
+    SenderSettings, StreamOptions,
 };
 use kraken_messaging::identity::{Guard, IdentityResolver};
 use kraken_messaging::proto::{self, ErrorCode, ServerMessage, server_message};
@@ -216,7 +217,6 @@ impl Node {
 fn settings(address: &str, max_handlers: usize) -> HubSettings {
     HubSettings {
         address: address.to_string(),
-        heartbeat_interval: Duration::from_secs(1),
         backoff_min: Duration::from_millis(50),
         backoff_max: Duration::from_millis(200),
         max_concurrent_handlers: max_handlers,
@@ -1444,34 +1444,7 @@ async fn an_end_counting_more_parts_than_arrived_fails_the_stream_as_lost_parts(
 }
 
 #[tokio::test]
-async fn a_hub_without_the_capability_is_unsupported_and_gets_nothing() {
-    for legacy in [false, true] {
-        let hub = FakeHub::start().await;
-        if legacy {
-            hub.set_ack(None);
-        } else {
-            hub.set_streaming(false);
-        }
-        let c = caller(&hub.address()).await;
-        assert!(!c.pool.handshake_for("").unwrap().streaming());
-        let e = c
-            .sender
-            .stream(&export(1, 0, None), StreamOptions::default())
-            .await
-            .err()
-            .expect("unsupported");
-        assert!(
-            matches!(e, MessagingError::UnsupportedByHub(_)),
-            "legacy {legacy}: {e:?}"
-        );
-        assert!(hub.requests().await.is_empty(), "nothing is sent");
-        assert_eq!(c.sender.in_flight(), 0);
-        c.shutdown().await;
-    }
-}
-
-#[tokio::test]
-async fn gating_errors_map_to_the_unary_errors() {
+async fn errors_before_the_first_part_map_to_the_unary_errors() {
     let hub = FakeHub::start().await;
     let c = caller(&hub.address()).await;
     // No owner.
@@ -1485,23 +1458,6 @@ async fn gating_errors_map_to_the_unary_errors() {
         matches!(e, MessagingError::NoHandler(ref t) if t == "t.Export"),
         "{e:?}"
     );
-    // An owner whose session did not negotiate streaming (an older library).
-    hub.set_streaming(false);
-    let probe = Arc::new(Probe::default());
-    let old = handler(&hub.address(), "svc-old", "o1", &probe, 2).await;
-    hub.set_streaming(true);
-    let e = c
-        .sender
-        .stream(&export(1, 0, None), StreamOptions::default())
-        .await
-        .err()
-        .unwrap();
-    assert!(
-        matches!(e, MessagingError::UnsupportedByHub(ref m) if m.contains("svc-old")),
-        "{e:?}"
-    );
-    assert_eq!(probe.started.load(Ordering::SeqCst), 0);
-    old.shutdown().await;
     // The type is a command.
     let owner = node_with(
         &hub.address(),
@@ -1530,15 +1486,6 @@ async fn gating_errors_map_to_the_unary_errors() {
         .err()
         .unwrap();
     assert!(matches!(e, MessagingError::InvalidMessage(_)), "{e:?}");
-    // The hub stopped sharing the capability after the handshake: it answers UNSUPPORTED.
-    hub.set_streaming(false);
-    let e = c
-        .sender
-        .stream(&export(1, 0, None), StreamOptions::default())
-        .await
-        .err()
-        .unwrap();
-    assert!(matches!(e, MessagingError::UnsupportedByHub(_)), "{e:?}");
     assert_eq!(c.sender.in_flight(), 0);
     owner.shutdown().await;
     c.shutdown().await;
@@ -1711,13 +1658,11 @@ async fn a_shared_streaming_type_streams_from_one_owner_instance() {
 }
 
 #[tokio::test]
-async fn a_pool_streams_to_one_capable_hub_only() {
-    // hub-3 is a P4a hub: every stream goes to hub-4.
+async fn a_pool_sends_each_stream_to_one_hub() {
     let (h3, h4) = (
         FakeHub::start_with_id("hub-3").await,
         FakeHub::start_with_id("hub-4").await,
     );
-    h3.set_streaming(false);
     let both = format!("{},{}", h3.address(), h4.address());
     let probe = Arc::new(Probe::default());
     let h = handler(&both, "svc-h", "h1", &probe, 4).await;
@@ -1730,7 +1675,11 @@ async fn a_pool_streams_to_one_capable_hub_only() {
             .unwrap();
         assert_eq!(collect(&mut stream).await.0, [0, 1]);
     }
-    assert_eq!((streams(&h3).await.len(), streams(&h4).await.len()), (0, 4));
+    assert_eq!(
+        (streams(&h3).await.len(), streams(&h4).await.len()),
+        (2, 2),
+        "round-robin"
+    );
     h.shutdown().await;
     c.shutdown().await;
 }
@@ -1784,99 +1733,5 @@ async fn a_stream_dropped_while_its_write_is_blocked_leaves_nothing_pending() {
         "a dropped open leaves nothing pending"
     );
     hub.drop_streams();
-    c.shutdown().await;
-}
-
-/// The capable hubs are ranked on a snapshot; the write refuses a stream that lost `streaming`
-/// in between (a reconnect to an older hub) and the open moves on (`UnsupportedByHub` when no
-/// capable hub is left), as the gather path does.
-#[tokio::test]
-async fn a_stream_is_not_written_to_a_hub_that_lost_the_capability_after_ranking() {
-    let (h1, h2) = (
-        FakeHub::start_with_id("hub-1").await,
-        FakeHub::start_with_id("hub-2").await,
-    );
-    let both = format!("{},{}", h1.address(), h2.address());
-    let c = caller(&both).await;
-    assert_eq!(c.pool.hub_ids(), ["hub-1", "hub-2"]);
-    h1.set_stall_reads(true);
-    let key_on_1 = (0..)
-        .map(|i| format!("k{i}"))
-        .find(|k| rendezvous_score("hub-1", k) > rendezvous_score("hub-2", k))
-        .unwrap();
-    let fillers: Vec<_> = (0..324)
-        .map(|i| {
-            let sender = Arc::clone(&c.sender);
-            let opts = SendOptions {
-                routing_key: Some(key_on_1.clone()),
-                retry: Some(RetryPolicy::NONE),
-                timeout: Some(Duration::from_secs(30)),
-                ..SendOptions::default()
-            };
-            let size = if i < 24 { 256 * 1024 } else { 1 };
-            tokio::spawn(async move {
-                let fill = Fill {
-                    data: "x".repeat(size),
-                };
-                sender.send_command(&fill, opts).await
-            })
-        })
-        .collect();
-    eventually("every filler handed to hub-1's stream", async || {
-        c.sender.in_flight() == fillers.len()
-    })
-    .await;
-    for filler in &fillers {
-        filler.abort();
-    }
-    for filler in fillers {
-        let _ = filler.await;
-    }
-    // Streams go round-robin: the one ranked [hub-1, hub-2] waits in the write to hub-1 (the one
-    // ranked the other way round ends at once with NO_HANDLER on hub-2).
-    let mut probes = 0;
-    let waiting = loop {
-        probes += 1;
-        assert!(probes <= 3, "no stream went to hub-1 first");
-        let sender = Arc::clone(&c.sender);
-        let call = tokio::spawn(async move {
-            sender
-                .stream(&export(1, 0, None), StreamOptions::default())
-                .await
-                .map(|_| ())
-        });
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        if !call.is_finished() {
-            break call;
-        }
-        let e = call.await.unwrap().unwrap_err();
-        assert!(matches!(e, MessagingError::NoHandler(_)), "{e:?}");
-    };
-    assert!(
-        streams(&h2).await.len() < probes,
-        "the waiting stream reached no hub"
-    );
-    h2.set_streaming(false);
-    h2.drop_streams();
-    eventually("hub-2 re-handshaken without the capability", async || {
-        c.pool.connections().iter().any(|conn| {
-            conn.address() == h2.address() && conn.handshake().is_some_and(|h| !h.streaming())
-        })
-    })
-    .await;
-    let on_h2_before = streams(&h2).await.len();
-    h1.drop_streams();
-    let e = tokio::time::timeout(Duration::from_secs(3), waiting)
-        .await
-        .expect("the open ends at once, not at the local guard")
-        .unwrap()
-        .unwrap_err();
-    assert!(matches!(e, MessagingError::UnsupportedByHub(_)), "{e:?}");
-    assert_eq!(
-        streams(&h2).await.len(),
-        on_h2_before,
-        "the stream was not written to hub-2's stream"
-    );
-    assert_eq!(c.sender.in_flight(), 0);
     c.shutdown().await;
 }

@@ -26,7 +26,7 @@ pub enum DeadLetterMode {
     /// Produced to `<topic>.dlt` with `kraken-dlt-*` headers; the topic belongs to the operator's
     /// tooling (it must exist, or broker auto-creation must be on).
     Topic,
-    /// Logged and skipped (the behaviour before P6a).
+    /// Logged and skipped: nothing is kept.
     Log,
 }
 
@@ -60,22 +60,17 @@ pub struct Config {
     /// comma-separated list of them, or one `dns:///name:port` whose addresses are re-resolved
     /// every 30 s. One address is the single-hub setup.
     pub hub_address: String,
-    /// How often an `InstanceStatus` goes to every hub that shares the `instance-status`
-    /// capability (default 5 s, at least 1 ms).
+    /// How often an `InstanceStatus` goes to every hub (default 5 s, at least 1 ms).
     pub hub_status_interval: Duration,
     /// Request timeout sent as `timeout_ms` when a call sets none (`SendOptions.timeout` wins).
-    /// `None` (default): a protocol v2 hub decides (its per-type override or its default, 5 s);
-    /// a legacy hub gets 5 s as before.
+    /// `None` (default): the hub decides (its per-type override or its default, 5 s).
     pub hub_request_timeout: Option<Duration>,
-    /// Heartbeat period when the hub does not announce one (hubs older than protocol v2; a v2 hub
-    /// announces its own, 3 s by default, in `RegisterAck`).
-    pub heartbeat_interval: Duration,
     /// Reconnect backoff floor; also where the backoff restarts once a connect reached the handshake.
     pub reconnect_backoff_min: Duration,
     /// Reconnect backoff ceiling (each wait is jittered by ±20 % and never exceeds it).
     pub reconnect_backoff_max: Duration,
-    /// Handlers run concurrently, at least 1; also the permits granted to a hub with flow control
-    /// (`Register.initial_permits`), which then queues further requests for this instance.
+    /// Handlers run concurrently, at least 1; also the permits granted to the hubs
+    /// (`Register.initial_permits`), which then queue further requests for this instance.
     pub max_concurrent_handlers: usize,
     /// `Register.load_factor`: this instance's relative capacity (100 = normal; 0 is sent as is and
     /// read as 100 by the hub). Weights its share of keyed commands and its load score for unkeyed
@@ -105,7 +100,7 @@ pub struct Config {
     pub hub_max_subscriptions: usize,
     /// The static token sent in `Register.credentials.token` on every hub stream (ADR 0018;
     /// `KRAKEN_HUB_TOKEN`). Needed when the hub runs with `KRAKEN_HUB_AUTH_MODE=enforce`; ignored
-    /// by a hub in `off` mode and by hubs older than P5a. Never logged (`Debug` prints `"***"`).
+    /// by a hub in `off` mode. Never logged (`Debug` prints `"***"`).
     /// An empty token is the same as none. Overridden by `hub_token_file` when that is set.
     pub hub_token: Option<SecretString>,
     /// A file holding the token (`KRAKEN_HUB_TOKEN_FILE`), for container secrets. Read at
@@ -195,7 +190,6 @@ impl Config {
             hub_address: hub_address.to_string(),
             hub_status_interval: Duration::from_secs(5),
             hub_request_timeout: None,
-            heartbeat_interval: Duration::from_secs(10),
             reconnect_backoff_min: Duration::from_millis(500),
             reconnect_backoff_max: Duration::from_secs(5),
             max_concurrent_handlers: 256,
@@ -282,7 +276,8 @@ impl Config {
     /// `KRAKEN_SERVICE_NAME` and `KRAKEN_MONGODB_URI` are required; `KRAKEN_HUB_ADDRESS` defaults to
     /// `static://kraken-hub:7000`, `KRAKEN_KAFKA_BOOTSTRAP` to `kafka:19092`. Optional:
     /// `KRAKEN_KAFKA_TOPIC`, `KRAKEN_JWKS_URL`, `KRAKEN_ISSUER`, `KRAKEN_HUB_REQUEST_TIMEOUT_MS`,
-    /// `KRAKEN_HUB_STATUS_INTERVAL_MS`, `KRAKEN_HEARTBEAT_INTERVAL_MS`, `KRAKEN_RECONNECT_BACKOFF_MIN_MS`, `KRAKEN_RECONNECT_BACKOFF_MAX_MS`,
+    /// `KRAKEN_HUB_STATUS_INTERVAL_MS`, `KRAKEN_RECONNECT_BACKOFF_MIN_MS`,
+    /// `KRAKEN_RECONNECT_BACKOFF_MAX_MS`,
     /// `KRAKEN_MAX_CONCURRENT_HANDLERS`, `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS`,
     /// `KRAKEN_KAFKA_DEAD_LETTER_MODE` (`collection`, `topic` or `log`),
     /// `KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS`,
@@ -340,9 +335,6 @@ impl Config {
         }
         if let Some(v) = optional("KRAKEN_HUB_STATUS_INTERVAL_MS") {
             c.hub_status_interval = millis("KRAKEN_HUB_STATUS_INTERVAL_MS", &v)?;
-        }
-        if let Some(v) = optional("KRAKEN_HEARTBEAT_INTERVAL_MS") {
-            c.heartbeat_interval = millis("KRAKEN_HEARTBEAT_INTERVAL_MS", &v)?;
         }
         if let Some(v) = optional("KRAKEN_RECONNECT_BACKOFF_MIN_MS") {
             c.reconnect_backoff_min = millis("KRAKEN_RECONNECT_BACKOFF_MIN_MS", &v)?;
@@ -1238,8 +1230,6 @@ mod tests {
         // F2: the backoff is capped at 5 s.
         assert_eq!(c.reconnect_backoff_min, Duration::from_millis(500));
         assert_eq!(c.reconnect_backoff_max, Duration::from_secs(5));
-        // Fallback for hubs that announce no interval (legacy hubs evict after 30 s).
-        assert_eq!(c.heartbeat_interval, Duration::from_secs(10));
     }
 
     fn secret_dir() -> PathBuf {

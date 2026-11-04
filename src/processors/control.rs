@@ -1,6 +1,6 @@
 //! Processor control (ADR 0023): [`ProcessorControl`], from
 //! [`KrakenMessaging::processor_control`](crate::KrakenMessaging::processor_control), answers the
-//! hub's [`ControlRequest`]s (capability `processor-control`) and pauses or resumes a processor
+//! hub's [`ControlRequest`]s and pauses or resumes a processor
 //! locally. One action per processor at a time on an instance; a renewal of the reset this
 //! instance holds is answered at once, never behind another action. Every action is logged at
 //! INFO with its `control_id`, processor, action and result.

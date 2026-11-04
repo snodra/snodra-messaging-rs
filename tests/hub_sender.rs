@@ -102,7 +102,6 @@ async fn sender_with(
     let (tx, mut rx) = mpsc::channel::<Inbound>(64);
     let settings = HubSettings {
         address: hub.address(),
-        heartbeat_interval: Duration::from_secs(1),
         backoff_min: Duration::from_millis(50),
         backoff_max: Duration::from_millis(500),
         ..HubSettings::default()
@@ -342,21 +341,6 @@ async fn v2_hub_gets_zero_unless_a_timeout_was_chosen() {
         "the hub decides (override or default)"
     );
     assert_eq!(sent[1].timeout_ms, 1_234, "the caller's choice is sent");
-    conn.shutdown().await;
-    hub.stop();
-}
-
-#[tokio::test]
-async fn legacy_hub_gets_todays_five_seconds() {
-    let hub = FakeHub::start().await;
-    hub.set_ack(None);
-    hub.set_responder(|req| Some(reply_with(&req, "{}"))).await;
-    let (sender, conn) = sender(&hub, None).await;
-    sender
-        .send_command(&Nop {}, SendOptions::default())
-        .await
-        .unwrap();
-    assert_eq!(hub.requests().await[0].timeout_ms, 5_000);
     conn.shutdown().await;
     hub.stop();
 }

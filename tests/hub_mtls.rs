@@ -67,7 +67,6 @@ impl World {
 fn settings(address: String, tls: HubTls) -> HubSettings {
     HubSettings {
         address,
-        heartbeat_interval: Duration::from_millis(200),
         backoff_min: Duration::from_millis(20),
         backoff_max: Duration::from_millis(200),
         handshake_timeout: Duration::from_secs(3),
@@ -1206,7 +1205,6 @@ async fn price_owner(w: &World) -> Arc<HubPool> {
 #[tokio::test]
 async fn the_drain_does_not_wait_for_the_subscriptions_this_instance_consumes() {
     let w = world(true).await;
-    w.hub.set_subscription(true);
     let owner = price_owner(&w).await;
     let (tls, first) = w.issue("svc", &ClientSpec::service("svc"));
     let c = client(settings(w.hub.address(), tls.clone())).await;
@@ -1391,8 +1389,11 @@ async fn the_files_are_checked_on_their_own_interval_not_the_heartbeat_period() 
     let w = world(true).await;
     let (tls, first) = w.issue("svc", &ClientSpec::service("svc"));
     // A heartbeat period of a minute: a check tied to it would not see the renewal in time.
+    w.hub.set_ack(Some(proto::RegisterAck {
+        heartbeat_interval_ms: 60_000,
+        ..default_ack()
+    }));
     let c = client(HubSettings {
-        heartbeat_interval: Duration::from_secs(60),
         certificate_check_interval: Duration::from_millis(200),
         ..settings(w.hub.address(), tls.clone())
     })

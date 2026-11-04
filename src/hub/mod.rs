@@ -19,10 +19,8 @@ pub use auth::{
     TokenStats, WAKE_INTERVAL, WallClock, refresh_margin,
 };
 pub use connection::{
-    CAPABILITIES, CLIENT_VERSION, CREDENTIALS_REFRESH, FLOW_CONTROL, Handshake, HubConnection,
-    HubSettings, INSTANCE_STATUS, Inbound, PERMIT_BATCH, PERMIT_FLUSH_AFTER, PROCESSOR_CONTROL,
-    PROCESSORS, PROTOCOL_VERSION, RegisteredTypes, ReplyTo, SCATTER_GATHER, STREAMING,
-    SUBSCRIPTION, StreamId,
+    CLIENT_VERSION, HEARTBEAT_INTERVAL_BEFORE_ACK, HubConnection, HubSettings, Inbound,
+    PERMIT_BATCH, PERMIT_FLUSH_AFTER, RegisteredTypes, ReplyTo, StreamId,
 };
 pub(crate) use dispatcher::{AbortOnDrop, invocation_error};
 pub use dispatcher::{AdmissionHook, Dispatcher};
@@ -32,7 +30,7 @@ pub use pool::{
 };
 pub use registry::{EventContext, HandlerRegistry};
 pub use sender::{
-    DEFAULT_CREDIT, LEGACY_REQUEST_TIMEOUT, LOCAL_GUARD_MARGIN, RETRY_MIN_REMAINING, RemoteError,
+    DEFAULT_CREDIT, DEFAULT_REQUEST_TIMEOUT, LOCAL_GUARD_MARGIN, RETRY_MIN_REMAINING, RemoteError,
     ScatterOptions, ScatterPart, ScatterResult, SendOptions, Sender, SenderSettings, StreamOptions,
     Subscription, SubscriptionOptions, request_timing, retry_budget,
 };

@@ -1,10 +1,10 @@
-//! End to end against the real P5a hub image (`KRAKEN_HUB_P5A_IMAGE`, default
-//! `kraken-hub:p5a-hub`) running `KRAKEN_HUB_AUTH_MODE=enforce` with an ACL file and a TLS
-//! certificate, both generated at test time and mounted in (nothing is checked in): a service with
-//! the right token registers over TLS and serves a query from a second service, a wrong token is
-//! refused with `UNAUTHENTICATED`, a token used for the wrong service or type is refused with
-//! `PERMISSION_DENIED`, a send outside the ACL is `AccessDenied`, and plain text against the TLS
-//! hub fails cleanly. No Kafka or MongoDB: the participants are a `HubConnection` and a `Sender`.
+//! End to end against the real hub image (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`) running
+//! `KRAKEN_HUB_AUTH_MODE=enforce` with an ACL file and a TLS certificate, both generated at test
+//! time and mounted in (nothing is checked in): a service with the right token registers over TLS
+//! and serves a query from a second service, a wrong token is refused with `UNAUTHENTICATED`, a
+//! token used for the wrong service or type is refused with `PERMISSION_DENIED`, a send outside the
+//! ACL is `AccessDenied`, and plain text against the TLS hub fails cleanly. No Kafka or MongoDB:
+//! the participants are a `HubConnection` and a `Sender`.
 mod support;
 
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use kraken_messaging::proto::{self, ClientMessage, client_message, reply};
 use kraken_messaging::{HubTls, MessagingError, Query, SecretString, message_type};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use support::containers::{HubContainer, HubImage, HubOptions, hub_with};
+use support::containers::{HubContainer, HubOptions, hub_with};
 use support::logs::Captured;
 use support::pki::{Pki, TempDir};
 use tokio::sync::mpsc;
@@ -116,7 +116,7 @@ async fn fixture() -> Fixture {
             + &acl_entry(&orders_token, "orders", &["orders.*"], &["billing.*"])),
     );
     let hub = hub_with(
-        HubOptions::new(HubImage::P5a)
+        HubOptions::new()
             .env("KRAKEN_HUB_AUTH_MODE", "enforce")
             .env("KRAKEN_HUB_ACL_FILE", "/etc/kraken/acl.toml")
             .env("KRAKEN_HUB_TLS_CERT", "/etc/kraken/hub-cert.pem")

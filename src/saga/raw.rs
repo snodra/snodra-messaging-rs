@@ -72,9 +72,9 @@ pub fn classify_failure(error: &MessagingError) -> RawOutcome {
             }
         }
         // Any other messaging failure is a handler error.
-        MessagingError::HubRegistrationRejected(_)
-        | MessagingError::UnsupportedByHub(_)
-        | MessagingError::Cancelled(_) => RawOutcome::Permanent(FailureReason::Failed, message),
+        MessagingError::HubRegistrationRejected(_) | MessagingError::Cancelled(_) => {
+            RawOutcome::Permanent(FailureReason::Failed, message)
+        }
     }
 }
 

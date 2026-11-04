@@ -1,42 +1,19 @@
-//! Compatibility suite against real hub images (roadmap rule: every phase checks new clients
-//! against the new hub and against the previous hub image).
+//! The hub protocol against the real hub image (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`):
 //!
-//! - `kraken-hub:dev` (`KRAKEN_HUB_IMAGE`): protocol v2 with flow control. The ack carries the
-//!   configured values and shares `flow-control`, per-type timeout overrides apply to requests sent
-//!   with `timeout_ms` 0, a request lost with the stream is `HubConnectionLost`, one never written is
-//!   `HubUnavailable`, and the client is back within the 5 s backoff cap after a hub restart. Flow
-//!   control (P1): a slow handler with one permit turns a burst into latency (the topology shows the
-//!   instance flow-controlled with a queue), a single permit goes back at once so a burst to a fast
+//! - The `RegisterAck` carries the configured values, per-type timeout overrides apply to requests
+//!   sent with `timeout_ms` 0, a request lost with the stream is `HubConnectionLost`, one never
+//!   written is `HubUnavailable`, and the client is back within the 5 s backoff cap after a hub
+//!   restart.
+//! - Flow control: a slow handler with one permit turns a burst into latency (the topology shows
+//!   the instance's permits and queue), a single permit goes back at once so a burst to a fast
 //!   handler is not paced by the flush timer, a full queue answers `HandlerBusy` and a retried
 //!   command gets through once it drains, retry never repeats a handler error or a timed-out
 //!   command, and queued requests are served by priority.
-//! - `kraken-hub:p0` (`KRAKEN_HUB_P0_IMAGE`): protocol v2 without flow control. The ack lists no
-//!   capability, no `Permits` are sent, the hub forwards without waiting and everything works as in
-//!   P0, reconnect included.
-//! - `kraken-hub:v1-baseline` (`KRAKEN_HUB_BASELINE_IMAGE`): the hub before protocol v2. The client
-//!   detects it (echo without ack) and works exactly as before, without `Permits`.
-//! - P3 (ADR 0016), one target through a `HubPool`: `kraken-hub:p3-hub` (`KRAKEN_HUB_P3_IMAGE`)
-//!   shares `instance-status` and gets `InstanceStatus` reports; `kraken-hub:p2`
-//!   (`KRAKEN_HUB_P2_IMAGE`) and the v1 baseline do not share it and get none, and work as before.
+//! - Status (ADR 0016, ADR 0022): one target through a `HubPool` reports `InstanceStatus`, with the
+//!   event processors' status, and the hub shows both in its topology.
 //!
-//! - P4a (ADR 0017): the new hub shares `scatter-gather`. Against `kraken-hub:p3`
-//!   (`KRAKEN_HUB_P3_IMAGE`) and the v1 baseline a scatter-gather fails with `UnsupportedByHub`
-//!   (nothing is sent), a unary query still works, and a shared query type is not registered
-//!   there (the field is ignored: a point query to it is `NoHandler`).
-//! - P4b (ADR 0017): the new hub shares `streaming`. Against `kraken-hub:p4a-hub`
-//!   (`KRAKEN_HUB_P4A_IMAGE`) a streaming query fails with `UnsupportedByHub` (nothing is sent)
-//!   while a unary query and a scatter-gather keep working.
-//! - P4c (ADR 0017): the new hub shares `subscription`. Against `kraken-hub:p4b-hub`
-//!   (`KRAKEN_HUB_P4B_IMAGE`) a subscription fails with `UnsupportedByHub` (nothing is sent)
-//!   while a unary query, a scatter-gather and a streaming query keep working.
-//!
-//! - P6a (ADR 0022): `kraken-hub:p6a-hub` (`KRAKEN_HUB_P6A_IMAGE`) shares `processors` and shows
-//!   the processor status in its topology; to `kraken-hub:p5c` (`KRAKEN_HUB_P5C_IMAGE`) the
-//!   `InstanceStatus` reports carry no processors.
-//!
-//! A missing image fails the test with the command that builds it. No Kafka or MongoDB: the
-//! participants are a `HubConnection` and a `Sender` each; a pass-through (`PermitTap`) records the
-//! `Permits` and `InstanceStatus` messages a participant writes.
+//! No Kafka or MongoDB: the participants are a `HubConnection` and a `Sender` each; a pass-through
+//! (`PermitTap`) records the `Permits` and `InstanceStatus` messages a participant writes.
 mod support;
 
 use std::pin::Pin;
@@ -45,17 +22,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use kraken_messaging::hub::{
-    CLIENT_VERSION, Dispatcher, HandlerRegistry, Handshake, HubConnection, HubPool, HubSettings,
-    Inbound, PERMIT_FLUSH_AFTER, RegisteredTypes, ScatterOptions, SendOptions, Sender,
-    SenderSettings, StreamOptions, SubscriptionOptions,
+    CLIENT_VERSION, HubConnection, HubPool, HubSettings, Inbound, PERMIT_FLUSH_AFTER,
+    RegisteredTypes, SendOptions, Sender, SenderSettings,
 };
-use kraken_messaging::identity::IdentityResolver;
 use kraken_messaging::proto::{self, ClientMessage, client_message, reply};
-use kraken_messaging::{
-    Command, MessagingError, Query, RetryPolicy, StreamingQuery, SubscriptionQuery, message_type,
-};
+use kraken_messaging::{Command, MessagingError, Query, RetryPolicy, message_type};
 use serde::{Deserialize, Serialize};
-use support::containers::{HubContainer, HubImage, HubOptions, free_port, hub_with};
+use support::containers::{HubContainer, HubOptions, free_port, hub_with, wait_until_reachable};
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt};
 use tonic::Status;
@@ -71,21 +44,21 @@ macro_rules! require_docker {
 
 #[derive(Serialize, Deserialize)]
 struct Fast {}
-message_type!(Fast, "compat.Fast");
+message_type!(Fast, "proto.Fast");
 impl Command for Fast {
     type Reply = ();
 }
 
 #[derive(Serialize, Deserialize)]
 struct Slow {}
-message_type!(Slow, "compat.Slow");
+message_type!(Slow, "proto.Slow");
 impl Command for Slow {
     type Reply = ();
 }
 
 #[derive(Serialize, Deserialize)]
 struct Hang {}
-message_type!(Hang, "compat.Hang");
+message_type!(Hang, "proto.Hang");
 impl Command for Hang {
     type Reply = ();
 }
@@ -93,10 +66,9 @@ impl Command for Hang {
 /// How long the handler side takes per type.
 fn handler_delay(type_name: &str) -> Duration {
     match type_name {
-        "compat.Fast" => Duration::from_millis(2_000), // under the 5 s default
-        "compat.Lookup" | "compat.Shared" => Duration::ZERO,
-        "compat.Slow" => Duration::from_millis(3_000), // over its 1.5 s override
-        _ => Duration::from_secs(30),                  // compat.Hang: never in time
+        "proto.Fast" => Duration::from_millis(2_000), // under the 5 s default
+        "proto.Slow" => Duration::from_millis(3_000), // over its 1.5 s override
+        _ => Duration::from_secs(30),                 // proto.Hang: never in time
     }
 }
 
@@ -113,19 +85,6 @@ impl Peer {
 
 /// A participant: registers `commands`, answers each after [`handler_delay`] on its arrival stream.
 async fn peer(address: &str, service: &str, commands: &[&str]) -> Peer {
-    peer_with(
-        address,
-        service,
-        RegisteredTypes {
-            commands: commands.iter().map(|c| c.to_string()).collect(),
-            ..RegisteredTypes::default()
-        },
-    )
-    .await
-}
-
-/// A participant registering `types`, answering like [`peer`].
-async fn peer_with(address: &str, service: &str, types: RegisteredTypes) -> Peer {
     let (tx, mut rx) = mpsc::channel::<Inbound>(64);
     let settings = HubSettings {
         address: address.to_string(),
@@ -139,7 +98,10 @@ async fn peer_with(address: &str, service: &str, types: RegisteredTypes) -> Peer
         uuid::Uuid::new_v4().to_string(),
         tx,
     );
-    conn.set_registered_types(types);
+    conn.set_registered_types(RegisteredTypes {
+        commands: commands.iter().map(|c| c.to_string()).collect(),
+        ..RegisteredTypes::default()
+    });
     let sender = Sender::new(Arc::clone(&conn), None, false);
     let forward = Arc::clone(&sender);
     tokio::spawn(async move {
@@ -171,40 +133,8 @@ async fn peer_with(address: &str, service: &str, types: RegisteredTypes) -> Peer
     Peer { conn, sender }
 }
 
-/// Returns once a `Topology` RPC on `address` succeeds (bounded by 30 s).
-async fn wait_until_reachable(address: &str) {
-    let target = address.replace("static://", "http://");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let attempt = async {
-            let channel = tonic::transport::Endpoint::from_shared(target.clone())
-                .ok()?
-                .connect()
-                .await
-                .ok()?;
-            proto::hub_client::HubClient::new(channel)
-                .topology(proto::TopologyRequest {})
-                .await
-                .ok()
-        };
-        if tokio::time::timeout(Duration::from_millis(500), attempt)
-            .await
-            .ok()
-            .flatten()
-            .is_some()
-        {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "hub at {address} never became reachable"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
 async fn topology(hub: &HubContainer) -> serde_json::Value {
-    reqwest::get(format!("{}/topology", hub.http))
+    reqwest::get(format!("{}/api/v1/topology", hub.http))
         .await
         .unwrap()
         .json()
@@ -213,38 +143,33 @@ async fn topology(hub: &HubContainer) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn new_hub_acks_with_its_configured_values_and_applies_type_overrides() {
+async fn the_ack_carries_the_configured_values_and_type_overrides_apply() {
     require_docker!();
     let hub = hub_with(
-        HubOptions::new(HubImage::Current)
-            .env("KRAKEN_HUB_ID", "compat-hub")
-            .env("KRAKEN_HUB_TIMEOUT_OVERRIDES", "compat.Slow=1500"),
+        HubOptions::new()
+            .env("KRAKEN_HUB_ID", "proto-hub")
+            .env("KRAKEN_HUB_TIMEOUT_OVERRIDES", "proto.Slow=1500"),
     )
     .await;
-    let b = peer(&hub.address, "compat-b", &["compat.Fast", "compat.Slow"]).await;
-    let a = peer(&hub.address, "compat-a", &[]).await;
+    let b = peer(&hub.address, "proto-b", &["proto.Fast", "proto.Slow"]).await;
+    let a = peer(&hub.address, "proto-a", &[]).await;
 
-    let Some(Handshake::V2(ack)) = a.conn.handshake() else {
-        panic!("expected a v2 handshake, got {:?}", a.conn.handshake());
-    };
-    assert_eq!(ack.hub_id, "compat-hub");
+    let ack = a.conn.handshake().expect("registered");
+    assert_eq!(ack.hub_id, "proto-hub");
     assert_eq!(ack.heartbeat_interval_ms, 3_000);
     assert_eq!(ack.heartbeat_timeout_ms, 10_000);
     assert_eq!(ack.default_timeout_ms, 5_000);
     assert_eq!(ack.max_timeout_ms, 60_000);
     assert_eq!(ack.context, "default");
-    assert_eq!(
-        ack.type_timeouts_ms.get("compat.Slow").copied(),
-        Some(1_500)
-    );
+    assert_eq!(ack.type_timeouts_ms.get("proto.Slow").copied(), Some(1_500));
     assert_eq!(ack.type_timeouts_ms.len(), 1);
 
-    // No timeout chosen: compat.Fast gets the hub default (5 s) and its 2 s handler makes it.
+    // No timeout chosen: proto.Fast gets the hub default (5 s) and its 2 s handler makes it.
     a.sender
         .send_command(&Fast {}, SendOptions::default())
         .await
         .expect("2 s handler within the 5 s default");
-    // compat.Slow gets its 1.5 s override from the hub: TIMEOUT from the hub after ~1.5 s.
+    // proto.Slow gets its 1.5 s override from the hub: TIMEOUT from the hub after ~1.5 s.
     let started = Instant::now();
     let err = a
         .sender
@@ -253,18 +178,18 @@ async fn new_hub_acks_with_its_configured_values_and_applies_type_overrides() {
         .unwrap_err();
     let took = started.elapsed();
     assert!(
-        matches!(err, MessagingError::Timeout(ref t) if t == "compat.Slow"),
+        matches!(err, MessagingError::Timeout(ref t) if t == "proto.Slow"),
         "{err:?}"
     );
     assert!(
         took >= Duration::from_millis(1_400) && took < Duration::from_millis(2_400),
         "override not applied: TIMEOUT after {took:?}"
     );
-    eprintln!("compat.Slow timed out after {took:?} (override 1500 ms)");
+    eprintln!("proto.Slow timed out after {took:?} (override 1500 ms)");
 
-    // The topology shows the hub id and each session's protocol and client version.
+    // The topology shows the hub id and each session's client version.
     let t = topology(&hub).await;
-    assert_eq!(t["hubId"], "compat-hub", "{t}");
+    assert_eq!(t["hubId"], "proto-hub", "{t}");
     let instances: Vec<&serde_json::Value> = t["services"]
         .as_array()
         .unwrap()
@@ -273,7 +198,6 @@ async fn new_hub_acks_with_its_configured_values_and_applies_type_overrides() {
         .collect();
     assert_eq!(instances.len(), 2, "{t}");
     for i in instances {
-        assert_eq!(i["protocolVersion"], 2, "{t}");
         assert_eq!(i["clientVersion"], CLIENT_VERSION, "{t}");
     }
     a.shutdown().await;
@@ -282,10 +206,12 @@ async fn new_hub_acks_with_its_configured_values_and_applies_type_overrides() {
 
 /// A request in flight when the hub dies (SIGKILL) is `HubConnectionLost`; one sent while no
 /// stream is up is `HubUnavailable`.
-async fn connection_lost_vs_unavailable(image: HubImage) {
-    let hub = hub_with(HubOptions::new(image)).await;
-    let b = peer(&hub.address, "compat-b", &["compat.Hang"]).await;
-    let a = peer(&hub.address, "compat-a", &[]).await;
+#[tokio::test]
+async fn a_lost_request_is_connection_lost_and_an_unsent_one_is_unavailable() {
+    require_docker!();
+    let hub = hub_with(HubOptions::new()).await;
+    let b = peer(&hub.address, "proto-b", &["proto.Hang"]).await;
+    let a = peer(&hub.address, "proto-a", &[]).await;
 
     let in_flight = tokio::spawn({
         let sender = Arc::clone(&a.sender);
@@ -332,87 +258,13 @@ async fn connection_lost_vs_unavailable(image: HubImage) {
 }
 
 #[tokio::test]
-async fn new_hub_lost_request_is_connection_lost_and_unsent_is_unavailable() {
-    require_docker!();
-    connection_lost_vs_unavailable(HubImage::Current).await;
-}
-
-#[tokio::test]
-async fn baseline_hub_lost_request_is_connection_lost_and_unsent_is_unavailable() {
-    require_docker!();
-    connection_lost_vs_unavailable(HubImage::Baseline).await;
-}
-
-#[tokio::test]
-async fn baseline_hub_runs_in_legacy_mode_without_regression() {
-    require_docker!();
-    let hub = hub_with(HubOptions::new(HubImage::Baseline)).await;
-    let b = peer(&hub.address, "compat-b", &["compat.Fast", "compat.Slow"]).await;
-    let a = peer(&hub.address, "compat-a", &[]).await;
-    assert_eq!(a.conn.handshake(), Some(Handshake::Legacy));
-    assert_eq!(b.conn.handshake(), Some(Handshake::Legacy));
-
-    // Legacy: timeout_ms 5000 is sent, so the 2 s handler makes it ...
-    a.sender
-        .send_command(&Fast {}, SendOptions::default())
-        .await
-        .expect("round trip through the old hub");
-    // ... and the old hub has no overrides: compat.Slow (3 s) succeeds within the 5 s as before.
-    a.sender
-        .send_command(&Slow {}, SendOptions::default())
-        .await
-        .expect("no override on the old hub");
-    // A chosen timeout still reaches the old hub and is enforced by it.
-    let err = a
-        .sender
-        .send_command(
-            &Slow {},
-            SendOptions {
-                timeout: Some(Duration::from_millis(1_000)),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap_err();
-    assert!(matches!(err, MessagingError::Timeout(_)), "{err:?}");
-
-    // Both sessions are still registered on the old hub after the exchanges.
-    let t = topology(&hub).await;
-    let names: Vec<&str> = t["services"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|s| s["serviceName"].as_str().unwrap())
-        .collect();
-    assert_eq!(names, ["compat-a", "compat-b"], "{t}");
-    a.shutdown().await;
-    b.shutdown().await;
-}
-
-#[tokio::test]
 async fn reconnects_within_the_backoff_cap_after_a_hub_restart() {
     require_docker!();
-    reconnects_within_the_backoff_cap(HubImage::Current).await;
-}
-
-#[tokio::test]
-async fn p0_hub_reconnects_within_the_backoff_cap_after_a_hub_restart() {
-    require_docker!();
-    reconnects_within_the_backoff_cap(HubImage::P0).await;
-}
-
-#[tokio::test]
-async fn baseline_hub_reconnects_within_the_backoff_cap_after_a_hub_restart() {
-    require_docker!();
-    reconnects_within_the_backoff_cap(HubImage::Baseline).await;
-}
-
-async fn reconnects_within_the_backoff_cap(image: HubImage) {
     support::init_tracing();
     let port = free_port();
-    let hub = hub_with(HubOptions::new(image).port(port)).await;
-    let b = peer(&hub.address, "compat-b", &["compat.Fast"]).await;
-    let a = peer(&hub.address, "compat-a", &[]).await;
+    let hub = hub_with(HubOptions::new().port(port)).await;
+    let b = peer(&hub.address, "proto-b", &["proto.Fast"]).await;
+    let a = peer(&hub.address, "proto-a", &[]).await;
 
     hub.container.stop_with_timeout(Some(0)).await.unwrap();
     // Long enough for the backoff to climb to its 5 s cap (0.5 + 1 + 2 + 4 s of attempts).
@@ -431,13 +283,7 @@ async fn reconnects_within_the_backoff_cap(image: HubImage) {
     );
     let took = ready.elapsed();
     assert!(ra && rb, "did not re-register after the hub restart");
-    eprintln!("{image:?}: re-registered {took:?} after the restarted hub was reachable");
-    let handshake = a.conn.handshake().unwrap();
-    assert_eq!(
-        handshake.is_legacy(),
-        image == HubImage::Baseline,
-        "{handshake:?}"
-    );
+    eprintln!("re-registered {took:?} after the restarted hub was reachable");
     // Cap 5 s (jitter never exceeds it) plus connect and handshake time.
     assert!(
         took <= Duration::from_millis(5_500),
@@ -451,7 +297,7 @@ async fn reconnects_within_the_backoff_cap(image: HubImage) {
     b.shutdown().await;
 }
 
-// ---- P1: flow control, priority, retry ----
+// ---- Flow control, priority, retry ----
 
 #[derive(Serialize, Deserialize)]
 struct FlowSlow {}
@@ -529,9 +375,8 @@ struct FlowPeer {
 /// A participant offering `permits` concurrent handlers (`max_concurrent_handlers`, which is also
 /// `Register.initial_permits`). As a handler (`handles`) it registers the `flow.*` types:
 /// `flow.Slow` takes 300 ms, `flow.Gate` waits for a permit of `gate`, `flow.Rec` 20 ms,
-/// `flow.Fail` answers `HANDLER_ERROR "handler busy"` (the v1 text of a full hub), `flow.Zero` at
-/// once, `flow.Hang` and `flow.HangQuery` 30 s. Every finished request grants its permit back, like
-/// the library does.
+/// `flow.Fail` answers `HANDLER_ERROR "handler failed"`, `flow.Zero` at once, `flow.Hang` and
+/// `flow.HangQuery` 30 s. Every finished request grants its permit back, like the library does.
 /// `retry` is the sender's configured default.
 async fn flow_peer(
     address: &str,
@@ -611,7 +456,7 @@ async fn flow_peer(
                             "flow.Fail" => reply::Result::Error(proto::Error {
                                 request_id: request.id.clone(),
                                 code: proto::ErrorCode::HandlerError as i32,
-                                message: "handler busy".into(),
+                                message: "handler failed".into(),
                                 details: vec![],
                             }),
                             _ => {
@@ -672,8 +517,9 @@ impl FlowPeer {
     }
 }
 
-/// A gRPC pass-through between one participant and a real hub that adds up the `Permits` the
-/// participant writes: a hub image gives no view of what a client sent.
+/// A gRPC pass-through between one participant and a real hub that adds up the `Permits` and
+/// `InstanceStatus` messages the participant writes: a hub image gives no view of what a client
+/// sent.
 struct PermitTap {
     address: String,
     permits: Arc<AtomicU64>,
@@ -820,14 +666,12 @@ fn no_retry() -> Option<RetryPolicy> {
 }
 
 #[tokio::test]
-async fn new_hub_turns_a_slow_handler_with_one_permit_into_latency_not_timeouts() {
+async fn a_slow_handler_with_one_permit_turns_into_latency_not_timeouts() {
     require_docker!();
-    let hub = hub_with(HubOptions::new(HubImage::Current)).await;
+    let hub = hub_with(HubOptions::new()).await;
     let tap = PermitTap::start(&hub.address).await;
     let b = flow_peer(&tap.address, "flow-b", true, 1, no_retry()).await;
     let a = flow_peer(&hub.address, "flow-a", false, 256, no_retry()).await;
-    let handshake = b.peer.conn.handshake().unwrap();
-    assert!(handshake.flow_control(), "{handshake:?}");
 
     let started = Instant::now();
     let calls: Vec<_> = (0..5)
@@ -836,11 +680,10 @@ async fn new_hub_turns_a_slow_handler_with_one_permit_into_latency_not_timeouts(
             tokio::spawn(async move { s.send_command(&FlowSlow {}, SendOptions::default()).await })
         })
         .collect();
-    // While they wait, the hub shows the instance as flow-controlled with its queue.
+    // While they wait, the hub shows the instance's permits and its queue.
     let mut saw_queue = false;
     for _ in 0..20 {
         let view = instance_view(&hub, "flow-b").await;
-        assert_eq!(view["flowControlled"], true, "{view}");
         assert!(view["permitsAvailable"].as_u64().unwrap() <= 1, "{view}");
         saw_queue |= view["queued"].as_u64().unwrap() > 0;
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -871,12 +714,11 @@ async fn new_hub_turns_a_slow_handler_with_one_permit_into_latency_not_timeouts(
 /// the instance, so each completion returns its permit at once. Waiting for the 50 ms flush timer
 /// instead would pace the instance at ~20 requests/s (100 calls in ~5 s).
 #[tokio::test]
-async fn new_hub_gets_a_single_permit_back_at_once_so_a_burst_is_not_paced_by_the_timer() {
+async fn a_single_permit_goes_back_at_once_so_a_burst_is_not_paced_by_the_timer() {
     require_docker!();
-    let hub = hub_with(HubOptions::new(HubImage::Current)).await;
+    let hub = hub_with(HubOptions::new()).await;
     let b = flow_peer(&hub.address, "flow-b", true, 1, no_retry()).await;
     let a = flow_peer(&hub.address, "flow-a", false, 256, no_retry()).await;
-    assert!(b.peer.conn.handshake().unwrap().flow_control());
 
     let started = Instant::now();
     let calls: Vec<_> = (0..100)
@@ -901,12 +743,9 @@ async fn new_hub_gets_a_single_permit_back_at_once_so_a_burst_is_not_paced_by_th
 }
 
 #[tokio::test]
-async fn new_hub_full_queue_is_handler_busy_and_a_retried_command_gets_through() {
+async fn a_full_queue_is_handler_busy_and_a_retried_command_gets_through() {
     require_docker!();
-    let hub = hub_with(
-        HubOptions::new(HubImage::Current).env("KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE", "1"),
-    )
-    .await;
+    let hub = hub_with(HubOptions::new().env("KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE", "1")).await;
     let b = flow_peer(&hub.address, "flow-b", true, 1, no_retry()).await;
     let a = flow_peer(&hub.address, "flow-a", false, 256, no_retry()).await;
     let gated = || {
@@ -976,11 +815,11 @@ async fn new_hub_full_queue_is_handler_busy_and_a_retried_command_gets_through()
 }
 
 #[tokio::test]
-async fn new_hub_retry_never_repeats_a_handler_error_or_a_timed_out_command() {
+async fn retry_never_repeats_a_handler_error_or_a_timed_out_command() {
     require_docker!();
     // The hub ends both hang types after 300 ms, well inside the 3 s budget the caller chooses, so
     // only the classification can stop a retry (a query is retried, a command is not).
-    let hub = hub_with(HubOptions::new(HubImage::Current).env(
+    let hub = hub_with(HubOptions::new().env(
         "KRAKEN_HUB_TIMEOUT_OVERRIDES",
         "flow.Hang=300,flow.HangQuery=300",
     ))
@@ -999,7 +838,7 @@ async fn new_hub_retry_never_repeats_a_handler_error_or_a_timed_out_command() {
 
     let failed = a.peer.sender.send_command(&FlowFail {}, budget()).await;
     assert!(
-        matches!(failed, Err(MessagingError::RemoteHandler { ref message, .. }) if message == "handler busy"),
+        matches!(failed, Err(MessagingError::RemoteHandler { ref message, .. }) if message == "handler failed"),
         "{failed:?}"
     );
 
@@ -1034,9 +873,9 @@ async fn new_hub_retry_never_repeats_a_handler_error_or_a_timed_out_command() {
 }
 
 #[tokio::test]
-async fn new_hub_serves_queued_requests_by_priority() {
+async fn queued_requests_are_served_by_priority() {
     require_docker!();
-    let hub = hub_with(HubOptions::new(HubImage::Current)).await;
+    let hub = hub_with(HubOptions::new()).await;
     let b = flow_peer(&hub.address, "flow-b", true, 1, no_retry()).await;
     let a = flow_peer(&hub.address, "flow-a", false, 256, no_retry()).await;
 
@@ -1094,88 +933,17 @@ async fn new_hub_serves_queued_requests_by_priority() {
     b.peer.shutdown().await;
 }
 
-/// Older hubs (P0: v2 without flow control; v1 baseline) ignore the new `Register` fields and
-/// forward without permits: the P1 client sends no `Permits`, never stalls and works as before.
-async fn older_hub_works_as_before(image: HubImage) {
-    let hub = hub_with(HubOptions::new(image)).await;
-    let tap = PermitTap::start(&hub.address).await;
-    let b = flow_peer(&tap.address, "flow-b", true, 2, no_retry()).await;
-    let a = flow_peer(&hub.address, "flow-a", false, 256, no_retry()).await;
-    let handshake = b.peer.conn.handshake().unwrap();
-    assert!(!handshake.flow_control(), "{handshake:?}");
-    match image {
-        HubImage::Baseline => assert!(handshake.is_legacy(), "{handshake:?}"),
-        _ => {
-            handshake.ack().expect("a v2 ack");
-        }
-    }
+// ---- Status reports ----
 
-    // More requests than the permits offered: an older hub forwards them all at once.
-    let started = Instant::now();
-    let calls: Vec<_> = (0..6)
-        .map(|i| {
-            let s = Arc::clone(&a.peer.sender);
-            tokio::spawn(async move {
-                let opts = SendOptions {
-                    priority: Some(i % 3), // ignored by an older hub
-                    ..Default::default()
-                };
-                s.send_command(&FlowSlow {}, opts).await
-            })
-        })
-        .collect();
-    for c in calls {
-        c.await.unwrap().expect("round trip through an older hub");
-    }
-    eprintln!(
-        "{image:?}: 6 calls to a 300 ms handler offering 2 permits took {:?}",
-        started.elapsed()
-    );
-    assert_eq!(b.count("flow.Slow"), 6);
-    assert!(
-        b.max_in_flight.load(Ordering::SeqCst) > 2,
-        "an older hub does not wait for permits"
-    );
-    let unknown = a
-        .peer
-        .sender
-        .send_command(&Fast {}, SendOptions::default())
-        .await;
-    assert!(
-        matches!(unknown, Err(MessagingError::NoHandler(_))),
-        "{unknown:?}"
-    );
-    tokio::time::sleep(PERMIT_FLUSH_AFTER * 3).await;
-    assert_eq!(
-        tap.permits(),
-        0,
-        "permits sent to a hub without flow control"
-    );
-    a.peer.shutdown().await;
-    b.peer.shutdown().await;
-}
-
+/// One target through a `HubPool` (what `KrakenMessaging` uses) behaves as the single-hub client:
+/// round trips work, the hub is known by its id, and `InstanceStatus` reports reach the hub, which
+/// shows them in its topology.
 #[tokio::test]
-async fn p0_hub_acks_without_flow_control_and_works_as_before() {
+async fn a_single_target_pool_reports_its_status_to_the_hub() {
     require_docker!();
-    older_hub_works_as_before(HubImage::P0).await;
-}
-
-#[tokio::test]
-async fn baseline_hub_works_as_before_without_flow_control() {
-    require_docker!();
-    older_hub_works_as_before(HubImage::Baseline).await;
-}
-
-// ---- P3: multi-hub client against one hub ----
-
-/// One target through a `HubPool` (what `KrakenMessaging` now uses) behaves as the single-hub
-/// client: registered in the hub's mode, round trips work, and `InstanceStatus` is written only to
-/// a hub that shares `instance-status` (the P3 hub; not P2, not v1).
-async fn single_target_pool(image: HubImage) {
-    let hub = hub_with(HubOptions::new(image)).await;
+    let hub = hub_with(HubOptions::new().env("KRAKEN_HUB_ID", "status-hub")).await;
     let tap = PermitTap::start(&hub.address).await;
-    let b = peer(&hub.address, "compat-b", &["compat.Fast"]).await;
+    let b = peer(&hub.address, "proto-b", &["proto.Fast"]).await;
     let (tx, mut rx) = mpsc::channel::<Inbound>(64);
     let pool = HubPool::new(
         HubSettings {
@@ -1183,7 +951,7 @@ async fn single_target_pool(image: HubImage) {
             status_interval: Duration::from_millis(100),
             ..HubSettings::default()
         },
-        "compat-pool".into(),
+        "proto-pool".into(),
         uuid::Uuid::new_v4().to_string(),
         tx,
     )
@@ -1197,51 +965,29 @@ async fn single_target_pool(image: HubImage) {
     });
     pool.start();
     assert!(pool.await_registered(Duration::from_secs(15)).await);
-    let handshake = pool.connections()[0].handshake().unwrap();
-    let shares_status = image == HubImage::P3;
-    assert_eq!(
-        handshake.is_legacy(),
-        image == HubImage::Baseline,
-        "{handshake:?}"
-    );
-    assert_eq!(handshake.instance_status(), shares_status, "{handshake:?}");
-    let expected_id = match &handshake {
-        Handshake::V2(ack) => ack.hub_id.clone(),
-        // A legacy hub is known by its target as host:port (shared with kraken-messaging).
-        Handshake::Legacy => tap.address.trim_start_matches("static://").to_string(),
-    };
-    assert_eq!(pool.hub_ids(), [expected_id]);
+    assert_eq!(pool.hub_ids(), ["status-hub"]);
     sender
         .send_command(&Fast {}, SendOptions::default())
         .await
         .expect("round trip through the single hub");
     tokio::time::sleep(Duration::from_millis(600)).await;
-    if shares_status {
-        assert!(
-            tap.statuses() >= 3,
-            "{} reports to the P3 hub",
-            tap.statuses()
-        );
-        let view = instance_view(&hub, "compat-pool").await;
-        assert!(view["statusAgeMs"].as_i64().unwrap() >= 0, "{view}");
-        assert_eq!(
-            view["connectedHubIds"].as_array().unwrap().len(),
-            1,
-            "{view}"
-        );
-    } else {
-        assert_eq!(tap.statuses(), 0, "InstanceStatus written to {image:?}");
-    }
+    assert!(tap.statuses() >= 3, "{} reports to the hub", tap.statuses());
+    let view = instance_view(&hub, "proto-pool").await;
+    assert!(view["statusAgeMs"].as_i64().unwrap() >= 0, "{view}");
+    assert_eq!(
+        view["connectedHubIds"],
+        serde_json::json!(["status-hub"]),
+        "{view}"
+    );
     pool.shutdown().await;
     b.shutdown().await;
 }
 
-// ---- P6a (ADR 0022): the processor status ----
-
-/// The processors' status rides on `InstanceStatus` only to a hub whose ack lists `processors`:
-/// the P6a hub keeps and shows it, the merged P5c hub never sees the field.
-async fn processor_status_to(image: HubImage) {
-    let hub = hub_with(HubOptions::new(image)).await;
+/// The processors' status (ADR 0022) rides on `InstanceStatus`: the hub keeps and shows it.
+#[tokio::test]
+async fn the_hub_gets_and_shows_the_processor_status() {
+    require_docker!();
+    let hub = hub_with(HubOptions::new()).await;
     let tap = PermitTap::start(&hub.address).await;
     let (tx, mut rx) = mpsc::channel::<Inbound>(64);
     let pool = HubPool::new(
@@ -1250,7 +996,7 @@ async fn processor_status_to(image: HubImage) {
             status_interval: Duration::from_millis(100),
             ..HubSettings::default()
         },
-        "compat-processors".into(),
+        "proto-processors".into(),
         uuid::Uuid::new_v4().to_string(),
         tx,
     )
@@ -1258,7 +1004,7 @@ async fn processor_status_to(image: HubImage) {
     pool.set_processor_status(Arc::new(|| {
         vec![proto::ProcessorStatus {
             name: "orders".into(),
-            group_id: "compat-processors.orders".into(),
+            group_id: "proto-processors.orders".into(),
             topic: "kraken.events".into(),
             state: proto::ProcessorState::ProcessorRunning as i32,
             partitions: vec![proto::PartitionStatus {
@@ -1276,361 +1022,12 @@ async fn processor_status_to(image: HubImage) {
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
     pool.start();
     assert!(pool.await_registered(Duration::from_secs(15)).await);
-    let handshake = pool.connections()[0].handshake().unwrap();
-    assert!(handshake.instance_status(), "{handshake:?}");
-    let shares = image == HubImage::P6a;
-    assert_eq!(handshake.processors(), shares, "{handshake:?}");
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(tap.statuses() >= 3, "{} reports", tap.statuses());
-    if shares {
-        assert!(tap.with_processors() >= 3, "{}", tap.with_processors());
-        let view = instance_view(&hub, "compat-processors").await;
-        assert_eq!(view["processors"][0]["name"], "orders", "{view}");
-        assert_eq!(view["processors"][0]["state"], "RUNNING", "{view}");
-        assert_eq!(view["processors"][0]["partitions"][0]["lag"], 12, "{view}");
-    } else {
-        assert_eq!(tap.with_processors(), 0, "processors written to {image:?}");
-    }
+    assert!(tap.with_processors() >= 3, "{}", tap.with_processors());
+    let view = instance_view(&hub, "proto-processors").await;
+    assert_eq!(view["processors"][0]["name"], "orders", "{view}");
+    assert_eq!(view["processors"][0]["state"], "RUNNING", "{view}");
+    assert_eq!(view["processors"][0]["partitions"][0]["lag"], 12, "{view}");
     pool.shutdown().await;
-}
-
-#[tokio::test]
-async fn p6a_hub_gets_and_shows_the_processor_status() {
-    require_docker!();
-    processor_status_to(HubImage::P6a).await;
-}
-
-#[tokio::test]
-async fn p5c_hub_gets_instance_status_without_processors() {
-    require_docker!();
-    processor_status_to(HubImage::P5c).await;
-}
-
-#[tokio::test]
-async fn p3_hub_single_target_gets_instance_status() {
-    require_docker!();
-    single_target_pool(HubImage::P3).await;
-}
-
-#[tokio::test]
-async fn p2_hub_single_target_works_and_gets_no_instance_status() {
-    require_docker!();
-    single_target_pool(HubImage::P2).await;
-}
-
-#[tokio::test]
-async fn baseline_hub_single_target_pool_runs_in_legacy_mode_without_instance_status() {
-    require_docker!();
-    single_target_pool(HubImage::Baseline).await;
-}
-
-#[derive(Serialize, Deserialize)]
-struct Lookup {}
-message_type!(Lookup, "compat.Lookup");
-impl Query for Lookup {
-    type Reply = ();
-}
-
-#[derive(Serialize, Deserialize)]
-struct SharedLookup {}
-message_type!(SharedLookup, "compat.Shared");
-impl Query for SharedLookup {
-    type Reply = ();
-}
-
-/// A hub before P4a: no `scatter-gather` in its ack (none at all for the baseline), so a
-/// scatter-gather fails with `UnsupportedByHub` before anything is sent, while a unary query to an
-/// exclusive owner works as before. The hub ignores `shared_query_types`: the registration is
-/// accepted, the shared type is simply not there.
-async fn scatter_gather_unsupported(image: HubImage) {
-    let hub = hub_with(HubOptions::new(image)).await;
-    let owner = peer_with(
-        &hub.address,
-        "compat-owner",
-        RegisteredTypes {
-            queries: vec!["compat.Lookup".into()],
-            shared_queries: vec!["compat.Shared".into()],
-            ..RegisteredTypes::default()
-        },
-    )
-    .await;
-    let a = peer(&hub.address, "compat-a", &[]).await;
-    let handshake = a.conn.handshake().unwrap();
-    assert!(!handshake.scatter_gather(), "{handshake:?}");
-
-    let e = a
-        .sender
-        .scatter_gather(&Lookup {}, ScatterOptions::default())
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(e, MessagingError::UnsupportedByHub(_)),
-        "{image:?}: {e:?}"
-    );
-    assert_eq!(a.sender.in_flight(), 0);
-    a.sender
-        .send_query(&Lookup {}, SendOptions::default())
-        .await
-        .expect("unary query on an older hub");
-    let e = a
-        .sender
-        .send_query(&SharedLookup {}, SendOptions::default())
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(e, MessagingError::NoHandler(_)),
-        "{image:?}: {e:?}"
-    );
-    a.shutdown().await;
-    owner.shutdown().await;
-}
-
-#[tokio::test]
-async fn p3_hub_scatter_gather_is_unsupported_by_hub_and_unary_still_works() {
-    require_docker!();
-    scatter_gather_unsupported(HubImage::P3).await;
-}
-
-#[tokio::test]
-async fn baseline_hub_scatter_gather_is_unsupported_by_hub_and_unary_still_works() {
-    require_docker!();
-    scatter_gather_unsupported(HubImage::Baseline).await;
-}
-
-/// `compat.Lookup` as a streaming query: the P4a hub knows the mode and rejects it.
-#[derive(Serialize, Deserialize)]
-struct StreamLookup {}
-message_type!(StreamLookup, "compat.Lookup");
-impl StreamingQuery for StreamLookup {
-    type Item = ();
-}
-
-/// A P4a hub (ADR 0017, P4b): it shares `scatter-gather` but not `streaming`, so a streaming
-/// query fails with `UnsupportedByHub` before anything is sent, while a unary query and a
-/// scatter-gather to the same owner work as before.
-#[tokio::test]
-async fn p4a_hub_streaming_is_unsupported_by_hub_and_unary_and_gathers_still_work() {
-    require_docker!();
-    let hub = hub_with(HubOptions::new(HubImage::P4a)).await;
-    let owner = peer_with(
-        &hub.address,
-        "compat-owner",
-        RegisteredTypes {
-            queries: vec!["compat.Lookup".into()],
-            ..RegisteredTypes::default()
-        },
-    )
-    .await;
-    let a = peer(&hub.address, "compat-a", &[]).await;
-    let handshake = a.conn.handshake().unwrap();
-    assert!(handshake.scatter_gather(), "{handshake:?}");
-    assert!(!handshake.streaming(), "{handshake:?}");
-
-    let e = a
-        .sender
-        .stream(&StreamLookup {}, StreamOptions::default())
-        .await
-        .err()
-        .expect("unsupported by a P4a hub");
-    assert!(matches!(e, MessagingError::UnsupportedByHub(_)), "{e:?}");
-    assert_eq!(a.sender.in_flight(), 0);
-    a.sender
-        .send_query(&Lookup {}, SendOptions::default())
-        .await
-        .expect("unary query on a P4a hub");
-    let gathered = a
-        .sender
-        .scatter_gather(&Lookup {}, ScatterOptions::default())
-        .await
-        .expect("scatter-gather on a P4a hub");
-    assert_eq!(gathered.parts.len(), 1);
-    assert_eq!(a.sender.in_flight(), 0);
-    a.shutdown().await;
-    owner.shutdown().await;
-}
-
-/// `compat.Rows`: a streaming query a P4b hub serves (two items).
-#[derive(Serialize, Deserialize)]
-struct Rows {}
-message_type!(Rows, "compat.Rows");
-impl StreamingQuery for Rows {
-    type Item = ();
-}
-
-/// `compat.Feed`: a subscription query, which only a P4c hub routes.
-#[derive(Serialize, Deserialize)]
-struct Feed {}
-message_type!(Feed, "compat.Feed");
-impl SubscriptionQuery for Feed {
-    type Initial = ();
-    type Update = ();
-}
-
-/// The handlers of the owner: `compat.Lookup` (unary), `compat.Rows` (streaming) and
-/// `compat.Feed` (subscription).
-fn owner_registry() -> HandlerRegistry {
-    let mut registry = HandlerRegistry::new();
-    registry.shared_query::<Lookup, _, _>(|_, _| async move { Ok(()) });
-    registry.streaming_query::<Rows, _, _, _>(|_, _| async move {
-        Ok(tokio_stream::iter(vec![Ok(()), Ok(())]))
-    });
-    registry.subscription_query::<Feed, _, _>(|_, _| async move { Ok(()) });
-    registry
-}
-
-/// An instance of `service` served by the library's own dispatcher with `registry`.
-async fn library_node(
-    address: &str,
-    service: &str,
-    registry: HandlerRegistry,
-) -> (Arc<HubPool>, Arc<Sender>) {
-    library_node_with_token(address, service, registry, None).await
-}
-
-/// [`library_node`] configured with the hub token `token` (P5a).
-async fn library_node_with_token(
-    address: &str,
-    service: &str,
-    registry: HandlerRegistry,
-    token: Option<&str>,
-) -> (Arc<HubPool>, Arc<Sender>) {
-    let (tx, mut rx) = mpsc::channel::<Inbound>(64);
-    let pool = HubPool::new(
-        HubSettings {
-            address: address.to_string(),
-            backoff_min: Duration::from_millis(500),
-            backoff_max: Duration::from_secs(5),
-            token: token.map(kraken_messaging::SecretString::new),
-            ..HubSettings::default()
-        },
-        service.to_string(),
-        uuid::Uuid::new_v4().to_string(),
-        tx,
-    )
-    .unwrap();
-    pool.set_registered_types(registry.registered_types());
-    let sender = Sender::with_pool(Arc::clone(&pool), SenderSettings::default());
-    let dispatcher = Arc::new(Dispatcher::new(
-        Arc::new(registry),
-        Arc::new(IdentityResolver::new(None)),
-        8,
-    ));
-    let forward = Arc::clone(&sender);
-    tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                Inbound::Request { request, reply_to } => {
-                    tokio::spawn(dispatcher.serve(request, reply_to));
-                }
-                Inbound::Flow(f) => dispatcher.flow(&f.request_id, f.credits),
-                Inbound::Cancel(c) => dispatcher.cancel(&c.request_id, &c.reason),
-                Inbound::Disconnected { stream, .. } => {
-                    dispatcher.stream_lost(stream);
-                    forward.on_inbound(msg);
-                }
-                other => forward.on_inbound(other),
-            }
-        }
-    });
-    pool.start();
-    assert!(
-        pool.await_all_registered(Duration::from_secs(15)).await,
-        "{service} did not register"
-    );
-    (pool, sender)
-}
-
-/// A P4b hub (ADR 0017, P4c): it shares `streaming` but not `subscription`, so a subscription
-/// fails with `UnsupportedByHub` before anything is sent, while a unary query, a scatter-gather
-/// and a streaming query to the same owner work as before.
-#[tokio::test]
-async fn p4b_hub_subscription_is_unsupported_by_hub_and_unary_gathers_and_streams_still_work() {
-    require_docker!();
-    let hub = hub_with(HubOptions::new(HubImage::P4b)).await;
-    let (owner_pool, _) = library_node(&hub.address, "compat-owner", owner_registry()).await;
-    let (second_pool, _) = library_node(&hub.address, "compat-owner-2", {
-        // A second owner of the shared `compat.Lookup`, so the gather has two parts.
-        let mut r = HandlerRegistry::new();
-        r.shared_query::<Lookup, _, _>(|_, _| async move { Ok(()) });
-        r
-    })
-    .await;
-    let (caller_pool, caller) =
-        library_node(&hub.address, "compat-caller", HandlerRegistry::new()).await;
-    let handshake = caller_pool.handshake_for("").unwrap();
-    assert!(handshake.streaming(), "{handshake:?}");
-    assert!(!handshake.subscription(), "{handshake:?}");
-
-    let e = caller
-        .subscribe(&Feed {}, SubscriptionOptions::default())
-        .await
-        .err()
-        .expect("unsupported by a P4b hub");
-    assert!(
-        matches!(e, MessagingError::UnsupportedByHub(ref m) if m.contains("subscription")),
-        "{e:?}"
-    );
-    assert_eq!(caller.in_flight(), 0);
-    caller
-        .send_query(&Lookup {}, SendOptions::default())
-        .await
-        .expect("unary query on a P4b hub");
-    let gathered = caller
-        .scatter_gather(&Lookup {}, ScatterOptions::default())
-        .await
-        .expect("scatter-gather on a P4b hub");
-    assert_eq!(gathered.parts.len(), 2, "both owners answer");
-    let items: Vec<_> = caller
-        .stream(&Rows {}, StreamOptions::default())
-        .await
-        .expect("streaming query on a P4b hub")
-        .collect()
-        .await;
-    assert_eq!(items.len(), 2);
-    assert!(items.iter().all(Result::is_ok), "{items:?}");
-    assert_eq!(caller.in_flight(), 0);
-    caller_pool.shutdown().await;
-    second_pool.shutdown().await;
-    owner_pool.shutdown().await;
-}
-
-/// A P4c hub predates access control (P5a): it ignores `Register.credentials`, so a configured
-/// token is harmless. Every request mode works as before, and the hub never needs the token.
-#[tokio::test]
-async fn p4c_hub_ignores_a_configured_token() {
-    require_docker!();
-    let hub = hub_with(HubOptions::new(HubImage::P4c)).await;
-    let token = format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    );
-    let (owner_pool, _) =
-        library_node_with_token(&hub.address, "compat-owner", owner_registry(), Some(&token)).await;
-    let (caller_pool, caller) = library_node_with_token(
-        &hub.address,
-        "compat-caller",
-        HandlerRegistry::new(),
-        Some(&token),
-    )
-    .await;
-    assert_eq!(caller_pool.connections()[0].last_rejection(), None);
-    caller
-        .send_query(&Lookup {}, SendOptions::default())
-        .await
-        .expect("unary query with a token configured");
-    let items: Vec<_> = caller
-        .stream(&Rows {}, StreamOptions::default())
-        .await
-        .expect("streaming query with a token configured")
-        .collect()
-        .await;
-    assert_eq!(items.len(), 2);
-    assert!(items.iter().all(Result::is_ok), "{items:?}");
-    caller
-        .subscribe(&Feed {}, SubscriptionOptions::default())
-        .await
-        .expect("subscription with a token configured");
-    caller_pool.shutdown().await;
-    owner_pool.shutdown().await;
 }

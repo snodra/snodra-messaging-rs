@@ -36,10 +36,6 @@ pub enum MessagingError {
     HubConnectionLost(String),
     #[error("{0}")]
     HubRegistrationRejected(String),
-    /// The feature needs a newer hub: no hub this client is registered on lists its capability in
-    /// the `RegisterAck` (or the hub answered `UNSUPPORTED`). Nothing was sent; not retried.
-    #[error("{0}")]
-    UnsupportedByHub(String),
     /// Hub code CANCELLED (ADR 0017, P4b): the hub ended a streaming query (it outlived
     /// `KRAKEN_HUB_MAX_STREAM_DURATION`). Not retried.
     #[error("{0}")]
@@ -114,7 +110,6 @@ impl MessagingError {
             Self::HubUnavailable(_) => "HubUnavailable",
             Self::HubConnectionLost(_) => "HubConnectionLost",
             Self::HubRegistrationRejected(_) => "HubRegistrationRejected",
-            Self::UnsupportedByHub(_) => "UnsupportedByHub",
             Self::Cancelled(_) => "Cancelled",
             Self::Serialization(_) => "Serialization",
             Self::Storage(_) => "Storage",
@@ -217,12 +212,5 @@ mod tests {
             &e
         ));
         assert_eq!(e.to_reply_code(), ErrorCode::HandlerError);
-    }
-
-    #[test]
-    fn handler_error_busy_from_an_old_hub_stays_remote_handler() {
-        let e =
-            MessagingError::from_hub("t.X", ErrorCode::HandlerError as i32, "handler busy", b"");
-        assert!(matches!(e, MessagingError::RemoteHandler { .. }), "{e:?}");
     }
 }

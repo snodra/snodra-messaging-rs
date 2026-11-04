@@ -18,7 +18,6 @@ use tokio::sync::mpsc;
 fn settings(address: String, tls: Option<HubTls>) -> HubSettings {
     HubSettings {
         address,
-        heartbeat_interval: Duration::from_secs(1),
         backoff_min: Duration::from_millis(20),
         backoff_max: Duration::from_millis(200),
         handshake_timeout: Duration::from_secs(3),

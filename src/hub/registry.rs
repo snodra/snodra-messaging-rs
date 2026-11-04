@@ -109,8 +109,7 @@ impl HandlerRegistry {
     ///
     /// Every registrant of the type, in every service, must register it shared: a hub rejects a
     /// `Register` that disagrees with an earlier one (`ALREADY_EXISTS`, the connection keeps
-    /// retrying). Shared types need a hub that lists `scatter-gather` in its ack; an older hub
-    /// ignores the field, so the type is not registered there.
+    /// retrying).
     ///
     /// # Panics
     /// When the type already has a handler here, shared or exclusive.

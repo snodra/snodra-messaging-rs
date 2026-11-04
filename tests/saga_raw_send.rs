@@ -71,7 +71,6 @@ async fn sender(hub: &FakeHub, settings: SenderSettings) -> Arc<Sender> {
     let conn = HubConnection::new(
         HubSettings {
             address: hub.address(),
-            heartbeat_interval: Duration::from_secs(1),
             backoff_min: Duration::from_millis(50),
             backoff_max: Duration::from_millis(500),
             ..HubSettings::default()
@@ -471,10 +470,6 @@ fn the_retry_taxonomy_names_every_failure() {
         // Any other messaging failure is a handler error.
         (
             MessagingError::Cancelled("cut".into()),
-            FailureReason::Failed,
-        ),
-        (
-            MessagingError::UnsupportedByHub("old hub".into()),
             FailureReason::Failed,
         ),
     ];

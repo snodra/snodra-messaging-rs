@@ -64,7 +64,6 @@ fn random_token() -> String {
 fn settings(address: String, token: Option<&str>) -> HubSettings {
     HubSettings {
         address,
-        heartbeat_interval: Duration::from_secs(1),
         backoff_min: Duration::from_millis(20),
         backoff_max: Duration::from_millis(300),
         token: token.map(SecretString::new),

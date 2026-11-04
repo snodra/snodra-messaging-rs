@@ -1,10 +1,10 @@
-//! End to end against the real hub image (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`, the P5b
-//! hub) running `KRAKEN_HUB_AUTH_MODE=enforce` with JWT authentication: the test identity provider
+//! End to end against the real hub image (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`) running
+//! `KRAKEN_HUB_AUTH_MODE=enforce` with JWT authentication: the test identity provider
 //! (`support::idp`: a token endpoint on the host and ES256 keys generated at test time) issues the
 //! tokens; its JWKS is served to the hub by a small container on the same bridge network (the hub
-//! reaches it as `keycloak`; reaching the test host from a container is runtime-specific). A `[[service]]` ACL
-//! entry gives a JWT service its rights; a static-token service (`orders`) sits beside it. No Kafka
-//! or MongoDB: the participants are a `HubConnection` and a `Sender`.
+//! reaches it as `keycloak`; reaching the test host from a container is runtime-specific). A
+//! `[[service]]` ACL entry gives a JWT service its rights; a static-token service (`orders`) sits
+//! beside it. No Kafka or MongoDB: the participants are a `HubConnection` and a `Sender`.
 mod support;
 
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use kraken_messaging::{HubOAuth2, MessagingError, Query, SecretString, message_t
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use support::containers::{
-    HubContainer, HubImage, HubOptions, STATIC_SERVER_PORT, StaticServer, hub_with, static_server,
+    HubContainer, HubOptions, STATIC_SERVER_PORT, StaticServer, hub_with, static_server,
 };
 use support::idp::Idp;
 use support::logs::Captured;
@@ -94,7 +94,7 @@ async fn fixture(lifetime: u64) -> Fixture {
         ),
     );
     let hub = hub_with(
-        HubOptions::new(HubImage::Current)
+        HubOptions::new()
             .env("KRAKEN_HUB_AUTH_MODE", "enforce")
             .env("KRAKEN_HUB_ACL_FILE", "/etc/kraken/acl.toml")
             .env("KRAKEN_HUB_JWT_ISSUER", &idp.issuer())

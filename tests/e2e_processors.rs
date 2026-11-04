@@ -1,6 +1,6 @@
-//! End to end against the real P6a hub image (`KRAKEN_HUB_P6A_IMAGE`, default
-//! `kraken-hub:p6a-hub`): a service's event processors, a parked letter and the lag reach the
-//! hub's `GET /api/v1/processors` and topology (ADR 0022).
+//! End to end against the real hub image (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`): a
+//! service's event processors, a parked letter and the lag reach the hub's `GET /api/v1/processors`
+//! and topology (ADR 0022).
 
 mod support;
 
@@ -12,7 +12,7 @@ use rdkafka::config::ClientConfig;
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde::{Deserialize, Serialize};
-use support::containers::{HubImage, HubOptions, hub_with};
+use support::containers::{HubOptions, hub_with};
 
 macro_rules! require_docker {
     () => {
@@ -37,7 +37,7 @@ async fn json(url: &str) -> serde_json::Value {
 #[tokio::test]
 async fn the_hub_shows_the_processors_their_letters_and_their_lag() {
     require_docker!();
-    let hub = hub_with(HubOptions::new(HubImage::P6a)).await;
+    let hub = hub_with(HubOptions::new()).await;
     let kafka = support::containers::kafka().await;
     let mongo = support::containers::mongo().await;
     let topic = "e2e.events";

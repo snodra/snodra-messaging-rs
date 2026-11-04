@@ -1,9 +1,8 @@
 //! Scatter-gather queries and shared query types (ADR 0017) against in-process fake hubs: shared
 //! registration, one part per target in arrival order and the end, failed and timed-out targets,
-//! `max_results`, the request fields, the `UnsupportedByHub` gate, errors before any target,
-//! parts and ends of unknown requests, a lost stream, a gather dropped while its write is
-//! blocked, the retry policy over the whole gather, and the multi-hub pool (one gather to one
-//! capable hub, the capability checked again on the stream it is written to).
+//! `max_results`, the request fields, errors before any target, parts and ends of unknown
+//! requests, a lost stream, a gather dropped while its write is blocked, the retry policy over the
+//! whole gather, and the multi-hub pool (one gather to one hub).
 mod support;
 
 use std::sync::Arc;
@@ -11,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use kraken_messaging::hub::{
     HubPool, HubSettings, Inbound, RegisteredTypes, RemoteError, ReplyTo, ScatterOptions,
-    ScatterPart, SendOptions, Sender, SenderSettings, rendezvous_score,
+    ScatterPart, Sender, SenderSettings,
 };
 use kraken_messaging::proto::{self, ClientMessage, ErrorCode, client_message, reply};
-use kraken_messaging::{Command, MessagingError, Query, RetryPolicy, message_type};
+use kraken_messaging::{MessagingError, Query, RetryPolicy, message_type};
 use serde::{Deserialize, Serialize};
 use support::fake_hub::FakeHub;
 use tokio::sync::mpsc;
@@ -36,16 +35,6 @@ impl Query for Find {
 
 fn find() -> Find {
     Find { term: "x".into() }
-}
-
-/// A command of `size` bytes, used to fill a stream.
-#[derive(Serialize, Deserialize)]
-struct Fill {
-    data: String,
-}
-message_type!(Fill, "t.Fill");
-impl Command for Fill {
-    type Reply = ();
 }
 
 /// How a target answers `t.Find`.
@@ -75,7 +64,6 @@ impl Node {
 fn settings(address: &str) -> HubSettings {
     HubSettings {
         address: address.to_string(),
-        heartbeat_interval: Duration::from_secs(1),
         backoff_min: Duration::from_millis(50),
         backoff_max: Duration::from_millis(200),
         ..HubSettings::default()
@@ -445,42 +433,6 @@ async fn the_stream_yields_parts_in_arrival_order_and_completes_on_the_end() {
 }
 
 #[tokio::test]
-async fn a_hub_without_the_capability_is_unsupported_and_gets_nothing() {
-    for legacy in [false, true] {
-        let hub = FakeHub::start().await;
-        if legacy {
-            hub.set_ack(None);
-        } else {
-            hub.set_scatter_gather(false);
-        }
-        let a = hub.address();
-        let c = caller(&a).await;
-        let e = c
-            .sender
-            .scatter_gather(&find(), ScatterOptions::default())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(e, MessagingError::UnsupportedByHub(_)),
-            "legacy {legacy}: {e:?}"
-        );
-        let stream = c
-            .sender
-            .scatter_gather_stream(&find(), ScatterOptions::default());
-        let mut stream = Box::pin(stream);
-        let first = stream.next().await.expect("one error");
-        assert!(
-            matches!(first, Err(MessagingError::UnsupportedByHub(_))),
-            "{first:?}"
-        );
-        assert!(stream.next().await.is_none());
-        drop(stream);
-        assert!(hub.requests().await.is_empty(), "nothing is sent");
-        c.shutdown().await;
-    }
-}
-
-#[tokio::test]
 async fn errors_before_any_target_map_to_the_unary_errors() {
     let hub = FakeHub::start().await;
     let a = hub.address();
@@ -514,14 +466,6 @@ async fn errors_before_any_target_map_to_the_unary_errors() {
         .await
         .unwrap_err();
     assert!(matches!(e, MessagingError::InvalidMessage(_)), "{e:?}");
-    // The hub stopped sharing the capability after the handshake: it answers UNSUPPORTED.
-    hub.set_scatter_gather(false);
-    let e = c
-        .sender
-        .scatter_gather(&find(), ScatterOptions::default())
-        .await
-        .unwrap_err();
-    assert!(matches!(e, MessagingError::UnsupportedByHub(_)), "{e:?}");
     assert_eq!(c.sender.in_flight(), 0);
     owner.shutdown().await;
     c.shutdown().await;
@@ -679,7 +623,7 @@ async fn the_retry_policy_repeats_the_whole_gather() {
 }
 
 #[tokio::test]
-async fn a_pool_sends_each_gather_to_one_hub_and_only_to_capable_ones() {
+async fn a_pool_sends_each_gather_to_one_hub() {
     let (h1, h2) = (
         FakeHub::start_with_id("hub-1").await,
         FakeHub::start_with_id("hub-2").await,
@@ -697,25 +641,6 @@ async fn a_pool_sends_each_gather_to_one_hub_and_only_to_capable_ones() {
     }
     let (n1, n2) = (gathers(&h1).await.len(), gathers(&h2).await.len());
     assert_eq!((n1, n2), (2, 2), "round-robin");
-    t.shutdown().await;
-    c.shutdown().await;
-
-    // hub-3 is a P3 hub: every gather goes to hub-4.
-    let (h3, h4) = (
-        FakeHub::start_with_id("hub-3").await,
-        FakeHub::start_with_id("hub-4").await,
-    );
-    h3.set_scatter_gather(false);
-    let both = format!("{},{}", h3.address(), h4.address());
-    let t = target(&both, "svc-a", "a1", Behaviour::Answer).await;
-    let c = caller(&both).await;
-    for _ in 0..4 {
-        c.sender
-            .scatter_gather(&find(), ScatterOptions::default())
-            .await
-            .unwrap();
-    }
-    assert_eq!((gathers(&h3).await.len(), gathers(&h4).await.len()), (0, 4));
     t.shutdown().await;
     c.shutdown().await;
 }
@@ -800,105 +725,5 @@ async fn a_gather_dropped_while_its_write_is_blocked_leaves_nothing_pending() {
         "a dropped gather leaves nothing pending"
     );
     hub.drop_streams();
-    c.shutdown().await;
-}
-
-/// The capable hubs are ranked on a snapshot of their handshakes; the write goes to the stream
-/// current then. A hub re-handshaken in between without `scatter-gather` (a reconnect to an
-/// older hub) must not get the gather: that hub would serve it as a unary query and the client
-/// would wait for the local guard. The write refuses such a stream and the gather moves on
-/// (`UnsupportedByHub` when no capable hub is left).
-#[tokio::test]
-async fn a_gather_is_not_written_to_a_stream_that_lost_the_capability_after_ranking() {
-    let (h1, h2) = (
-        FakeHub::start_with_id("hub-1").await,
-        FakeHub::start_with_id("hub-2").await,
-    );
-    let both = format!("{},{}", h1.address(), h2.address());
-    let c = caller(&both).await;
-    assert_eq!(c.pool.hub_ids(), ["hub-1", "hub-2"]);
-    // hub-1 stops reading; commands keyed to it fill its stream (the HTTP/2 windows, then the
-    // outbound buffer), so the next write to it waits.
-    h1.set_stall_reads(true);
-    let key_on_1 = (0..)
-        .map(|i| format!("k{i}"))
-        .find(|k| rendezvous_score("hub-1", k) > rendezvous_score("hub-2", k))
-        .unwrap();
-    let fillers: Vec<_> = (0..324)
-        .map(|i| {
-            let sender = Arc::clone(&c.sender);
-            let opts = SendOptions {
-                routing_key: Some(key_on_1.clone()),
-                retry: Some(RetryPolicy::NONE),
-                timeout: Some(Duration::from_secs(30)),
-                ..SendOptions::default()
-            };
-            let size = if i < 24 { 256 * 1024 } else { 1 };
-            tokio::spawn(async move {
-                let fill = Fill {
-                    data: "x".repeat(size),
-                };
-                sender.send_command(&fill, opts).await
-            })
-        })
-        .collect();
-    eventually("every filler handed to hub-1's stream", async || {
-        c.sender.in_flight() == fillers.len()
-    })
-    .await;
-    for filler in &fillers {
-        filler.abort();
-    }
-    for filler in fillers {
-        let _ = filler.await;
-    }
-    // Gathers go round-robin: the one ranked [hub-1, hub-2] waits in the write to hub-1 (the one
-    // ranked the other way round ends at once with NO_HANDLER on hub-2).
-    let mut probes = 0;
-    let waiting = loop {
-        probes += 1;
-        assert!(probes <= 3, "no gather went to hub-1 first");
-        let sender = Arc::clone(&c.sender);
-        let call = tokio::spawn(async move {
-            sender
-                .scatter_gather(&find(), ScatterOptions::default())
-                .await
-        });
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        if !call.is_finished() {
-            break call;
-        }
-        let e = call.await.unwrap().unwrap_err();
-        assert!(matches!(e, MessagingError::NoHandler(_)), "{e:?}");
-    };
-    assert!(
-        gathers(&h2).await.len() < probes,
-        "the waiting gather reached no hub"
-    );
-    // hub-2 is replaced by an older hub: its new stream's ack lists no scatter-gather.
-    h2.set_scatter_gather(false);
-    h2.drop_streams();
-    eventually("hub-2 re-handshaken without the capability", async || {
-        c.pool.connections().iter().any(|conn| {
-            conn.address() == h2.address() && conn.handshake().is_some_and(|h| !h.scatter_gather())
-        })
-    })
-    .await;
-    let on_h2_before = gathers(&h2).await.len();
-    // hub-1's stream ends: the waiting gather was never written there and moves to hub-2, whose
-    // current stream must refuse it.
-    h1.drop_streams();
-    let e = tokio::time::timeout(Duration::from_secs(3), waiting)
-        .await
-        .expect("the gather ends at once, not at the local guard")
-        .unwrap()
-        .unwrap_err();
-    assert!(matches!(e, MessagingError::UnsupportedByHub(_)), "{e:?}");
-    assert_eq!(
-        gathers(&h2).await.len(),
-        on_h2_before,
-        "the gather was not written to hub-2's stream"
-    );
-    assert_eq!(c.sender.in_flight(), 0);
     c.shutdown().await;
 }

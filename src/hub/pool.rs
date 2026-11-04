@@ -2,14 +2,14 @@
 //!
 //! The hubs never talk to each other; availability comes from every instance registering on every
 //! hub. A [`HubPool`] holds one [`HubConnection`] per target of `hub_address` ([`HubTargets`]),
-//! each with its own handshake, heartbeat, reconnect backoff and legacy detection, all sending the
-//! identical `Register`, and all feeding one inbound channel (replies go on the arrival stream).
+//! each with its own handshake, heartbeat and reconnect backoff, all sending the identical
+//! `Register`, and all feeding one inbound channel (replies go on the arrival stream).
 //!
 //! - **Dedupe.** Two targets whose acks carry the same `hub_id` are one hub: the connection
 //!   acknowledged first keeps it, the other is closed for good (logged once). A hub has no say in
 //!   this: its second `Register` already replaced the first stream's session, so that stream is
-//!   ended by the hub and reconnects, once. A hub without an id (legacy, or an empty
-//!   `RegisterAck.hub_id`) is identified by its target as `host:port` (prefix stripped).
+//!   ended by the hub and reconnects, once. An empty `RegisterAck.hub_id` (a real hub always
+//!   names itself) stands for the target as `host:port` (prefix stripped).
 //! - **Routing.** An unkeyed request goes round-robin over the hubs whose stream is handshaken
 //!   (reconnecting ones are skipped); a keyed one to the live hub with the highest
 //!   [`rendezvous_score`](super::rendezvous_score) for `(hub_id, routing key)`. A request that
@@ -26,8 +26,7 @@
 //!   gets nothing. Permits are never revoked when N grows. The local concurrency guard stays the
 //!   total.
 //! - **Status.** Every `status_interval` an `InstanceStatus` (acknowledged hub ids, handlers in
-//!   flight) goes to every hub whose ack lists `instance-status`, and never to another; it carries
-//!   the event processors' status (ADR 0022) only to the hubs whose ack also lists `processors`.
+//!   flight, the event processors' status, ADR 0022) goes to every live hub.
 //! - **DNS.** A `dns:///name:port` target is resolved at start and every `dns_refresh` into
 //!   `ip:port` targets of one family (IPv4 when any, else IPv6, [`resolved_targets`]): a new
 //!   address gets a connection; a vanished one leaves the routing at once, gets an empty
@@ -80,10 +79,11 @@ use crate::security::HubTls;
 
 use super::auth::AuthStatus;
 use super::connection::{
-    Handshake, Hooks, HubConnection, HubSettings, Inbound, RegisteredTypes, StreamId,
+    Hooks, HubConnection, HubSettings, Inbound, RegisteredTypes, StreamId, hub_id,
 };
 use super::mtls::{self, ClientIdentity};
 use super::targets::{HubTargets, permit_share, rank_keyed, rank_round_robin, resolved_targets};
+use crate::proto::RegisterAck;
 
 /// The longest a vanished DNS address stays open to finish its requests.
 pub const DRAIN_LIMIT: Duration = Duration::from_secs(65);
@@ -164,11 +164,11 @@ impl Member {
     }
 }
 
-/// A live hub at one moment: its connection, id and handshake.
+/// A live hub at one moment: its connection, id and ack.
 struct Live {
     conn: Arc<HubConnection>,
     hub_id: String,
-    handshake: Handshake,
+    ack: RegisterAck,
 }
 
 /// What the certificate watch has seen and said (see the module docs).
@@ -335,8 +335,8 @@ impl HubPool {
         }
     }
 
-    /// Where every status tick reads the event processors' status (ADR 0022); it goes only to the
-    /// hubs whose ack lists `processors`. Without one (the default) the field is always empty.
+    /// Where every status tick reads the event processors' status (ADR 0022). Without one (the
+    /// default) the field is always empty.
     pub fn set_processor_status(&self, source: ProcessorStatusSource) {
         *self.processor_status.lock().unwrap() = Some(source);
     }
@@ -431,8 +431,8 @@ impl HubPool {
                 .all(|m| m.role() == Role::Active && m.conn.handshake().is_some())
     }
 
-    /// The ids of the hubs live now (handshaken streams), in target order; a hub without an id
-    /// (legacy, or an empty `RegisterAck.hub_id`) by its target as `host:port`.
+    /// The ids of the hubs live now (handshaken streams), in target order; an empty
+    /// `RegisterAck.hub_id` by its target as `host:port`.
     pub fn hub_ids(&self) -> Vec<String> {
         self.live().into_iter().map(|l| l.hub_id).collect()
     }
@@ -457,16 +457,16 @@ impl HubPool {
         self.members().iter().map(|m| Arc::clone(&m.conn)).collect()
     }
 
-    /// The handshake a request with `routing_key` would be sent with now (the first choice),
-    /// without taking a round-robin turn.
-    pub fn handshake_for(&self, routing_key: &str) -> Option<Handshake> {
+    /// The `RegisterAck` of the hub a request with `routing_key` would be sent to now (the first
+    /// choice), without taking a round-robin turn.
+    pub fn handshake_for(&self, routing_key: &str) -> Option<RegisterAck> {
         let live = self.live();
         if routing_key.is_empty() {
-            return live.into_iter().next().map(|l| l.handshake);
+            return live.into_iter().next().map(|l| l.ack);
         }
         let ids: Vec<&str> = live.iter().map(|l| l.hub_id.as_str()).collect();
         let first = *rank_keyed(&ids, routing_key).first()?;
-        Some(live[first].handshake.clone())
+        Some(live[first].ack.clone())
     }
 
     /// Requests that arrived on any hub and whose handler has not finished.
@@ -485,32 +485,17 @@ impl HubPool {
     /// rendezvous with one. When the write fails or `build` refuses the stream (nothing was
     /// written) the next hub in that order is tried, so `build` may run more than once, each time
     /// for another stream; the last error (`HubUnavailable`, or `build`'s) is returned when no hub
-    /// took it. Over the live hubs whose ack lists `capability` only (`None`: every live hub). `UnsupportedByHub` when hubs are live but none lists it (nothing
-    /// was written); `HubUnavailable` when none is live. The hubs are ranked on a snapshot of
-    /// their handshakes; `build` sees the handshake of the stream current at the write and should
-    /// check the capability again (a hub re-handshaken in between may have lost it).
+    /// took it; `HubUnavailable` when none is live. `build` sees the ack of the stream current
+    /// at the write.
     pub(crate) async fn send_where<T>(
         &self,
         routing_key: &str,
-        capability: Option<&str>,
         wait: Option<Duration>,
-        mut build: impl FnMut(StreamId, &Handshake) -> Result<(ClientMessage, T), MessagingError>,
+        mut build: impl FnMut(StreamId, &RegisterAck) -> Result<(ClientMessage, T), MessagingError>,
     ) -> Result<(StreamId, T), MessagingError> {
         let mut last = None;
-        let ranked = self.ranked_waiting(routing_key, capability, wait).await;
-        if ranked.is_empty()
-            && let Some(capability) = capability
-            && !self.live().is_empty()
-        {
-            return Err(MessagingError::UnsupportedByHub(format!(
-                "no hub this instance is registered on lists the \"{capability}\" capability; it needs a newer kraken-hub"
-            )));
-        }
-        for conn in ranked {
-            match conn
-                .send_with(|stream, handshake| build(stream, handshake))
-                .await
-            {
+        for conn in self.ranked_waiting(routing_key, wait).await {
+            match conn.send_with(|stream, ack| build(stream, ack)).await {
                 Ok(sent) => return Ok(sent),
                 Err(e) => {
                     tracing::debug!(hub = %conn.address(), "not written, trying the next hub: {e}");
@@ -531,17 +516,14 @@ impl HubPool {
         routing_key: &str,
         tried: &[String],
         wait: Option<Duration>,
-        mut build: impl FnMut(StreamId, &Handshake) -> Result<(ClientMessage, T), MessagingError>,
+        mut build: impl FnMut(StreamId, &RegisterAck) -> Result<(ClientMessage, T), MessagingError>,
     ) -> Result<(StreamId, T, String), MessagingError> {
         let mut last = None;
-        for conn in self.ranked_waiting(routing_key, None, wait).await {
+        for conn in self.ranked_waiting(routing_key, wait).await {
             if tried.iter().any(|a| a == conn.address()) {
                 continue;
             }
-            match conn
-                .send_with(|stream, handshake| build(stream, handshake))
-                .await
-            {
+            match conn.send_with(|stream, ack| build(stream, ack)).await {
                 Ok((stream, extra)) => return Ok((stream, extra, conn.address().to_string())),
                 Err(e) => {
                     tracing::debug!(hub = %conn.address(), "not written, trying the next hub: {e}");
@@ -609,12 +591,11 @@ impl HubPool {
             .into_iter()
             .filter(|m| m.role() == Role::Active)
             .filter_map(|m| {
-                let handshake = m.conn.handshake()?;
-                let hub_id = handshake.hub_id(m.address());
+                let ack = m.conn.handshake()?;
                 Some(Live {
                     conn: Arc::clone(&m.conn),
-                    hub_id,
-                    handshake,
+                    hub_id: hub_id(&ack, m.address()),
+                    ack,
                 })
             })
             .collect()
@@ -627,10 +608,9 @@ impl HubPool {
     async fn ranked_waiting(
         &self,
         routing_key: &str,
-        capability: Option<&str>,
         wait: Option<Duration>,
     ) -> Vec<Arc<HubConnection>> {
-        let ranked = self.ranked(routing_key, capability);
+        let ranked = self.ranked(routing_key);
         if !ranked.is_empty() || !self.rolling() {
             return ranked;
         }
@@ -643,10 +623,10 @@ impl HubPool {
             tokio::select! {
                 _ = changes.changed() => {}
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {}
-                _ = tokio::time::sleep_until(deadline) => return self.ranked(routing_key, capability),
+                _ = tokio::time::sleep_until(deadline) => return self.ranked(routing_key),
                 _ = self.cancel.cancelled() => return vec![],
             }
-            let ranked = self.ranked(routing_key, capability);
+            let ranked = self.ranked(routing_key);
             if !ranked.is_empty() || !self.rolling() {
                 return ranked;
             }
@@ -658,13 +638,9 @@ impl HubPool {
         self.members().iter().any(|m| m.role() == Role::Rolling)
     }
 
-    /// The live hubs (those whose ack lists `capability`, when given) in the order a request with
-    /// `routing_key` tries them.
-    fn ranked(&self, routing_key: &str, capability: Option<&str>) -> Vec<Arc<HubConnection>> {
-        let mut live = self.live();
-        if let Some(capability) = capability {
-            live.retain(|l| l.handshake.shares(capability));
-        }
+    /// The live hubs in the order a request with `routing_key` tries them.
+    fn ranked(&self, routing_key: &str) -> Vec<Arc<HubConnection>> {
+        let live = self.live();
         if live.is_empty() {
             return vec![];
         }
@@ -716,7 +692,7 @@ impl HubPool {
             }),
             accept: Box::new({
                 let (weak, address) = (weak.clone(), address.clone());
-                move |handshake| weak.upgrade().is_none_or(|p| p.accept(&address, handshake))
+                move |ack| weak.upgrade().is_none_or(|p| p.accept(&address, ack))
             }),
             changed: Box::new(move || {
                 if let Some(pool) = weak.upgrade() {
@@ -777,8 +753,8 @@ impl HubPool {
 
     /// The connection at `address` completed its handshake: it keeps its hub unless another
     /// active connection reached the same hub id first.
-    fn accept(&self, address: &str, handshake: &Handshake) -> bool {
-        let hub_id = handshake.hub_id(address);
+    fn accept(&self, address: &str, ack: &RegisterAck) -> bool {
+        let hub_id = hub_id(ack, address);
         let mut owners = self.owners.lock().unwrap();
         // This connection may reach another hub than before (a restarted hub gets a new id).
         owners.retain(|_, owner| owner != address);
@@ -815,41 +791,30 @@ impl HubPool {
         }
     }
 
-    /// One `InstanceStatus` to every live hub sharing `instance-status`.
+    /// One `InstanceStatus` to every live hub.
     pub(crate) async fn report_status(&self) {
         let live = self.live();
         let mut ids: Vec<String> = Vec::new();
-        for l in live.iter().filter(|l| !l.handshake.is_legacy()) {
+        for l in &live {
             if !ids.contains(&l.hub_id) {
                 ids.push(l.hub_id.clone());
             }
         }
+        // The processors' status (ADR 0022), read once.
+        let source = self.processor_status.lock().unwrap().clone();
         let status = InstanceStatus {
             connected_hub_ids: ids,
             handlers_in_flight: self.handlers_in_flight().min(u32::MAX as usize) as u32,
-            processors: Vec::new(),
+            processors: source.map(|source| source()).unwrap_or_default(),
         };
-        // The processors' status (ADR 0022), read once, only when some hub shares it.
-        let source = self.processor_status.lock().unwrap().clone();
-        let processors = match source {
-            Some(source) if live.iter().any(|l| l.handshake.processors()) => source(),
-            _ => Vec::new(),
-        };
-        let writes = live
-            .iter()
-            .filter(|l| l.handshake.instance_status())
-            .map(|l| {
-                let mut status = status.clone();
-                if l.handshake.processors() {
-                    status.processors = processors.clone();
-                }
-                let msg = ClientMessage {
-                    message: Some(client_message::Message::Status(status)),
-                };
-                async move {
-                    let _ = tokio::time::timeout(STATUS_WRITE_TIMEOUT, l.conn.send(msg)).await;
-                }
-            });
+        let writes = live.iter().map(|l| {
+            let msg = ClientMessage {
+                message: Some(client_message::Message::Status(status.clone())),
+            };
+            async move {
+                let _ = tokio::time::timeout(STATUS_WRITE_TIMEOUT, l.conn.send(msg)).await;
+            }
+        });
         futures::future::join_all(writes).await;
     }
 

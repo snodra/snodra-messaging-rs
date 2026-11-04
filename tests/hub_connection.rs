@@ -5,8 +5,7 @@ use std::time::Duration;
 
 use kraken_messaging::MessagingError;
 use kraken_messaging::hub::{
-    CAPABILITIES, CLIENT_VERSION, Handshake, HubConnection, HubSettings, Inbound,
-    PERMIT_FLUSH_AFTER, RegisteredTypes,
+    CLIENT_VERSION, HubConnection, HubSettings, Inbound, PERMIT_FLUSH_AFTER, RegisteredTypes,
 };
 use kraken_messaging::proto::{
     self, ClientMessage, Heartbeat, Reply, ServerMessage, client_message, reply, server_message,
@@ -15,15 +14,9 @@ use support::fake_hub::{FakeHub, default_ack};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep, timeout};
 
-fn settings(
-    address: String,
-    heartbeat_ms: u64,
-    backoff_min_ms: u64,
-    backoff_max_ms: u64,
-) -> HubSettings {
+fn settings(address: String, backoff_min_ms: u64, backoff_max_ms: u64) -> HubSettings {
     HubSettings {
         address,
-        heartbeat_interval: Duration::from_millis(heartbeat_ms),
         backoff_min: Duration::from_millis(backoff_min_ms),
         backoff_max: Duration::from_millis(backoff_max_ms),
         handshake_timeout: Duration::from_secs(5),
@@ -49,7 +42,7 @@ fn heartbeat() -> ClientMessage {
 #[tokio::test]
 async fn registers_with_declared_types() {
     let hub = FakeHub::start().await;
-    let (conn, _rx) = connection(settings(hub.address(), 1_000, 50, 500));
+    let (conn, _rx) = connection(settings(hub.address(), 50, 500));
     conn.set_types(vec!["t.Cmd".into()], vec!["t.Q".into()]);
     conn.start();
 
@@ -66,9 +59,9 @@ async fn registers_with_declared_types() {
 }
 
 #[tokio::test]
-async fn registers_shared_query_types_apart_and_knows_whether_the_hub_scatters() {
+async fn registers_shared_query_types_apart() {
     let hub = FakeHub::start().await;
-    let (conn, _rx) = connection(settings(hub.address(), 1_000, 50, 500));
+    let (conn, _rx) = connection(settings(hub.address(), 50, 500));
     conn.set_registered_types(RegisteredTypes {
         commands: vec!["t.Cmd".into()],
         queries: vec!["t.Q".into()],
@@ -83,41 +76,6 @@ async fn registers_shared_query_types_apart_and_knows_whether_the_hub_scatters()
     assert_eq!(r.command_types, vec!["t.Cmd"]);
     assert_eq!(r.query_types, vec!["t.A", "t.Q"]);
     assert_eq!(r.shared_query_types, vec!["t.S1", "t.S2"]);
-    assert!(conn.handshake().unwrap().scatter_gather());
-    assert!(conn.handshake().unwrap().streaming());
-    conn.shutdown().await;
-
-    // A P3 hub does not share the capability; a legacy hub has no ack at all.
-    hub.set_scatter_gather(false);
-    let (conn, _rx) = connection(settings(hub.address(), 1_000, 50, 500));
-    conn.start();
-    assert!(conn.await_registered(Duration::from_secs(5)).await);
-    assert!(!conn.handshake().unwrap().scatter_gather());
-    conn.shutdown().await;
-    assert!(!Handshake::Legacy.scatter_gather());
-
-    // A P4a hub shares scatter-gather but not streaming.
-    hub.set_scatter_gather(true);
-    hub.set_streaming(false);
-    let (conn, _rx) = connection(settings(hub.address(), 1_000, 50, 500));
-    conn.start();
-    assert!(conn.await_registered(Duration::from_secs(5)).await);
-    let h = conn.handshake().unwrap();
-    assert!(h.scatter_gather() && !h.streaming(), "{h:?}");
-    conn.shutdown().await;
-    assert!(!Handshake::Legacy.streaming());
-    hub.stop();
-}
-
-#[tokio::test]
-async fn legacy_hub_heartbeats_at_the_configured_interval() {
-    let hub = FakeHub::start().await;
-    hub.set_ack(None); // a hub older than protocol v2 announces no interval
-    let (conn, _rx) = connection(settings(hub.address(), 100, 50, 500));
-    conn.start();
-    assert!(conn.await_registered(Duration::from_secs(5)).await);
-    sleep(Duration::from_secs(1)).await;
-    assert!(hub.heartbeats() >= 3, "got {} heartbeats", hub.heartbeats());
     conn.shutdown().await;
     hub.stop();
 }
@@ -126,7 +84,7 @@ async fn legacy_hub_heartbeats_at_the_configured_interval() {
 async fn reconnects_after_server_restart() {
     support::init_tracing();
     let hub = FakeHub::start().await;
-    let (conn, mut rx) = connection(settings(hub.address(), 1_000, 50, 1_000));
+    let (conn, mut rx) = connection(settings(hub.address(), 50, 1_000));
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);
 
@@ -154,7 +112,7 @@ async fn reconnects_after_server_restart() {
 async fn already_exists_is_reported_and_retried_at_max_backoff() {
     let hub = FakeHub::start().await;
     hub.reject_next_with_already_exists();
-    let (conn, _rx) = connection(settings(hub.address(), 1_000, 50, 300));
+    let (conn, _rx) = connection(settings(hub.address(), 50, 300));
     let started = Instant::now();
     conn.start();
 
@@ -177,7 +135,7 @@ async fn already_exists_is_reported_and_retried_at_max_backoff() {
 
 #[tokio::test]
 async fn send_without_stream_is_hub_unavailable() {
-    let (conn, _rx) = connection(settings("static://127.0.0.1:1".into(), 1_000, 50, 500));
+    let (conn, _rx) = connection(settings("static://127.0.0.1:1".into(), 50, 500));
     assert!(matches!(
         conn.send(heartbeat()).await,
         Err(MessagingError::HubUnavailable(_))
@@ -189,7 +147,7 @@ async fn invalid_argument_is_retried_at_max_backoff() {
     support::init_tracing();
     let hub = FakeHub::start().await;
     hub.reject_next_with_invalid_argument();
-    let (conn, _rx) = connection(settings(hub.address(), 1_000, 50, 300));
+    let (conn, _rx) = connection(settings(hub.address(), 50, 300));
     let started = Instant::now();
     conn.start();
     sleep(Duration::from_millis(120)).await;
@@ -221,7 +179,7 @@ async fn hung_handshake_is_abandoned_and_reported() {
             }
         }
     });
-    let mut s = settings(format!("static://{addr}"), 1_000, 50, 500);
+    let mut s = settings(format!("static://{addr}"), 50, 500);
     s.handshake_timeout = Duration::from_millis(500);
     let (conn, mut rx) = connection(s);
     conn.start();
@@ -242,9 +200,9 @@ async fn hung_handshake_is_abandoned_and_reported() {
 }
 
 #[tokio::test]
-async fn register_declares_protocol_v2_and_client_version() {
+async fn register_declares_the_client_version() {
     let hub = FakeHub::start().await;
-    let (conn, _rx) = connection(settings(hub.address(), 1_000, 50, 500));
+    let (conn, _rx) = connection(settings(hub.address(), 50, 500));
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);
     let r = &hub.registers().await[0];
@@ -256,19 +214,19 @@ async fn register_declares_protocol_v2_and_client_version() {
 }
 
 #[tokio::test]
-async fn ack_completes_the_handshake_and_its_interval_replaces_the_fallback() {
+async fn ack_completes_the_handshake_and_its_interval_is_the_heartbeat_period() {
     let hub = FakeHub::start().await;
     let ack = proto::RegisterAck {
         heartbeat_interval_ms: 100,
         ..default_ack()
     };
     hub.set_ack(Some(ack.clone()));
-    // Fallback 10 s: only the announced 100 ms explains several heartbeats within a second.
-    let (conn, _rx) = connection(settings(hub.address(), 10_000, 50, 500));
+    // Before the ack 3 s: only the announced 100 ms explains several heartbeats within a second.
+    let (conn, _rx) = connection(settings(hub.address(), 50, 500));
     assert_eq!(conn.handshake(), None);
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);
-    assert_eq!(conn.handshake(), Some(Handshake::V2(ack)));
+    assert_eq!(conn.handshake(), Some(ack));
     let before = hub.heartbeats();
     sleep(Duration::from_secs(1)).await;
     let sent = hub.heartbeats() - before;
@@ -277,25 +235,14 @@ async fn ack_completes_the_handshake_and_its_interval_replaces_the_fallback() {
     hub.stop();
 }
 
+/// The `RegisterAck` is the only registration confirmation: a hub that echoes the heartbeat but
+/// never acknowledges the `Register` leaves the stream unconfirmed, and it is abandoned at the
+/// handshake timeout and opened again; once the hub acknowledges, the instance registers.
 #[tokio::test]
-async fn echo_without_ack_is_legacy_mode() {
+async fn an_echo_without_an_ack_does_not_register_and_the_stream_is_abandoned() {
     let hub = FakeHub::start().await;
     hub.set_ack(None);
-    let (conn, _rx) = connection(settings(hub.address(), 1_000, 50, 500));
-    conn.start();
-    assert!(conn.await_registered(Duration::from_secs(5)).await);
-    assert_eq!(conn.handshake(), Some(Handshake::Legacy));
-    assert!(conn.handshake().unwrap().is_legacy());
-    conn.shutdown().await;
-    hub.stop();
-}
-
-#[tokio::test]
-async fn no_ack_and_no_echo_fails_the_handshake_and_reconnects() {
-    let hub = FakeHub::start().await;
-    hub.set_ack(None);
-    hub.set_echo_heartbeats(false);
-    let mut s = settings(hub.address(), 1_000, 50, 100);
+    let mut s = settings(hub.address(), 50, 100);
     s.handshake_timeout = Duration::from_millis(300);
     let (conn, mut rx) = connection(s);
     conn.start();
@@ -307,9 +254,11 @@ async fn no_ack_and_no_echo_fails_the_handshake_and_reconnects() {
         }
     })
     .await;
-    assert!(lost.is_ok(), "an unconfirmed stream must be abandoned");
+    assert!(lost.is_ok(), "a stream without an ack must be abandoned");
+    assert!(hub.heartbeats() >= 1, "the hub echoed the heartbeat");
+    assert_eq!(conn.handshake(), None);
     assert!(!conn.await_registered(Duration::from_millis(10)).await);
-    hub.set_echo_heartbeats(true);
+    hub.set_ack(Some(default_ack()));
     assert!(conn.await_registered(Duration::from_secs(3)).await);
     conn.shutdown().await;
     hub.stop();
@@ -318,7 +267,7 @@ async fn no_ack_and_no_echo_fails_the_handshake_and_reconnects() {
 #[tokio::test]
 async fn send_returns_the_stream_it_wrote_to() {
     let hub = FakeHub::start().await;
-    let (conn, _rx) = connection(settings(hub.address(), 1_000, 50, 500));
+    let (conn, _rx) = connection(settings(hub.address(), 50, 500));
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);
     let stream = conn.send(heartbeat()).await.unwrap();
@@ -333,7 +282,7 @@ async fn send_returns_the_stream_it_wrote_to() {
 #[tokio::test]
 async fn send_on_writes_only_to_the_named_stream_and_flow_and_cancel_come_inbound() {
     let hub = FakeHub::start().await;
-    let (conn, mut rx) = connection(settings(hub.address(), 1_000, 50, 500));
+    let (conn, mut rx) = connection(settings(hub.address(), 50, 500));
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);
     let stream = conn.current_stream().unwrap();
@@ -405,7 +354,7 @@ async fn next_request(
 #[tokio::test]
 async fn reply_goes_to_the_arrival_stream_and_never_to_a_newer_one() {
     let hub = FakeHub::start().await;
-    let (conn, mut rx) = connection(settings(hub.address(), 1_000, 50, 500));
+    let (conn, mut rx) = connection(settings(hub.address(), 50, 500));
     conn.set_types(vec!["t.Cmd".into()], vec![]);
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);
@@ -464,7 +413,7 @@ async fn backoff_restarts_from_the_floor_after_a_handshaken_stream() {
     // backoff_max 2 s: three drops of a handshaken stream must each reconnect within the floor's
     // jittered 120 ms (plus connect time), never at the doubled or capped value.
     let hub = FakeHub::start().await;
-    let (conn, mut rx) = connection(settings(hub.address(), 1_000, 100, 2_000));
+    let (conn, mut rx) = connection(settings(hub.address(), 100, 2_000));
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);
     for round in 0..3 {
@@ -495,21 +444,19 @@ async fn backoff_restarts_from_the_floor_after_a_handshaken_stream() {
 #[tokio::test]
 async fn register_offers_permits_load_factor_and_tags() {
     let hub = FakeHub::start().await;
-    let mut s = settings(hub.address(), 1_000, 50, 500);
+    let mut s = settings(hub.address(), 50, 500);
     s.load_factor = 250;
     s.tags = [("zone".to_string(), "eu-1".to_string())].into();
     let (conn, _rx) = connection(s);
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);
     let r = &hub.registers().await[0];
-    assert!(CAPABILITIES.contains(&"flow-control"));
     assert_eq!(
         r.initial_permits, 4,
         "max_concurrent_handlers permits up front"
     );
     assert_eq!(r.load_factor, 250);
     assert_eq!(r.tags.get("zone").map(String::as_str), Some("eu-1"));
-    assert!(conn.handshake().unwrap().flow_control());
     conn.shutdown().await;
     hub.stop();
 }
@@ -534,7 +481,7 @@ async fn requests_in(
 #[tokio::test]
 async fn permits_are_granted_in_batches_of_16_or_after_50_ms() {
     let hub = FakeHub::start().await;
-    let mut s = settings(hub.address(), 1_000, 50, 500);
+    let mut s = settings(hub.address(), 50, 500);
     s.max_concurrent_handlers = 64;
     let (conn, mut rx) = connection(s);
     conn.start();
@@ -576,7 +523,7 @@ async fn permits_are_granted_in_batches_of_16_or_after_50_ms() {
 #[tokio::test]
 async fn a_single_permit_goes_back_at_once() {
     let hub = FakeHub::start().await;
-    let mut s = settings(hub.address(), 1_000, 50, 500);
+    let mut s = settings(hub.address(), 50, 500);
     s.max_concurrent_handlers = 1;
     let (conn, mut rx) = connection(s);
     conn.start();
@@ -602,36 +549,10 @@ async fn a_single_permit_goes_back_at_once() {
 }
 
 #[tokio::test]
-async fn no_permits_to_a_hub_without_flow_control() {
-    for p0_hub in [true, false] {
-        let hub = FakeHub::start().await;
-        if p0_hub {
-            hub.set_flow_control(false); // the merged P0 hub: ack without the capability
-        } else {
-            hub.set_ack(None); // a v1 hub: no ack at all
-        }
-        let (conn, mut rx) = connection(settings(hub.address(), 1_000, 50, 500));
-        conn.start();
-        assert!(conn.await_registered(Duration::from_secs(5)).await);
-        assert!(!conn.handshake().unwrap().flow_control());
-        for h in requests_in(&hub, &mut rx, 20).await {
-            h.grant().await;
-        }
-        sleep(Duration::from_millis(120)).await;
-        assert!(
-            hub.permits().is_empty(),
-            "permits sent to a hub without flow control"
-        );
-        conn.shutdown().await;
-        hub.stop();
-    }
-}
-
-#[tokio::test]
 async fn permits_go_only_to_the_arrival_stream() {
     support::init_tracing();
     let hub = FakeHub::start().await;
-    let (conn, mut rx) = connection(settings(hub.address(), 1_000, 50, 500));
+    let (conn, mut rx) = connection(settings(hub.address(), 50, 500));
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);
     let old = requests_in(&hub, &mut rx, 1).await.remove(0);

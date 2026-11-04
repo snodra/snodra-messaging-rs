@@ -1,7 +1,8 @@
-//! End to end with two real P3 hubs (`kraken-hub:p3-hub`, ADR 0016): every instance registers on
-//! both, reports its connected hubs to both, spreads unkeyed requests over both, survives one hub
-//! stopping mid-traffic and is back on it within the backoff cap once it restarts, and moves a
-//! stopped hub's permits to the other one (`Permits.grant`) without revoking them on its return.
+//! End to end with two real hubs (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`, ADR 0016): every
+//! instance registers on both, reports its connected hubs to both, spreads unkeyed requests over
+//! both, survives one hub stopping mid-traffic and is back on it within the backoff cap once it
+//! restarts, and moves a stopped hub's permits to the other one (`Permits.grant`) without revoking
+//! them on its return.
 mod support;
 
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use kraken_messaging::hub::SendOptions;
 use kraken_messaging::{Command, Config, KrakenMessaging, MessagingError, message_type};
 use serde::{Deserialize, Serialize};
 use support::containers::{
-    HubContainer, HubImage, HubOptions, free_port, hub_with, mongo, wait_until_reachable,
+    HubContainer, HubOptions, free_port, hub_with, mongo, wait_until_reachable,
 };
 
 macro_rules! require_docker {
@@ -42,15 +43,10 @@ const STATUS_SEEN_WITHIN: Duration = Duration::from_secs(8);
 /// not after a stall", not a tight latency bound.
 const REJOIN_WITHIN: Duration = Duration::from_secs(12);
 
-/// Two P3 hubs with fixed ids, on fixed host ports (a restart keeps the address).
+/// Two hubs with fixed ids, on fixed host ports (a restart keeps the address).
 async fn two_hubs() -> (HubContainer, HubContainer) {
-    let start = |id: &'static str| {
-        hub_with(
-            HubOptions::new(HubImage::P3)
-                .port(free_port())
-                .env("KRAKEN_HUB_ID", id),
-        )
-    };
+    let start =
+        |id: &'static str| hub_with(HubOptions::new().port(free_port()).env("KRAKEN_HUB_ID", id));
     tokio::join!(start(IDS[0]), start(IDS[1]))
 }
 
@@ -389,7 +385,7 @@ async fn one_hub_reached_through_two_targets_keeps_the_instance_registered() {
     require_docker!();
     let (h, db) = tokio::join!(
         hub_with(
-            HubOptions::new(HubImage::P3)
+            HubOptions::new()
                 .port(free_port())
                 .env("KRAKEN_HUB_ID", "e2e-solo"),
         ),

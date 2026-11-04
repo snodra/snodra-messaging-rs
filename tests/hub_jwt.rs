@@ -67,7 +67,6 @@ async fn a_credentials_message_reaches_the_hub_and_is_recorded() {
     let conn = connection(
         HubSettings {
             address: hub.address(),
-            heartbeat_interval: Duration::from_secs(1),
             ..HubSettings::default()
         },
         "svc",
@@ -601,7 +600,6 @@ async fn the_refresh_loop_notices_a_wall_clock_jump_without_waiting_for_the_mono
 fn jwt_settings(address: String, provider: &Arc<TokenProvider>) -> HubSettings {
     HubSettings {
         address,
-        heartbeat_interval: Duration::from_secs(1),
         backoff_min: Duration::from_millis(20),
         backoff_max: Duration::from_millis(300),
         token_provider: Some(Arc::clone(provider)),
@@ -629,7 +627,7 @@ async fn wait_for_registers(hub: &FakeHub, n: usize) {
 }
 
 #[tokio::test]
-async fn the_register_carries_the_fetched_jwt_and_declares_credentials_refresh() {
+async fn the_register_carries_the_fetched_jwt() {
     let idp = Idp::start("svc", SECRET).await;
     let hub = FakeHub::start().await;
     jwt_hub_acl(&hub);
@@ -746,25 +744,21 @@ async fn connections_that_start_together_fetch_one_token() {
 }
 
 #[tokio::test]
-async fn a_refreshed_token_goes_to_the_hubs_that_offer_credentials_refresh_and_to_no_other() {
+async fn a_refreshed_token_goes_to_every_hub() {
     let idp = Idp::start("svc", SECRET).await;
     idp.set_lifetime(6); // refreshed after ~3 s
     // Distinct hub ids: a pool keeps one connection per hub.
-    let (capable, plain) = (
-        FakeHub::start_with_id("capable").await,
-        FakeHub::start_with_id("plain").await,
+    let (a, b) = (
+        FakeHub::start_with_id("a").await,
+        FakeHub::start_with_id("b").await,
     );
-    for hub in [&capable, &plain] {
+    for hub in [&a, &b] {
         jwt_hub_acl(hub);
     }
-    capable.set_credentials_refresh(true);
     let provider = provider(&idp);
     let (tx, _rx) = mpsc::channel::<Inbound>(16);
     let pool = HubPool::new(
-        jwt_settings(
-            format!("{},{}", capable.address(), plain.address()),
-            &provider,
-        ),
+        jwt_settings(format!("{},{}", a.address(), b.address()), &provider),
         "svc".into(),
         uuid::Uuid::new_v4().to_string(),
         tx,
@@ -772,35 +766,35 @@ async fn a_refreshed_token_goes_to_the_hubs_that_offer_credentials_refresh_and_t
     .unwrap();
     pool.start();
     assert!(pool.await_all_registered(Duration::from_secs(5)).await);
-    let registered = jwt_of(&capable.registers().await[0]).unwrap();
+    let registered = jwt_of(&a.registers().await[0]).unwrap();
 
-    until("the refresh", Duration::from_secs(8), || {
-        !capable.refreshes().is_empty()
+    until("the refreshes", Duration::from_secs(8), || {
+        !a.refreshes().is_empty() && !b.refreshes().is_empty()
     })
     .await;
-    let refreshes = capable.refreshes();
-    assert_eq!(
-        refreshes.len(),
-        1,
-        "one refresh per new token: {refreshes:?}"
-    );
-    let Some(proto::credentials::Kind::Jwt(sent)) = refreshes[0].1.kind.clone() else {
-        panic!("a jwt refresh: {:?}", refreshes[0]);
-    };
-    assert_ne!(sent, registered, "the new token, not the registered one");
-    assert_eq!(idp::claims(&sent)["azp"], "svc");
-    assert_eq!(
-        sent,
-        provider.token().await.unwrap().value().expose(),
-        "the provider's current token"
-    );
-    // The same token reached both hubs' provider-side at once: give a (wrongly) sent refresh time to
-    // arrive before asserting that none did.
+    // Give a (wrongly) repeated refresh time to arrive before asserting that none did.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(plain.refreshes().is_empty(), "no capability, no refresh");
+    for hub in [&a, &b] {
+        let refreshes = hub.refreshes();
+        assert_eq!(
+            refreshes.len(),
+            1,
+            "one refresh per new token: {refreshes:?}"
+        );
+        let Some(proto::credentials::Kind::Jwt(sent)) = refreshes[0].1.kind.clone() else {
+            panic!("a jwt refresh: {:?}", refreshes[0]);
+        };
+        assert_ne!(sent, registered, "the new token, not the registered one");
+        assert_eq!(idp::claims(&sent)["azp"], "svc");
+        assert_eq!(
+            sent,
+            provider.token().await.unwrap().value().expose(),
+            "the provider's current token"
+        );
+    }
     assert_eq!(
         pool.credentials_refreshes_sent(),
-        1,
+        2,
         "the metric's counterpart"
     );
     assert_eq!(pool.auth().kind, AuthKind::Jwt);
@@ -809,11 +803,11 @@ async fn a_refreshed_token_goes_to_the_hubs_that_offer_credentials_refresh_and_t
         Some(provider.token().await.unwrap().expires_at())
     );
     // Nobody reconnected: one Register per hub.
-    assert_eq!(capable.registers().await.len(), 1);
-    assert_eq!(plain.registers().await.len(), 1);
+    assert_eq!(a.registers().await.len(), 1);
+    assert_eq!(b.registers().await.len(), 1);
     pool.shutdown().await;
-    capable.stop();
-    plain.stop();
+    a.stop();
+    b.stop();
 }
 
 #[tokio::test]
@@ -822,7 +816,6 @@ async fn a_renewal_published_before_the_register_ack_is_sent_right_after_the_ack
     let hub = FakeHub::start().await;
     jwt_hub_acl(&hub);
     hub.set_ack(Some(support::fake_hub::default_ack()));
-    hub.set_credentials_refresh(true);
     hub.set_ack_delay(Duration::from_millis(1200));
     let provider = provider(&idp);
     let conn = connection(jwt_settings(hub.address(), &provider), "svc");
@@ -831,7 +824,7 @@ async fn a_renewal_published_before_the_register_ack_is_sent_right_after_the_ack
     let registered_with = jwt_of(&hub.registers().await[0]).unwrap();
 
     // The Register is out, the ack is not: the provider publishes a new token now. The stream
-    // cannot send it yet (it does not know that the hub takes refreshes).
+    // sends it only once the hub has confirmed the registration.
     let renewed = provider.refresh().await.unwrap();
     assert_ne!(renewed.value().expose(), registered_with);
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -864,7 +857,6 @@ async fn a_new_stream_after_a_refresh_registers_with_the_new_token() {
     let hub = FakeHub::start().await;
     jwt_hub_acl(&hub);
     hub.set_ack(Some(support::fake_hub::default_ack()));
-    hub.set_credentials_refresh(true);
     let provider = provider(&idp);
     let conn = connection(jwt_settings(hub.address(), &provider), "svc");
     conn.start();
@@ -1000,16 +992,15 @@ async fn a_stream_refused_on_an_old_token_does_not_discard_a_newer_one_fetched_m
     idp.set_lifetime(300);
     let hub = FakeHub::start().await;
     jwt_hub_acl(&hub);
-    hub.set_ack(Some(support::fake_hub::default_ack()));
-    // The hub does not offer credentials-refresh: the stream never sends the newer token.
-    hub.set_ack_delay(Duration::from_millis(1200));
+    // The hub never acknowledges: the stream never sends the newer token.
+    hub.set_ack(None);
     let provider = provider(&idp);
     let conn = connection(jwt_settings(hub.address(), &provider), "svc");
     conn.start();
     wait_for_registers(&hub, 1).await;
     let presented = jwt_of(&hub.registers().await[0]).unwrap();
 
-    // While the ack is held back a newer token is fetched (published, not presented), and the hub
+    // While the ack is missing a newer token is fetched (published, not presented), and the hub
     // then closes the stream as unauthenticated.
     let newer = provider.refresh().await.unwrap();
     hub.close_streams_with(tonic::Code::Unauthenticated, "token expired");
@@ -1121,7 +1112,6 @@ async fn a_refused_refresh_is_a_registration_rejection() {
     let hub = FakeHub::start().await;
     jwt_hub_acl(&hub);
     hub.set_ack(Some(support::fake_hub::default_ack()));
-    hub.set_credentials_refresh(true);
     let provider = provider(&idp);
     let conn = connection(jwt_settings(hub.address(), &provider), "svc");
     conn.start();
@@ -1160,11 +1150,9 @@ async fn a_rotated_token_file_is_sent_as_a_refresh_without_reconnecting() {
         ],
     );
     hub.set_ack(Some(support::fake_hub::default_ack()));
-    hub.set_credentials_refresh(true);
     let conn = connection(
         HubSettings {
             address: hub.address(),
-            heartbeat_interval: Duration::from_millis(200),
             token_file: Some(file.clone()),
             ..HubSettings::default()
         },

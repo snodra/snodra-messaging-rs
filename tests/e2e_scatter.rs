@@ -1,7 +1,7 @@
-//! End to end with two real P4a hubs (`kraken-hub:p4a-hub`, ADR 0017) and the P3 pool
-//! configuration (every instance on both hubs): a scatter-gather over three instances of two
-//! services owning a shared query gets three parts, a unary query on the shared type reaches every
-//! instance of both owners, and a gather whose hub dies before its end fails with
+//! End to end with two real hubs (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`, ADR 0017) and the
+//! multi-hub configuration (every instance on both hubs): a scatter-gather over three instances of
+//! two services owning a shared query gets three parts, a unary query on the shared type reaches
+//! every instance of both owners, and a gather whose hub dies before its end fails with
 //! `HubConnectionLost` while the next one succeeds on the other hub.
 mod support;
 
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use kraken_messaging::hub::{ScatterOptions, SendOptions};
 use kraken_messaging::{Config, KrakenMessaging, MessagingError, Query, message_type};
 use serde::{Deserialize, Serialize};
-use support::containers::{HubContainer, HubImage, HubOptions, free_port, hub_with, mongo};
+use support::containers::{HubContainer, HubOptions, free_port, hub_with, mongo};
 use tokio_stream::StreamExt;
 
 macro_rules! require_docker {
@@ -40,13 +40,8 @@ impl Query for Find {
 const IDS: [&str; 2] = ["e2e-p4a-1", "e2e-p4a-2"];
 
 async fn two_hubs() -> (HubContainer, HubContainer) {
-    let start = |id: &'static str| {
-        hub_with(
-            HubOptions::new(HubImage::P4a)
-                .port(free_port())
-                .env("KRAKEN_HUB_ID", id),
-        )
-    };
+    let start =
+        |id: &'static str| hub_with(HubOptions::new().port(free_port()).env("KRAKEN_HUB_ID", id));
     tokio::join!(start(IDS[0]), start(IDS[1]))
 }
 

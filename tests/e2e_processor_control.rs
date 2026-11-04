@@ -1,7 +1,7 @@
-//! End to end against the real P6b hub image (`KRAKEN_HUB_P6B_IMAGE`, default
-//! `kraken-hub:p6b-hub`): the hub's HTTP API, with its write token, pauses and resumes a
-//! service's named processor, resets it to `earliest` (the range replayed, the reset handler run
-//! once, the handler that disallows replay skipped) and retries its dead letter (ADR 0023).
+//! End to end against the real hub image (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`): the hub's
+//! HTTP API, with its write token, pauses and resumes a service's named processor, resets it to
+//! `earliest` (the range replayed, the reset handler run once, the handler that disallows replay
+//! skipped) and retries its dead letter (ADR 0023).
 
 mod support;
 
@@ -17,7 +17,7 @@ use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use support::containers::{HubImage, HubOptions, hub_with};
+use support::containers::{HubOptions, hub_with};
 
 macro_rules! require_docker {
     () => {
@@ -80,10 +80,8 @@ async fn call(
 #[tokio::test]
 async fn the_hub_pauses_resets_and_retries_a_processor_with_its_write_token() {
     require_docker!();
-    let hub = hub_with(
-        HubOptions::new(HubImage::P6b).env("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN", WRITE_TOKEN),
-    )
-    .await;
+    let hub =
+        hub_with(HubOptions::new().env("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN", WRITE_TOKEN)).await;
     let kafka = support::containers::kafka().await;
     let mongo = support::containers::mongo().await;
     let topic = "e2e.ctl.events";

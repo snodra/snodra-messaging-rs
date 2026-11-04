@@ -43,143 +43,27 @@ pub async fn mongo() -> MongoDb {
     }
 }
 
-/// Which hub build a test runs against.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HubImage {
-    /// The hub under development: `KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`.
-    Current,
-    /// The previous hub release, for compatibility tests: `KRAKEN_HUB_BASELINE_IMAGE`, default
-    /// `kraken-hub:v1-baseline` (the hub before protocol v2).
-    Baseline,
-    /// The merged P0 hub (protocol v2 without flow control): `KRAKEN_HUB_P0_IMAGE`, default
-    /// `kraken-hub:p0`.
-    P0,
-    /// The merged P2 hub (flow control, no `instance-status`): `KRAKEN_HUB_P2_IMAGE`, default
-    /// `kraken-hub:p2`.
-    P2,
-    /// The P3 hub (multi-hub, `instance-status`): `KRAKEN_HUB_P3_IMAGE`, default
-    /// `kraken-hub:p3-hub`.
-    P3,
-    /// The P4a hub (scatter-gather, shared query types): `KRAKEN_HUB_P4A_IMAGE`, default
-    /// `kraken-hub:p4a-hub`.
-    P4a,
-    /// The P4b hub (streaming queries): `KRAKEN_HUB_P4B_IMAGE`, default `kraken-hub:p4b-hub`.
-    P4b,
-    /// The P4c hub (subscription queries): `KRAKEN_HUB_P4C_IMAGE`, default `kraken-hub:p4c-hub`.
-    P4c,
-    /// The P5a hub (access control: static tokens, ACL, TLS): `KRAKEN_HUB_P5A_IMAGE`, default
-    /// `kraken-hub:p5a-hub`.
-    P5a,
-    /// The merged P5c hub (mutual TLS; no `processors`): `KRAKEN_HUB_P5C_IMAGE`, default
-    /// `kraken-hub:p5c`.
-    P5c,
-    /// The P6a hub (event processor status, `processors`): `KRAKEN_HUB_P6A_IMAGE`, default
-    /// `kraken-hub:p6a-hub`.
-    P6a,
-    /// The P6b hub (processor control, `processor-control`): `KRAKEN_HUB_P6B_IMAGE`, default
-    /// `kraken-hub:p6b-hub`.
-    P6b,
-}
-
-impl HubImage {
-    fn reference(self) -> String {
-        match self {
-            HubImage::Current => {
-                std::env::var("KRAKEN_HUB_IMAGE").unwrap_or_else(|_| "kraken-hub:dev".to_string())
-            }
-            HubImage::Baseline => std::env::var("KRAKEN_HUB_BASELINE_IMAGE")
-                .unwrap_or_else(|_| "kraken-hub:v1-baseline".to_string()),
-            HubImage::P0 => {
-                std::env::var("KRAKEN_HUB_P0_IMAGE").unwrap_or_else(|_| "kraken-hub:p0".to_string())
-            }
-            HubImage::P2 => {
-                std::env::var("KRAKEN_HUB_P2_IMAGE").unwrap_or_else(|_| "kraken-hub:p2".to_string())
-            }
-            HubImage::P3 => std::env::var("KRAKEN_HUB_P3_IMAGE")
-                .unwrap_or_else(|_| "kraken-hub:p3-hub".to_string()),
-            HubImage::P4a => std::env::var("KRAKEN_HUB_P4A_IMAGE")
-                .unwrap_or_else(|_| "kraken-hub:p4a-hub".to_string()),
-            HubImage::P4b => std::env::var("KRAKEN_HUB_P4B_IMAGE")
-                .unwrap_or_else(|_| "kraken-hub:p4b-hub".to_string()),
-            HubImage::P4c => std::env::var("KRAKEN_HUB_P4C_IMAGE")
-                .unwrap_or_else(|_| "kraken-hub:p4c-hub".to_string()),
-            HubImage::P5a => std::env::var("KRAKEN_HUB_P5A_IMAGE")
-                .unwrap_or_else(|_| "kraken-hub:p5a-hub".to_string()),
-            HubImage::P5c => std::env::var("KRAKEN_HUB_P5C_IMAGE")
-                .unwrap_or_else(|_| "kraken-hub:p5c".to_string()),
-            HubImage::P6a => std::env::var("KRAKEN_HUB_P6A_IMAGE")
-                .unwrap_or_else(|_| "kraken-hub:p6a-hub".to_string()),
-            HubImage::P6b => std::env::var("KRAKEN_HUB_P6B_IMAGE")
-                .unwrap_or_else(|_| "kraken-hub:p6b-hub".to_string()),
-        }
-    }
-
-    fn hint(self) -> &'static str {
-        match self {
-            HubImage::Current => {
-                "run `docker build -t kraken-hub:dev .` in ../kraken-hub (or set KRAKEN_HUB_IMAGE)"
-            }
-            HubImage::Baseline => {
-                "tag the previous hub release, e.g. `git worktree add /tmp/hub-v1 <tag> && docker build -t kraken-hub:v1-baseline /tmp/hub-v1` (or set KRAKEN_HUB_BASELINE_IMAGE)"
-            }
-            HubImage::P0 => {
-                "build the merged P0 hub and tag it `kraken-hub:p0` (or set KRAKEN_HUB_P0_IMAGE)"
-            }
-            HubImage::P2 => {
-                "build the merged P2 hub and tag it `kraken-hub:p2` (or set KRAKEN_HUB_P2_IMAGE)"
-            }
-            HubImage::P3 => {
-                "build the P3 hub and tag it `kraken-hub:p3-hub` (or set KRAKEN_HUB_P3_IMAGE)"
-            }
-            HubImage::P4a => {
-                "build the P4a hub and tag it `kraken-hub:p4a-hub` (or set KRAKEN_HUB_P4A_IMAGE)"
-            }
-            HubImage::P4b => {
-                "build the P4b hub and tag it `kraken-hub:p4b-hub` (or set KRAKEN_HUB_P4B_IMAGE)"
-            }
-            HubImage::P4c => {
-                "build the P4c hub and tag it `kraken-hub:p4c-hub` (or set KRAKEN_HUB_P4C_IMAGE)"
-            }
-            HubImage::P5a => {
-                "build the P5a hub and tag it `kraken-hub:p5a-hub` (or set KRAKEN_HUB_P5A_IMAGE)"
-            }
-            HubImage::P5c => {
-                "build the merged P5c hub and tag it `kraken-hub:p5c` (or set KRAKEN_HUB_P5C_IMAGE)"
-            }
-            HubImage::P6a => {
-                "build the P6a hub and tag it `kraken-hub:p6a-hub` (or set KRAKEN_HUB_P6A_IMAGE)"
-            }
-            HubImage::P6b => {
-                "build the P6b hub and tag it `kraken-hub:p6b-hub` (or set KRAKEN_HUB_P6B_IMAGE)"
-            }
-        }
-    }
-}
-
-fn split_image(full: String) -> (String, String) {
+/// The hub image under test: `KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`.
+pub fn hub_image() -> (String, String) {
+    let full = std::env::var("KRAKEN_HUB_IMAGE").unwrap_or_else(|_| "kraken-hub:dev".to_string());
     match full.rsplit_once(':') {
         Some((name, tag)) => (name.to_string(), tag.to_string()),
         None => (full, "latest".to_string()),
     }
 }
 
-pub fn hub_image() -> (String, String) {
-    split_image(HubImage::Current.reference())
-}
-
 /// Panics with the build command when the hub image is missing: an absent image must never skip a test silently.
 pub fn hub_image_or_fail() -> (String, String) {
-    image_or_fail(HubImage::Current)
-}
-
-pub fn image_or_fail(image: HubImage) -> (String, String) {
-    let (name, tag) = split_image(image.reference());
+    let (name, tag) = hub_image();
     let ok = std::process::Command::new("docker")
         .args(["image", "inspect", &format!("{name}:{tag}")])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    assert!(ok, "hub image {name}:{tag} not found: {}", image.hint());
+    assert!(
+        ok,
+        "hub image {name}:{tag} not found: run `docker build -t kraken-hub:dev .` in ../kraken-hub (or set KRAKEN_HUB_IMAGE)"
+    );
     (name, tag)
 }
 
@@ -189,10 +73,9 @@ pub struct HubContainer {
     pub http: String,
 }
 
-/// How to start a hub container.
-#[derive(Clone, Debug)]
+/// How to start a hub container (the image under test, [`hub_image`]).
+#[derive(Clone, Debug, Default)]
 pub struct HubOptions {
-    pub image: HubImage,
     /// Fixed host port for gRPC, so `stop`/`start` keeps the address the clients use.
     pub port: Option<u16>,
     /// Extra `KRAKEN_HUB_*` variables, for example `KRAKEN_HUB_TIMEOUT_OVERRIDES`.
@@ -204,14 +87,8 @@ pub struct HubOptions {
 }
 
 impl HubOptions {
-    pub fn new(image: HubImage) -> HubOptions {
-        HubOptions {
-            image,
-            port: None,
-            env: vec![],
-            mounts: vec![],
-            host_names: vec![],
-        }
+    pub fn new() -> HubOptions {
+        HubOptions::default()
     }
 
     pub fn port(mut self, port: u16) -> HubOptions {
@@ -267,7 +144,7 @@ async fn probe_or_fail(addr: &str) {
 }
 
 pub async fn hub_with(options: HubOptions) -> HubContainer {
-    let (name, tag) = image_or_fail(options.image);
+    let (name, tag) = hub_image_or_fail();
     let mut image = GenericImage::new(name, tag)
         .with_exposed_port(7000.tcp())
         .with_exposed_port(7001.tcp())
@@ -328,12 +205,7 @@ pub async fn hub_with(options: HubOptions) -> HubContainer {
 }
 
 pub async fn hub() -> HubContainer {
-    hub_with(HubOptions::new(HubImage::Current)).await
-}
-
-/// The previous hub release (`KRAKEN_HUB_BASELINE_IMAGE`).
-pub async fn hub_baseline() -> HubContainer {
-    hub_with(HubOptions::new(HubImage::Baseline)).await
+    hub_with(HubOptions::new()).await
 }
 
 impl MongoDb {
@@ -355,7 +227,7 @@ pub fn free_port() -> u16 {
 
 /// The hub published on a fixed host port, so `stop`/`start` keeps the address the clients use.
 pub async fn hub_on(port: u16) -> HubContainer {
-    hub_with(HubOptions::new(HubImage::Current).port(port)).await
+    hub_with(HubOptions::new().port(port)).await
 }
 
 /// Returns once a `Topology` RPC on `address` succeeds (bounded by 30 s). After `start` the host

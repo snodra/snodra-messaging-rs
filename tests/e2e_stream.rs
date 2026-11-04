@@ -1,8 +1,8 @@
-//! End to end with two real P4b hubs (`kraken-hub:p4b-hub`, ADR 0017) and the P3 pool
-//! configuration (every instance on both hubs): one service streams 1 000 rows under a credit
-//! window of 8 and another collects them all in order (the stream pins one instance and one hub,
-//! which count it in flight until the end); a stream dropped mid-way is cancelled at the hub and
-//! at its handler (the counts fall back to 0); `max_results` and the idle timeout end a stream
+//! End to end with two real hubs (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`, ADR 0017) and the
+//! multi-hub configuration (every instance on both hubs): one service streams 1 000 rows under a
+//! credit window of 8 and another collects them all in order (the stream pins one instance and one
+//! hub, which count it in flight until the end); a stream dropped mid-way is cancelled at the hub
+//! and at its handler (the counts fall back to 0); `max_results` and the idle timeout end a stream
 //! from the hub.
 mod support;
 
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use kraken_messaging::hub::StreamOptions;
 use kraken_messaging::{Config, KrakenMessaging, MessagingError, StreamingQuery, message_type};
 use serde::{Deserialize, Serialize};
-use support::containers::{HubContainer, HubImage, HubOptions, free_port, hub_with, mongo};
+use support::containers::{HubContainer, HubOptions, free_port, hub_with, mongo};
 use tokio_stream::StreamExt;
 
 macro_rules! require_docker {
@@ -44,13 +44,8 @@ impl StreamingQuery for Export {
 const IDS: [&str; 2] = ["e2e-p4b-1", "e2e-p4b-2"];
 
 async fn two_hubs() -> (HubContainer, HubContainer) {
-    let start = |id: &'static str| {
-        hub_with(
-            HubOptions::new(HubImage::P4b)
-                .port(free_port())
-                .env("KRAKEN_HUB_ID", id),
-        )
-    };
+    let start =
+        |id: &'static str| hub_with(HubOptions::new().port(free_port()).env("KRAKEN_HUB_ID", id));
     tokio::join!(start(IDS[0]), start(IDS[1]))
 }
 

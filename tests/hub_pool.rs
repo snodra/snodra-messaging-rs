@@ -1,7 +1,7 @@
 //! Multi-hub (ADR 0016) against in-process fake hubs: one connection per hub with the identical
 //! registration, permits split, routing (round-robin, rendezvous by key), failover of requests
-//! never written, `HubConnectionLost` for written ones, dedupe by hub id, `InstanceStatus` only to
-//! hubs that share the capability, and `dns:///` re-resolution.
+//! never written, `HubConnectionLost` for written ones, dedupe by hub id, `InstanceStatus` to every
+//! hub, and `dns:///` re-resolution.
 mod support;
 
 use std::net::SocketAddr;
@@ -9,8 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kraken_messaging::hub::{
-    Handshake, HubPool, HubSettings, Inbound, ReplyTo, SendOptions, Sender, SenderSettings,
-    rendezvous_score,
+    HubPool, HubSettings, Inbound, ReplyTo, SendOptions, Sender, SenderSettings, rendezvous_score,
 };
 use kraken_messaging::proto::{self, ServerMessage, reply, server_message};
 use kraken_messaging::{Command, MessagingError, Query, RetryPolicy, message_type};
@@ -63,7 +62,6 @@ impl Client {
 fn settings(address: String) -> HubSettings {
     HubSettings {
         address,
-        heartbeat_interval: Duration::from_secs(1),
         backoff_min: Duration::from_millis(50),
         backoff_max: Duration::from_millis(200),
         max_concurrent_handlers: 10,
@@ -634,24 +632,13 @@ async fn two_targets_of_one_replacing_hub_settle_without_ping_pong() {
     c.shutdown().await;
 }
 
-/// A hub without an id (a legacy hub, or an empty `RegisterAck.hub_id`) is known by its target
-/// as `host:port` (shared with kraken-messaging): two such hubs are two hubs, not duplicates.
+/// A hub whose ack carries an empty `RegisterAck.hub_id` is known by its target as `host:port`
+/// (shared with kraken-messaging): two such hubs are two hubs, not duplicates.
 #[tokio::test]
 async fn a_hub_without_an_id_is_known_by_its_bare_target() {
-    let (a, b, old) = (
-        answering("").await,
-        answering("").await,
-        answering("x").await,
-    );
-    old.set_ack(None);
-    let c = client(settings(format!(
-        "{},http://{},{}",
-        a.address(),
-        b.addr,
-        old.address()
-    )))
-    .await;
-    let ids = [a.addr.to_string(), b.addr.to_string(), old.addr.to_string()];
+    let (a, b) = (answering("").await, answering("").await);
+    let c = client(settings(format!("{},http://{}", a.address(), b.addr))).await;
+    let ids = [a.addr.to_string(), b.addr.to_string()];
     eventually("three hubs", async || c.pool.hub_ids() == ids).await;
     let by_conn: Vec<Option<String>> = c.pool.connections().iter().map(|c| c.hub_id()).collect();
     assert_eq!(by_conn, ids.map(Some));
@@ -694,26 +681,24 @@ async fn a_dual_stack_dns_name_reaches_each_hub_once_over_ipv4() {
     c.shutdown().await;
 }
 
-/// `InstanceStatus` goes every interval to the hubs that share `instance-status` and to no other;
-/// it lists the acknowledged hubs (not a legacy one, which has no id) and the handlers running.
+/// `InstanceStatus` goes every interval to every hub; it lists the acknowledged hubs and the
+/// handlers running.
 #[tokio::test]
-async fn instance_status_goes_only_to_hubs_sharing_the_capability() {
-    let (a, b, old) = (
-        answering("hub-a").await,
-        answering("hub-b").await,
-        answering("hub-v1").await,
-    );
-    b.set_instance_status(false); // a P2 hub
-    old.set_ack(None); // a v1 hub
-    let c = client(settings(addresses(&[&a, &b, &old]))).await;
-    all_registered(&c, &["hub-a", "hub-b", &old.addr.to_string()]).await;
-    assert!(c.pool.connections()[2].handshake() == Some(Handshake::Legacy));
+async fn instance_status_goes_to_every_hub() {
+    let (a, b) = (answering("hub-a").await, answering("hub-b").await);
+    let c = client(settings(addresses(&[&a, &b]))).await;
+    all_registered(&c, &["hub-a", "hub-b"]).await;
     a.send_to_clients(push_request("in-1")).await;
     eventually("a handler runs", async || c.held.lock().unwrap().len() == 1).await;
-    eventually("hub-a got reports", async || a.statuses().len() >= 2).await;
-    let (_, last) = a.statuses().last().cloned().unwrap();
-    assert_eq!(last.connected_hub_ids, ["hub-a", "hub-b"]);
-    assert_eq!(last.handlers_in_flight, 1);
+    eventually("both hubs got reports", async || {
+        a.statuses().len() >= 2 && b.statuses().len() >= 2
+    })
+    .await;
+    for hub in [&a, &b] {
+        let (_, last) = hub.statuses().last().cloned().unwrap();
+        assert_eq!(last.connected_hub_ids, ["hub-a", "hub-b"]);
+        assert_eq!(last.handlers_in_flight, 1);
+    }
     let reply_to = c.held.lock().unwrap().pop().unwrap();
     reply_to.grant().await;
     let seen = a.statuses().len();
@@ -723,21 +708,13 @@ async fn instance_status_goes_only_to_hubs_sharing_the_capability() {
             .any(|(_, s)| s.handlers_in_flight == 0)
     })
     .await;
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    assert!(
-        b.statuses().is_empty(),
-        "no report to a hub without the capability"
-    );
-    assert!(old.statuses().is_empty(), "no report to a legacy hub");
     c.shutdown().await;
 }
 
-/// ADR 0022: the processor status rides on `InstanceStatus` only to hubs whose ack lists
-/// `processors`; a hub that shares `instance-status` alone gets the report with the field empty.
+/// ADR 0022: the processor status rides on every hub's `InstanceStatus`.
 #[tokio::test]
-async fn processor_status_goes_only_to_hubs_sharing_the_processors_capability() {
+async fn processor_status_goes_to_every_hub() {
     let (a, b) = (answering("hub-a").await, answering("hub-b").await);
-    b.set_processors(false); // a P5 hub
     let c = client_with(settings(addresses(&[&a, &b])), |pool| {
         pool.set_processor_status(Arc::new(|| {
             vec![proto::ProcessorStatus {
@@ -750,19 +727,15 @@ async fn processor_status_goes_only_to_hubs_sharing_the_processors_capability() 
     })
     .await;
     all_registered(&c, &["hub-a", "hub-b"]).await;
-    assert!(c.pool.connections()[0].handshake().unwrap().processors());
-    assert!(!c.pool.connections()[1].handshake().unwrap().processors());
     eventually("both hubs got reports", async || {
         a.statuses().len() >= 2 && b.statuses().len() >= 2
     })
     .await;
-    let (_, last) = a.statuses().last().cloned().unwrap();
-    assert_eq!(last.processors.len(), 1);
-    assert_eq!(last.processors[0].name, "orders");
-    assert!(
-        b.statuses().iter().all(|(_, s)| s.processors.is_empty()),
-        "never to a hub without the capability"
-    );
+    for hub in [&a, &b] {
+        let (_, last) = hub.statuses().last().cloned().unwrap();
+        assert_eq!(last.processors.len(), 1);
+        assert_eq!(last.processors[0].name, "orders");
+    }
     c.shutdown().await;
 }
 
