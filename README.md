@@ -1,3 +1,7 @@
+<p align="center">
+  <img alt="kraken messaging mascot" src="https://gitlab.damoreira.ml/kraken-org/kraken/-/raw/main/docs/assets/brand/svg/kraken-messaging.svg" width="160">
+</p>
+
 <h1 align="center">kraken-messaging-rs</h1>
 
 <p align="center">
