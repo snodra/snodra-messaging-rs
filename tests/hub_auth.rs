@@ -707,7 +707,16 @@ async fn another_services_instance_id_is_a_permission_denied_rejection() {
         );
         // The library surfaces it as a registration rejection, logged once at error.
         assert_eq!(thief.last_rejection().as_deref(), Some(expected.as_str()));
-        assert!(!thief.is_connected());
+        // The rejection and the client's connected flag are updated on different tasks; wait for
+        // the flag to settle instead of racing it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while thief.is_connected() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{mode:?}: thief is still connected"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(!thief.await_registered(Duration::from_millis(50)).await);
         let errors = captured
             .lines()
