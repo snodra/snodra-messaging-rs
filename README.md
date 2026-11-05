@@ -1377,7 +1377,7 @@ with `protobuf-compiler` installed.
 
 ```mermaid
 flowchart LR
-    fmt["fmt<br/>cargo fmt --check"] --> clippy["clippy<br/>--all-targets -D warnings"] --> test["test<br/>cargo test"] --> docker["docker · tag vX.Y.Z<br/>Kaniko → registry"]
+    fmt["fmt<br/>cargo fmt --check"] --> clippy["clippy<br/>--all-targets -D warnings"] --> test["test<br/>cargo test"] --> docker["docker · tag vX.Y.Z<br/>Docker → Harbor"]
 ```
 
 | Stage | Job | Runs | Produces |
@@ -1385,7 +1385,7 @@ flowchart LR
 | fmt | `fmt` | always | formatting check |
 | clippy | `clippy` | always | lint with warnings as errors |
 | test | `test` | always | unit and in-process integration tests |
-| docker | `docker` | only on tags `vX.Y.Z` | `registry.gitlab.damoreira.ml/kraken-org/kraken-messaging-rs:vX.Y.Z` and `:latest` |
+| docker | `docker` | only on tags `vX.Y.Z` | `harbor.damoreira.ml/kraken-org/kraken-messaging-rs:vX.Y.Z` and `:latest` |
 
 The crate is consumed as a git dependency pinned to a tag, so the image job mainly proves the Dockerfile; the sandbox compose builds `examples/service-c` from source.
 
