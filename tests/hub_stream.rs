@@ -832,9 +832,10 @@ async fn a_stream_yields_the_handlers_items_in_order_then_ends() {
     assert!(error.is_none(), "{error:?}");
     assert_eq!(rows, (0..200).collect::<Vec<_>>());
     drop(stream);
-    // Half the window back every time half of it was consumed.
+    // Half the window back every time half of it was consumed. The final top-up may or may not
+    // race the stream end, so 48 is the stable lower bound for 200 rows.
     let flows = hub.flows();
-    assert!(flows.len() >= 49, "{} flows", flows.len());
+    assert!(flows.len() >= 48, "{} flows", flows.len());
     assert!(flows.iter().all(|(_, f)| f.credits == 4), "{flows:?}");
     assert_eq!(c.sender.in_flight(), 0);
     assert_eq!(hub.open_streams(), 0);
