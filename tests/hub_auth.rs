@@ -596,11 +596,24 @@ async fn a_handled_type_outside_the_acl_is_a_permission_denied_rejection() {
             .iter()
             .all(|r| r.code == tonic::Code::PermissionDenied)
     );
-    let errors = captured
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut errors = captured
         .lines()
         .iter()
         .filter(|l| l.contains(" ERROR ") && l.contains("hub rejected the registration"))
         .count();
+    while errors != 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected one rejection log, got {errors}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        errors = captured
+            .lines()
+            .iter()
+            .filter(|l| l.contains(" ERROR ") && l.contains("hub rejected the registration"))
+            .count();
+    }
     assert_eq!(errors, 1);
     // The ACL is fixed (the operator widened it): the next attempt registers and logs again if
     // it is ever refused for another reason.
@@ -718,11 +731,24 @@ async fn another_services_instance_id_is_a_permission_denied_rejection() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(!thief.await_registered(Duration::from_millis(50)).await);
-        let errors = captured
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut errors = captured
             .lines()
             .iter()
             .filter(|l| l.contains(" ERROR ") && l.contains("hub rejected the registration"))
             .count();
+        while errors != 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{mode:?}: expected one rejection log, got {errors}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            errors = captured
+                .lines()
+                .iter()
+                .filter(|l| l.contains(" ERROR ") && l.contains("hub rejected the registration"))
+                .count();
+        }
         assert_eq!(errors, 1, "{mode:?}");
         // Nothing moved: the holder is still registered on its stream.
         assert!(holder.is_connected(), "{mode:?}");
