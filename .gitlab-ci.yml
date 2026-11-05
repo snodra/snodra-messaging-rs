@@ -6,9 +6,8 @@ stages:
   - test
   - release
 
+# CARGO_HOME, RUSTUP_HOME and PATH come from the runner's [[runners]] environment.
 variables:
-  CARGO_HOME: "$HOME/.cargo"
-  RUSTUP_HOME: "$HOME/.rustup"
   CARGO_TERM_COLOR: always
   TESTCONTAINERS_RYUK_DISABLED: "true"
 
