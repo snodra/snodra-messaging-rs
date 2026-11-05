@@ -41,6 +41,9 @@ clippy:
 
 test:
   stage: test
+  before_script:
+    - echo "$HARBOR_PASSWORD" | docker login -u "$HARBOR_USERNAME" --password-stdin "$HARBOR_HOST"
+    - docker pull "$KRAKEN_HUB_IMAGE"
   script:
     - cargo test --all-features
 
