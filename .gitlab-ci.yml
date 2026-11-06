@@ -26,19 +26,10 @@ fmt:
 proto-sync:
   stage: check
   script:
-    - |
-      export GIT_ASKPASS="$CI_PROJECT_DIR/.git-askpass"
-      cat > "$GIT_ASKPASS" <<'EOF'
-      #!/bin/sh
-      case "$1" in
-        Username*) echo "$KRAKEN_UMBRELLA_DEPLOY_USER" ;;
-        Password*) echo "$KRAKEN_UMBRELLA_DEPLOY_TOKEN" ;;
-      esac
-      EOF
-      chmod +x "$GIT_ASKPASS"
-      rm -rf "$CI_PROJECT_DIR/../kraken"
-      git clone --depth 1 "https://${CI_SERVER_HOST}/kraken-org/kraken.git" "$CI_PROJECT_DIR/../kraken"
-      KRAKEN_PROTO_SYNC_REQUIRED=true KRAKEN_PROTO_SOURCE="$CI_PROJECT_DIR/../kraken/protocol/hub.proto" bash scripts/check-proto-sync.sh
+    - git config --global url."https://${KRAKEN_UMBRELLA_DEPLOY_USER}:${KRAKEN_UMBRELLA_DEPLOY_TOKEN}@${CI_SERVER_HOST}/kraken-org/kraken.git".insteadOf "https://${CI_SERVER_HOST}/kraken-org/kraken.git"
+    - rm -rf "$CI_PROJECT_DIR/../kraken"
+    - git -c url."https://${KRAKEN_UMBRELLA_DEPLOY_USER}:${KRAKEN_UMBRELLA_DEPLOY_TOKEN}@${CI_SERVER_HOST}/kraken-org/kraken.git".insteadOf="https://${CI_SERVER_HOST}/kraken-org/kraken.git" clone --depth 1 "https://${CI_SERVER_HOST}/kraken-org/kraken.git" "$CI_PROJECT_DIR/../kraken"
+    - KRAKEN_PROTO_SYNC_REQUIRED=true KRAKEN_PROTO_SOURCE="$CI_PROJECT_DIR/../kraken/protocol/hub.proto" bash scripts/check-proto-sync.sh
 
 clippy:
   stage: check
@@ -65,57 +56,92 @@ release:
   script:
     - |
       set -euo pipefail
-      if git describe --tags --exact-match >/dev/null 2>&1; then
-        echo "HEAD is already tagged; nothing to do."
-        exit 0
-      fi
-      CURRENT=$(git tag --list 'v*' --sort=-v:refname | head -1)
+      CURRENT=$(git tag --list 'v*' --sort=-v:refname | head -1 || true)
       if [ -z "$CURRENT" ]; then CURRENT="v0.0.0"; fi
-      BUMP="${SEMVER_BUMP:-}"
-      if [ -z "$BUMP" ]; then
-        if [ "$CURRENT" = "v0.0.0" ]; then
-          LOG=$(git log --format='%s%n%b')
-        else
-          LOG=$(git log "$CURRENT..HEAD" --format='%s%n%b')
-        fi
-        if echo "$LOG" | grep -qE 'BREAKING[ -]CHANGE|^[A-Za-z]+(\([^)]*\))?!:'; then
-          BUMP=major
-        elif echo "$LOG" | grep -qE '^feat(\([^)]*\))?:'; then
-          BUMP=minor
-        elif echo "$LOG" | grep -qE '^(fix|perf)(\([^)]*\))?:'; then
-          BUMP=patch
-        else
-          echo "No semver-relevant commits since $CURRENT; no release."
+      if [ -n "${RELEASE_VERSION:-}" ]; then
+        VERSION="${RELEASE_VERSION#v}"
+        NEXT="v$VERSION"
+        echo "Using explicit RELEASE_VERSION: $VERSION ($NEXT)"
+      else
+        if git describe --tags --exact-match >/dev/null 2>&1; then
+          echo "HEAD is already tagged $(git describe --tags --exact-match); nothing to do."
           exit 0
         fi
+        BUMP="${SEMVER_BUMP:-}"
+        if [ -z "$BUMP" ]; then
+          if [ "$CURRENT" = "v0.0.0" ]; then
+            LOG=$(git log --format='%s%n%b')
+          else
+            LOG=$(git log "$CURRENT..HEAD" --format='%s%n%b')
+          fi
+          if [ -z "$LOG" ]; then
+            echo "No new commits since $CURRENT; no release."
+            exit 0
+          fi
+          if echo "$LOG" | grep -qE 'BREAKING[ -]CHANGE|^[A-Za-z]+(\([^)]*\))?!:'; then
+            BUMP=major
+          elif echo "$LOG" | grep -qE '^feat(\([^)]*\))?:'; then
+            BUMP=minor
+          else
+            BUMP=patch
+          fi
+        fi
+        case "$BUMP" in
+          major|minor|patch) ;;
+          *) echo "SEMVER_BUMP must be major, minor or patch"; exit 1 ;;
+        esac
+        V="${CURRENT#v}"
+        IFS=. read -r MAJ MIN PAT <<< "$V"
+        case "$BUMP" in
+          major) MAJ=$((MAJ+1)); MIN=0; PAT=0 ;;
+          minor) MIN=$((MIN+1)); PAT=0 ;;
+          patch) PAT=$((PAT+1)) ;;
+        esac
+        NEXT="v$MAJ.$MIN.$PAT"
+        VERSION="$MAJ.$MIN.$PAT"
+        echo "Current: $CURRENT; bump: $BUMP; next: $NEXT"
       fi
-      case "$BUMP" in
-        major|minor|patch) ;;
-        *) echo "SEMVER_BUMP must be major, minor or patch"; exit 1 ;;
-      esac
-      V="${CURRENT#v}"
-      IFS=. read -r MAJ MIN PAT <<< "$V"
-      case "$BUMP" in
-        major) MAJ=$((MAJ+1)); MIN=0; PAT=0 ;;
-        minor) MIN=$((MIN+1)); PAT=0 ;;
-        patch) PAT=$((PAT+1)) ;;
-      esac
-      NEXT="v$MAJ.$MIN.$PAT"
-      VERSION="$MAJ.$MIN.$PAT"
-      echo "Current: $CURRENT; bump: $BUMP; next: $NEXT"
       if [ "${DRY_RUN:-false}" = "true" ]; then
-        echo "DRY_RUN: not tagging"
+        echo "DRY_RUN: not tagging or publishing"
         exit 0
       fi
-      git config user.name "kraken-org CI"
-      git config user.email "ci@damoreira.ml"
-      git tag -a "$NEXT" -m "$CI_PROJECT_NAME $NEXT"
-      git push "$CI_REPOSITORY_URL" "$NEXT"
+      if ! git rev-parse "$NEXT" >/dev/null 2>&1; then
+        git config user.name "kraken-org CI"
+        git config user.email "ci@damoreira.ml"
+        git tag -a "$NEXT" -m "$CI_PROJECT_NAME $NEXT"
+        git push "$CI_REPOSITORY_URL" "$NEXT"
+      else
+        echo "Tag $NEXT already exists, skipping tag push"
+      fi
+      sed -i.bak -E 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
+      rm -f Cargo.toml.bak
+      cargo package --no-verify --allow-dirty
+      CRATE_FILE="target/package/kraken-messaging-rs-$VERSION.crate"
+      PKG_URL="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/kraken-messaging-rs/$VERSION/kraken-messaging-rs-$VERSION.crate"
+      curl --silent --fail-with-body --show-error \
+        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        --upload-file "$CRATE_FILE" \
+        "$PKG_URL"
       RELEASE=$(jq -n \
         --arg name "$CI_PROJECT_NAME $NEXT" \
         --arg tag "$NEXT" \
-        --arg desc "Rust crate release $VERSION. Consumed as a git dependency; see the tag." \
-        '{name:$name,tag_name:$tag,description:$desc}')
+        --arg desc "Rust crate release $VERSION." \
+        --arg crate_url "$PKG_URL" \
+        --arg crate_name "kraken-messaging-rs-$VERSION.crate" \
+        '{
+          name: $name,
+          tag_name: $tag,
+          description: $desc,
+          assets: {
+            links: [
+              {
+                name: $crate_name,
+                url: $crate_url,
+                link_type: "package"
+              }
+            ]
+          }
+        }')
       STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
         --request POST \
         --header "JOB-TOKEN: $CI_JOB_TOKEN" \
