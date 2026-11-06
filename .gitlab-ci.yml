@@ -26,9 +26,9 @@ fmt:
 proto-sync:
   stage: check
   script:
-    - git config --global url."https://${KRAKEN_UMBRELLA_DEPLOY_USER}:${KRAKEN_UMBRELLA_DEPLOY_TOKEN}@${CI_SERVER_HOST}/".insteadOf "https://${CI_SERVER_HOST}/"
+    - git config --global url."https://${KRAKEN_UMBRELLA_DEPLOY_USER}:${KRAKEN_UMBRELLA_DEPLOY_TOKEN}@${CI_SERVER_HOST}/kraken-org/kraken.git".insteadOf "https://${CI_SERVER_HOST}/kraken-org/kraken.git"
     - rm -rf "$CI_PROJECT_DIR/../kraken"
-    - git clone --depth 1 "https://${CI_SERVER_HOST}/kraken-org/kraken.git" "$CI_PROJECT_DIR/../kraken"
+    - git -c url."https://${KRAKEN_UMBRELLA_DEPLOY_USER}:${KRAKEN_UMBRELLA_DEPLOY_TOKEN}@${CI_SERVER_HOST}/kraken-org/kraken.git".insteadOf="https://${CI_SERVER_HOST}/kraken-org/kraken.git" clone --depth 1 "https://${CI_SERVER_HOST}/kraken-org/kraken.git" "$CI_PROJECT_DIR/../kraken"
     - KRAKEN_PROTO_SYNC_REQUIRED=true KRAKEN_PROTO_SOURCE="$CI_PROJECT_DIR/../kraken/protocol/hub.proto" bash scripts/check-proto-sync.sh
 
 clippy:
