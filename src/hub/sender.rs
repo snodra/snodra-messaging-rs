@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::Stream;
 use futures::stream::{BoxStream, StreamExt};
@@ -45,6 +45,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::codec;
 use crate::context::{MessageContext, hub_headers};
 use crate::error::MessagingError;
+use crate::metrics::{DECODE_FAILED, Metrics, request_outcome};
 use crate::proto::{
     self, ClientMessage, ErrorCode, RegisterAck, RequestKind, RequestMode, client_message, reply,
 };
@@ -186,6 +187,9 @@ pub struct SenderSettings {
     pub priorities: HashMap<String, i32>,
     /// Default retry policy (`Config.hub_retry`); `None` (the default): no retry.
     pub retry: Option<RetryPolicy>,
+    /// What every command and query call is timed on (`kraken.hub.client.request.duration`);
+    /// [`Metrics::global`] by default.
+    pub metrics: Metrics,
 }
 
 impl Default for SenderSettings {
@@ -195,6 +199,7 @@ impl Default for SenderSettings {
             forward_jwt: true,
             priorities: HashMap::new(),
             retry: None,
+            metrics: Metrics::global(),
         }
     }
 }
@@ -862,6 +867,7 @@ pub struct Sender {
     forward_jwt: bool,
     priorities: HashMap<String, i32>,
     retry: Option<RetryPolicy>,
+    metrics: Metrics,
 }
 
 impl Sender {
@@ -894,6 +900,7 @@ impl Sender {
             forward_jwt: settings.forward_jwt,
             priorities: settings.priorities,
             retry: settings.retry,
+            metrics: settings.metrics,
         });
         hubs.add_pending_probe(weak_probe(Arc::downgrade(&sender), Sender::pending_on));
         sender
@@ -914,10 +921,15 @@ impl Sender {
         command: &C,
         opts: SendOptions,
     ) -> Result<C::Reply, MessagingError> {
-        let bytes = self
-            .request(RequestKind::Command, C::TYPE, codec::encode(command)?, opts)
-            .await?;
-        codec::decode_reply(&bytes)
+        let started = Instant::now();
+        let reply = match codec::encode(command) {
+            Ok(payload) => {
+                self.request(RequestKind::Command, C::TYPE, payload, opts)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        self.decoded(RequestKind::Command, C::TYPE, started, reply)
     }
 
     pub async fn send_query<Q: Query>(
@@ -925,10 +937,40 @@ impl Sender {
         query: &Q,
         opts: SendOptions,
     ) -> Result<Q::Reply, MessagingError> {
-        let bytes = self
-            .request(RequestKind::Query, Q::TYPE, codec::encode(query)?, opts)
-            .await?;
-        codec::decode_reply(&bytes)
+        let started = Instant::now();
+        let reply = match codec::encode(query) {
+            Ok(payload) => {
+                self.request(RequestKind::Query, Q::TYPE, payload, opts)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        self.decoded(RequestKind::Query, Q::TYPE, started, reply)
+    }
+
+    /// Decodes the reply of a call started at `started` and times the call with its final outcome
+    /// (`kraken.hub.client.request.duration`; a reply that does not decode is
+    /// [`DECODE_FAILED`]). A call its caller dropped records nothing.
+    fn decoded<R: DeserializeOwned + 'static>(
+        &self,
+        kind: RequestKind,
+        type_name: &str,
+        started: Instant,
+        reply: Result<Vec<u8>, MessagingError>,
+    ) -> Result<R, MessagingError> {
+        let (result, outcome) = match reply {
+            Ok(bytes) => match codec::decode_reply(&bytes) {
+                Ok(r) => (Ok(r), request_outcome(Ok(()))),
+                Err(e) => (Err(e), DECODE_FAILED),
+            },
+            Err(e) => {
+                let outcome = request_outcome(Err(&e));
+                (Err(e), outcome)
+            }
+        };
+        self.metrics
+            .hub_request(kind, type_name, outcome, started.elapsed());
+        result
     }
 
     /// Completes the pending request a `Reply`/`Error` refers to; a `Disconnected` fails the requests
@@ -1078,10 +1120,17 @@ impl Sender {
             authorization: None,
             ..options
         };
-        match self
+        let started = Instant::now();
+        let result = self
             .request_with(RequestKind::Command, type_name, payload, options, headers)
-            .await
-        {
+            .await;
+        self.metrics.hub_request(
+            RequestKind::Command,
+            type_name,
+            request_outcome(result.as_ref().map(|_| ())),
+            started.elapsed(),
+        );
+        match result {
             Ok(_) => RawOutcome::Success,
             Err(e @ MessagingError::NoHandler(_)) => RawOutcome::Transient(e.to_string()),
             Err(e) => classify_failure(&e),

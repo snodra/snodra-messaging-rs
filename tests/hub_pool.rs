@@ -728,6 +728,42 @@ async fn instance_status_goes_to_every_hub() {
     c.shutdown().await;
 }
 
+/// The hub client gauges read what the status reports: the live hubs and the requests being
+/// handled; the credential counters are read from memory too (no token fetch without OAuth2).
+#[tokio::test]
+async fn the_hub_client_gauges_count_live_hubs_and_running_handlers() {
+    use kraken_messaging::metrics::{
+        HUB_CLIENT_CONNECTED_HUBS, HUB_CLIENT_CREDENTIALS_REFRESHES_SENT,
+        HUB_CLIENT_HANDLERS_IN_FLIGHT, HUB_CLIENT_TOKEN_FETCHES, Metrics,
+    };
+    let meter = support::metrics::TestMeter::new();
+    let (a, b) = (answering("hub-a").await, answering("hub-b").await);
+    let c = client(settings(addresses(&[&a, &b]))).await;
+    HubPool::observe(&c.pool, &Metrics::new(meter.meter()));
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    assert_eq!(meter.value(HUB_CLIENT_CONNECTED_HUBS, &[]), Some(2.0));
+    assert_eq!(meter.value(HUB_CLIENT_HANDLERS_IN_FLIGHT, &[]), Some(0.0));
+    a.send_to_clients(push_request("in-1")).await;
+    eventually("a handler runs", async || c.held.lock().unwrap().len() == 1).await;
+    assert_eq!(meter.value(HUB_CLIENT_HANDLERS_IN_FLIGHT, &[]), Some(1.0));
+    assert_eq!(
+        meter.value(HUB_CLIENT_CREDENTIALS_REFRESHES_SENT, &[]),
+        Some(0.0)
+    );
+    assert!(
+        meter.points_of(HUB_CLIENT_TOKEN_FETCHES).is_empty(),
+        "no OAuth2, no token fetch counter"
+    );
+    b.set_down(true);
+    eventually("one hub left", async || {
+        meter.value(HUB_CLIENT_CONNECTED_HUBS, &[]) == Some(1.0)
+    })
+    .await;
+    let reply_to = c.held.lock().unwrap().pop().unwrap();
+    reply_to.grant().await;
+    c.shutdown().await;
+}
+
 /// ADR 0022: the processor status rides on every hub's `InstanceStatus`.
 #[tokio::test]
 async fn processor_status_goes_to_every_hub() {

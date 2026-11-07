@@ -59,6 +59,17 @@ pub const HUB_CLIENT_HANDLERS_IN_FLIGHT: &str = "kraken.hub.client.handlers.in.f
 /// `kraken_hub_client_connected_hubs`: hubs with an acknowledged stream.
 pub const HUB_CLIENT_CONNECTED_HUBS: &str = "kraken.hub.client.connected.hubs";
 
+/// `kraken_hub_client_token_fetches_total{result}`: access token fetches (OAuth2 only) by result
+/// (`ok`, `http_error`, `oauth_error`, `io_error`, `bad_response`).
+pub const HUB_CLIENT_TOKEN_FETCHES: &str = "kraken.hub.client.token.fetches";
+/// `kraken_hub_client_certificate_rotations_total`: client certificate pairs adopted after the
+/// first (client certificate only).
+pub const HUB_CLIENT_CERTIFICATE_ROTATIONS: &str = "kraken.hub.client.certificate.rotations";
+/// `kraken_hub_client_credentials_refreshes_sent_total`: `ClientMessage.credentials` written to
+/// the hubs.
+pub const HUB_CLIENT_CREDENTIALS_REFRESHES_SENT: &str =
+    "kraken.hub.client.credentials.refreshes.sent";
+
 /// The bucket boundaries of the duration histograms, in seconds (the hub's).
 pub const DURATION_BOUNDARIES: [f64; 15] = [
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
@@ -245,12 +256,13 @@ impl Metrics {
         );
     }
 
-    /// One command or query sent through the hub (`type_name` is its registered wire type).
+    /// One command or query call through the hub (`type_name` is its registered wire type),
+    /// with its final outcome ([`request_outcome`], or [`DECODE_FAILED`]).
     pub(crate) fn hub_request(
         &self,
         kind: RequestKind,
         type_name: &str,
-        result: Result<(), &MessagingError>,
+        outcome: &'static str,
         took: Duration,
     ) {
         let kind = match kind {
@@ -262,7 +274,7 @@ impl Metrics {
             &[
                 KeyValue::new("kind", kind),
                 KeyValue::new("type", type_name.to_string()),
-                KeyValue::new("outcome", request_outcome(result)),
+                KeyValue::new("outcome", outcome),
             ],
         );
     }
@@ -343,13 +355,13 @@ mod tests {
         metrics.hub_request(
             RequestKind::Command,
             "t.Do",
-            Ok(()),
+            request_outcome(Ok(())),
             Duration::from_millis(5),
         );
         metrics.hub_request(
             RequestKind::Query,
             "t.Get",
-            Err(&MessagingError::Timeout("t.Get".into())),
+            request_outcome(Err(&MessagingError::Timeout("t.Get".into()))),
             Duration::from_secs(2),
         );
         let ok = t
@@ -404,7 +416,7 @@ mod tests {
         metrics.outbox_published(true);
         metrics.event_consumed("p".into(), Value::from(OTHER), Consumed::Parked);
         metrics.event_handled("p".into(), Value::from(OTHER), Duration::from_millis(1));
-        metrics.hub_request(RequestKind::Command, "t", Ok(()), Duration::ZERO);
+        metrics.hub_request(RequestKind::Command, "t", "ok", Duration::ZERO);
         let gauge_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ran = Arc::clone(&gauge_ran);
         metrics

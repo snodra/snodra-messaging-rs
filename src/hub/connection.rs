@@ -830,7 +830,7 @@ impl HubConnection {
     }
 
     /// The credential refreshes (`ClientMessage.credentials`) written to hubs so far
-    /// (`kraken_messaging_hub_credentials_refreshes_sent_total`).
+    /// (`kraken_hub_client_credentials_refreshes_sent_total`).
     pub fn credentials_refreshes_sent(&self) -> u64 {
         self.refreshes_sent.load(Ordering::Relaxed)
     }

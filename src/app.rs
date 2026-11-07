@@ -161,8 +161,10 @@ impl KrakenMessaging {
                 forward_jwt: config.forward_jwt,
                 priorities: config.hub_priorities.clone(),
                 retry: config.hub_retry.clone(),
+                metrics: metrics.clone(),
             },
         );
+        HubPool::observe(&hubs, &metrics);
         Ok(KrakenMessagingBuilder {
             registry: HandlerRegistry::new(),
             client,
@@ -289,14 +291,14 @@ impl KrakenMessaging {
     /// How this instance authenticates to the hubs: `none`, a static `token`, a `jwt`
     /// (Keycloak client credentials, ADR 0019) or a client `certificate` (mutual TLS, ADR 0020),
     /// the current access token's expiry, the last token fetch error and the token fetch counts by
-    /// result (`kraken_messaging_hub_token_fetches_total{result}`); for a certificate, the one
+    /// result (`kraken_hub_client_token_fetches_total{result}`); for a certificate, the one
     /// presented (fingerprint, `notAfter`, rotations).
     pub fn hub_auth(&self) -> crate::hub::AuthStatus {
         self.hubs.auth()
     }
 
     /// The credential refreshes sent to the hubs so far
-    /// (`kraken_messaging_hub_credentials_refreshes_sent_total`).
+    /// (`kraken_hub_client_credentials_refreshes_sent_total`).
     pub fn hub_credentials_refreshes_sent(&self) -> u64 {
         self.hubs.credentials_refreshes_sent()
     }

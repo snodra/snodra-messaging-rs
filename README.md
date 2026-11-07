@@ -1196,9 +1196,9 @@ running, `KrakenMessaging::hub_auth()` (also `HubPool::auth()`, `HubConnection::
 `AuthKind` (`none`, `token`, `jwt`), the current token's expiry, the last token fetch error and
 `token_fetches`, the fetch counts by result (`ok`, `http_error`, `oauth_error`, `io_error`,
 `bad_response`; also `TokenProvider::stats()`); `hub_credentials_refreshes_sent()` counts the
-refreshes written. This crate has no
-metrics registry, so these counters stand in for `kraken_messaging_hub_token_fetches_total{result}`
-and `kraken_messaging_hub_credentials_refreshes_sent_total`. A static token session whose
+refreshes written; the same counts are exported as `kraken_hub_client_token_fetches_total{result}`
+and `kraken_hub_client_credentials_refreshes_sent_total` (see [Metrics](#metrics)). A static token
+session whose
 `KRAKEN_HUB_TOKEN_FILE` changes also sends a refresh (checked once per heartbeat) on its handshaken
 streams, so a token rotation needs no reconnect.
 
@@ -1207,7 +1207,7 @@ host is loopback or a single-label name: the secret then crosses the network in 
 
 Differences from the Kotlin starter: the Rust configuration has no relaxed `KRAKEN_MESSAGING_*`
 binding (only `KRAKEN_HUB_OAUTH2_*`), no `/env` redaction layer to extend (`SecretString` prints
-`"***"`), and no metrics registry (accessors above).
+`"***"`).
 
 ### Authenticating with a client certificate (mTLS)
 
@@ -1304,8 +1304,8 @@ certificate says so.
 fingerprint, not_after, rotations })`: the first 8 hex characters of the SHA-256 of the leaf presented
 (what the hub's logs and `/api/v1/topology` show), its `notAfter`, and how many times the presented certificate
 changed since the first one. Logs name a certificate by that fingerprint and the service only; the
-key is never read into a log, an error or a `Debug` print. This crate has no metrics registry
-(accessors only).
+key is never read into a log, an error or a `Debug` print. The rotations are also exported as
+`kraken_hub_client_certificate_rotations_total` (see [Metrics](#metrics)).
 
 **A client without a certificate against a `required` hub** fails at the transport, not as a
 rejection: with TLS 1.3 the client learns that its certificate was refused only when the stream opens,
@@ -1317,7 +1317,7 @@ token or JWT.
 Differences from the Kotlin starter: the settings are `HubTls.client_cert_file` / `client_key_file`
 (`KRAKEN_HUB_TLS_CLIENT_CERT` / `_KEY`) and there is no relaxed `KRAKEN_MESSAGING_*` binding; rotation
 is run by the `HubPool` (a `HubConnection` used on its own re-reads the files on reconnect only); the
-rotation count is in `CertificateStatus` and there is no metrics registry.
+rotation count is in `CertificateStatus` (and `kraken_hub_client_certificate_rotations_total`).
 
 **Turning it on: permissive first.** (1) Run the hub with `KRAKEN_HUB_AUTH_MODE=permissive` and the
 ACL; it logs and counts every violation (`kraken_hub_auth_violations_total`) and refuses nothing;
