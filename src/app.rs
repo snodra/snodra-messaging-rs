@@ -45,6 +45,7 @@ use crate::kafka::{
     EventBus, LocalEventDispatcher, NoSagas, OUTBOX_COLLECTION, OutboxPublisher,
     PROCESSED_EVENTS_COLLECTION, ProcessorSettings, SagaStage, ensure_indexes,
 };
+use crate::metrics::Metrics;
 use crate::processors::dead_letters::ensure_dead_letter_indexes;
 use crate::processors::reset::ResetHandler;
 use crate::processors::{
@@ -85,6 +86,8 @@ pub struct KrakenMessagingBuilder {
     stats: SagaStats,
     /// "Now" for the saga runtime, relay, scheduler, idempotent handlers and ingress.
     clock: Clock,
+    /// What the library records its metrics on (ADR 0026).
+    metrics: Metrics,
     /// The named event processors' handlers (ADR 0022), by processor name.
     processors: std::collections::BTreeMap<String, HandlerRegistry>,
     /// Invalid processor names given to `event_in`, returned by `start()`.
@@ -119,9 +122,25 @@ pub struct KrakenMessaging {
 }
 
 impl KrakenMessaging {
-    /// Prepares the connections (nothing starts yet) so handlers can capture `events()` and the senders.
+    /// Prepares the connections (nothing starts yet) so handlers can capture `events()` and the
+    /// senders. The metrics (ADR 0026) are recorded on
+    /// `opentelemetry::global::meter("kraken-messaging-rs")` as the global meter provider is now:
+    /// install the application's provider before this call; with none, nothing is recorded.
     pub async fn builder(config: Config) -> Result<KrakenMessagingBuilder, MessagingError> {
+        Self::builder_with_meter(
+            config,
+            opentelemetry::global::meter(crate::metrics::METER_NAME),
+        )
+        .await
+    }
+
+    /// [`builder`](Self::builder) recording the metrics on `meter` instead of the global one.
+    pub async fn builder_with_meter(
+        config: Config,
+        meter: opentelemetry::metrics::Meter,
+    ) -> Result<KrakenMessagingBuilder, MessagingError> {
         config.validate()?;
+        let metrics = Metrics::new(meter);
         let client = mongodb::Client::with_uri_str(&config.mongodb_uri).await?;
         let db = client
             .default_database()
@@ -158,6 +177,7 @@ impl KrakenMessaging {
             sources: Vec::new(),
             stats: SagaStats::new(),
             clock: Clock::system(),
+            metrics,
             processors: std::collections::BTreeMap::new(),
             processor_errors: Vec::new(),
             reset_handlers: Vec::new(),
@@ -739,6 +759,7 @@ impl KrakenMessagingBuilder {
             sources,
             stats,
             clock,
+            metrics,
             processors: named_registries,
             processor_errors,
             reset_handlers,
@@ -955,6 +976,7 @@ impl KrakenMessagingBuilder {
                 config.outbox_poll_interval,
                 config.outbox_batch_size,
                 config.outbox_max_attempts,
+                &metrics,
             )?;
             tasks.push(publisher.start(cancel.clone()));
         }

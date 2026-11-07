@@ -11,6 +11,7 @@ use kraken_messaging::kafka::{
     EventBus, EventConsumer, LocalEventDispatcher, NoSagas, OutboxPublisher, ProcessorSettings,
     ensure_indexes, headers,
 };
+use kraken_messaging::metrics::{self, Metrics};
 use kraken_messaging::{Event, message_type};
 use mongodb::bson::doc;
 use rdkafka::Message;
@@ -19,6 +20,7 @@ use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Headers;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde::{Deserialize, Serialize};
+use support::metrics::TestMeter;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -104,6 +106,7 @@ async fn outbox_relays_to_kafka_with_kotlin_headers() {
     let mongo = support::containers::mongo().await;
     let (_client, db) = db(&mongo.uri).await;
     let bus = EventBus::new(db.clone());
+    let meter = TestMeter::new();
     let publisher = OutboxPublisher::new(
         db.clone(),
         &kafka.bootstrap,
@@ -112,6 +115,7 @@ async fn outbox_relays_to_kafka_with_kotlin_headers() {
         Duration::from_millis(100),
         100,
         10,
+        &Metrics::new(meter.meter()),
     )
     .unwrap();
 
@@ -126,6 +130,12 @@ async fn outbox_relays_to_kafka_with_kotlin_headers() {
     .unwrap();
     let raw = raw_consumer(&kafka.bootstrap, "raw-reader");
     assert_eq!(publisher.relay_once().await.unwrap(), 1);
+    assert_eq!(
+        meter.value(metrics::OUTBOX_PUBLISHED, &[("outcome", "ok")]),
+        Some(1.0)
+    );
+    assert_eq!(meter.value(metrics::OUTBOX_PENDING, &[]), Some(0.0));
+    assert_eq!(meter.value(metrics::OUTBOX_OLDEST_AGE, &[]), Some(0.0));
     assert_eq!(publisher.relay_once().await.unwrap(), 0, "already sent");
 
     // The topic is auto-created by the first produce; the raw consumer may see transient metadata errors before that.
@@ -338,30 +348,54 @@ async fn failed_send_marks_attempts() {
     let mongo = support::containers::mongo().await;
     let (_client, db) = db(&mongo.uri).await;
     let bus = EventBus::new(db.clone());
-    bus.publish(
-        &Happened {
-            id: "e-x".into(),
-            at: Utc::now(),
-        },
-        None,
-    )
-    .await
-    .unwrap();
-    // Unreachable broker: the delivery times out, the document stays unsent with attempts = 1.
+    for id in ["e-x", "e-y", "e-z"] {
+        bus.publish(
+            &Happened {
+                id: id.into(),
+                at: Utc::now(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    // Unreachable broker: the delivery times out, the document stays unsent with attempts = 1
+    // and the batch stops there.
+    let meter = TestMeter::new();
     let publisher = OutboxPublisher::new(
         db.clone(),
         "127.0.0.1:1",
         TOPIC,
         "svc-a",
         Duration::from_millis(100),
-        100,
+        2,
         10,
+        &Metrics::new(meter.meter()),
     )
     .unwrap();
+    assert_eq!(
+        meter.value(metrics::OUTBOX_PENDING, &[]),
+        Some(0.0),
+        "no poll yet"
+    );
     assert_eq!(publisher.relay_once().await.unwrap(), 0);
+    assert_eq!(
+        meter.value(metrics::OUTBOX_PUBLISHED, &[("outcome", "failed")]),
+        Some(1.0)
+    );
+    assert_eq!(
+        meter.value(metrics::OUTBOX_PENDING, &[]),
+        Some(3.0),
+        "a full batch: every pending document counted"
+    );
+    let age = meter.value(metrics::OUTBOX_OLDEST_AGE, &[]).unwrap();
+    assert!(
+        age > 0.0,
+        "the oldest document waited out the failed send: {age}"
+    );
     let d = db
         .collection::<mongodb::bson::Document>("outbox")
-        .find_one(doc! {})
+        .find_one(doc! { "attempts": 1 })
         .await
         .unwrap()
         .unwrap();
@@ -409,6 +443,7 @@ async fn non_retriable_send_marks_failed_immediately() {
         Duration::from_millis(100),
         100,
         10,
+        &Metrics::global(),
     )
     .unwrap();
     let _ = publisher.relay_once().await.unwrap();

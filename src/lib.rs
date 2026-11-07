@@ -11,6 +11,7 @@ pub mod external;
 pub mod hub;
 pub mod identity;
 pub mod kafka;
+pub mod metrics;
 pub mod processors;
 pub mod proto;
 pub mod retry;

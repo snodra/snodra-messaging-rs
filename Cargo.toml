@@ -43,6 +43,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pki-types = { version = "1", features = ["std"] }
 tracing = "0.1.44"
 thiserror = "2"
+# Metrics (ADR 0026): the library records through the OpenTelemetry API only; the application
+# installs the meter provider (the SDK and an exporter). No provider: the API's no-op meter.
+opentelemetry = { version = "0.33.1", default-features = false, features = ["metrics"] }
 
 [features]
 # `saga::testing`: SagaTestFixture and the in-memory saga ports (S2-R6), for a service's own tests
@@ -63,3 +66,5 @@ time = "0.3" # validity periods of the test certificates
 tokio-stream = { version = "0.1", features = ["net"] } # TcpListenerStream for the in-process fake hub
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15.0", features = ["kafka", "mongo"] }
+# The in-memory metric exporter the metrics tests read back (as kraken-hub's).
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["metrics", "testing"] }
