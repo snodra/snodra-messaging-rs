@@ -8,16 +8,34 @@
 //! error; else STARTING before the first assignment (an empty one counts) and between a revoke
 //! and the next assign; else RUNNING. `operation_id` names the reset holding the processor's
 //! lock, `replaying` and `replay_until` its open replay ranges on the assigned partitions.
+//!
+//! The processor gauges (ADR 0026) read the same status when the meter collects:
+//! `kraken.processor.state{processor,state}` (every state, 1 for the current one),
+//! `kraken.processor.lag{processor,partition}` (each assigned partition whose lag is known) and
+//! `kraken.dead.letters{processor}`.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::AsyncInstrument;
 use tokio::sync::Notify;
 
 use crate::config::DeadLetterMode;
+use crate::metrics::{DEAD_LETTERS, Metrics, PROCESSOR_LAG, PROCESSOR_STATE};
 use crate::proto::{PartitionStatus, ProcessorState, ProcessorStatus};
+
+/// The states a processor reports, with their `state` label (the `ProcessorState` name without
+/// `PROCESSOR_`, lower case, as the hub's `kraken_hub_processor_state`).
+const STATES: [(ProcessorState, &str); 5] = [
+    (ProcessorState::ProcessorStarting, "starting"),
+    (ProcessorState::ProcessorRunning, "running"),
+    (ProcessorState::ProcessorPaused, "paused"),
+    (ProcessorState::ProcessorFailing, "failing"),
+    (ProcessorState::ProcessorStopped, "stopped"),
+];
 
 /// How long a failure keeps a processor FAILING.
 pub const FAILING_FOR: Duration = Duration::from_secs(60);
@@ -96,6 +114,61 @@ impl ProcessorMonitor {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Registers the processor gauges of `monitors` on `metrics`; a monitor reports while it
+    /// lives.
+    pub(crate) fn observe(monitors: &[Arc<ProcessorMonitor>], metrics: &Metrics) {
+        let watched: Arc<[Weak<ProcessorMonitor>]> = monitors.iter().map(Arc::downgrade).collect();
+        let each = move |report: fn(&ProcessorStatus, &dyn AsyncInstrument<u64>)| {
+            let watched = Arc::clone(&watched);
+            move |o: &dyn AsyncInstrument<u64>| {
+                for m in watched.iter().filter_map(Weak::upgrade) {
+                    report(&m.status(), o);
+                }
+            }
+        };
+        let meter = metrics.meter();
+        meter
+            .u64_observable_gauge(PROCESSOR_STATE)
+            .with_description("1 for the processor's state now (starting, running, paused, failing, stopped), 0 for the others")
+            .with_callback(each(|s, o| {
+                for (state, label) in STATES {
+                    o.observe(
+                        u64::from(s.state == state as i32),
+                        &[
+                            KeyValue::new("processor", s.name.clone()),
+                            KeyValue::new("state", label),
+                        ],
+                    );
+                }
+            }))
+            .build();
+        meter
+            .u64_observable_gauge(PROCESSOR_LAG)
+            .with_description("Records behind on each partition assigned to this instance whose lag is known, as the processor status")
+            .with_callback(each(|s, o| {
+                for p in s.partitions.iter().filter(|p| p.lag >= 0) {
+                    o.observe(
+                        p.lag as u64,
+                        &[
+                            KeyValue::new("processor", s.name.clone()),
+                            KeyValue::new("partition", p.partition.to_string()),
+                        ],
+                    );
+                }
+            }))
+            .build();
+        meter
+            .u64_observable_gauge(DEAD_LETTERS)
+            .with_description("The processor's letters in dead_letters as last sampled (0 when the dead-letter mode is not collection)")
+            .with_callback(each(|s, o| {
+                o.observe(
+                    s.dead_letters,
+                    &[KeyValue::new("processor", s.name.clone())],
+                );
+            }))
+            .build();
     }
 
     pub fn topic(&self) -> &str {
@@ -326,6 +399,59 @@ mod tests {
 
     fn state(m: &ProcessorMonitor, now: Instant) -> ProcessorState {
         ProcessorState::try_from(m.status_at(now).state).unwrap()
+    }
+
+    #[test]
+    fn the_gauges_read_the_status_one_state_at_one_and_only_known_lags() {
+        use crate::metrics::test_meter::TestMeter;
+        use crate::metrics::{DEAD_LETTERS, Metrics, PROCESSOR_LAG, PROCESSOR_STATE};
+        let t = TestMeter::new();
+        let m = Arc::new(monitor());
+        ProcessorMonitor::observe(&[Arc::clone(&m)], &Metrics::new(t.meter()));
+        let state_of = |t: &TestMeter| {
+            let on: Vec<String> = t
+                .points_of(PROCESSOR_STATE)
+                .into_iter()
+                .filter(|p| p.attributes["processor"] == "orders" && p.value == 1.0)
+                .map(|p| p.attributes["state"].clone())
+                .collect();
+            on
+        };
+        assert_eq!(state_of(&t), ["starting"]);
+        assert_eq!(
+            t.points_of(PROCESSOR_STATE).len(),
+            5,
+            "every state, the others at 0"
+        );
+
+        m.assigned(&[0, 1]);
+        m.offsets(0, 5, 12);
+        m.set_dead_letters(3);
+        assert_eq!(state_of(&t), ["running"]);
+        assert_eq!(
+            t.value(
+                PROCESSOR_LAG,
+                &[("processor", "orders"), ("partition", "0")]
+            ),
+            Some(7.0)
+        );
+        assert_eq!(
+            t.points_of(PROCESSOR_LAG).len(),
+            1,
+            "partition 1's lag is not known yet"
+        );
+        assert_eq!(t.value(DEAD_LETTERS, &[("processor", "orders")]), Some(3.0));
+
+        m.revoked(&[0]);
+        assert!(
+            t.points_of(PROCESSOR_LAG).is_empty(),
+            "a revoked partition is no longer reported"
+        );
+        drop(m);
+        assert!(
+            t.points_of(PROCESSOR_STATE).is_empty(),
+            "a dropped monitor reports nothing"
+        );
     }
 
     #[test]

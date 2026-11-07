@@ -912,6 +912,7 @@ impl KrakenMessagingBuilder {
             }
         }
         let monitors: Vec<Arc<ProcessorMonitor>> = runners.iter().map(|r| r.monitor()).collect();
+        ProcessorMonitor::observe(&monitors, &metrics);
         let processor_control = ProcessorControl::new(runners.clone(), dead_letters.clone());
         let reported = monitors.clone();
         hubs.set_processor_status(Arc::new(move || {

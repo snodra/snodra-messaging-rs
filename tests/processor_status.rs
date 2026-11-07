@@ -140,13 +140,11 @@ async fn the_lag_of_records_produced_while_stopped_shows_while_the_handler_is_bu
     produce(&kafka.bootstrap, topic, 3, 8).await;
     let gate = Arc::new(Semaphore::new(0));
     let held = Arc::clone(&gate);
-    let app = KrakenMessaging::builder(config(
-        "svc-st",
-        &hub.address(),
-        &kafka.bootstrap,
-        &uri,
-        topic,
-    ))
+    let meter = support::metrics::TestMeter::new();
+    let app = KrakenMessaging::builder_with_meter(
+        config("svc-st", &hub.address(), &kafka.bootstrap, &uri, topic),
+        meter.meter(),
+    )
     .await
     .unwrap()
     .event::<Ticked, _, _>(move |_, _| {
@@ -168,6 +166,28 @@ async fn the_lag_of_records_produced_while_stopped_shows_while_the_handler_is_bu
     .await;
     let p = default_of(&app).partitions[0];
     assert_eq!((p.partition, p.position, p.lag), (0, -1, 5), "{p:?}");
+    // The gauges read the same status.
+    assert_eq!(
+        meter.value(
+            kraken_messaging::metrics::PROCESSOR_LAG,
+            &[("processor", "default"), ("partition", "0")]
+        ),
+        Some(5.0)
+    );
+    assert_eq!(
+        meter.value(
+            kraken_messaging::metrics::PROCESSOR_STATE,
+            &[("processor", "default"), ("state", "running")]
+        ),
+        Some(1.0)
+    );
+    assert_eq!(
+        meter.value(
+            kraken_messaging::metrics::DEAD_LETTERS,
+            &[("processor", "default")]
+        ),
+        Some(0.0)
+    );
     gate.add_permits(5);
     eventually("caught up", Duration::from_secs(60), || {
         default_of(&app)
