@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mongodb::Database;
+use opentelemetry::Value;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{
     BaseConsumer, CommitMode, Consumer, ConsumerContext, Rebalance, StreamConsumer,
@@ -30,13 +31,14 @@ use rdkafka::{ClientContext, Message, Offset, TopicPartitionList};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::dispatch::{LocalEventDispatcher, MarkerPosition, RecordDispatch};
+use super::dispatch::{LocalEventDispatcher, MarkerPosition, RecordDispatch, StageOneDone};
 use super::headers;
 use crate::codec;
 use crate::config::DeadLetterMode;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
 use crate::hub::HandlerRegistry;
+use crate::metrics::{Consumed, Metrics, OTHER, TypeLabels};
 use crate::processors::ProcessorMonitor;
 use crate::processors::control_store::ReplayRange;
 use crate::processors::dead_letters::{
@@ -134,6 +136,9 @@ pub struct ProcessorSettings {
     pub dead_letter_retention: Duration,
     /// Where `dead_letters` lives (mode `collection`).
     pub db: Option<Database>,
+    /// What the consumer records `kraken.events.consumed` and `kraken.event.handler.duration`
+    /// on (ADR 0026).
+    pub metrics: Metrics,
 }
 
 /// What processor control (ADR 0023) tells a processor's consumer, shared by its every run: the
@@ -273,6 +278,11 @@ pub struct EventConsumer {
     /// Per partition: the generation and offset it was sought back to, until that record is
     /// delivered again.
     rewound: Mutex<HashMap<i32, (u64, i64)>>,
+    metrics: Metrics,
+    /// The `processor` label.
+    processor_label: Value,
+    /// The `type` labels: the types this processor handles, anything else `other`.
+    types: TypeLabels,
 }
 
 /// Whether a record was acknowledged, and how it counts in the status.
@@ -345,8 +355,12 @@ impl EventConsumer {
                 retention: settings.dead_letter_retention,
             },
         };
+        let types = TypeLabels::new(dispatcher.event_types());
         Ok(Arc::new(EventConsumer {
             consumer,
+            processor_label: Value::from(Arc::<str>::from(settings.name.as_str())),
+            types,
+            metrics: settings.metrics,
             dispatcher,
             topic: settings.topic,
             name: settings.name,
@@ -530,6 +544,10 @@ impl EventConsumer {
             .iter()
             .map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).to_string()))
             .collect();
+        let type_label = match hdrs.get(headers::TYPE) {
+            Some(t) => self.types.label(t),
+            None => Value::from(OTHER),
+        };
         let generation = self.monitor.generation();
         let pending = self
             .pending
@@ -540,7 +558,13 @@ impl EventConsumer {
         if let Some(pending) = pending {
             // Its attempts are done: only the letter is missing.
             return self
-                .letter_after_attempts(msg, &raw_headers, pending.error, pending.attempts)
+                .letter_after_attempts(
+                    msg,
+                    &raw_headers,
+                    &type_label,
+                    pending.error,
+                    pending.attempts,
+                )
                 .await;
         }
         let payload = msg.payload().unwrap_or(&[]);
@@ -552,11 +576,14 @@ impl EventConsumer {
             msg.offset(),
             |t| self.dispatcher.interested_here(t),
         ) {
-            RecordDisposition::Skip(NO_HANDLER) => return Done::Ack { processed: false },
+            RecordDisposition::Skip(NO_HANDLER) => {
+                self.consumed(&type_label, Consumed::Skipped);
+                return Done::Ack { processed: false };
+            }
             // Malformed: a letter that blocks nothing (ADR 0022 INVALID).
             RecordDisposition::Skip(reason) => {
                 tracing::warn!(processor = %self.name, topic = msg.topic(), partition = msg.partition(), offset = msg.offset(), "invalid record: {reason}");
-                let parked = self
+                let taken = self
                     .dead_letter(
                         msg,
                         &raw_headers,
@@ -566,10 +593,12 @@ impl EventConsumer {
                         0,
                     )
                     .await;
-                return if parked {
-                    Done::Ack { processed: false }
-                } else {
-                    Done::Again
+                return match taken {
+                    Some(outcome) => {
+                        self.consumed(&type_label, outcome);
+                        Done::Ack { processed: false }
+                    }
+                    None => Done::Again,
                 };
             }
             RecordDisposition::Handle { type_name, id } => (type_name, id),
@@ -583,7 +612,7 @@ impl EventConsumer {
             match self.head_of(&key).await {
                 None => return Done::Again,
                 Some(Some(head)) => {
-                    let parked = self
+                    let taken = self
                         .dead_letter(
                             msg,
                             &raw_headers,
@@ -593,9 +622,10 @@ impl EventConsumer {
                             0,
                         )
                         .await;
-                    if !parked {
+                    let Some(outcome) = taken else {
                         return Done::Again;
-                    }
+                    };
+                    self.consumed(&type_label, outcome);
                     // A replay never reaches the sagas (ADR 0023).
                     if self
                         .control
@@ -630,10 +660,21 @@ impl EventConsumer {
                     },
                 )
                 .await;
+            if let Some(took) = stages.stage_one_took {
+                self.metrics
+                    .event_handled(self.processor_label.clone(), type_label.clone(), took);
+            }
             let (failure, in_stage_one) = match (stages.stage_one, stages.stage_two) {
                 (Some(Err(e)), _) => (e, true),
                 (_, Some(Err(e))) => (e, false),
-                _ => return Done::Ack { processed: true },
+                (Some(Ok(StageOneDone::Duplicate)), None) => {
+                    self.consumed(&type_label, Consumed::Duplicate);
+                    return Done::Ack { processed: true };
+                }
+                _ => {
+                    self.consumed(&type_label, Consumed::Handled);
+                    return Done::Ack { processed: true };
+                }
             };
             // A payload the handler cannot read (or a handler's own InvalidMessage) cannot get
             // better by retrying: parked after this attempt.
@@ -652,6 +693,7 @@ impl EventConsumer {
                 // Stage 1 is done; the saga stage could not even park its failure (ADR 0021): logged
                 // and skipped, no letter (a retry would find the marker and do nothing).
                 tracing::error!(processor = %self.name, r#type = %type_name, id = %id, topic = msg.topic(), partition = msg.partition(), offset = msg.offset(), attempts = attempt, "saga stage failed, record skipped: {failure}");
+                self.consumed(&type_label, Consumed::Failed);
                 return Done::Ack { processed: false };
             }
             tracing::error!(processor = %self.name, r#type = %type_name, id = %id, topic = msg.topic(), partition = msg.partition(), offset = msg.offset(), attempts = attempt, "event handler failed on every attempt: {failure}");
@@ -659,12 +701,19 @@ impl EventConsumer {
                 .letter_after_attempts(
                     msg,
                     &raw_headers,
+                    &type_label,
                     DeadLetterError::from_error(&failure),
                     attempt,
                 )
                 .await;
         }
         Done::Ack { processed: false }
+    }
+
+    /// How a record ended for this processor (`kraken.events.consumed`).
+    fn consumed(&self, type_label: &Value, outcome: Consumed) {
+        self.metrics
+            .event_consumed(self.processor_label.clone(), type_label.clone(), outcome);
     }
 
     /// What this processor's stage-1 marker of `msg` records (ADR 0023).
@@ -684,10 +733,11 @@ impl EventConsumer {
         &self,
         msg: &BorrowedMessage<'_>,
         raw_headers: &[(String, Vec<u8>)],
+        type_label: &Value,
         error: DeadLetterError,
         attempts: u32,
     ) -> Done {
-        if self
+        if let Some(outcome) = self
             .dead_letter(
                 msg,
                 raw_headers,
@@ -698,6 +748,7 @@ impl EventConsumer {
             )
             .await
         {
+            self.consumed(type_label, outcome);
             return Done::Ack { processed: false };
         }
         let generation = self.monitor.generation();
@@ -804,9 +855,11 @@ impl EventConsumer {
         }
     }
 
-    /// Hands the record to the sink: logged (mode `log`), produced to `<topic>.dlt` (mode `topic`,
-    /// SEQUENCED never happens there) or parked in `dead_letters` (mode `collection`). False when
-    /// the sink could not take it: the record is then not acknowledged and comes again.
+    /// Hands the record to the sink: logged (mode `log`, the record [`Consumed::Failed`]),
+    /// produced to `<topic>.dlt` (mode `topic`, SEQUENCED never happens there) or parked in
+    /// `dead_letters` (mode `collection`), the record [`Consumed::Parked`] (or
+    /// [`Consumed::Duplicate`]: its letter was there already). `None` when the sink could not take
+    /// it: the record is then not acknowledged and comes again.
     async fn dead_letter(
         &self,
         msg: &BorrowedMessage<'_>,
@@ -815,11 +868,11 @@ impl EventConsumer {
         error: DeadLetterError,
         blocked_by: Option<String>,
         attempts: u32,
-    ) -> bool {
+    ) -> Option<Consumed> {
         match &self.sink {
             Sink::Log => {
                 tracing::error!(processor = %self.name, topic = msg.topic(), partition = msg.partition(), offset = msg.offset(), reason = reason.as_str(), "record skipped: {}", error.message);
-                true
+                Some(Consumed::Failed)
             }
             Sink::Topic { producer, topic } => {
                 let mut headers = OwnedHeaders::new();
@@ -860,12 +913,12 @@ impl EventConsumer {
                     .send(record, Timeout::After(Duration::from_secs(30)))
                     .await
                 {
-                    Ok(_) => true,
+                    Ok(_) => Some(Consumed::Parked),
                     Err((e, _)) => {
                         tracing::warn!(processor = %self.name, dlt = %topic, "cannot produce to the dead-letter topic, the record comes again: {e}");
                         self.monitor
                             .error(&format!("dead-letter topic {topic}: {e}"));
-                        false
+                        None
                     }
                 }
             }
@@ -896,24 +949,26 @@ impl EventConsumer {
                 };
                 match store.park(&letter).await {
                     Ok(parked) => {
-                        if parked == Parked::Already {
+                        let outcome = if parked == Parked::Already {
                             tracing::info!(processor = %self.name, letter = %letter.id, "record already parked");
+                            Consumed::Duplicate
                         } else {
                             tracing::warn!(processor = %self.name, letter = %letter.id, reason = reason.as_str(), "record parked in dead_letters");
-                        }
+                            Consumed::Parked
+                        };
                         if reason != DeadLetterReason::Invalid
                             && let Some(key) = &letter.key
                         {
                             self.parked.lock().unwrap().keys.insert(key.clone());
                         }
                         self.monitor.sample_dead_letters_soon();
-                        true
+                        Some(outcome)
                     }
                     Err(e) => {
                         tracing::warn!(processor = %self.name, letter = %letter.id, "cannot park the record, it comes again (its offset stays uncommitted): {e}");
                         self.monitor
                             .error(&format!("cannot park {}: {e}", letter.id));
-                        false
+                        None
                     }
                 }
             }

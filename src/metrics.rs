@@ -64,22 +64,25 @@ pub const DURATION_BOUNDARIES: [f64; 15] = [
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 
-/// How one record ended for its processor's stage 1 (`kraken_events_consumed_total{outcome}`).
+/// How one record ended for one processor (`kraken.events.consumed{outcome}`): one per record
+/// and processor, at its final outcome there, never per attempt (a stop in the middle of the
+/// attempts records nothing: the record comes again).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Consumed {
-    /// The handlers ran and their marker committed (or, for a type only the sagas handle, the saga
-    /// stage ran).
+    /// The dispatch succeeded: stage 1 ran (in `default` the saga stage too, including for an
+    /// event no saga instance claimed), or the saga stage alone for a type only sagas handle.
     Handled,
-    /// The marker was there already: nothing ran.
+    /// The processor's stage-1 marker already existed and no saga stage ran, or the record's own
+    /// letter already existed (a redelivery after a crash).
     Duplicate,
-    /// Acknowledged without handling: no handler here, or a malformed record in dead-letter mode
-    /// `log`.
+    /// The processor does not handle the type.
     Skipped,
-    /// Its attempts were exhausted and it was skipped without a letter (mode `log`), or the saga
-    /// stage failed for good.
+    /// Given up without a letter: mode `log` after the attempts or for a malformed record, or
+    /// only the saga stage failed for good (in `default`).
     Failed,
-    /// It went to the dead letters (the collection or `<topic>.dlt`): it failed on every
-    /// attempt, was malformed, or its key had a parked letter.
+    /// Taken by the dead letters (mode `collection` or `topic`): it failed on every attempt
+    /// (`HANDLER_FAILED`), was malformed (`INVALID`) or its key had a parked letter
+    /// (`SEQUENCED`).
     Parked,
 }
 
@@ -95,8 +98,9 @@ impl Consumed {
     }
 }
 
-/// The `outcome` of a hub request: `ok`, or what its error is (the hub's names where it has
-/// them).
+/// The `outcome` of a hub request: `ok`, or what its error is: the hub's outcome names, plus
+/// `unavailable` (no live hub, or the hub connection broke) and `error` (anything else), as
+/// Kotlin's. A reply that does not decode is `invalid_request` (see [`DECODE_FAILED`]).
 pub fn request_outcome(result: Result<(), &MessagingError>) -> &'static str {
     let Err(e) = result else {
         return "ok";
@@ -112,14 +116,16 @@ pub fn request_outcome(result: Result<(), &MessagingError>) -> &'static str {
         MessagingError::Unauthenticated(_) | MessagingError::AccessDenied(_) => "denied",
         MessagingError::InvalidMessage(_) => "invalid_request",
         MessagingError::Cancelled(_) => "cancelled",
-        MessagingError::HubUnavailable(_) => "unavailable",
-        MessagingError::HubConnectionLost(_) => "connection_lost",
+        MessagingError::HubUnavailable(_) | MessagingError::HubConnectionLost(_) => "unavailable",
         MessagingError::HubRegistrationRejected(_)
         | MessagingError::Serialization(_)
         | MessagingError::Storage(_)
-        | MessagingError::Transport(_) => "other",
+        | MessagingError::Transport(_) => "error",
     }
 }
+
+/// The `outcome` of a hub request whose reply did not decode.
+pub const DECODE_FAILED: &str = "invalid_request";
 
 /// The bounded values of a `type` label: the types this service registered, interned (a label
 /// costs no allocation), anything else [`OTHER`].
@@ -378,11 +384,16 @@ mod tests {
         );
         assert_eq!(
             request_outcome(Err(&MessagingError::HubConnectionLost("x".into()))),
-            "connection_lost"
+            "unavailable",
+            "the hub connection broke: as Kotlin's"
+        );
+        assert_eq!(
+            request_outcome(Err(&MessagingError::HubUnavailable("x".into()))),
+            "unavailable"
         );
         assert_eq!(
             request_outcome(Err(&MessagingError::Storage("x".into()))),
-            "other"
+            "error"
         );
     }
 

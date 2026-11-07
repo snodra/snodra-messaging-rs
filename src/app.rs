@@ -901,6 +901,7 @@ impl KrakenMessagingBuilder {
                         dead_letter_mode: config.dead_letter_mode,
                         dead_letter_retention: config.dead_letter_retention,
                         db: Some(db.clone()),
+                        metrics: metrics.clone(),
                     },
                     dispatcher,
                     &db,

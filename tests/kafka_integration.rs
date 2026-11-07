@@ -76,6 +76,7 @@ fn consumer(
     db: mongodb::Database,
     registry: HandlerRegistry,
     max_attempts: u32,
+    metrics: &Metrics,
 ) -> Arc<EventConsumer> {
     EventConsumer::processor(
         ProcessorSettings {
@@ -88,6 +89,7 @@ fn consumer(
             dead_letter_mode: DeadLetterMode::Log,
             dead_letter_retention: Duration::from_secs(86_400),
             db: None,
+            metrics: metrics.clone(),
         },
         Arc::new(LocalEventDispatcher::new(
             client,
@@ -201,7 +203,16 @@ async fn consumer_handles_once_and_dedupes() {
             Ok(())
         }
     });
-    let consumer = consumer(&kafka.bootstrap, "svc-b", client, db.clone(), registry, 3);
+    let meter = TestMeter::new();
+    let consumer = consumer(
+        &kafka.bootstrap,
+        "svc-b",
+        client,
+        db.clone(),
+        registry,
+        3,
+        &Metrics::new(meter.meter()),
+    );
     let cancel = CancellationToken::new();
     let handle = consumer.start(cancel.clone());
 
@@ -214,11 +225,11 @@ async fn consumer_handles_once_and_dedupes() {
         at: Utc::now(),
     })
     .unwrap();
-    for _ in 0..2 {
+    for type_name in ["t.Happened", "t.Happened", "x.Foreign"] {
         let hs = rdkafka::message::OwnedHeaders::new()
             .insert(rdkafka::message::Header {
                 key: headers::TYPE,
-                value: Some("t.Happened"),
+                value: Some(type_name),
             })
             .insert(rdkafka::message::Header {
                 key: headers::ID,
@@ -259,6 +270,31 @@ async fn consumer_handles_once_and_dedupes() {
         .await
         .unwrap();
     assert_eq!(markers, 1);
+    let consumed = |type_name: &str, outcome: &str| {
+        meter.value(
+            metrics::EVENTS_CONSUMED,
+            &[
+                ("processor", "default"),
+                ("type", type_name),
+                ("outcome", outcome),
+            ],
+        )
+    };
+    assert_eq!(consumed("t.Happened", "handled"), Some(1.0));
+    assert_eq!(consumed("t.Happened", "duplicate"), Some(1.0));
+    assert_eq!(
+        consumed("other", "skipped"),
+        Some(1.0),
+        "a foreign type is not a label value"
+    );
+    assert_eq!(
+        meter.value(
+            metrics::EVENT_HANDLER_DURATION,
+            &[("processor", "default"), ("type", "t.Happened")]
+        ),
+        Some(2.0),
+        "every stage-1 run is timed, the duplicate's too"
+    );
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
 }
@@ -286,7 +322,16 @@ async fn panicking_handler_is_retried_then_skipped() {
             Ok(())
         }
     });
-    let consumer = consumer(&kafka.bootstrap, "svc-c", client, db.clone(), registry, 2);
+    let meter = TestMeter::new();
+    let consumer = consumer(
+        &kafka.bootstrap,
+        "svc-c",
+        client,
+        db.clone(),
+        registry,
+        2,
+        &Metrics::new(meter.meter()),
+    );
     let cancel = CancellationToken::new();
     let handle = consumer.start(cancel.clone());
 
@@ -338,6 +383,30 @@ async fn panicking_handler_is_retried_then_skipped() {
         .await
         .unwrap();
     assert_eq!(markers, 1, "only the good record is marked processed");
+    let consumed = |outcome: &str| {
+        meter.value(
+            metrics::EVENTS_CONSUMED,
+            &[
+                ("processor", "default"),
+                ("type", "t.Happened"),
+                ("outcome", outcome),
+            ],
+        )
+    };
+    assert_eq!(
+        consumed("failed"),
+        Some(1.0),
+        "mode log: given up, no letter"
+    );
+    assert_eq!(consumed("handled"), Some(1.0));
+    assert_eq!(
+        meter.value(
+            metrics::EVENT_HANDLER_DURATION,
+            &[("processor", "default"), ("type", "t.Happened")]
+        ),
+        Some(3.0),
+        "both attempts of the poison record and the good one"
+    );
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
 }
