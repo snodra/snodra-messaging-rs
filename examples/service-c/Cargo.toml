@@ -15,6 +15,11 @@ serde = { version = "1.0.229", features = ["derive"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The metrics export (ADR 0026): the OTLP meter provider the library's metrics go to when
+# KRAKEN_OTLP_ENDPOINT is set (the versions kraken-hub and files-service use).
+opentelemetry = { version = "0.33.1", default-features = false, features = ["metrics"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["grpc-tonic", "metrics"] }
 serde_json = "1.0.154"
 # The banner saga's edge (example-only, not the crate's): the printer webhook and GET /banners over
 # HTTP (axum, already in the lock through tonic) and the printer client (the crate's reqwest).

@@ -88,7 +88,15 @@ and reset `audit` and retry and discard its letters through the hub's HTTP API (
 processors and dead letters").
 
 Configuration is the crate's `Config::from_env`: `KRAKEN_SERVICE_NAME` (`service-c`), `KRAKEN_HUB_ADDRESS`,
-`KRAKEN_KAFKA_BOOTSTRAP`, `KRAKEN_MONGODB_URI` (its own database), `RUST_LOG` (default `info`).
+`KRAKEN_KAFKA_BOOTSTRAP`, `KRAKEN_MONGODB_URI` (its own database), `KRAKEN_INSTANCE_ID` (default a fresh UUID),
+`RUST_LOG` (default `info`).
+
+Metrics (ADR 0026, the crate README's "Metrics"): with `KRAKEN_OTLP_ENDPOINT` set (OTLP/gRPC, e.g.
+`http://otel-lgtm:4317`) `src/telemetry.rs` installs an OTLP meter provider as the global one before the messaging is
+built, with the resource `service.name` = `KRAKEN_SERVICE_NAME` and `service.instance.id` = the instance id the hub
+sees, and exports every 60 s (`OTEL_METRIC_EXPORT_INTERVAL`, ms, changes it); the library's series then reach
+Prometheus with `job="service-c"` and `instance="<instance id>"`. Unset (the default), no provider is installed and
+the library records nothing.
 
 Run from the IDE against the sandbox infrastructure:
 

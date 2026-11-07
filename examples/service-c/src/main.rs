@@ -16,6 +16,7 @@ mod handlers;
 mod http;
 mod messages;
 mod printer;
+mod telemetry;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -78,6 +79,11 @@ async fn main() -> Result<(), MessagingError> {
         .init();
 
     let config = Config::from_env()?;
+    // Before the builder: the library records on the global meter provider as it is then.
+    let otlp_endpoint = std::env::var("KRAKEN_OTLP_ENDPOINT")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let _metrics = telemetry::init_metrics(&config, otlp_endpoint.as_deref())?;
     let banners = BannerSettings::from_env()?;
     let audit = audit::Audit::default();
     let (audit_handler, audit_notifier, audit_resets) =
