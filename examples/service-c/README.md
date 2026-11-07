@@ -96,7 +96,12 @@ Metrics (ADR 0026, the crate README's "Metrics"): with `KRAKEN_OTLP_ENDPOINT` se
 built, with the resource `service.name` = `KRAKEN_SERVICE_NAME` and `service.instance.id` = the instance id the hub
 sees, and exports every 60 s (`OTEL_METRIC_EXPORT_INTERVAL`, ms, changes it); the library's series then reach
 Prometheus with `job="service-c"` and `instance="<instance id>"`. Unset (the default), no provider is installed and
-the library records nothing.
+the library records nothing. The examples sandbox sets both (`compose.local.yaml`: 5 s).
+
+`GET /greetings/{name}/count` sends service-b's query `examples.CountGreetings` through the hub and answers
+`{"name","count"}` (502 with the error when the call fails): the sandbox's one call from Rust to Kotlin, which gives
+`kraken_hub_client_request_duration_seconds` a Rust sender (the examples smoke's step 29c compares it with
+service-a's).
 
 Run from the IDE against the sandbox infrastructure:
 

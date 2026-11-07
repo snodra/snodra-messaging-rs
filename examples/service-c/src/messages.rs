@@ -51,6 +51,22 @@ impl Query for Inventory {
     type Reply = InventoryLevel;
 }
 
+/// service-b's query (Kotlin `examples-api`): how often a name was greeted. service-c sends it
+/// through the hub from `GET /greetings/{name}/count`, the sandbox's one call from Rust to Kotlin.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct CountGreetings {
+    pub name: String,
+}
+#[derive(Serialize, Deserialize, Debug)]
+pub struct GreetingCount {
+    pub name: String,
+    pub count: i64,
+}
+message_type!(CountGreetings, "examples.CountGreetings");
+impl Query for CountGreetings {
+    type Reply = GreetingCount;
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TextShouted {
     pub text: String,

@@ -6,9 +6,10 @@
 //! command `examples.IncrementCounter`, which drives its counters. Prints every shouted text as a
 //! banner on the sandbox's fake printer through a saga (`banner.rs`, sagas S2), with its own
 //! idempotent printer adapters, the printer's topic as an external source and a small HTTP side for
-//! the printer's webhook and the banner outcomes (`http.rs`). Runs a named event processor, `audit`
-//! (`audit.rs`, P6a), whose failures become dead letters the example's admin endpoints retry and
-//! discard.
+//! the printer's webhook and the banner outcomes (`http.rs`), which also sends service-b's
+//! `examples.CountGreetings` through the hub (the sandbox's call from Rust to Kotlin). Runs a
+//! named event processor, `audit` (`audit.rs`, P6a), whose failures become dead letters the
+//! example's admin endpoints retry and discard.
 
 mod audit;
 mod banner;
@@ -296,6 +297,7 @@ async fn main() -> Result<(), MessagingError> {
         ingress: app.ingress(),
         secret: banners.secret,
         outcomes,
+        sender: app.sender(),
     })
     .merge(audit::router(audit::AuditHttp {
         audit,
