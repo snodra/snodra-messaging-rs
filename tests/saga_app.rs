@@ -124,11 +124,11 @@ async fn an_event_starts_a_saga_whose_command_reaches_the_idempotent_adapter_and
     let mongo = support::containers::mongo().await;
     let calls: Arc<Mutex<Vec<MessageContext>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let builder = KrakenMessaging::builder(config(
-        &hub.address(),
-        &kafka.bootstrap,
-        &mongo.uri_for("banner"),
-    ))
+    let meter = support::metrics::TestMeter::new();
+    let builder = KrakenMessaging::builder_with_meter(
+        config(&hub.address(), &kafka.bootstrap, &mongo.uri_for("banner")),
+        meter.meter(),
+    )
     .await
     .unwrap();
     let recorded = Arc::clone(&calls);
@@ -367,6 +367,36 @@ async fn an_event_starts_a_saga_whose_command_reaches_the_idempotent_adapter_and
         3
     );
     assert!(app.saga_failures().list(None).await.unwrap().is_empty());
+    // -- and so did the meter, with the same names and labels
+    use kraken_messaging::saga::stats::{
+        DEADLINES_FIRED, EXTERNAL_CALLS, SAGA_DISPATCH_PENDING, SAGAS_ACTIVE, SAGAS_ENDED,
+        SAGAS_STARTED,
+    };
+    assert_eq!(
+        meter.value(SAGAS_STARTED, &[("type", "app.Banner")]),
+        Some(3.0)
+    );
+    assert_eq!(
+        meter.value(SAGAS_ENDED, &[("type", "app.Banner")]),
+        Some(3.0)
+    );
+    assert_eq!(
+        meter.value(DEADLINES_FIRED, &[("name", "banner-timeout")]),
+        Some(1.0)
+    );
+    assert_eq!(
+        meter.value(
+            EXTERNAL_CALLS,
+            &[("handler", "app.PrintBanner"), ("outcome", "succeeded")]
+        ),
+        Some(3.0)
+    );
+    assert!(
+        meter
+            .value(SAGAS_ACTIVE, &[("type", "app.Banner")])
+            .is_some()
+    );
+    assert!(meter.value(SAGA_DISPATCH_PENDING, &[]).is_some());
 
     // -- the adapter's command type is registered with the hub
     let registers = hub.registers().await;

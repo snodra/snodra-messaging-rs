@@ -54,9 +54,9 @@ use crate::processors::{
 };
 use crate::proto::ProcessorStatus;
 use crate::saga::{
-    Clock, DeadlineScheduler, LocalFirstSender, RawCommandSender, SagaDefinition,
-    SagaDispatchRelay, SagaFailures, SagaPorts, SagaRetry, SagaRuntime, SagaStats, SagaType,
-    ensure_external_call_indexes, ensure_saga_indexes, stats::SAMPLE_INTERVAL,
+    Clock, DeadlineScheduler, LocalFirstSender, OtelSagaMetrics, RawCommandSender, SagaDefinition,
+    SagaDispatchRelay, SagaFailures, SagaMetrics, SagaPorts, SagaRetry, SagaRuntime, SagaStats,
+    SagaType, ensure_external_call_indexes, ensure_saga_indexes, stats::SAMPLE_INTERVAL,
     validate_registrations,
 };
 use crate::types::{Command, Event, MessageType, Query, StreamingQuery, SubscriptionQuery};
@@ -109,6 +109,9 @@ pub struct KrakenMessaging {
     handlers: TaskTracker,
     ingress: ExternalEventIngress,
     stats: SagaStats,
+    /// What the saga runtime, relay, scheduler and idempotent handlers report to: `stats` and
+    /// the meter ([`OtelSagaMetrics`]).
+    saga_metrics: Arc<dyn SagaMetrics>,
     /// The saga runtime, when a saga is registered (and enabled).
     runtime: Option<Arc<SagaRuntime>>,
     /// Stops the relay, the deadline scheduler and the gauge sampler.
@@ -266,14 +269,14 @@ impl KrakenMessaging {
                 SagaPorts::mongo(self.client.clone(), self.db.clone()),
                 self.clock.clone(),
                 SagaRetry::default(),
-                Arc::new(self.stats.clone()),
+                Arc::clone(&self.saga_metrics),
             ))
         });
         SagaFailures::new(runtime)
     }
 
-    /// The saga, deadline, dispatch and external-call statistics (S2-R7): the Kotlin meters'
-    /// names and labels as counters and gauges, see [`SagaStats`] and
+    /// The saga, deadline, dispatch and external-call statistics (S2-R7): the values the saga
+    /// metrics export (ADR 0026), as counters and gauges in memory, see [`SagaStats`] and
     /// [`crate::saga::stats`]. All zero in a service without sagas or idempotent handlers.
     pub fn saga_stats(&self) -> SagaStats {
         self.stats.clone()
@@ -783,13 +786,15 @@ impl KrakenMessagingBuilder {
             Vec::new()
         };
         ensure_indexes(&db, config.outbox_retention, config.idempotency_retention).await?;
+        let saga_metrics: Arc<dyn SagaMetrics> =
+            Arc::new(OtelSagaMetrics::new(&metrics, stats.clone()));
         if !registry.idempotent_handlers().is_empty() {
             ensure_external_call_indexes(&db, config.external_calls_retention).await?;
             external_calls.bind(ExternalCalls::new(
                 db.clone(),
                 clock.clone(),
                 config.external_call_settings(),
-                Arc::new(stats.clone()),
+                Arc::clone(&saga_metrics),
             )?);
         }
         let registry = Arc::new(registry);
@@ -815,7 +820,7 @@ impl KrakenMessagingBuilder {
                 SagaPorts::mongo(client.clone(), db.clone()),
                 clock.clone(),
                 config.saga_retry(),
-                Arc::new(stats.clone()),
+                Arc::clone(&saga_metrics),
             )))
         };
         let stage: Arc<dyn SagaStage> = match &runtime {
@@ -1004,7 +1009,7 @@ impl KrakenMessagingBuilder {
                 Arc::clone(&local),
                 clock.clone(),
                 config.relay_settings(),
-                Arc::new(stats.clone()),
+                Arc::clone(&saga_metrics),
             )?;
             saga_tasks.push(relay.start(saga_cancel.clone()));
             let scheduler = DeadlineScheduler::new(
@@ -1012,7 +1017,7 @@ impl KrakenMessagingBuilder {
                 Arc::clone(runtime),
                 clock.clone(),
                 config.deadline_settings(),
-                Arc::new(stats.clone()),
+                Arc::clone(&saga_metrics),
             )?;
             saga_tasks.push(scheduler.start(saga_cancel.clone()));
             saga_tasks.push(stats.start_sampler(db.clone(), SAMPLE_INTERVAL, saga_cancel.clone()));
@@ -1042,6 +1047,7 @@ impl KrakenMessagingBuilder {
             handlers,
             ingress,
             stats,
+            saga_metrics,
             runtime,
             saga_cancel,
             saga_tasks,

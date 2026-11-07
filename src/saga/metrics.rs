@@ -1,7 +1,7 @@
-//! What the saga runtime, relay and scheduler report. The crate has no metrics registry (P5b), so
-//! the hooks are a trait: the statistics of Task 12 implement it; [`NoopSagaMetrics`] is the
-//! default. Every method has an empty default so hooks can be added without breaking
-//! implementations.
+//! What the saga runtime, relay and scheduler report: a trait. The application's is
+//! [`OtelSagaMetrics`](super::OtelSagaMetrics) (the meter and the [`SagaStats`](super::SagaStats)
+//! behind `KrakenMessaging::saga_stats()`, ADR 0026); [`NoopSagaMetrics`] reports nothing. Every
+//! method has an empty default so hooks can be added without breaking implementations.
 
 use std::collections::HashMap;
 
