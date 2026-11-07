@@ -154,7 +154,7 @@ impl KrakenMessaging {
         let hubs = HubPool::new(
             settings,
             config.service_name.clone(),
-            uuid::Uuid::new_v4().to_string(),
+            config.instance_id.clone(),
             tx,
         )?;
         let sender = Sender::with_pool(
@@ -282,6 +282,7 @@ impl KrakenMessaging {
         self.stats.clone()
     }
 
+    /// `Config.instance_id`: the id the hubs know this instance by.
     pub fn instance_id(&self) -> &str {
         self.hubs.instance_id()
     }

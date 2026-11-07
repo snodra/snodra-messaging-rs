@@ -57,6 +57,10 @@ pub struct Config {
     /// Hub `Register.service_name`, event `source`, and the base of the event processors' Kafka
     /// consumer groups (`<service_name>.<processor>`, `default` included).
     pub service_name: String,
+    /// This instance's id: its hub `Register.instance_id` and the `service.instance.id` the
+    /// application gives its meter provider's resource (ADR 0026). A fresh UUID per `Config`
+    /// unless set (`KRAKEN_INSTANCE_ID`, e.g. a pod name); unique among the service's instances.
+    pub instance_id: String,
     /// The hubs to connect to (ADR 0016): `host:port` (`static://` prefix optional), a
     /// comma-separated list of them, or one `dns:///name:port` whose addresses are re-resolved
     /// every 30 s. One address is the single-hub setup.
@@ -188,6 +192,7 @@ impl Config {
     ) -> Config {
         Config {
             service_name: service_name.to_string(),
+            instance_id: uuid::Uuid::new_v4().to_string(),
             hub_address: hub_address.to_string(),
             hub_status_interval: Duration::from_secs(5),
             hub_request_timeout: None,
@@ -276,7 +281,7 @@ impl Config {
 
     /// `KRAKEN_SERVICE_NAME` and `KRAKEN_MONGODB_URI` are required; `KRAKEN_HUB_ADDRESS` defaults to
     /// `static://kraken-hub:7000`, `KRAKEN_KAFKA_BOOTSTRAP` to `kafka:19092`. Optional:
-    /// `KRAKEN_KAFKA_TOPIC`, `KRAKEN_JWKS_URL`, `KRAKEN_ISSUER`, `KRAKEN_HUB_REQUEST_TIMEOUT_MS`,
+    /// `KRAKEN_INSTANCE_ID`, `KRAKEN_KAFKA_TOPIC`, `KRAKEN_JWKS_URL`, `KRAKEN_ISSUER`, `KRAKEN_HUB_REQUEST_TIMEOUT_MS`,
     /// `KRAKEN_HUB_STATUS_INTERVAL_MS`, `KRAKEN_RECONNECT_BACKOFF_MIN_MS`,
     /// `KRAKEN_RECONNECT_BACKOFF_MAX_MS`,
     /// `KRAKEN_MAX_CONCURRENT_HANDLERS`, `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS`,
@@ -324,6 +329,9 @@ impl Config {
             &optional("KRAKEN_KAFKA_BOOTSTRAP").unwrap_or_else(|| "kafka:19092".into()),
             &required("KRAKEN_MONGODB_URI")?,
         );
+        if let Some(id) = optional("KRAKEN_INSTANCE_ID") {
+            c.instance_id = id;
+        }
         if let Some(t) = optional("KRAKEN_KAFKA_TOPIC") {
             c.kafka_topic = t;
         }
@@ -553,6 +561,11 @@ impl Config {
         if self.service_name.trim().is_empty() {
             return Err(MessagingError::InvalidMessage(
                 "service_name must not be empty".into(),
+            ));
+        }
+        if self.instance_id.trim().is_empty() {
+            return Err(MessagingError::InvalidMessage(
+                "instance_id (KRAKEN_INSTANCE_ID) must not be empty".into(),
             ));
         }
         HubTargets::parse(&self.hub_address)?;
@@ -899,6 +912,21 @@ mod tests {
 
     fn code_config() -> Config {
         Config::new("svc", "static://hub:7000", "kafka:19092", "mongodb://m/db")
+    }
+
+    #[test]
+    fn the_instance_id_is_a_fresh_uuid_unless_set() {
+        let (a, b) = (code_config(), code_config());
+        uuid::Uuid::parse_str(&a.instance_id).expect("a UUID");
+        assert_ne!(a.instance_id, b.instance_id, "one per Config");
+        uuid::Uuid::parse_str(&from(&[]).instance_id).expect("a UUID from the environment too");
+        assert_eq!(
+            from(&[("KRAKEN_INSTANCE_ID", "pod-7")]).instance_id,
+            "pod-7"
+        );
+        let mut c = code_config();
+        c.instance_id = " ".into();
+        assert!(c.validate().is_err(), "an empty id");
     }
 
     #[test]
