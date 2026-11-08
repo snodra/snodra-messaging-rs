@@ -14,7 +14,7 @@
 //! `kraken.processor.lag{processor,partition}` (each assigned partition whose lag is known) and
 //! `kraken.dead.letters{processor}`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -88,6 +88,13 @@ pub struct ProcessorMonitor {
     sample: Notify,
 }
 
+fn lag_attrs(processor: &str, partition: i32) -> [KeyValue; 2] {
+    [
+        KeyValue::new("processor", processor.to_string()),
+        KeyValue::new("partition", partition.to_string()),
+    ]
+}
+
 impl ProcessorMonitor {
     pub fn new(
         name: &str,
@@ -117,9 +124,38 @@ impl ProcessorMonitor {
     }
 
     /// Registers the processor gauges of `monitors` on `metrics`; a monitor reports while it
-    /// lives.
+    /// lives. The lag of a partition that left the assignment (or whose monitor is gone) is
+    /// observed once more as 0, then not at all: Prometheus keeps a series that stops at its last
+    /// value for minutes (no staleness over OTLP), which next to the new owner's would read as a
+    /// lag nobody has. An assigned partition whose lag is unknown is not observed (0 means caught
+    /// up).
     pub(crate) fn observe(monitors: &[Arc<ProcessorMonitor>], metrics: &Metrics) {
         let watched: Arc<[Weak<ProcessorMonitor>]> = monitors.iter().map(Arc::downgrade).collect();
+        let lag = {
+            let watched = Arc::clone(&watched);
+            let last = Mutex::new(HashSet::<(String, i32)>::new());
+            move |o: &dyn AsyncInstrument<u64>| {
+                let statuses: Vec<ProcessorStatus> = watched
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .map(|m| m.status())
+                    .collect();
+                let assigned: HashSet<(String, i32)> = statuses
+                    .iter()
+                    .flat_map(|s| s.partitions.iter().map(|p| (s.name.clone(), p.partition)))
+                    .collect();
+                let mut last = last.lock().unwrap();
+                for (processor, partition) in last.difference(&assigned) {
+                    o.observe(0, &lag_attrs(processor, *partition));
+                }
+                for s in &statuses {
+                    for p in s.partitions.iter().filter(|p| p.lag >= 0) {
+                        o.observe(p.lag as u64, &lag_attrs(&s.name, p.partition));
+                    }
+                }
+                *last = assigned;
+            }
+        };
         let each = move |report: fn(&ProcessorStatus, &dyn AsyncInstrument<u64>)| {
             let watched = Arc::clone(&watched);
             move |o: &dyn AsyncInstrument<u64>| {
@@ -146,18 +182,8 @@ impl ProcessorMonitor {
             .build();
         meter
             .u64_observable_gauge(PROCESSOR_LAG)
-            .with_description("Records behind on each partition assigned to this instance whose lag is known, as the processor status")
-            .with_callback(each(|s, o| {
-                for p in s.partitions.iter().filter(|p| p.lag >= 0) {
-                    o.observe(
-                        p.lag as u64,
-                        &[
-                            KeyValue::new("processor", s.name.clone()),
-                            KeyValue::new("partition", p.partition.to_string()),
-                        ],
-                    );
-                }
-            }))
+            .with_description("Records behind on each partition assigned to this instance whose lag is known, as the processor status (a partition that left the assignment reads 0 once)")
+            .with_callback(lag)
             .build();
         meter
             .u64_observable_gauge(DEAD_LETTERS)
@@ -442,16 +468,33 @@ mod tests {
         );
         assert_eq!(t.value(DEAD_LETTERS, &[("processor", "orders")]), Some(3.0));
 
+        // Prometheus keeps a series that stops at its last value (no staleness over OTLP): a
+        // revoked partition reads 0 once, then is gone; its new owner reports it from then on.
         m.revoked(&[0]);
-        assert!(
-            t.points_of(PROCESSOR_LAG).is_empty(),
-            "a revoked partition is no longer reported"
-        );
+        let lag = |t: &TestMeter| {
+            let mut lag: Vec<(String, f64)> = t
+                .points_of(PROCESSOR_LAG)
+                .into_iter()
+                .map(|p| (p.attributes["partition"].clone(), p.value))
+                .collect();
+            lag.sort_by(|a, b| a.0.cmp(&b.0));
+            lag
+        };
+        assert_eq!(lag(&t), [("0".to_string(), 0.0)], "revoked: 0 once");
+        assert_eq!(lag(&t), [], "then no longer reported");
+        // Partition 1 is still assigned, its lag unknown: absent, not 0 (0 means caught up).
+        assert_eq!(m.assigned_partitions(), [1]);
         drop(m);
+        assert_eq!(
+            lag(&t),
+            [("1".to_string(), 0.0)],
+            "a dropped monitor's partitions read 0 once"
+        );
         assert!(
             t.points_of(PROCESSOR_STATE).is_empty(),
             "a dropped monitor reports nothing"
         );
+        assert_eq!(lag(&t), []);
     }
 
     #[test]
