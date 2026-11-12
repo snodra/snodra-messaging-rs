@@ -387,7 +387,7 @@ async fn db(uri: &str) -> Database {
 const DAY: Duration = Duration::from_secs(86_400);
 
 async fn ensure_all(db: &Database) {
-    ensure_saga_indexes(db, 30 * DAY, 7 * DAY, 7 * DAY)
+    ensure_saga_indexes(db, 30 * DAY, 7 * DAY, 7 * DAY, 30 * DAY)
         .await
         .unwrap();
     ensure_external_call_indexes(db, 30 * DAY).await.unwrap();
@@ -474,6 +474,9 @@ async fn every_index_of_the_contract_exists_with_its_keys_partial_filters_and_tt
         options(&index(&db, "saga_dispatch", &["dispatchedAt"]).await).expire_after,
         Some(7 * DAY)
     );
+    let failed = index(&db, "saga_dispatch", &["failedAt"]).await;
+    assert_eq!(options(&failed).name.as_deref(), Some("failedAt_ttl"));
+    assert_eq!(options(&failed).expire_after, Some(30 * DAY));
     assert_eq!(
         options(&index(&db, "saga_dispatch_leases", &["until"]).await).expire_after,
         Some(Duration::ZERO)
@@ -487,13 +490,9 @@ async fn every_index_of_the_contract_exists_with_its_keys_partial_filters_and_tt
     );
 
     index(&db, "saga_failures", &["sagaType", "lastFailedAt"]).await;
-    assert!(
-        indexes(&db, "saga_failures")
-            .await
-            .iter()
-            .all(|m| options(m).expire_after.is_none()),
-        "saga_failures has no TTL"
-    );
+    let parked = index(&db, "saga_failures", &["lastFailedAt"]).await;
+    assert_eq!(options(&parked).name.as_deref(), Some("lastFailedAt_ttl"));
+    assert_eq!(options(&parked).expire_after, Some(30 * DAY));
 
     assert_eq!(
         options(&index(&db, "external_calls", &["updatedAt"]).await).expire_after,

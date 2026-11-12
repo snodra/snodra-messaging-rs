@@ -39,6 +39,7 @@ impl Store {
             Duration::from_secs(30 * 86_400),
             Duration::from_secs(7 * 86_400),
             Duration::from_secs(7 * 86_400),
+            Duration::from_secs(30 * 86_400),
         )
         .await
         .unwrap();

@@ -155,8 +155,12 @@ pub struct Config {
     /// How long an ended saga instance is kept (`KRAKEN_SAGAS_ENDED_RETENTION_MS`, default 30 d).
     pub sagas_ended_retention: Duration,
     /// How long a dispatched `saga_dispatch` entry is kept (`KRAKEN_SAGAS_DISPATCH_RETENTION_MS`,
-    /// default 7 d; an entry that failed for good stays).
+    /// default 7 d; an entry that failed for good is kept by `sagas_failed_retention`).
     pub sagas_dispatch_retention: Duration,
+    /// How long what failed for good is kept (`KRAKEN_SAGAS_FAILED_RETENTION_MS`, default 30 d):
+    /// `saga_dispatch` entries given up on (by `failedAt`) and parked events in `saga_failures`
+    /// (by `lastFailedAt`, which a retry that fails again moves on).
+    pub sagas_failed_retention: Duration,
     /// `KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS`, default 500 ms.
     pub sagas_relay_poll_interval: Duration,
     /// How long a saga's dispatch lease holds (`KRAKEN_SAGAS_RELAY_LEASE_MS`, default 30 s).
@@ -229,6 +233,7 @@ impl Config {
             sagas_max_attempts: 5,
             sagas_ended_retention: Duration::from_secs(30 * 86_400),
             sagas_dispatch_retention: Duration::from_secs(7 * 86_400),
+            sagas_failed_retention: Duration::from_secs(30 * 86_400),
             sagas_relay_poll_interval: Duration::from_millis(500),
             sagas_relay_lease: Duration::from_secs(30),
             sagas_relay_max_attempts: 10,
@@ -302,7 +307,8 @@ impl Config {
     /// and `KRAKEN_HUB_OAUTH2_CLIENT_ID` defaults to the service name), `KRAKEN_HUB_OAUTH2_SCOPE`,
     /// `KRAKEN_HUB_OAUTH2_CA`; the saga settings (ADR 0021) `KRAKEN_SAGAS_ENABLED`,
     /// `KRAKEN_SAGAS_MAX_ATTEMPTS`, `KRAKEN_SAGAS_ENDED_RETENTION_MS`,
-    /// `KRAKEN_SAGAS_DISPATCH_RETENTION_MS`, `KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS`,
+    /// `KRAKEN_SAGAS_DISPATCH_RETENTION_MS`, `KRAKEN_SAGAS_FAILED_RETENTION_MS`,
+    /// `KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS`,
     /// `KRAKEN_SAGAS_RELAY_LEASE_MS`, `KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS`,
     /// `KRAKEN_SAGAS_RELAY_INITIAL_BACKOFF_MS`, `KRAKEN_SAGAS_RELAY_MAX_BACKOFF_MS`,
     /// `KRAKEN_DEADLINES_POLL_INTERVAL_MS`, `KRAKEN_DEADLINES_LEASE_MS`,
@@ -507,6 +513,10 @@ impl Config {
             (
                 "KRAKEN_SAGAS_DISPATCH_RETENTION_MS",
                 &mut c.sagas_dispatch_retention,
+            ),
+            (
+                "KRAKEN_SAGAS_FAILED_RETENTION_MS",
+                &mut c.sagas_failed_retention,
             ),
             (
                 "KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS",
@@ -733,6 +743,11 @@ impl Config {
                 "sagas_dispatch_retention",
                 "KRAKEN_SAGAS_DISPATCH_RETENTION_MS",
                 self.sagas_dispatch_retention,
+            ),
+            (
+                "sagas_failed_retention",
+                "KRAKEN_SAGAS_FAILED_RETENTION_MS",
+                self.sagas_failed_retention,
             ),
             (
                 "deadlines_retention",
@@ -1686,6 +1701,7 @@ mod tests {
         assert_eq!(c.sagas_max_attempts, 5);
         assert_eq!(c.sagas_ended_retention, Duration::from_secs(30 * 86_400));
         assert_eq!(c.sagas_dispatch_retention, Duration::from_secs(7 * 86_400));
+        assert_eq!(c.sagas_failed_retention, Duration::from_secs(30 * 86_400));
         assert_eq!(c.sagas_relay_poll_interval, Duration::from_millis(500));
         assert_eq!(c.sagas_relay_lease, Duration::from_secs(30));
         assert_eq!(c.sagas_relay_max_attempts, 10);
@@ -1717,6 +1733,7 @@ mod tests {
             ("KRAKEN_SAGAS_MAX_ATTEMPTS", "7"),
             ("KRAKEN_SAGAS_ENDED_RETENTION_MS", "86400000"),
             ("KRAKEN_SAGAS_DISPATCH_RETENTION_MS", "3600000"),
+            ("KRAKEN_SAGAS_FAILED_RETENTION_MS", "172800000"),
             ("KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS", "250"),
             ("KRAKEN_SAGAS_RELAY_LEASE_MS", "10000"),
             ("KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS", "4"),
@@ -1733,6 +1750,7 @@ mod tests {
         assert_eq!(c.saga_retry().max_attempts(), 7);
         assert_eq!(c.sagas_ended_retention, Duration::from_secs(86_400));
         assert_eq!(c.sagas_dispatch_retention, Duration::from_secs(3600));
+        assert_eq!(c.sagas_failed_retention, Duration::from_secs(2 * 86_400));
         let relay = c.relay_settings();
         assert_eq!(relay.poll_interval, Duration::from_millis(250));
         assert_eq!(relay.lease, Duration::from_secs(10));
@@ -1757,6 +1775,8 @@ mod tests {
             ("KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS", "0"),
             ("KRAKEN_SAGAS_ENDED_RETENTION_MS", "999"),
             ("KRAKEN_SAGAS_DISPATCH_RETENTION_MS", "0"),
+            ("KRAKEN_SAGAS_FAILED_RETENTION_MS", "0"),
+            ("KRAKEN_SAGAS_FAILED_RETENTION_MS", "999"),
             ("KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS", "0"),
             ("KRAKEN_SAGAS_RELAY_LEASE_MS", "0"),
             ("KRAKEN_SAGAS_RELAY_INITIAL_BACKOFF_MS", "0"),

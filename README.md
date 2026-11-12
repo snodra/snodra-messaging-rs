@@ -746,6 +746,7 @@ service without sagas):
 | `KRAKEN_SAGAS_MAX_ATTEMPTS` | 5 | attempts of one (event, saga type) on conflicts before it is parked (200 ms doubling to 5 s); a handler error gets two |
 | `KRAKEN_SAGAS_ENDED_RETENTION_MS` | 30 d | TTL of ended sagas |
 | `KRAKEN_SAGAS_DISPATCH_RETENTION_MS` | 7 d | TTL of dispatched `saga_dispatch` entries |
+| `KRAKEN_SAGAS_FAILED_RETENTION_MS` | 30 d | TTL of what failed for good: `saga_dispatch` entries given up on (`failedAt_ttl`) and parked events in `saga_failures` (`lastFailedAt_ttl`, moved on by a retry that fails again); at least 1000 ms |
 | `KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS` | 500 | how often the relay looks for recorded entries |
 | `KRAKEN_SAGAS_RELAY_LEASE_MS` | 30000 | one saga's dispatch lease, renewed while a send runs |
 | `KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS` | 10 | attempts of a command on transient failures before `EXHAUSTED` |

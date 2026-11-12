@@ -809,6 +809,7 @@ impl KrakenMessagingBuilder {
                 config.sagas_ended_retention,
                 config.sagas_dispatch_retention,
                 config.deadlines_retention,
+                config.sagas_failed_retention,
             )
             .await?;
             // Transactions do not create collections on older servers.

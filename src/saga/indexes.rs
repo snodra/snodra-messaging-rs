@@ -24,7 +24,8 @@ fn index(keys: Document, name: &str, configure: impl FnOnce(&mut IndexOptions)) 
 /// `saga_failures`. The association and start-key indexes are partial on `ended: false`, so ended
 /// instances neither route events nor hold a start key; the TTL indexes expire ended sagas
 /// (`ended_retention`, on `endedAt`), dispatched entries (`dispatch_retention`, on
-/// `dispatchedAt`: a failed entry has none and stays), fired or cancelled deadlines
+/// `dispatchedAt`), what failed for good (`failed_retention`: entries given up on, on
+/// `failedAt`, and parked events, on `lastFailedAt`), fired or cancelled deadlines
 /// (`deadline_retention`, on `finishedAt`) and, at once, expired dispatch leases. A document whose
 /// date is absent is never expired.
 pub async fn ensure_saga_indexes(
@@ -32,6 +33,7 @@ pub async fn ensure_saga_indexes(
     ended_retention: Duration,
     dispatch_retention: Duration,
     deadline_retention: Duration,
+    failed_retention: Duration,
 ) -> Result<(), MessagingError> {
     let sagas = db.collection::<Document>(SAGAS_COLLECTION);
     sagas
@@ -66,6 +68,9 @@ pub async fn ensure_saga_indexes(
             index(doc! { "dispatchedAt": 1 }, "dispatchedAt_ttl", |o| {
                 o.expire_after = Some(dispatch_retention)
             }),
+            index(doc! { "failedAt": 1 }, "failedAt_ttl", |o| {
+                o.expire_after = Some(failed_retention)
+            }),
             index(
                 doc! { "noticeNextAt": 1 },
                 "noticePending_noticeNextAt",
@@ -95,11 +100,16 @@ pub async fn ensure_saga_indexes(
         .await?;
 
     db.collection::<Document>(SAGA_FAILURES_COLLECTION)
-        .create_index(index(
-            doc! { "sagaType": 1, "lastFailedAt": 1 },
-            "sagaType_1_lastFailedAt_1",
-            |_| {},
-        ))
+        .create_indexes([
+            index(
+                doc! { "sagaType": 1, "lastFailedAt": 1 },
+                "sagaType_1_lastFailedAt_1",
+                |_| {},
+            ),
+            index(doc! { "lastFailedAt": 1 }, "lastFailedAt_ttl", |o| {
+                o.expire_after = Some(failed_retention)
+            }),
+        ])
         .await?;
     Ok(())
 }
