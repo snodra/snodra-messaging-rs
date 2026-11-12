@@ -411,13 +411,17 @@ async fn a_failing_key_parks_its_later_records_while_other_keys_flow_until_it_is
     let topic = "s.events";
     let handler = Handler::default();
     handler.fail("o-bad");
-    let app = KrakenMessaging::builder(config(
-        "svc-s",
-        &hub.address(),
-        &kafka.bootstrap,
-        &mongo.uri_for("seq"),
-        topic,
-    ))
+    let meter = support::metrics::TestMeter::new();
+    let app = KrakenMessaging::builder_with_meter(
+        config(
+            "svc-s",
+            &hub.address(),
+            &kafka.bootstrap,
+            &mongo.uri_for("seq"),
+            topic,
+        ),
+        meter.meter(),
+    )
     .await
     .unwrap()
     .event::<Placed, _, _>(handler.handle())
@@ -462,6 +466,22 @@ async fn a_failing_key_parks_its_later_records_while_other_keys_flow_until_it_is
             (4, DeadLetterReason::Invalid),
         ]
     );
+    // One outcome per record: a malformed record of a handled type keeps its type, one without a
+    // type header (or of a type nobody handles here) is `other`.
+    let consumed = |type_name: &str, outcome: &str| {
+        meter.value(
+            kraken_messaging::metrics::EVENTS_CONSUMED,
+            &[
+                ("processor", "default"),
+                ("type", type_name),
+                ("outcome", outcome),
+            ],
+        )
+    };
+    assert_eq!(consumed("p.Placed", "parked"), Some(3.0));
+    assert_eq!(consumed("p.Placed", "handled"), Some(3.0));
+    assert_eq!(consumed("other", "parked"), Some(1.0));
+    assert_eq!(consumed("other", "skipped"), Some(1.0));
     let head = parked[0].id.clone();
     assert_eq!(parked[1].blocked_by.as_deref(), Some(head.as_str()));
     assert_eq!(parked[1].attempts, 0);

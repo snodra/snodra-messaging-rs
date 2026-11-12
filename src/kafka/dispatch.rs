@@ -14,6 +14,7 @@
 //! acknowledges the record.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use mongodb::bson::{DateTime, doc};
@@ -111,6 +112,8 @@ pub struct Stages {
     pub stage_one: Option<Result<StageOneDone, MessagingError>>,
     /// `None`: no saga is interested in the type. `Ok(applied)` as [`SagaStage::process`].
     pub stage_two: Option<Result<bool, MessagingError>>,
+    /// How long stage 1 took (its marker transaction with the handlers), when it ran.
+    pub stage_one_took: Option<Duration>,
 }
 
 /// Where the record of a stage-1 marker sits (ADR 0023): the Kafka consumer's markers (and a dead
@@ -353,14 +356,16 @@ impl LocalEventDispatcher {
         ctx: &MessageContext,
         record: RecordDispatch<'_>,
     ) -> Stages {
-        let stage_one = if record.stage_one && self.registry.has_event_handler(type_name) {
-            Some(
-                self.stage_one_done(dedupe_id, type_name, payload, ctx, record)
-                    .await,
-            )
-        } else {
-            None
-        };
+        let (stage_one, stage_one_took) =
+            if record.stage_one && self.registry.has_event_handler(type_name) {
+                let started = Instant::now();
+                let done = self
+                    .stage_one_done(dedupe_id, type_name, payload, ctx, record)
+                    .await;
+                (Some(done), Some(started.elapsed()))
+            } else {
+                (None, None)
+            };
         // Stage 1's failure is held until stage 2 ran: the sagas must not miss an event because an
         // ordinary handler failed. A replay never reaches the sagas: they saw the record already.
         let stage_two = if !record.replay && self.stage.interested(type_name) {
@@ -371,6 +376,7 @@ impl LocalEventDispatcher {
         Stages {
             stage_one,
             stage_two,
+            stage_one_took,
         }
     }
 

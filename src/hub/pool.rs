@@ -68,16 +68,23 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
 use futures::FutureExt;
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::AsyncInstrument;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::MessagingError;
+use crate::metrics::{
+    HUB_CLIENT_CERTIFICATE_ROTATIONS, HUB_CLIENT_CONNECTED_HUBS,
+    HUB_CLIENT_CREDENTIALS_REFRESHES_SENT, HUB_CLIENT_HANDLERS_IN_FLIGHT, HUB_CLIENT_TOKEN_FETCHES,
+    Metrics,
+};
 use crate::proto::{ClientMessage, InstanceStatus, ProcessorStatus, client_message};
 use crate::retry::random_unit;
 use crate::security::HubTls;
 
-use super::auth::AuthStatus;
+use super::auth::{AuthKind, AuthStatus};
 use super::connection::{
     Hooks, HubConnection, HubSettings, Inbound, RegisteredTypes, StreamId, hub_id,
 };
@@ -449,9 +456,75 @@ impl HubPool {
     }
 
     /// The credential refreshes (`ClientMessage.credentials`) written to any hub so far
-    /// (`kraken_messaging_hub_credentials_refreshes_sent_total`).
+    /// (`kraken_hub_client_credentials_refreshes_sent_total`).
     pub fn credentials_refreshes_sent(&self) -> u64 {
         self.refreshes_sent.load(Ordering::Relaxed)
+    }
+
+    /// Registers the hub client gauges and counters on `metrics` (ADR 0026), read from memory
+    /// when the meter collects, while the pool lives: `kraken.hub.client.connected.hubs` (the
+    /// live hubs), `kraken.hub.client.handlers.in.flight` ([`handlers_in_flight`]),
+    /// `kraken.hub.client.credentials.refreshes.sent`, and with OAuth2
+    /// `kraken.hub.client.token.fetches{result}`, with a client certificate
+    /// `kraken.hub.client.certificate.rotations`.
+    ///
+    /// [`handlers_in_flight`]: Self::handlers_in_flight
+    pub fn observe(pool: &Arc<HubPool>, metrics: &Metrics) {
+        let meter = metrics.meter();
+        let each = |read: fn(&HubPool, &dyn AsyncInstrument<u64>)| {
+            let pool = Arc::downgrade(pool);
+            move |o: &dyn AsyncInstrument<u64>| {
+                if let Some(pool) = pool.upgrade() {
+                    read(&pool, o);
+                }
+            }
+        };
+        meter
+            .u64_observable_gauge(HUB_CLIENT_CONNECTED_HUBS)
+            .with_description("Hubs with an acknowledged stream")
+            .with_callback(each(|p, o| o.observe(p.live().len() as u64, &[])))
+            .build();
+        meter
+            .u64_observable_gauge(HUB_CLIENT_HANDLERS_IN_FLIGHT)
+            .with_description("Incoming hub requests being handled or waiting for a handler permit")
+            .with_callback(each(|p, o| o.observe(p.handlers_in_flight() as u64, &[])))
+            .build();
+        meter
+            .u64_observable_counter(HUB_CLIENT_CREDENTIALS_REFRESHES_SENT)
+            .with_description("ClientMessage.credentials written to the hubs")
+            .with_callback(each(|p, o| o.observe(p.credentials_refreshes_sent(), &[])))
+            .build();
+        match pool.auth().kind {
+            AuthKind::Jwt => {
+                meter
+                    .u64_observable_counter(HUB_CLIENT_TOKEN_FETCHES)
+                    .with_description("Access token fetches by result")
+                    .with_callback(each(|p, o| {
+                        let fetches = p.auth().token_fetches;
+                        for (result, n) in [
+                            ("ok", fetches.ok),
+                            ("http_error", fetches.http_error),
+                            ("oauth_error", fetches.oauth_error),
+                            ("io_error", fetches.io_error),
+                            ("bad_response", fetches.bad_response),
+                        ] {
+                            o.observe(n, &[KeyValue::new("result", result)]);
+                        }
+                    }))
+                    .build();
+            }
+            AuthKind::Certificate => {
+                meter
+                    .u64_observable_counter(HUB_CLIENT_CERTIFICATE_ROTATIONS)
+                    .with_description("Client certificate pairs adopted from the files")
+                    .with_callback(each(|p, o| {
+                        let rotations = p.auth().certificate.map_or(0, |c| c.rotations);
+                        o.observe(rotations, &[]);
+                    }))
+                    .build();
+            }
+            AuthKind::None | AuthKind::Token => {}
+        }
     }
 
     /// Every connection of the pool, closed duplicates and draining ones included.

@@ -53,7 +53,7 @@ pub const WAKE_INTERVAL: Duration = Duration::from_secs(5);
 pub const ERROR_CLIP: usize = 200;
 
 /// The outcome of one token fetch, as the `result` label of
-/// `kraken_messaging_hub_token_fetches_total`.
+/// `kraken_hub_client_token_fetches_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FetchResult {
     Ok,
@@ -80,8 +80,8 @@ impl FetchResult {
     }
 }
 
-/// Fetch counts per [`FetchResult`]: the library's counterpart of
-/// `kraken_messaging_hub_token_fetches_total{result}` (this crate exports no metrics registry).
+/// Fetch counts per [`FetchResult`]: what `kraken_hub_client_token_fetches_total{result}` reads
+/// ([`HubPool::observe`](super::HubPool::observe)).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TokenStats {
     pub ok: u64,
@@ -250,8 +250,8 @@ pub struct AuthStatus {
     pub token_expires_at: Option<SystemTime>,
     /// The last token fetch error (clipped), cleared by the next success (`Jwt` only).
     pub last_error: Option<String>,
-    /// Token fetches so far by result (`Jwt` only; all zero otherwise): the library's counterpart
-    /// of `kraken_messaging_hub_token_fetches_total{result}`.
+    /// Token fetches so far by result (`Jwt` only; all zero otherwise), as
+    /// `kraken_hub_client_token_fetches_total{result}` exports them.
     pub token_fetches: TokenStats,
     /// The client certificate the hub streams present (`Certificate` only; `None` until a stream
     /// registered with it).

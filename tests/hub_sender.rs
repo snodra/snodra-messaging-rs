@@ -120,6 +120,70 @@ async fn sender_with(
     (sender, conn)
 }
 
+/// Every command or query call through the hub is timed once, with its final outcome: a reply
+/// that does not decode is `invalid_request`, as Kotlin's.
+#[tokio::test]
+async fn every_call_is_timed_by_kind_type_and_final_outcome() {
+    use kraken_messaging::metrics::{HUB_CLIENT_REQUEST_DURATION, Metrics};
+    let hub = FakeHub::start().await;
+    hub.set_responder(|req| {
+        Some(match req.r#type.as_str() {
+            "t.Ping" => reply_with(&req, r#"{"echoed":"x"}"#),
+            "t.Count" => reply_with(&req, r#"{"n":"not a number"}"#),
+            _ => hub_error(&req, ErrorCode::NoHandler, "no handler"),
+        })
+    })
+    .await;
+    let meter = support::metrics::TestMeter::new();
+    let (sender, conn) = sender_with(
+        &hub,
+        SenderSettings {
+            metrics: Metrics::new(meter.meter()),
+            ..SenderSettings::default()
+        },
+    )
+    .await;
+    let ping = || Ping { text: "x".into() };
+    sender
+        .send_command(&ping(), SendOptions::default())
+        .await
+        .unwrap();
+    sender
+        .send_command(&ping(), SendOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        sender
+            .send_query(&Count { name: "c".into() }, SendOptions::default())
+            .await
+            .is_err()
+    );
+    assert!(
+        sender
+            .send_command(&Nop {}, SendOptions::default())
+            .await
+            .is_err()
+    );
+    let calls = |kind: &str, t: &str, outcome: &str| {
+        meter.value(
+            HUB_CLIENT_REQUEST_DURATION,
+            &[("kind", kind), ("type", t), ("outcome", outcome)],
+        )
+    };
+    assert_eq!(calls("command", "t.Ping", "ok"), Some(2.0));
+    assert_eq!(calls("query", "t.Count", "invalid_request"), Some(1.0));
+    assert_eq!(calls("command", "t.Nop", "no_handler"), Some(1.0));
+    let point = meter
+        .point(
+            HUB_CLIENT_REQUEST_DURATION,
+            &[("kind", "command"), ("type", "t.Ping"), ("outcome", "ok")],
+        )
+        .unwrap();
+    assert_eq!(point.unit, "s");
+    assert!(point.value > 0.0, "{point:?}");
+    conn.shutdown().await;
+}
+
 #[tokio::test]
 async fn send_command_round_trips_reply() {
     let hub = FakeHub::start().await;

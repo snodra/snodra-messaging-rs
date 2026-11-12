@@ -41,6 +41,7 @@ indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
 | Sagas and deadlines on the Kotlin starter's collections, the relay, parked events | `KrakenMessagingBuilder::saga`, `saga::SagaContext`, `app.saga_failures()` (see [Sagas](#sagas)) |
 | Idempotent adapters, partner Kafka topics, webhooks; saga statistics | `idempotent_command`, `external_source`, `app.ingress()`, `external::webhook::verify`, `app.saga_stats()` |
 | A saga test fixture (feature `testing`) | `saga::testing::SagaTestFixture` |
+| Metrics through the OpenTelemetry API (outbox, consumed events, processors, hub client, sagas); the application installs the provider | `metrics`, `KrakenMessaging::builder_with_meter`, `saga::OtelSagaMetrics` (see [Metrics](#metrics)) |
 | One builder wiring all of it from `KRAKEN_*` variables | `KrakenMessaging`, `Config` |
 
 ## Table of contents
@@ -57,6 +58,7 @@ indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
 - [Dead letters](#dead-letters)
 - [Processor control](#processor-control)
 - [Security](#security)
+- [Metrics](#metrics)
 - [Build and test](#build-and-test)
 - [Example](#example)
 - [CI/CD pipeline](#cicd-pipeline)
@@ -120,6 +122,7 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 | Variable | Default | Meaning |
 |---|---|---|
 | `KRAKEN_SERVICE_NAME` | required | hub `service_name`, base of every processor's consumer group (`<service>.<processor>`, `default` included), event `source` |
+| `KRAKEN_INSTANCE_ID` | a fresh UUID per `Config` | `Config.instance_id`: the hub `Register.instance_id`, and the `service.instance.id` the application gives its meter provider (see [Metrics](#metrics)); unique among the service's instances (a pod name, for example) |
 | `KRAKEN_MONGODB_URI` | required | must name a database, e.g. `mongodb://mongodb:27017/service-c?replicaSet=rs0` |
 | `KRAKEN_HUB_ADDRESS` | `static://kraken-hub:7000` | the hub's gRPC target (`static://` optional), a comma-separated list of them, or one `dns:///name:port` re-resolved every 30 s (see [Multiple hubs](#multiple-hubs)); one target is the single-hub setup |
 | `KRAKEN_HUB_STATUS_INTERVAL_MS` | 5000 | how often `InstanceStatus` goes to every hub (at least 1) |
@@ -769,7 +772,8 @@ I/O timeouts under 15 s**, so its calls finish (or fail cleanly) within a deploy
 `kraken.deadlines.fired{name}`, `kraken.deadlines.due{name}`, `kraken.external.calls{handler,outcome}`,
 `kraken.saga.command.failures{type,reason}`, `kraken.sagas.active{type}`, `kraken.saga.dispatch.pending`): typed reads
 (`started`, `ended`, `events`, `deadlines_fired`, `deadlines_due`, `external_calls`, `command_failures`, `active`,
-`dispatch_pending`) and `snapshot()` for an exporter. The two database-counted gauges are sampled every 15 s. While a saga
+`dispatch_pending`) and `snapshot()`; the same values are exported on the meter (see [Metrics](#metrics)). The two
+database-counted gauges are sampled every 15 s. While a saga
 handles a message, a `tracing` span `saga` carries `saga_type`, `saga_id` and `correlation_id`.
 
 ### Testing a saga
@@ -823,7 +827,7 @@ The behaviour is ADR 0021's rulings 1 to 46; where Rust differs, the S2 ruling s
   checks at startup).
 - A partner translator is a closure returning `Result<Option<TranslatedEvent>, _>`; `InvalidMessage` skips the record at once.
 - Configuration is `KRAKEN_*` environment variables (milliseconds); partner sources and the webhook secret are set in code.
-- Metrics are `SagaStats` counters and gauges (no Micrometer); the logging keys are a `tracing` span's fields.
+- Metrics go through the OpenTelemetry API (no Micrometer), with the same series; the logging keys are a `tracing` span's fields.
 - A deadline's `payloadType` is `std::any::type_name` of its payload (Kotlin: the `@MessageType` name or the FQCN).
 - `SagaTestFixture` is in the crate behind a feature (Kotlin: `kraken-messaging-test`) and panics instead of throwing.
 
@@ -1196,9 +1200,9 @@ running, `KrakenMessaging::hub_auth()` (also `HubPool::auth()`, `HubConnection::
 `AuthKind` (`none`, `token`, `jwt`), the current token's expiry, the last token fetch error and
 `token_fetches`, the fetch counts by result (`ok`, `http_error`, `oauth_error`, `io_error`,
 `bad_response`; also `TokenProvider::stats()`); `hub_credentials_refreshes_sent()` counts the
-refreshes written. This crate has no
-metrics registry, so these counters stand in for `kraken_messaging_hub_token_fetches_total{result}`
-and `kraken_messaging_hub_credentials_refreshes_sent_total`. A static token session whose
+refreshes written; the same counts are exported as `kraken_hub_client_token_fetches_total{result}`
+and `kraken_hub_client_credentials_refreshes_sent_total` (see [Metrics](#metrics)). A static token
+session whose
 `KRAKEN_HUB_TOKEN_FILE` changes also sends a refresh (checked once per heartbeat) on its handshaken
 streams, so a token rotation needs no reconnect.
 
@@ -1207,7 +1211,7 @@ host is loopback or a single-label name: the secret then crosses the network in 
 
 Differences from the Kotlin starter: the Rust configuration has no relaxed `KRAKEN_MESSAGING_*`
 binding (only `KRAKEN_HUB_OAUTH2_*`), no `/env` redaction layer to extend (`SecretString` prints
-`"***"`), and no metrics registry (accessors above).
+`"***"`).
 
 ### Authenticating with a client certificate (mTLS)
 
@@ -1304,8 +1308,8 @@ certificate says so.
 fingerprint, not_after, rotations })`: the first 8 hex characters of the SHA-256 of the leaf presented
 (what the hub's logs and `/api/v1/topology` show), its `notAfter`, and how many times the presented certificate
 changed since the first one. Logs name a certificate by that fingerprint and the service only; the
-key is never read into a log, an error or a `Debug` print. This crate has no metrics registry
-(accessors only).
+key is never read into a log, an error or a `Debug` print. The rotations are also exported as
+`kraken_hub_client_certificate_rotations_total` (see [Metrics](#metrics)).
 
 **A client without a certificate against a `required` hub** fails at the transport, not as a
 rejection: with TLS 1.3 the client learns that its certificate was refused only when the stream opens,
@@ -1317,7 +1321,7 @@ token or JWT.
 Differences from the Kotlin starter: the settings are `HubTls.client_cert_file` / `client_key_file`
 (`KRAKEN_HUB_TLS_CLIENT_CERT` / `_KEY`) and there is no relaxed `KRAKEN_MESSAGING_*` binding; rotation
 is run by the `HubPool` (a `HubConnection` used on its own re-reads the files on reconnect only); the
-rotation count is in `CertificateStatus` and there is no metrics registry.
+rotation count is in `CertificateStatus` (and `kraken_hub_client_certificate_rotations_total`).
 
 **Turning it on: permissive first.** (1) Run the hub with `KRAKEN_HUB_AUTH_MODE=permissive` and the
 ACL; it logs and counts every violation (`kraken_hub_auth_violations_total`) and refuses nothing;
@@ -1342,6 +1346,77 @@ and in `tests/e2e_mtls.rs` against `kraken-hub:dev` in `enforce` with `KRAKEN_HU
 (two hubs for the rotation; a certificate that lives 8 s for the hub's `notAfter` close). The hub's own
 server certificate is issued by the same CA with the client usage too, so its `--health-check`, which
 presents the hub's own pair under `required`, stays healthy.
+
+## Metrics
+
+The library records its metrics through the OpenTelemetry metrics API (`opentelemetry` 0.33, ADR 0026); the
+application installs the meter provider (the SDK and an exporter, e.g. OTLP to otel-lgtm). `KrakenMessaging::builder`
+records on `opentelemetry::global::meter("kraken-messaging-rs")` **as the global provider is when it runs**, so install
+the provider first; `KrakenMessaging::builder_with_meter(config, meter)` takes a meter instead (tests read one back
+from the SDK's in-memory exporter). With no provider installed the global meter is the API's no-op one: nothing is
+recorded, no gauge callback runs, a measurement costs a virtual call.
+
+```rust
+use opentelemetry::KeyValue;
+use opentelemetry_otlp::{MetricExporter, WithExportConfig};
+use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
+
+let config = Config::from_env()?;
+let provider = SdkMeterProvider::builder()
+    .with_resource(
+        Resource::builder_empty()
+            .with_service_name(config.service_name.clone()) // Prometheus `job`
+            .with_attribute(KeyValue::new("service.instance.id", config.instance_id.clone())) // `instance`
+            .build(),
+    )
+    .with_periodic_exporter(MetricExporter::builder().with_tonic().with_endpoint("http://otel-lgtm:4317").build()?)
+    .build();
+opentelemetry::global::set_meter_provider(provider.clone()); // before the builder
+let app = KrakenMessaging::builder(config).await? /* ... */ .start().await?;
+// ... at exit, after app.shutdown(): provider.shutdown() exports what is pending.
+```
+
+`examples/service-c` does exactly this when `KRAKEN_OTLP_ENDPOINT` is set (`src/telemetry.rs`). The resource is the
+identity of every series: `service.name` the service name and `service.instance.id` the instance id the hub sees
+(`Config.instance_id`), which Prometheus turns into `job` and `instance`; set no `service.namespace` (it changes `job`).
+The data points carry no instance label of their own.
+
+Instruments are named with dots, as Kotlin's Micrometer meters; the OTLP-to-Prometheus translation turns the dots into
+underscores, adds the unit suffix (`s` → `_seconds`) and `_total` to counters, so the Rust and the Kotlin library export
+the same series. The two histograms are explicit-bucket histograms in seconds with the hub's boundaries (1 ms … 60 s).
+Label values come from bounded sets: `type` is a type this service registered (a foreign producer's type is `other`),
+`processor` a processor name, the rest fixed outcome and state names; never an id, a key or free text. Gauges are
+observed from values the library holds anyway (the processor status, the outbox relay's last poll, the hub pool), never
+with a Kafka or MongoDB call in a callback.
+
+| Series (Prometheus) | Type | Labels | Meaning |
+|---|---|---|---|
+| `kraken_outbox_pending` | gauge | — | outbox documents neither sent nor failed, as the relay's last poll saw them (the batch, or a count of all of them behind a full batch); only where the relay runs, every instance reports the same database: aggregate with `max by (job)` |
+| `kraken_outbox_oldest_age_seconds` | gauge | — | age of the oldest of them now, 0 when none |
+| `kraken_outbox_published_total` | counter | `outcome` (`ok`, `failed`) | publish attempts (`failed`: any attempt that did not publish, retried or given up) |
+| `kraken_events_consumed_total` | counter | `processor`, `type`, `outcome` | one per record and processor at its final outcome there: `handled` (stage 1 ran, and in `default` the saga stage; or only the saga stage for a type only sagas handle), `duplicate` (the marker was there and no saga stage ran, or the record's letter was there already), `skipped` (the processor does not handle the type), `parked` (taken by the dead letters, collection or `<topic>.dlt`: `HANDLER_FAILED`, `INVALID`, `SEQUENCED`), `failed` (given up without a letter: mode `log`, or the saga stage failed for good); a redelivery or a stop mid-attempts counts nothing |
+| `kraken_event_handler_duration_seconds` | histogram | `processor`, `type` | every stage-1 run of a consumed record (marker transaction with the handlers; failures and duplicate markers included; not the saga stage, back-offs, skipped, `SEQUENCED` or `INVALID` records, partner topics, webhooks, letter retries) |
+| `kraken_processor_lag` | gauge | `processor`, `partition` | the lag of each partition assigned to this instance whose lag is known, as the processor status; a partition that leaves the assignment (or whose processor goes) reads 0 once, then disappears, and one whose lag is unknown has no series. Prometheus keeps a series that stops at its last value for 5 minutes, so dashboards take the `max` per partition before summing: `sum by (job, processor) (max by (job, processor, partition) (kraken_processor_lag))` |
+| `kraken_processor_state` | gauge | `processor`, `state` | 1 for the processor's state now, 0 for the others (`starting`, `running`, `paused`, `failing`, `stopped`, as the hub's `kraken_hub_processor_state`) |
+| `kraken_dead_letters` | gauge | `processor` | the processor's letters as last sampled (every 30 s and after a park); 0 in modes `topic` and `log` |
+| `kraken_hub_client_request_duration_seconds` | histogram | `kind` (`command`, `query`), `type`, `outcome` | every command or query call through the hub (and the saga relay's commands), from the call to its result, retries included; `outcome`: `ok`, `no_handler`, `timeout`, `handler_disconnected`, `handler_error`, `invalid_request` (also a reply that does not decode), `resource_exhausted`, `cancelled`, `denied`, `unavailable` (no live hub, or the connection broke), `error` (also a request that cannot be encoded); local dispatch, scatter-gather, streams and subscriptions are not timed, nor a call its caller dropped |
+| `kraken_hub_client_handlers_in_flight` | gauge | — | requests from the hubs being handled or waiting for a handler permit, over all hubs |
+| `kraken_hub_client_connected_hubs` | gauge | — | hubs with an acknowledged stream (not rolling over) |
+| `kraken_hub_client_token_fetches_total` | counter | `result` (`ok`, `http_error`, `oauth_error`, `io_error`, `bad_response`) | access token fetches (with `KRAKEN_HUB_OAUTH2_*` only) |
+| `kraken_hub_client_certificate_rotations_total` | counter | — | client certificate pairs adopted after the first (with a client certificate only) |
+| `kraken_hub_client_credentials_refreshes_sent_total` | counter | — | `ClientMessage.credentials` written to the hubs |
+| `kraken_sagas_started_total`, `kraken_sagas_ended_total` | counter | `type` | saga instances started, ended, per saga type |
+| `kraken_saga_events_total` | counter | `type`, `outcome` (`handled`, `no_match`, `conflict`, `parked`) | events handled by a saga type |
+| `kraken_deadlines_fired_total` | counter | `name` | deadlines whose handler ran |
+| `kraken_deadlines_due` | gauge | `name` | scheduled deadlines past their due time after the scheduler's last poll |
+| `kraken_external_calls_total` | counter | `handler`, `outcome` (`succeeded`, `replayed`, `failed`, `retryable`, `unknown`) | idempotent handler calls (`handler`: the message's wire type) |
+| `kraken_saga_command_failures_total` | counter | `type`, `reason` (`FailureReason`, e.g. `NO_HANDLER`) | `SagaCommandFailed` notices nobody handled |
+| `kraken_sagas_active` | gauge | `type` | live saga instances (sampled every 15 s) |
+| `kraken_saga_dispatch_pending` | gauge | — | `saga_dispatch` entries neither dispatched nor failed (sampled every 15 s) |
+
+The saga series are exported by `OtelSagaMetrics`, which the runtime, relay, deadline scheduler and idempotent handlers
+report to; it also keeps `app.saga_stats()`. The instrument names are constants in `kraken_messaging::metrics` and
+`kraken_messaging::saga::stats`.
 
 ## Build and test
 

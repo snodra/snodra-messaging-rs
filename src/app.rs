@@ -45,6 +45,7 @@ use crate::kafka::{
     EventBus, LocalEventDispatcher, NoSagas, OUTBOX_COLLECTION, OutboxPublisher,
     PROCESSED_EVENTS_COLLECTION, ProcessorSettings, SagaStage, ensure_indexes,
 };
+use crate::metrics::Metrics;
 use crate::processors::dead_letters::ensure_dead_letter_indexes;
 use crate::processors::reset::ResetHandler;
 use crate::processors::{
@@ -53,9 +54,9 @@ use crate::processors::{
 };
 use crate::proto::ProcessorStatus;
 use crate::saga::{
-    Clock, DeadlineScheduler, LocalFirstSender, RawCommandSender, SagaDefinition,
-    SagaDispatchRelay, SagaFailures, SagaPorts, SagaRetry, SagaRuntime, SagaStats, SagaType,
-    ensure_external_call_indexes, ensure_saga_indexes, stats::SAMPLE_INTERVAL,
+    Clock, DeadlineScheduler, LocalFirstSender, OtelSagaMetrics, RawCommandSender, SagaDefinition,
+    SagaDispatchRelay, SagaFailures, SagaMetrics, SagaPorts, SagaRetry, SagaRuntime, SagaStats,
+    SagaType, ensure_external_call_indexes, ensure_saga_indexes, stats::SAMPLE_INTERVAL,
     validate_registrations,
 };
 use crate::types::{Command, Event, MessageType, Query, StreamingQuery, SubscriptionQuery};
@@ -85,6 +86,8 @@ pub struct KrakenMessagingBuilder {
     stats: SagaStats,
     /// "Now" for the saga runtime, relay, scheduler, idempotent handlers and ingress.
     clock: Clock,
+    /// What the library records its metrics on (ADR 0026).
+    metrics: Metrics,
     /// The named event processors' handlers (ADR 0022), by processor name.
     processors: std::collections::BTreeMap<String, HandlerRegistry>,
     /// Invalid processor names given to `event_in`, returned by `start()`.
@@ -106,6 +109,9 @@ pub struct KrakenMessaging {
     handlers: TaskTracker,
     ingress: ExternalEventIngress,
     stats: SagaStats,
+    /// What the saga runtime, relay, scheduler and idempotent handlers report to: `stats` and
+    /// the meter ([`OtelSagaMetrics`]).
+    saga_metrics: Arc<dyn SagaMetrics>,
     /// The saga runtime, when a saga is registered (and enabled).
     runtime: Option<Arc<SagaRuntime>>,
     /// Stops the relay, the deadline scheduler and the gauge sampler.
@@ -119,9 +125,25 @@ pub struct KrakenMessaging {
 }
 
 impl KrakenMessaging {
-    /// Prepares the connections (nothing starts yet) so handlers can capture `events()` and the senders.
+    /// Prepares the connections (nothing starts yet) so handlers can capture `events()` and the
+    /// senders. The metrics (ADR 0026) are recorded on
+    /// `opentelemetry::global::meter("kraken-messaging-rs")` as the global meter provider is now:
+    /// install the application's provider before this call; with none, nothing is recorded.
     pub async fn builder(config: Config) -> Result<KrakenMessagingBuilder, MessagingError> {
+        Self::builder_with_meter(
+            config,
+            opentelemetry::global::meter(crate::metrics::METER_NAME),
+        )
+        .await
+    }
+
+    /// [`builder`](Self::builder) recording the metrics on `meter` instead of the global one.
+    pub async fn builder_with_meter(
+        config: Config,
+        meter: opentelemetry::metrics::Meter,
+    ) -> Result<KrakenMessagingBuilder, MessagingError> {
         config.validate()?;
+        let metrics = Metrics::new(meter);
         let client = mongodb::Client::with_uri_str(&config.mongodb_uri).await?;
         let db = client
             .default_database()
@@ -132,7 +154,7 @@ impl KrakenMessaging {
         let hubs = HubPool::new(
             settings,
             config.service_name.clone(),
-            uuid::Uuid::new_v4().to_string(),
+            config.instance_id.clone(),
             tx,
         )?;
         let sender = Sender::with_pool(
@@ -142,8 +164,10 @@ impl KrakenMessaging {
                 forward_jwt: config.forward_jwt,
                 priorities: config.hub_priorities.clone(),
                 retry: config.hub_retry.clone(),
+                metrics: metrics.clone(),
             },
         );
+        HubPool::observe(&hubs, &metrics);
         Ok(KrakenMessagingBuilder {
             registry: HandlerRegistry::new(),
             client,
@@ -158,6 +182,7 @@ impl KrakenMessaging {
             sources: Vec::new(),
             stats: SagaStats::new(),
             clock: Clock::system(),
+            metrics,
             processors: std::collections::BTreeMap::new(),
             processor_errors: Vec::new(),
             reset_handlers: Vec::new(),
@@ -244,19 +269,20 @@ impl KrakenMessaging {
                 SagaPorts::mongo(self.client.clone(), self.db.clone()),
                 self.clock.clone(),
                 SagaRetry::default(),
-                Arc::new(self.stats.clone()),
+                Arc::clone(&self.saga_metrics),
             ))
         });
         SagaFailures::new(runtime)
     }
 
-    /// The saga, deadline, dispatch and external-call statistics (S2-R7): the Kotlin meters'
-    /// names and labels as counters and gauges, see [`SagaStats`] and
+    /// The saga, deadline, dispatch and external-call statistics (S2-R7): the values the saga
+    /// metrics export (ADR 0026), as counters and gauges in memory, see [`SagaStats`] and
     /// [`crate::saga::stats`]. All zero in a service without sagas or idempotent handlers.
     pub fn saga_stats(&self) -> SagaStats {
         self.stats.clone()
     }
 
+    /// `Config.instance_id`: the id the hubs know this instance by.
     pub fn instance_id(&self) -> &str {
         self.hubs.instance_id()
     }
@@ -269,14 +295,14 @@ impl KrakenMessaging {
     /// How this instance authenticates to the hubs: `none`, a static `token`, a `jwt`
     /// (Keycloak client credentials, ADR 0019) or a client `certificate` (mutual TLS, ADR 0020),
     /// the current access token's expiry, the last token fetch error and the token fetch counts by
-    /// result (`kraken_messaging_hub_token_fetches_total{result}`); for a certificate, the one
+    /// result (`kraken_hub_client_token_fetches_total{result}`); for a certificate, the one
     /// presented (fingerprint, `notAfter`, rotations).
     pub fn hub_auth(&self) -> crate::hub::AuthStatus {
         self.hubs.auth()
     }
 
     /// The credential refreshes sent to the hubs so far
-    /// (`kraken_messaging_hub_credentials_refreshes_sent_total`).
+    /// (`kraken_hub_client_credentials_refreshes_sent_total`).
     pub fn hub_credentials_refreshes_sent(&self) -> u64 {
         self.hubs.credentials_refreshes_sent()
     }
@@ -739,6 +765,7 @@ impl KrakenMessagingBuilder {
             sources,
             stats,
             clock,
+            metrics,
             processors: named_registries,
             processor_errors,
             reset_handlers,
@@ -760,13 +787,15 @@ impl KrakenMessagingBuilder {
             Vec::new()
         };
         ensure_indexes(&db, config.outbox_retention, config.idempotency_retention).await?;
+        let saga_metrics: Arc<dyn SagaMetrics> =
+            Arc::new(OtelSagaMetrics::new(&metrics, stats.clone()));
         if !registry.idempotent_handlers().is_empty() {
             ensure_external_call_indexes(&db, config.external_calls_retention).await?;
             external_calls.bind(ExternalCalls::new(
                 db.clone(),
                 clock.clone(),
                 config.external_call_settings(),
-                Arc::new(stats.clone()),
+                Arc::clone(&saga_metrics),
             )?);
         }
         let registry = Arc::new(registry);
@@ -792,7 +821,7 @@ impl KrakenMessagingBuilder {
                 SagaPorts::mongo(client.clone(), db.clone()),
                 clock.clone(),
                 config.saga_retry(),
-                Arc::new(stats.clone()),
+                Arc::clone(&saga_metrics),
             )))
         };
         let stage: Arc<dyn SagaStage> = match &runtime {
@@ -880,6 +909,7 @@ impl KrakenMessagingBuilder {
                         dead_letter_mode: config.dead_letter_mode,
                         dead_letter_retention: config.dead_letter_retention,
                         db: Some(db.clone()),
+                        metrics: metrics.clone(),
                     },
                     dispatcher,
                     &db,
@@ -890,6 +920,7 @@ impl KrakenMessagingBuilder {
             }
         }
         let monitors: Vec<Arc<ProcessorMonitor>> = runners.iter().map(|r| r.monitor()).collect();
+        ProcessorMonitor::observe(&monitors, &metrics);
         let processor_control = ProcessorControl::new(runners.clone(), dead_letters.clone());
         let reported = monitors.clone();
         hubs.set_processor_status(Arc::new(move || {
@@ -955,6 +986,7 @@ impl KrakenMessagingBuilder {
                 config.outbox_poll_interval,
                 config.outbox_batch_size,
                 config.outbox_max_attempts,
+                &metrics,
             )?;
             tasks.push(publisher.start(cancel.clone()));
         }
@@ -978,7 +1010,7 @@ impl KrakenMessagingBuilder {
                 Arc::clone(&local),
                 clock.clone(),
                 config.relay_settings(),
-                Arc::new(stats.clone()),
+                Arc::clone(&saga_metrics),
             )?;
             saga_tasks.push(relay.start(saga_cancel.clone()));
             let scheduler = DeadlineScheduler::new(
@@ -986,7 +1018,7 @@ impl KrakenMessagingBuilder {
                 Arc::clone(runtime),
                 clock.clone(),
                 config.deadline_settings(),
-                Arc::new(stats.clone()),
+                Arc::clone(&saga_metrics),
             )?;
             saga_tasks.push(scheduler.start(saga_cancel.clone()));
             saga_tasks.push(stats.start_sampler(db.clone(), SAMPLE_INTERVAL, saga_cancel.clone()));
@@ -1016,6 +1048,7 @@ impl KrakenMessagingBuilder {
             handlers,
             ingress,
             stats,
+            saga_metrics,
             runtime,
             saga_cancel,
             saga_tasks,

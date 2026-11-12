@@ -466,6 +466,7 @@ async fn the_consumer_hands_a_record_only_a_saga_wants_to_the_saga_stage() {
             dead_letter_mode: DeadLetterMode::Log,
             dead_letter_retention: Duration::from_secs(86_400),
             db: None,
+            metrics: kraken_messaging::metrics::Metrics::global(),
         },
         Arc::new(LocalEventDispatcher::new(
             f.client.clone(),

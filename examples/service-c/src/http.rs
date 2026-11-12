@@ -8,6 +8,9 @@
 //!   failure (the printer retries).
 //! - `GET /banners/{jobId}`: how the banner ended (`PRINTED`, or `FAILED` with its reason), 404
 //!   while it is in flight (or unknown).
+//! - `GET /greetings/{name}/count`: service-b's `examples.CountGreetings` through the hub, the
+//!   sandbox's call from Rust to Kotlin (`{"name","count"}`; 502 with the error when it fails). The
+//!   examples smoke uses it for the Rust side of `kraken_hub_client_request_duration_seconds`.
 
 use axum::Router;
 use axum::body::Bytes;
@@ -15,9 +18,13 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use kraken_messaging::SendOptions;
 use kraken_messaging::external::ExternalEventIngress;
+use kraken_messaging::hub::Sender;
+use std::sync::Arc;
 
 use crate::banner::BannerOutcomes;
+use crate::messages::CountGreetings;
 use crate::printer::{self, SOURCE};
 
 #[derive(Clone)]
@@ -25,13 +32,34 @@ pub struct Http {
     pub ingress: ExternalEventIngress,
     pub secret: String,
     pub outcomes: BannerOutcomes,
+    pub sender: Arc<Sender>,
 }
 
 pub fn router(http: Http) -> Router {
     Router::new()
         .route("/printer/webhook", post(webhook))
         .route("/banners/{job_id}", get(banner))
+        .route("/greetings/{name}/count", get(count_greetings))
         .with_state(http)
+}
+
+async fn count_greetings(State(http): State<Http>, Path(name): Path<String>) -> Response {
+    match http
+        .sender
+        .send_query(&CountGreetings { name }, SendOptions::default())
+        .await
+    {
+        Ok(count) => (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_vec(&count).unwrap_or_default(),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("CountGreetings failed: {e}"),
+        )
+            .into_response(),
+    }
 }
 
 async fn webhook(State(http): State<Http>, headers: HeaderMap, body: Bytes) -> StatusCode {

@@ -1,8 +1,9 @@
-//! Saga, deadline, dispatch and external-call statistics (S2-R7, ADR 0021 ruling 21): the crate
-//! has no metrics registry (P5b), so the Kotlin meters are counters and gauges behind accessors,
-//! with the same names and labels (`kraken.sagas.started{type}` is what Prometheus shows as
-//! `kraken_sagas_started_total{type}`). Every label value is a saga type, a deadline name, a
-//! handler label, an outcome or a reason, never an id.
+//! Saga, deadline, dispatch and external-call statistics (S2-R7, ADR 0021 ruling 21): the Kotlin
+//! meters as counters and gauges behind accessors, with the same names and labels, which
+//! [`OtelSagaMetrics`](super::OtelSagaMetrics) also records on the meter (ADR 0026:
+//! `kraken.sagas.started{type}` is what Prometheus shows as `kraken_sagas_started_total{type}`).
+//! Every label value is a saga type, a deadline name, a handler label, an outcome or a reason,
+//! never an id.
 //!
 //! - counters `kraken.sagas.started{type}`, `kraken.sagas.ended{type}`;
 //! - `kraken.saga.events{type,outcome}`, outcome `handled | no_match | conflict | parked`;
@@ -17,11 +18,12 @@
 //!   [`SagaStats::start_sampler`] does so every [`SAMPLE_INTERVAL`] (15 s, as Kotlin). A failed
 //!   sample is logged and keeps the last values.
 //!
-//! [`SagaStats`] implements [`SagaMetrics`], so it is what the runtime, the relay, the scheduler
-//! and the idempotent handlers report to; `KrakenMessaging::saga_stats()` hands it out.
+//! [`SagaStats`] implements [`SagaMetrics`]; the application's runtime, relay, scheduler and
+//! idempotent handlers report to the [`OtelSagaMetrics`](super::OtelSagaMetrics) over it, and
+//! `KrakenMessaging::saga_stats()` hands it out.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use futures::TryStreamExt;
@@ -76,7 +78,16 @@ struct Inner {
 #[derive(Clone, Default)]
 pub struct SagaStats(Arc<Mutex<Inner>>);
 
-fn event_outcome(outcome: EventOutcome) -> &'static str {
+/// A [`SagaStats`] that does not keep it alive (what an observable gauge holds).
+pub(crate) struct WeakSagaStats(Weak<Mutex<Inner>>);
+
+impl WeakSagaStats {
+    pub(crate) fn upgrade(&self) -> Option<SagaStats> {
+        self.0.upgrade().map(SagaStats)
+    }
+}
+
+pub(crate) fn event_outcome(outcome: EventOutcome) -> &'static str {
     match outcome {
         EventOutcome::Handled => "handled",
         EventOutcome::NoMatch => "no_match",
@@ -85,7 +96,7 @@ fn event_outcome(outcome: EventOutcome) -> &'static str {
     }
 }
 
-fn reason_name(reason: FailureReason) -> String {
+pub(crate) fn reason_name(reason: FailureReason) -> String {
     serde_json::to_value(reason)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
@@ -127,6 +138,20 @@ impl SagaStats {
                 .gauges
                 .insert(key(name, &[(label, tag.as_str())]), *value);
         }
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakSagaStats {
+        WeakSagaStats(Arc::downgrade(&self.0))
+    }
+
+    /// Every gauge named `name` with its labels and value.
+    pub(crate) fn gauges(&self, name: &str) -> Vec<(Vec<(&'static str, String)>, u64)> {
+        self.inner()
+            .gauges
+            .iter()
+            .filter(|((n, _), _)| *n == name)
+            .map(|((_, labels), value)| (labels.clone(), *value))
+            .collect()
     }
 
     /// Makes the `kraken.sagas.active` gauge of each of `saga_types` exist (at 0) before its

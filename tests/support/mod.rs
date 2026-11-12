@@ -82,6 +82,7 @@ pub fn token_without_realm_access(subject: &str) -> String {
 pub mod fake_hub;
 pub mod idp;
 pub mod logs;
+pub mod metrics;
 pub mod order_saga;
 pub mod pki;
 pub mod saga;
