@@ -146,6 +146,10 @@ fn a_kotlin_shaped_document_of_each_collection_deserialises() {
     assert_eq!(call.attempts, 1);
     assert_eq!(call.updated_at, at("2026-11-03T10:05:01Z"));
     assert_eq!(call.lease_until, Some(at("2026-11-03T10:10:01Z")));
+    assert_eq!(
+        call.owner.as_deref(),
+        Some("0b9e2c7a-3d41-4f7e-8c55-6a1f2e9d4b70")
+    );
 }
 
 /// The names and BSON types of `doc` against the contract: `expected` lists `(field, type)` for
@@ -347,6 +351,7 @@ fn a_document_rust_writes_has_exactly_the_contracts_field_names_and_bson_types_a
             ("attempts", "int"),
             ("updatedAt", "date"),
             ("leaseUntil", "date"),
+            ("owner", "string"),
         ],
     );
     assert_eq!(to_doc(&call).get_str("status"), Ok("IN_PROGRESS"));
@@ -358,6 +363,7 @@ fn a_document_rust_writes_has_exactly_the_contracts_field_names_and_bson_types_a
         attempts: 1,
         updated_at: at("2026-11-03T12:00:00Z"),
         lease_until: None,
+        owner: None,
     };
     assert_shape(
         &to_doc(&started),

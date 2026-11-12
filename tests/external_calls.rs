@@ -298,6 +298,7 @@ impl Ex {
                 attempts: 1,
                 updated_at: start,
                 lease_until: Some(DateTime::from_system_time(t0() + LEASE)),
+                owner: Some("an earlier call".into()),
             })
             .await
             .unwrap();
@@ -1144,4 +1145,53 @@ async fn a_call_whose_record_another_call_gave_up_as_unknown_reports_an_unknown_
     let stored = ex.record("job-9").await.unwrap();
     assert_eq!(stored.status, ExternalCallStatus::Unknown);
     assert_eq!(stored.reply, None);
+}
+
+#[tokio::test]
+async fn a_call_whose_record_was_reset_and_begun_afresh_cannot_settle_the_new_call() {
+    require_docker!();
+    let ex = Ex::start().await;
+    let go_first = Arc::new(tokio::sync::Notify::new());
+    let first = slow_call(&ex.calls, "job-9", true, &go_first, || Ok(7));
+    ex.await_attempts("job-9", 1).await;
+    ex.store.clock.set(t0() + LEASE + Duration::from_secs(1));
+    // The second call takes the record over and fails retryably: the record is deleted.
+    let second = ex
+        .calls
+        .execute::<u32, _>("ex.Slow", "job-9", true, async {
+            Err(MessagingError::RetryableExternal("partner busy".into()))
+        })
+        .await;
+    assert!(
+        matches!(second, Err(MessagingError::RetryableExternal(_))),
+        "{second:?}"
+    );
+    assert!(
+        ex.record("job-9").await.is_none(),
+        "the retryable failure reset the record"
+    );
+    // A third call begins afresh: a new record with attempts = 1 again, as the first call's was.
+    let go_third = Arc::new(tokio::sync::Notify::new());
+    let third = slow_call(&ex.calls, "job-9", true, &go_third, || Ok(9));
+    ex.await_attempts("job-9", 1).await;
+
+    go_first.notify_one();
+    let late = first.await.unwrap();
+
+    assert!(
+        matches!(late, Err(MessagingError::RetryableExternal(_))),
+        "the first call no longer owns the record, although its attempts match: {late:?}"
+    );
+    let stored = ex.record("job-9").await.unwrap();
+    assert_eq!(
+        stored.status,
+        ExternalCallStatus::InProgress,
+        "the third call's record is untouched: {stored:?}"
+    );
+    go_third.notify_one();
+    assert_eq!(third.await.unwrap().unwrap(), 9);
+    let stored = ex.record("job-9").await.unwrap();
+    assert_eq!(stored.status, ExternalCallStatus::Succeeded);
+    assert_eq!(stored.reply.as_deref(), Some("9"));
+    assert_eq!(stored.owner, None, "a settled record has no owner");
 }

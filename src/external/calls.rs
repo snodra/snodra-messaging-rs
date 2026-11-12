@@ -18,10 +18,12 @@
 //!    the adapter itself leaves the record `UNKNOWN` (ruling 39); any other failure (a panic
 //!    included) is `FAILED` with `{"code","message"}`.
 //!
-//! 4. Ownership (ruling 70): every write after `begin` filters on the key, `IN_PROGRESS` and the
-//!    `attempts` value this call set (1 on insert, the takeover's count), so a call whose lease ran
-//!    out never overwrites or deletes the record of the call that took it over or gave it up as
-//!    `UNKNOWN`. A `SUCCEEDED` write that matches nothing is logged at warn and never reported as
+//! 4. Ownership (ruling 70, amended in H1): every write after `begin` filters on the key,
+//!    `IN_PROGRESS` and the `owner` token this call wrote (a random id, at the insert or the
+//!    takeover), so a call whose lease ran out never overwrites or deletes the record of the call
+//!    that took it over, gave it up as `UNKNOWN`, or began it afresh after a retryable reset (the
+//!    `attempts` count starts at 1 again then; a token never repeats). A settled record has no
+//!    `owner`. A `SUCCEEDED` write that matches nothing is logged at warn and never reported as
 //!    success (`RetryableExternal` with `external_idempotent`, else `UnknownOutcome`); a failure
 //!    write that matches nothing is logged at warn and the call still returns its own error. The
 //!    expired-lease change to `UNKNOWN` reads the record again when it matched nothing (the slow
@@ -146,10 +148,10 @@ fn handler_error(label: &str, message: String) -> MessagingError {
     }
 }
 
-/// What `begin` decided: run the body under the ownership token `attempts` (the value this call
-/// set on the record), or the call is answered from the record.
+/// What `begin` decided: run the body under the ownership token `owner` (written on the record
+/// with `attempts`), or the call is answered from the record.
 enum Begin {
-    Run { attempts: i32 },
+    Run { attempts: i32, owner: String },
     Replay(Option<String>),
 }
 
@@ -225,7 +227,7 @@ impl ExternalCalls {
         R: Serialize + DeserializeOwned + 'static,
         Fut: Future<Output = Result<R, MessagingError>>,
     {
-        let attempts = match self.begin(key, external_idempotent, label).await? {
+        let (attempts, owner) = match self.begin(key, external_idempotent, label).await? {
             Begin::Replay(reply) => {
                 self.metrics.external_call(label, ExternalOutcome::Replayed);
                 let reply = reply.unwrap_or_else(|| "{}".to_string());
@@ -236,9 +238,13 @@ impl ExternalCalls {
                     )
                 });
             }
-            Begin::Run { attempts } => attempts,
+            Begin::Run { attempts, owner } => (attempts, owner),
         };
-        let owned = Owned { key, attempts };
+        let owned = Owned {
+            key,
+            attempts,
+            owner: &owner,
+        };
         // A dropped future (the request was cancelled) leaves the record IN_PROGRESS: whether the
         // external system was reached is unknown, and its lease decides.
         let result = match AssertUnwindSafe(body).catch_unwind().await {
@@ -290,6 +296,7 @@ impl ExternalCalls {
         };
         for _ in 0..MAX_BEGIN_ROUNDS {
             let now = self.now();
+            let owner = uuid::Uuid::new_v4().to_string();
             let record = ExternalCallDocument {
                 id: key.to_string(),
                 status: ExternalCallStatus::InProgress,
@@ -298,9 +305,10 @@ impl ExternalCalls {
                 attempts: 1,
                 updated_at: now,
                 lease_until: Some(self.lease_from_now()),
+                owner: Some(owner.clone()),
             };
             match self.calls.insert_one(&record).await {
-                Ok(_) => return Ok(Begin::Run { attempts: 1 }),
+                Ok(_) => return Ok(Begin::Run { attempts: 1, owner }),
                 Err(e) if crate::saga::ports::is_duplicate_key(&e) => {} // an earlier call exists
                 Err(e) => return Err(store_down(e)),
             }
@@ -332,7 +340,7 @@ impl ExternalCalls {
                     let same_record = doc! {
                         "_id": key,
                         "status": "IN_PROGRESS",
-                        "attempts": existing.attempts,
+                        "owner": existing.owner.map(Bson::String).unwrap_or(Bson::Null),
                         "leaseUntil": lease.map(Bson::DateTime).unwrap_or(Bson::Null),
                     };
                     if external_idempotent {
@@ -341,7 +349,11 @@ impl ExternalCalls {
                             .find_one_and_update(
                                 same_record,
                                 doc! {
-                                    "$set": { "leaseUntil": self.lease_from_now(), "updatedAt": now },
+                                    "$set": {
+                                        "leaseUntil": self.lease_from_now(),
+                                        "updatedAt": now,
+                                        "owner": &owner,
+                                    },
                                     "$inc": { "attempts": 1 },
                                 },
                             )
@@ -351,6 +363,7 @@ impl ExternalCalls {
                         if let Some(taken) = taken {
                             return Ok(Begin::Run {
                                 attempts: taken.attempts,
+                                owner,
                             });
                         }
                     } else {
@@ -360,7 +373,7 @@ impl ExternalCalls {
                                 same_record,
                                 doc! {
                                     "$set": { "status": "UNKNOWN", "updatedAt": now },
-                                    "$unset": { "leaseUntil": "" },
+                                    "$unset": { "leaseUntil": "", "owner": "" },
                                 },
                             )
                             .await
@@ -400,7 +413,7 @@ impl ExternalCalls {
                 owned.filter(),
                 doc! {
                     "$set": { "status": "SUCCEEDED", "reply": reply, "updatedAt": self.now() },
-                    "$unset": { "leaseUntil": "", "error": "" },
+                    "$unset": { "leaseUntil": "", "owner": "", "error": "" },
                 },
             )
             .await?;
@@ -466,7 +479,7 @@ impl ExternalCalls {
                 owned.filter(),
                 doc! {
                     "$set": { "status": "UNKNOWN", "updatedAt": self.now() },
-                    "$unset": { "leaseUntil": "" },
+                    "$unset": { "leaseUntil": "", "owner": "" },
                 },
             )
             .await
@@ -508,7 +521,7 @@ impl ExternalCalls {
                         owned.filter(),
                         doc! {
                             "$set": { "status": "FAILED", "error": error, "updatedAt": self.now() },
-                            "$unset": { "leaseUntil": "" },
+                            "$unset": { "leaseUntil": "", "owner": "" },
                         },
                     )
                     .await
@@ -523,18 +536,19 @@ impl ExternalCalls {
     }
 }
 
-/// The record a running call owns: its key and the `attempts` value the call set when it inserted
-/// or took the record over. Every write after `begin` filters on both and on `IN_PROGRESS`, so a
-/// call whose lease ran out never writes over (or deletes) the record of the call that took it
-/// over or settled it (ruling 70).
+/// The record a running call owns: its key and the `owner` token the call wrote when it inserted
+/// or took the record over (`attempts`, its count then, is for the log). Every write after `begin`
+/// filters on the token and on `IN_PROGRESS`, so a call whose lease ran out never writes over (or
+/// deletes) the record of the call that took it over, settled it or began it afresh (ruling 70).
 struct Owned<'a> {
     key: &'a str,
     attempts: i32,
+    owner: &'a str,
 }
 
 impl Owned<'_> {
     fn filter(&self) -> mongodb::bson::Document {
-        doc! { "_id": self.key, "status": "IN_PROGRESS", "attempts": self.attempts }
+        doc! { "_id": self.key, "status": "IN_PROGRESS", "owner": self.owner }
     }
 
     /// Whether a write matched the owned record; when it did not, says so at warn.
@@ -543,7 +557,7 @@ impl Owned<'_> {
             tracing::warn!(
                 key = %self.key,
                 attempts = self.attempts,
-                "the call's record is no longer its own (its lease ran out and another call took it over or settled it): not {what}"
+                "the call's record is no longer its own (its lease ran out and another call took it over, settled it or began it afresh): not {what}"
             );
         }
         matched > 0

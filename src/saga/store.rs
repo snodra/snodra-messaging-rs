@@ -220,4 +220,8 @@ pub struct ExternalCallDocument {
     pub updated_at: DateTime,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_until: Option<DateTime>,
+    /// The ownership token of the call running it (a random id written at the insert and at a
+    /// take-over), unset when the call is settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }

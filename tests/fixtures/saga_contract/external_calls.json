@@ -6,5 +6,6 @@
   "error": "{\"code\":\"HANDLER_ERROR\",\"message\":\"no paper\"}",
   "attempts": 1,
   "updatedAt": {"$date": "2026-11-03T10:05:01Z"},
-  "leaseUntil": {"$date": "2026-11-03T10:10:01Z"}
+  "leaseUntil": {"$date": "2026-11-03T10:10:01Z"},
+  "owner": "0b9e2c7a-3d41-4f7e-8c55-6a1f2e9d4b70"
 }

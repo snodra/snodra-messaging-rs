@@ -730,6 +730,9 @@ reached the partner, a 5xx, a 429) and `MessagingError::UnknownOutcome` when the
 after the request went out); never retry inside the handler. With `external_idempotent = true` the partner de-duplicates by
 the key, so a call that crashed mid-way is made again after the lease instead of reported as `UNKNOWN_OUTCOME`. Every handler
 of a command a saga sends must be idempotent by `idempotency-key`: a crash between sending and marking it sent sends it again.
+A call owns its record through a random `owner` token it writes when it inserts the record or takes it over; a call whose
+lease ran out never settles, overwrites or deletes the record of a later call, also when the record was reset by a
+retryable failure and begun afresh in between (its success is then reported retryable or unknown, never as a success).
 
 **Configuration** (`Config::from_env`, Kotlin's defaults; retentions at least 1 s, intervals at least 1 ms, checked also in a
 service without sagas):
