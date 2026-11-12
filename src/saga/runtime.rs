@@ -188,19 +188,14 @@ impl SagaRuntime {
     /// with the retries of ruling 33. `true` when it was applied (or no longer matches anything),
     /// `false` when it failed again (the failure stays with `attempts` increased and the new
     /// error) or was no longer parked (a concurrent retry or discard: it is then not brought
-    /// back).
+    /// back). `InvalidMessage` without writing anything when its saga type does not run here
+    /// (not registered, or sagas disabled): the failure keeps its error and attempts.
     pub async fn reapply(&self, failure: &SagaFailureDocument) -> Result<bool, MessagingError> {
         let Some(&i) = self.by_name.get(failure.saga_type.as_str()) else {
-            self.park_again(
-                failure,
-                &format!(
-                    "Saga type '{}' does not exist in this service",
-                    failure.saga_type
-                ),
-                0,
-            )
-            .await?;
-            return Ok(false);
+            return Err(not_run_here(
+                &failure.saga_type,
+                &format!("parked event {} is left as it was", failure.id),
+            ));
         };
         let ctx = context_of(failure);
         let kind = self
@@ -213,6 +208,17 @@ impl SagaRuntime {
             )
             .await?;
         Ok(kind.is_some_and(|k| k != Kind::Gone))
+    }
+
+    /// `InvalidMessage` unless saga type `saga_type` runs in this service.
+    pub(crate) fn ensure_runs(&self, saga_type: &str) -> Result<(), MessagingError> {
+        if self.by_name.contains_key(saga_type) {
+            return Ok(());
+        }
+        Err(not_run_here(
+            saga_type,
+            "its parked events are left as they were",
+        ))
     }
 
     /// Fires `deadline` (claimed by the scheduler): in one transaction, a deadline no longer
@@ -862,6 +868,12 @@ impl SagaStage for SagaRuntime {
     ) -> BoxFuture<'a, Result<bool, MessagingError>> {
         Box::pin(self.process_event(type_name, payload, ctx))
     }
+}
+
+fn not_run_here(saga_type: &str, what: &str) -> MessagingError {
+    MessagingError::InvalidMessage(format!(
+        "Saga type '{saga_type}' does not run in this service: {what}"
+    ))
 }
 
 /// The handlers of `t` for `event_type`, in registration order; the handler of

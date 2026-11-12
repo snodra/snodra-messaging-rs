@@ -7,7 +7,9 @@
 //! applies the event, so concurrent retries apply it once. A failure that fails again stays, with
 //! `attempts` increased and the new error. A discarded event keeps its marker: redelivering the
 //! record does not apply it either, and a `discard` is final even when it lands while a retry is
-//! failing (ruling 36).
+//! failing (ruling 36). A parked event whose saga type does not run in this service (not
+//! registered, or sagas disabled) is not retried: the retry is refused and the event keeps its
+//! error and attempts (amended in H1).
 
 use std::sync::Arc;
 
@@ -50,7 +52,8 @@ impl SagaFailures {
     }
 
     /// Re-delivers the parked event `id` (`<sagaType>:<eventId>`); `true` when it was applied,
-    /// `false` when unknown or failed again.
+    /// `false` when unknown or failed again. `InvalidMessage` (nothing written) when its saga type
+    /// does not run in this service.
     pub async fn retry(&self, id: &str) -> Result<bool, MessagingError> {
         let mut tx = self
             .ports
@@ -71,7 +74,9 @@ impl SagaFailures {
     }
 
     /// Retries every parked event of saga type `saga_type`; returns how many were applied.
+    /// `InvalidMessage` (nothing written) when the type does not run in this service.
     pub async fn retry_all(&self, saga_type: &str) -> Result<usize, MessagingError> {
+        self.runtime.ensure_runs(saga_type)?;
         let mut applied = 0;
         for failure in self.list(Some(saga_type)).await? {
             if self.runtime.reapply(&failure).await? {

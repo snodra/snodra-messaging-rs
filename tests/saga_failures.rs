@@ -311,7 +311,7 @@ async fn retry_of_an_unknown_id_is_false() {
 }
 
 #[tokio::test]
-async fn a_failure_of_a_saga_type_this_service_does_not_have_stays_parked_and_says_so() {
+async fn a_failure_of_a_saga_type_this_service_does_not_have_is_refused_and_left_as_it_was() {
     require_docker!();
     let fx = Fx::start().await;
     fx.deliver("f7", "e-f7").await;
@@ -325,13 +325,22 @@ async fn a_failure_of_a_saga_type_this_service_does_not_have_stays_parked_and_sa
         .await
         .unwrap();
 
-    assert!(!fx.failures.retry("rt.Gone:e-f7").await.unwrap());
+    let refused = fx.failures.retry("rt.Gone:e-f7").await;
+    let refused_all = fx.failures.retry_all("rt.Gone").await;
 
+    for refusal in [refused.map(|_| 0), refused_all] {
+        match refusal {
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("Saga type 'rt.Gone' does not run in this service"),
+                "{e}"
+            ),
+            Ok(n) => panic!("a retry of a type this service does not run is refused, got {n}"),
+        }
+    }
     let kept = fx.failures.list(Some("rt.Gone")).await.unwrap().remove(0);
-    assert!(
-        kept.error.contains("does not exist in this service"),
-        "{}",
-        kept.error
+    assert_eq!(
+        kept, gone,
+        "the parked event keeps its error, attempts and lastFailedAt"
     );
-    assert_eq!(kept.attempts, gone.attempts, "no attempt was made");
 }

@@ -720,7 +720,9 @@ saga's transaction, for a state that may roll back, with no order, retry or idem
 
 **Handlers block.** A saga handler runs on the consumer's task and holds a tokio worker and the partition while it runs:
 keep it to recording. A panic is a handler error: two attempts, then the event is parked in `saga_failures`
-(`app.saga_failures()`: `list(type)`, `retry(id)`, `retry_all(type)`, `discard(id)`).
+(`app.saga_failures()`: `list(type)`, `retry(id)`, `retry_all(type)`, `discard(id)`). A retry of an event whose saga type
+does not run in this service (not registered, or `KRAKEN_SAGAS_ENABLED=false`) is refused with `InvalidMessage` and
+writes nothing: the event keeps its error and attempts until the type runs again.
 
 **Adapters.** `idempotent_command::<C>(key, external_idempotent, handler)` (and `idempotent_event::<E>`, whose body runs inside
 the ordinary handlers' transaction: prefer commands for slow calls) records each call in `external_calls`.
