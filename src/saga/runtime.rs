@@ -163,7 +163,8 @@ impl SagaRuntime {
             let kind = self
                 .deliver(&self.types[i], type_name, payload, ctx, None)
                 .await?;
-            if matches!(kind, Some(Kind::Handled | Kind::Duplicate)) {
+            // Parked (`None`): the instance got the event and its handler failed; the park says so.
+            if matches!(kind, Some(Kind::Handled | Kind::Duplicate) | None) {
                 applied = true;
             }
         }

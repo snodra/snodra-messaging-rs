@@ -36,8 +36,8 @@ pub enum Outcome {
     Duplicate,
     /// No ordinary handler and no saga wants the type: nothing was done and no marker written.
     NoInterest,
-    /// No ordinary handler, and the saga stage is interested in the type but applied the event to
-    /// no saga instance (ruling 27: the relay logs and counts a `SagaCommandFailed` nobody got).
+    /// No ordinary handler, and the saga stage is interested in the type but the event reached no
+    /// saga instance (ruling 27: the relay logs and counts a `SagaCommandFailed` nobody got).
     Unclaimed,
 }
 
@@ -46,8 +46,8 @@ pub enum Outcome {
 /// `process` hands the event to every interested saga type, each in its own transaction. By
 /// contract `process` fails only when parking a failed event itself fails (the store is down, so
 /// the record is redelivered instead of lost), never for a failing saga handler: such an event is
-/// parked in `saga_failures` (ruling 3). It returns whether the event was applied to at least one
-/// saga instance (an event a saga type already applied counts).
+/// parked in `saga_failures` (ruling 3). It returns whether the event reached at least one saga
+/// instance: applied, already applied before, or parked because its handler failed.
 pub trait SagaStage: Send + Sync {
     fn interested(&self, type_name: &str) -> bool;
 
