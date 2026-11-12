@@ -4,9 +4,10 @@
 //! Per (event, saga type) (ADR 0021 ruling 1) one transaction runs: the marker `processed_events`
 //! id `saga:<sagaType>:<eventId>` is inserted first (an existing one skips the event); the live
 //! instances associated with the event are resolved per handler (`key = value`); when none
-//! matches, a start handler creates one with `startKey = "<type>|<key>=<value>"` (a force-new
-//! handler always creates one, without a start key); each instance's handlers run in registration
-//! order, a handler running only on instances associated with its own key and value (ruling 4).
+//! matches, a start handler creates one with `startKey = "<type>|<key>=<value>"` (the parts
+//! percent-escaped, [`start_key_of`]; a force-new handler always creates one, without a start
+//! key); each instance's handlers run in registration order, a handler running only on instances
+//! associated with its own key and value (ruling 4).
 //! Handlers see one [`SagaContext`] per instance that only records; once every handler returned,
 //! the state is written with an optimistic version check (`version + 1`; 0 means just created),
 //! the recorded dispatch entries (`seq = version * 1000 + index`) and deadline changes are
@@ -492,7 +493,7 @@ impl SagaRuntime {
                 .enumerate()
                 .find(|(i, v)| handlers[*i].start && !handlers[*i].force_new && v.is_some());
             if let Some((i, Some(value))) = start {
-                let key = format!("{}|{}={}", t.name, handlers[i].key, value);
+                let key = start_key_of(t.name, &handlers[i].key, value);
                 planned.push(self.start_instance(
                     t,
                     handlers[i],
@@ -959,7 +960,7 @@ fn plan(
     .filter(|key| {
         associations
             .iter()
-            .any(|a| format!("{}|{}={}", t.name, a.k, a.v) == *key)
+            .any(|a| start_key_of(t.name, &a.k, &a.v) == *key)
     });
     let version = doc.map_or(0, |d| d.version + 1);
     let next = SagaDocument {
@@ -1081,4 +1082,38 @@ fn describe(e: &StoreError) -> String {
         text.truncate(end);
     }
     text
+}
+
+/// The start key of a saga started by `key = value`: `<type>|<key>=<value>` with `%`, `|` and `=`
+/// percent-escaped in each part (`%25`, `%7C`, `%3D`), so two different pairs never build the same
+/// key; the same bytes as Kotlin's `SagaRuntime.startKey` (ADR 0021 ruling 73).
+pub(crate) fn start_key_of(type_name: &str, key: &str, value: &str) -> String {
+    fn escape(part: &str) -> String {
+        part.replace('%', "%25")
+            .replace('|', "%7C")
+            .replace('=', "%3D")
+    }
+    format!("{}|{}={}", escape(type_name), escape(key), escape(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::start_key_of;
+
+    /// The same inputs and expected strings as Kotlin's `SagaRuntimeTest` (start keys whose parts
+    /// contain the separators stay apart): both libraries build the same key (ADR 0021 ruling 73).
+    #[test]
+    fn start_keys_whose_parts_contain_the_separators_stay_apart() {
+        assert_eq!(start_key_of("rt.Escape", "k=x", "1"), "rt.Escape|k%3Dx=1");
+        assert_eq!(start_key_of("rt.Escape", "k", "x=1"), "rt.Escape|k=x%3D1");
+        assert_eq!(
+            start_key_of("rt.Escape|a%b", "k", "v"),
+            "rt.Escape%7Ca%25b|k=v",
+            "the type name and a percent sign are escaped too"
+        );
+        assert_eq!(
+            start_key_of("rt.Order", "orderId", "o1"),
+            "rt.Order|orderId=o1"
+        );
+    }
 }
