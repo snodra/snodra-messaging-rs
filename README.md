@@ -902,7 +902,7 @@ list locally.
 | `last_error`, `last_error_at_ms` | `<error variant>: <message>` of the last failure (never the payload), cut at 512 bytes |
 | `event_types`, `dead_letter_mode` | the processor's types (`default` with the saga types), sorted; the mode |
 | `operation_id` | the reset holding the processor's lock (empty when none) |
-| `replaying`, `partitions[].replay_until` | a replay range is open on one of its assigned partitions; per partition the range's `until` (0 when none) |
+| `replaying`, `partitions[].replay_until` | a replay range is open and not yet passed on one of its assigned partitions; per partition the range's `until` (0 when none or passed) |
 
 ## Dead letters
 
@@ -1088,7 +1088,9 @@ KrakenMessaging::builder(config).await?
   replay deletes exactly `{processor, topic, partition, offset in [from, until)}`. Markers
   of local dispatch, sagas, ingress and failure notices have none.
 - **The ranges end.** Once this instance is past a range's `until` on its partition it removes the
-  range from the document; status `replaying` and `replay_until` show the open ones.
+  range from the document (on its 5 s poll); status `replaying` and `replay_until` show the ranges
+  this instance's position (or the group's committed offset) has not passed yet, so a partition stops
+  replaying as soon as its last replayed record is acknowledged.
 - `reset_handler` for a processor without event handlers here fails `start()`.
 
 ## Security

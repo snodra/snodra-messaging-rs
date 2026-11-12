@@ -7,7 +7,10 @@
 //! a record exhausted its attempts, a letter could not be parked or the consumer reported an
 //! error; else STARTING before the first assignment (an empty one counts) and between a revoke
 //! and the next assign; else RUNNING. `operation_id` names the reset holding the processor's
-//! lock, `replaying` and `replay_until` its open replay ranges on the assigned partitions.
+//! lock, `replaying` and `replay_until` its open replay ranges on the assigned partitions that
+//! this instance's position (or the group's committed offset) has not passed yet: a partition
+//! stops replaying as its last replayed record is acknowledged, not when the poll removes the
+//! range from the document.
 //!
 //! The processor gauges (ADR 0026) read the same status when the meter collects:
 //! `kraken.processor.state{processor,state}` (every state, 1 for the current one),
@@ -222,7 +225,7 @@ impl ProcessorMonitor {
         } else {
             ProcessorState::ProcessorRunning
         };
-        let partitions = st
+        let partitions: Vec<PartitionStatus> = st
             .partitions
             .iter()
             .map(|(&partition, o)| PartitionStatus {
@@ -231,9 +234,15 @@ impl ProcessorMonitor {
                 committed: o.committed,
                 high_watermark: o.high_watermark,
                 lag: lag(o),
-                replay_until: st.replay.get(&partition).copied().unwrap_or(0),
+                replay_until: st
+                    .replay
+                    .get(&partition)
+                    .copied()
+                    .filter(|&until| o.position.max(o.committed) < until)
+                    .unwrap_or(0),
             })
             .collect();
+        let replaying = partitions.iter().any(|p| p.replay_until > 0);
         let (last_error, last_error_at_ms) = st.last_error.clone().unwrap_or_default();
         ProcessorStatus {
             name: self.name.clone(),
@@ -252,7 +261,7 @@ impl ProcessorMonitor {
             last_error_at_ms,
             event_types: self.event_types.clone(),
             dead_letter_mode: self.mode.as_str().to_string(),
-            replaying: st.partitions.keys().any(|p| st.replay.contains_key(p)),
+            replaying,
             operation_id: st.operation.clone().unwrap_or_default(),
         }
     }
@@ -606,6 +615,33 @@ mod tests {
         m.offsets(1, 30, 40);
         assert_eq!(m.progress(1), Some(30));
         assert_eq!(m.progress(7), None);
+    }
+
+    #[test]
+    fn a_partition_stops_replaying_as_soon_as_its_position_passes_the_range() {
+        let m = monitor();
+        m.assigned(&[1, 2]);
+        m.set_replay(BTreeMap::from([(1, 40), (2, 10)]));
+        let until = |m: &ProcessorMonitor| {
+            m.status()
+                .partitions
+                .iter()
+                .map(|p| (p.partition, p.replay_until))
+                .collect::<Vec<_>>()
+        };
+        m.acknowledged(1, 38, true);
+        assert!(m.status().replaying);
+        assert_eq!(until(&m), [(1, 40), (2, 10)]);
+
+        // The last record of the range is acknowledged: not replaying from now on, without
+        // waiting for the poll to remove the range from the document.
+        m.acknowledged(1, 39, true);
+        assert_eq!(until(&m), [(1, 0), (2, 10)]);
+        assert!(m.status().replaying, "partition 2 still replays");
+        // The group's committed offset (another instance consumed it before a rebalance).
+        m.offsets(2, 10, 50);
+        assert_eq!(until(&m), [(1, 0), (2, 0)]);
+        assert!(!m.status().replaying);
     }
 
     #[test]
