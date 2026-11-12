@@ -2,8 +2,10 @@
 //! [`KrakenMessaging::processor_control`](crate::KrakenMessaging::processor_control), answers the
 //! hub's [`ControlRequest`]s and pauses or resumes a processor
 //! locally. One action per processor at a time on an instance; a renewal of the reset this
-//! instance holds is answered at once, never behind another action. Every action is logged at
-//! INFO with its `control_id`, processor, action and result.
+//! instance holds is answered at once, never behind another action, and so is a dead-letter
+//! request while a reset of the processor executes here: a list is read beside the execute, a
+//! retry, retry-all or discard is refused `LOCKED` (the hub would time it out while it waited).
+//! Every action is logged at INFO with its `control_id`, processor, action and result.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -157,7 +159,29 @@ impl ProcessorControl {
         let Some(serial) = self.inner.serial.get(processor) else {
             return unknown(processor);
         };
-        let _serial = serial.lock().await;
+        let free = serial.try_lock().ok();
+        if free.is_none()
+            && let Some(operation) = runner.and_then(|r| r.executing())
+        {
+            match action {
+                Action::DeadLetterList(l) => return self.list(processor, l.limit).await,
+                Action::DeadLetterRetry(_)
+                | Action::DeadLetterRetryAll(_)
+                | Action::DeadLetterDiscard(_) => {
+                    return refused(Refusal::new(
+                        ControlRefusal::Locked,
+                        format!(
+                            "processor '{processor}' is executing reset operation {operation}; try again when it finished"
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let _serial = match free {
+            Some(serial) => serial,
+            None => serial.lock().await,
+        };
         match action {
             Action::Pause(_) | Action::Resume(_) => {
                 let Some(runner) = runner else {

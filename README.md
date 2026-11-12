@@ -992,8 +992,11 @@ dashboard pause, resume and reset a processor on every instance at once and work
 (see the hub's `hub.md`, "Processor control", for the routes and the write token). Each
 `ControlRequest` is handled off the hub stream's
 read loop (heartbeats and requests never wait for it), one per processor at a time, answered on the
-stream it came on and logged at INFO (`control_id`, processor, action, result). Nothing is
-configured: no environment variable, no setting.
+stream it came on and logged at INFO (`control_id`, processor, action, result). Two never wait
+behind a running reset execute of their processor: the renewal of the reset, and the dead letters
+(a list is read beside the execute; a retry, retry-all or discard is refused `LOCKED` "processor
+'<name>' is executing reset operation <id>; try again when it finished"). Nothing is configured: no
+environment variable, no setting.
 
 **The state lives in the service's MongoDB**, collection `processor_control`, one document per
 processor (`_id` its name), which every instance reads before its consumer first polls and then

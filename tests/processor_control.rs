@@ -1336,6 +1336,43 @@ async fn control_requests_never_hold_the_hub_stream_and_renewals_never_wait() {
         started.elapsed() < Duration::from_secs(2),
         "answered at once"
     );
+    // Dead letters never wait behind the execute (the hub times a request out after 10 s): the
+    // list is read beside it, a change is refused at once.
+    let started = std::time::Instant::now();
+    let page = hub
+        .control(
+            "default",
+            Action::DeadLetterList(proto::DeadLetterList { limit: 10 }),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        matches!(
+            page.as_ref().and_then(|r| r.result.as_ref()),
+            Some(Answer::DeadLetters(p)) if p.total == 0
+        ),
+        "{page:?}"
+    );
+    for change in [
+        Action::DeadLetterRetry(proto::DeadLetterRetry {
+            letter_id: "default:stream.events:0:0".into(),
+        }),
+        Action::DeadLetterRetryAll(proto::DeadLetterRetryAll {}),
+        Action::DeadLetterDiscard(proto::DeadLetterDiscard {
+            letter_id: "default:stream.events:0:0".into(),
+        }),
+    ] {
+        let (code, message) = refused(hub.control("default", change, Duration::from_secs(5)).await);
+        assert_eq!(code, ControlRefusal::Locked, "{message}");
+        assert!(
+            message.contains("executing reset operation op-s"),
+            "{message}"
+        );
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "answered at once"
+    );
     hub.send_to_clients(proto::ServerMessage {
         message: Some(proto::server_message::Message::Request(proto::Request {
             id: "ping-1".into(),
