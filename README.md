@@ -997,7 +997,7 @@ read loop (heartbeats and requests never wait for it), one per processor at a ti
 stream it came on and logged at INFO (`control_id`, processor, action, result). Two never wait
 behind a running reset execute of their processor: the renewal of the reset, and the dead letters
 (a list is read beside the execute; a retry, retry-all or discard is refused `LOCKED` "processor
-'<name>' is executing reset operation <id>; try again when it finished"). Nothing is configured: no
+'<name>' is executing reset operation <id>; try again when it finished", as in Kotlin). Nothing is configured: no
 environment variable, no setting.
 
 **The state lives in the service's MongoDB**, collection `processor_control`, one document per
@@ -1047,7 +1047,7 @@ renewal that arrives after the finish never takes the lock again: an operation t
 instance (finished, aborted, its lease passed, its lock lost) is remembered for at least
 max(2 x lease, 60 s), and a prepare of it, or a renewal whose lock is gone, is `NOT_PREPARED`. A
 prepare or renewal asking for a lease under 1000 ms is `INVALID` (the executor extends its lease every
-half lease, at most every 10 s, and a tiny one would only spin against MongoDB).
+half lease, at most every 10 s, and a tiny one would only spin against MongoDB), as in Kotlin.
 
 The execute resolves the target (`earliest` the low watermarks, `latest` the high watermarks, a
 time the first offset at or after it, else the end), refuses while the group has members
