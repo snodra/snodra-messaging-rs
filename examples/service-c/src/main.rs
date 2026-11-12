@@ -253,19 +253,7 @@ async fn main() -> Result<(), MessagingError> {
             false,
             move |cmd, _ctx| {
                 let (printer, events) = (poll_printer.clone(), poll_events.clone());
-                async move {
-                    let Some(job) = printer.status(&cmd.job_id).await? else {
-                        return Ok(());
-                    };
-                    if job.status == "DONE" {
-                        let printed = BannerPrinted {
-                            job_id: job.job_id,
-                            text: job.name,
-                        };
-                        events.publish(&printed, Some(&printed.text)).await?;
-                    }
-                    Ok(())
-                }
+                async move { printer::poll(&printer, &events, &cmd).await }
             },
         )
         .external_source(

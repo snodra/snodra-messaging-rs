@@ -29,7 +29,9 @@ through the Rust form of service-b's postcard saga with service-c's own types (`
   the way it answers postcards: `webhook-*` posts to service-c's `POST /printer/webhook` (checked with
   `external::webhook::verify`, applied once through `app.ingress()`), `topic-*` produces to the printer's topic for
   service-c, `printer.banner.events` (the external source `printer-banner`), `poll-*` makes the saga send
-  `examples.PollBannerJob` every 2 s (the adapter publishes `examples.BannerPrinted` once the printer says `DONE`),
+  `examples.PollBannerJob` every 2 s (the adapter publishes `examples.BannerPrinted` once the printer says `DONE`; a
+  publish that fails is retryable, so the relay sends the poll again instead of failing the banner; the job id is sent
+  as one percent-encoded path segment of `GET /jobs/{id}`),
   `silent-*` never answers and `crash-*` crashes before replying.
 - `examples.BannerPrinted` ends the saga; the timeout publishes `examples.BannerFailed` `TIMEOUT`, and a command that
   failed for good (`SagaCommandFailed`, for example `UNKNOWN_OUTCOME` after the crash) `BannerFailed` with that reason.

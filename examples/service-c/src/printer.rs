@@ -12,9 +12,10 @@ use kraken_messaging::MessagingError;
 use kraken_messaging::external::TranslatedEvent;
 use kraken_messaging::external::kafka::{BorrowedMessage, Message};
 use kraken_messaging::external::webhook;
+use kraken_messaging::kafka::EventBus;
 use serde::{Deserialize, Serialize};
 
-use crate::messages::BannerPrinted;
+use crate::messages::{BannerPrinted, PollBannerJob};
 
 /// The name of the printer's topic source (`builder.external_source`) and of the webhook's
 /// ingress source: one dedupe namespace for both channels, so a notification the printer sends
@@ -152,7 +153,7 @@ impl Printer {
         };
         let response = self
             .http
-            .get(format!("{}/jobs/{job_id}", self.url))
+            .get(self.job_url(job_id)?)
             .send()
             .await
             .map_err(retryable)?;
@@ -163,6 +164,54 @@ impl Printer {
         classify(code, &format!("polling {job_id}"))?;
         Ok(Some(response.json().await.map_err(retryable)?))
     }
+
+    /// `GET /jobs/{id}` of `job_id`, the id one percent-encoded path segment (it carries the
+    /// shout's text: a `/`, `?` or `#` in it must not change the path or add a query).
+    fn job_url(&self, job_id: &str) -> Result<reqwest::Url, MessagingError> {
+        let invalid = || {
+            MessagingError::InvalidMessage(format!(
+                "the printer URL {} is not a base URL",
+                self.url
+            ))
+        };
+        let mut url = reqwest::Url::parse(&self.url).map_err(|_| invalid())?;
+        url.path_segments_mut()
+            .map_err(|()| invalid())?
+            .pop_if_empty()
+            .extend(["jobs", job_id]);
+        Ok(url)
+    }
+}
+
+/// The poll adapter's body (`PollBannerJob`): asks the printer about the job and publishes
+/// `BannerPrinted` when it is done.
+pub async fn poll(
+    printer: &Printer,
+    events: &EventBus,
+    cmd: &PollBannerJob,
+) -> Result<(), MessagingError> {
+    let Some(job) = printer.status(&cmd.job_id).await? else {
+        return Ok(());
+    };
+    if job.status == "DONE" {
+        let printed = BannerPrinted {
+            job_id: job.job_id,
+            text: job.name,
+        };
+        // The printer was only read: a repeat is safe, so a publish that fails (the outbox is
+        // unreachable) is retryable and the relay sends this poll again, rather than FAILED,
+        // which would end the banner.
+        events
+            .publish(&printed, Some(&printed.text))
+            .await
+            .map_err(|e| {
+                MessagingError::RetryableExternal(format!(
+                    "the printer said {} is printed but BannerPrinted could not be published: {e}",
+                    printed.job_id
+                ))
+            })?;
+    }
+    Ok(())
 }
 
 /// An HTTP status of the printer as the adapter's outcome.
@@ -225,10 +274,74 @@ pub fn no_headers() -> HashMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::{
-        Printer, PrinterNotification, ReplyTo, check_webhook, classify, translate_payload,
+        Printer, PrinterNotification, ReplyTo, check_webhook, classify, poll, translate_payload,
     };
+    use crate::messages::PollBannerJob;
     use kraken_messaging::MessagingError;
+    use kraken_messaging::kafka::EventBus;
+
+    /// A printer on a free loopback port that answers every request with `DONE` for `jobId` and
+    /// records the path and query it was asked for.
+    async fn done_printer() -> (Printer, Arc<Mutex<Vec<String>>>) {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&asked);
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.lock().unwrap().push(uri.to_string());
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    r#"{"jobId":"banner-x","name":"x","status":"DONE"}"#,
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let reply_to = ReplyTo {
+            webhook: String::new(),
+            topic: String::new(),
+        };
+        (Printer::new(&url, reply_to).unwrap(), asked)
+    }
+
+    #[tokio::test]
+    async fn a_job_id_is_one_encoded_path_segment_of_the_status_request() {
+        let (printer, asked) = done_printer().await;
+
+        printer.status("banner-a/b?c#d e").await.unwrap();
+
+        assert_eq!(
+            *asked.lock().unwrap(),
+            ["/jobs/banner-a%2Fb%3Fc%23d%20e"],
+            "a shout's text must not change the printer's path or add a query"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_poll_whose_publish_fails_is_retryable_so_the_saga_keeps_polling() {
+        let (printer, _) = done_printer().await;
+        // An outbox that cannot be reached: the publish fails after the printer said DONE.
+        let db =
+            mongodb::Client::with_uri_str("mongodb://127.0.0.1:1/x?serverSelectionTimeoutMS=200")
+                .await
+                .unwrap()
+                .database("x");
+        let cmd = PollBannerJob {
+            job_id: "banner-x".into(),
+            attempt: 1,
+        };
+
+        let polled = poll(&printer, &EventBus::new(db), &cmd).await;
+
+        assert!(
+            matches!(polled, Err(MessagingError::RetryableExternal(_))),
+            "a failed publish must not make the poll FAILED: {polled:?}"
+        );
+    }
 
     const SECRET: &str = "test-secret";
     const BODY: &[u8] = br#"{"deliveryId":"printed-banner-webhook-1","jobId":"banner-webhook-1","name":"webhook-1"}"#;
