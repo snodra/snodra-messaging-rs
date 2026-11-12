@@ -1040,7 +1040,9 @@ lease passes and the instances release it and consume again by themselves. An in
 (or polls) while an unexpired lock it was not prepared for is held stays out of the group too. A
 renewal that arrives after the finish never takes the lock again: an operation that ended on an
 instance (finished, aborted, its lease passed, its lock lost) is remembered for at least
-max(2 x lease, 60 s), and a prepare of it, or a renewal whose lock is gone, is `NOT_PREPARED`.
+max(2 x lease, 60 s), and a prepare of it, or a renewal whose lock is gone, is `NOT_PREPARED`. A
+prepare or renewal asking for a lease under 1000 ms is `INVALID` (the executor extends its lease every
+half lease, at most every 10 s, and a tiny one would only spin against MongoDB).
 
 The execute resolves the target (`earliest` the low watermarks, `latest` the high watermarks, a
 time the first offset at or after it, else the end), refuses while the group has members

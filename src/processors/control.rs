@@ -27,6 +27,12 @@ use crate::proto::{self, ControlRefusal, ControlReply, ControlRequest};
 pub const MAX_CONTROL_TEXT_BYTES: usize = 512;
 /// The most letters one `dead_letter_list` returns.
 pub const MAX_LIST_LIMIT: u32 = 100;
+/// The shortest lease a `reset_prepare` may ask for (the hub asks for 30 s): a shorter one would
+/// lapse before anything happened and have the executor extend it against MongoDB in a spin.
+pub const MIN_RESET_LEASE_MS: i64 = 1000;
+/// The refusal of a prepare without an operation id or with a lease under [`MIN_RESET_LEASE_MS`].
+pub(crate) const BAD_PREPARE: &str =
+    "a prepare needs an operation id and a lease of at least 1000 ms";
 
 /// See the module docs. Cheap to clone.
 #[derive(Clone)]
@@ -135,6 +141,11 @@ impl ProcessorControl {
                 "the request names no action",
             ));
         };
+        if let Action::ResetPrepare(p) = &action
+            && p.lease_ms < MIN_RESET_LEASE_MS
+        {
+            return refused(Refusal::new(ControlRefusal::Invalid, BAD_PREPARE));
+        }
         let runner = self.inner.runners.get(processor);
         // A renewal of the reset this instance holds: at once (ADR 0023), never behind an execute.
         // One whose lock is gone is refused, never turned into a prepare that takes the lock.
@@ -397,5 +408,54 @@ fn describe(answer: &Answer) -> String {
             "retried {}, failed {}, blocked {}, skipped {}",
             r.retried, r.failed, r.blocked, r.skipped
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A control without runners over a database that is never connected to.
+    async fn control() -> ProcessorControl {
+        let client =
+            mongodb::Client::with_uri_str("mongodb://127.0.0.1:1/x?serverSelectionTimeoutMS=200")
+                .await
+                .unwrap();
+        let db = client.default_database().unwrap();
+        ProcessorControl::new(
+            Vec::new(),
+            DeadLetters::new(db, DeadLetterMode::Collection, vec![]),
+        )
+    }
+
+    fn prepare(lease_ms: i64) -> ControlRequest {
+        ControlRequest {
+            control_id: "c-1".into(),
+            processor: "audit".into(),
+            action: Some(Action::ResetPrepare(proto::ResetPrepare {
+                operation_id: "op-1".into(),
+                lease_ms,
+            })),
+        }
+    }
+
+    fn refusal(reply: ControlReply) -> (ControlRefusal, String) {
+        match reply.result {
+            Some(Answer::Refused(r)) => (ControlRefusal::try_from(r.code).unwrap(), r.message),
+            other => panic!("not refused: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prepare_or_renewal_with_a_lease_under_a_second_is_invalid() {
+        let control = control().await;
+        for lease_ms in [-1, 0, 1, 999] {
+            let (code, message) = refusal(control.handle(prepare(lease_ms)).await);
+            assert_eq!(code, ControlRefusal::Invalid, "lease {lease_ms} ms");
+            assert!(message.contains("at least 1000 ms"), "{message}");
+        }
+        // A second is a lease: what comes next is about the processor, not the lease.
+        let (code, _) = refusal(control.handle(prepare(1000)).await);
+        assert_eq!(code, ControlRefusal::UnknownProcessor);
     }
 }

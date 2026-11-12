@@ -457,10 +457,11 @@ impl ProcessorRunner {
         operation: &str,
         lease: Duration,
     ) -> Result<String, Refusal> {
-        if operation.is_empty() || lease.is_zero() {
+        // The lease is checked by the control, before a renewal too.
+        if operation.is_empty() {
             return Err(Refusal::new(
                 ControlRefusal::Invalid,
-                "a prepare needs an operation id and a positive lease",
+                super::control::BAD_PREPARE,
             ));
         }
         if self.has_ended(operation) {
