@@ -211,14 +211,15 @@ impl SagaRuntime {
         Ok(kind.is_some_and(|k| k != Kind::Gone))
     }
 
-    /// `InvalidMessage` unless saga type `saga_type` runs in this service.
-    pub(crate) fn ensure_runs(&self, saga_type: &str) -> Result<(), MessagingError> {
+    /// `InvalidMessage` unless saga type `saga_type` runs in this service; the message counts its
+    /// `parked` events.
+    pub(crate) fn ensure_runs(&self, saga_type: &str, parked: usize) -> Result<(), MessagingError> {
         if self.by_name.contains_key(saga_type) {
             return Ok(());
         }
         Err(not_run_here(
             saga_type,
-            "its parked events are left as they were",
+            &format!("its parked events ({parked}) are left as they were"),
         ))
     }
 

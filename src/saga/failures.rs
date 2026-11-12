@@ -73,12 +73,16 @@ impl SagaFailures {
         }
     }
 
-    /// Retries every parked event of saga type `saga_type`; returns how many were applied.
-    /// `InvalidMessage` (nothing written) when the type does not run in this service.
+    /// Retries every parked event of saga type `saga_type`; returns how many were applied (0 when
+    /// none is parked). `InvalidMessage` (nothing written) when the type does not run in this
+    /// service and has parked events.
     pub async fn retry_all(&self, saga_type: &str) -> Result<usize, MessagingError> {
-        self.runtime.ensure_runs(saga_type)?;
+        let parked = self.list(Some(saga_type)).await?;
+        if !parked.is_empty() {
+            self.runtime.ensure_runs(saga_type, parked.len())?;
+        }
         let mut applied = 0;
-        for failure in self.list(Some(saga_type)).await? {
+        for failure in parked {
             if self.runtime.reapply(&failure).await? {
                 applied += 1;
             }

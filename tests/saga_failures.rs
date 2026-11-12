@@ -12,7 +12,7 @@ use kraken_messaging::kafka::SagaStage;
 use kraken_messaging::saga::ports::{SagaPorts, StoreError, Tx, TxProvider};
 use kraken_messaging::saga::store::SagaFailureDocument;
 use kraken_messaging::saga::{NoopSagaMetrics, SagaFailures, SagaRetry, SagaRuntime, SagaType};
-use kraken_messaging::{MessageType, RetryPolicy};
+use kraken_messaging::{MessageType, MessagingError, RetryPolicy};
 use mongodb::bson::{DateTime, doc};
 use support::order_saga::*;
 use support::saga::{Store, event_ctx, state, t0};
@@ -307,6 +307,11 @@ async fn retry_of_an_unknown_id_is_false() {
     assert!(!fx.failures.retry("rt.Flaky:nope").await.unwrap());
     assert!(!fx.failures.retry("rt.Gone:e-1").await.unwrap());
     assert_eq!(fx.failures.retry_all("rt.Flaky").await.unwrap(), 0);
+    assert_eq!(
+        fx.failures.retry_all("rt.Gone").await.unwrap(),
+        0,
+        "nothing parked: nothing to refuse, as in Kotlin"
+    );
     assert!(fx.failures.list(None).await.unwrap().is_empty());
 }
 
@@ -328,13 +333,19 @@ async fn a_failure_of_a_saga_type_this_service_does_not_have_is_refused_and_left
     let refused = fx.failures.retry("rt.Gone:e-f7").await;
     let refused_all = fx.failures.retry_all("rt.Gone").await;
 
-    for refusal in [refused.map(|_| 0), refused_all] {
+    for (refusal, text) in [
+        (
+            refused.map(|_| 0),
+            "Saga type 'rt.Gone' does not run in this service: parked event rt.Gone:e-f7 is left as it was",
+        ),
+        (
+            refused_all,
+            "Saga type 'rt.Gone' does not run in this service: its parked events (1) are left as they were",
+        ),
+    ] {
         match refusal {
-            Err(e) => assert!(
-                e.to_string()
-                    .contains("Saga type 'rt.Gone' does not run in this service"),
-                "{e}"
-            ),
+            Err(MessagingError::InvalidMessage(message)) => assert_eq!(message, text),
+            Err(e) => panic!("refused as InvalidMessage, got {e}"),
             Ok(n) => panic!("a retry of a type this service does not run is refused, got {n}"),
         }
     }
