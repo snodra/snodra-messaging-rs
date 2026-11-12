@@ -1401,6 +1401,13 @@ Label values come from bounded sets: `type` is a type this service registered (a
 observed from values the library holds anyway (the processor status, the outbox relay's last poll, the hub pool), never
 with a Kafka or MongoDB call in a callback.
 
+An instance that stops (a restart, a crash) exports nothing more, and Prometheus keeps a gauge series that stops at its last
+value for 5 minutes (OTLP carries no staleness markers), so a dead instance would still look connected, running or busy.
+The kraken dashboards therefore read the library gauges as `last_over_time(<gauge>[$instance_seen])` (`$instance_seen`
+3 m by default, like the hub dashboard's `$hub_seen`): a series without a sample in that window drops out. Queries of your
+own should do the same; the export interval (the OpenTelemetry SDK's default 60 s, `OTEL_METRIC_EXPORT_INTERVAL`; the
+sandbox's 5 s) must stay well under the window.
+
 | Series (Prometheus) | Type | Labels | Meaning |
 |---|---|---|---|
 | `kraken_outbox_pending` | gauge | — | outbox documents neither sent nor failed, as the relay's last poll saw them (the batch, or a count of all of them behind a full batch); only where the relay runs, every instance reports the same database: aggregate with `max by (job)` |
