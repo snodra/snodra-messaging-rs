@@ -3,8 +3,9 @@
 //! time and mounted in (nothing is checked in): a service with the right token registers over TLS
 //! and serves a query from a second service, a wrong token is refused with `UNAUTHENTICATED`, a
 //! token used for the wrong service or type is refused with `PERMISSION_DENIED`, a send outside the
-//! ACL is `AccessDenied`, and plain text against the TLS hub fails cleanly. No Kafka or MongoDB:
-//! the participants are a `HubConnection` and a `Sender`.
+//! ACL is `AccessDenied`, and plain text against the TLS hub fails cleanly. A hub in mode `off`
+//! ignores whatever token a client sends. No Kafka or MongoDB: the participants are a
+//! `HubConnection` and a `Sender`.
 mod support;
 
 use std::sync::Arc;
@@ -144,10 +145,10 @@ impl Peer {
     }
 }
 
-/// A participant of `service` with `token` and `tls`, registering `types`; it answers
-/// `billing.GetInvoice` with an `Invoice` naming the service.
+/// A participant of `service` with `token` and `tls` on the hub at `address`, registering
+/// `types`; it answers `billing.GetInvoice` with an `Invoice` naming the service.
 fn peer(
-    f: &Fixture,
+    address: &str,
     service: &str,
     token: &str,
     tls: Option<HubTls>,
@@ -156,7 +157,7 @@ fn peer(
     let (tx, mut rx) = mpsc::channel::<Inbound>(64);
     let conn = HubConnection::new(
         HubSettings {
-            address: f.hub.address.clone(),
+            address: address.to_string(),
             backoff_min: Duration::from_millis(100),
             backoff_max: Duration::from_secs(1),
             token: Some(SecretString::new(token)),
@@ -214,9 +215,15 @@ fn billing_types() -> RegisteredTypes {
 async fn a_service_with_the_right_token_registers_over_tls_and_serves_a_query() {
     require_docker!();
     let f = fixture().await;
-    let billing = peer(&f, "billing", &f.billing_token, f.tls(), billing_types());
+    let billing = peer(
+        &f.hub.address,
+        "billing",
+        &f.billing_token,
+        f.tls(),
+        billing_types(),
+    );
     let orders = peer(
-        &f,
+        &f.hub.address,
         "orders",
         &f.orders_token,
         f.tls(),
@@ -247,7 +254,13 @@ async fn a_wrong_token_is_rejected_with_unauthenticated() {
     let f = fixture().await;
     let captured = Captured::default();
     let _logs = captured.install();
-    let intruder = peer(&f, "billing", &random_token(), f.tls(), billing_types());
+    let intruder = peer(
+        &f.hub.address,
+        "billing",
+        &random_token(),
+        f.tls(),
+        billing_types(),
+    );
     let deadline = Instant::now() + Duration::from_secs(15);
     while intruder.conn.last_rejection().is_none() {
         assert!(
@@ -286,7 +299,7 @@ async fn a_token_used_for_the_wrong_service_or_type_is_rejected_with_permission_
         let captured = Captured::default();
         let _logs = captured.install();
         // The billing token, presented as another service or for a type it may not handle.
-        let p = peer(&f, service, &f.billing_token, f.tls(), types);
+        let p = peer(&f.hub.address, service, &f.billing_token, f.tls(), types);
         let deadline = Instant::now() + Duration::from_secs(15);
         while p.conn.last_rejection().is_none() {
             assert!(
@@ -312,7 +325,7 @@ async fn a_send_outside_the_acl_is_access_denied() {
     require_docker!();
     let f = fixture().await;
     let orders = peer(
-        &f,
+        &f.hub.address,
         "orders",
         &f.orders_token,
         f.tls(),
@@ -337,7 +350,13 @@ async fn plain_text_against_the_tls_hub_fails_cleanly() {
     let f = fixture().await;
     let captured = Captured::default();
     let _logs = captured.install();
-    let plain = peer(&f, "billing", &f.billing_token, None, billing_types());
+    let plain = peer(
+        &f.hub.address,
+        "billing",
+        &f.billing_token,
+        None,
+        billing_types(),
+    );
     let started = Instant::now();
     // Not a hang: the hint is logged within a few seconds. The first failure can be a refused
     // connect (the host-mapped port not forwarding yet) that carries no hint, so wait for the
@@ -354,4 +373,43 @@ async fn plain_text_against_the_tls_hub_fails_cleanly() {
     assert!(plain.conn.handshake().is_none());
     assert!(!captured.text().contains(&f.billing_token));
     plain.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_hub_in_mode_off_ignores_the_token_a_client_sends() {
+    require_docker!();
+    let hub = hub_with(HubOptions::new().env("KRAKEN_HUB_AUTH_MODE", "off")).await;
+    // Tokens no hub knows (one shaped like a JWT): `off` reads no credential, so both register.
+    let billing = peer(
+        &hub.address,
+        "billing",
+        &random_token(),
+        None,
+        billing_types(),
+    );
+    let orders = peer(
+        &hub.address,
+        "orders",
+        "eyJhbGciOiJSUzI1NiJ9.eyJhenAiOiJzb21lb25lLWVsc2UifQ.c2lnbmF0dXJl",
+        None,
+        RegisteredTypes::default(),
+    );
+    assert!(billing.conn.await_registered(Duration::from_secs(15)).await);
+    assert!(orders.conn.await_registered(Duration::from_secs(15)).await);
+    assert_eq!(billing.conn.last_rejection(), None);
+
+    let invoice = orders
+        .sender
+        .send_query(&GetInvoice { id: 9 }, SendOptions::default())
+        .await
+        .expect("no ACL applies in mode off");
+    assert_eq!(
+        invoice,
+        Invoice {
+            id: 9,
+            owner: "billing".into()
+        }
+    );
+    billing.shutdown().await;
+    orders.shutdown().await;
 }
