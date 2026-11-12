@@ -146,6 +146,10 @@ fn a_kotlin_shaped_document_of_each_collection_deserialises() {
     assert_eq!(call.attempts, 1);
     assert_eq!(call.updated_at, at("2026-11-03T10:05:01Z"));
     assert_eq!(call.lease_until, Some(at("2026-11-03T10:10:01Z")));
+    assert_eq!(
+        call.owner.as_deref(),
+        Some("0b9e2c7a-3d41-4f7e-8c55-6a1f2e9d4b70")
+    );
 }
 
 /// The names and BSON types of `doc` against the contract: `expected` lists `(field, type)` for
@@ -347,6 +351,7 @@ fn a_document_rust_writes_has_exactly_the_contracts_field_names_and_bson_types_a
             ("attempts", "int"),
             ("updatedAt", "date"),
             ("leaseUntil", "date"),
+            ("owner", "string"),
         ],
     );
     assert_eq!(to_doc(&call).get_str("status"), Ok("IN_PROGRESS"));
@@ -358,6 +363,7 @@ fn a_document_rust_writes_has_exactly_the_contracts_field_names_and_bson_types_a
         attempts: 1,
         updated_at: at("2026-11-03T12:00:00Z"),
         lease_until: None,
+        owner: None,
     };
     assert_shape(
         &to_doc(&started),
@@ -381,7 +387,7 @@ async fn db(uri: &str) -> Database {
 const DAY: Duration = Duration::from_secs(86_400);
 
 async fn ensure_all(db: &Database) {
-    ensure_saga_indexes(db, 30 * DAY, 7 * DAY, 7 * DAY)
+    ensure_saga_indexes(db, 30 * DAY, 7 * DAY, 7 * DAY, 30 * DAY)
         .await
         .unwrap();
     ensure_external_call_indexes(db, 30 * DAY).await.unwrap();
@@ -468,6 +474,9 @@ async fn every_index_of_the_contract_exists_with_its_keys_partial_filters_and_tt
         options(&index(&db, "saga_dispatch", &["dispatchedAt"]).await).expire_after,
         Some(7 * DAY)
     );
+    let failed = index(&db, "saga_dispatch", &["failedAt"]).await;
+    assert_eq!(options(&failed).name.as_deref(), Some("failedAt_ttl"));
+    assert_eq!(options(&failed).expire_after, Some(30 * DAY));
     assert_eq!(
         options(&index(&db, "saga_dispatch_leases", &["until"]).await).expire_after,
         Some(Duration::ZERO)
@@ -481,13 +490,9 @@ async fn every_index_of_the_contract_exists_with_its_keys_partial_filters_and_tt
     );
 
     index(&db, "saga_failures", &["sagaType", "lastFailedAt"]).await;
-    assert!(
-        indexes(&db, "saga_failures")
-            .await
-            .iter()
-            .all(|m| options(m).expire_after.is_none()),
-        "saga_failures has no TTL"
-    );
+    let parked = index(&db, "saga_failures", &["lastFailedAt"]).await;
+    assert_eq!(options(&parked).name.as_deref(), Some("lastFailedAt_ttl"));
+    assert_eq!(options(&parked).expire_after, Some(30 * DAY));
 
     assert_eq!(
         options(&index(&db, "external_calls", &["updatedAt"]).await).expire_after,

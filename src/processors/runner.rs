@@ -96,6 +96,18 @@ struct Held {
     lease: Duration,
 }
 
+/// Clears [`ProcessorRunner::executing`] however the execute ends (a panic or a dropped request
+/// included).
+struct Executing<'a>(&'a Mutex<Option<String>>);
+
+impl Drop for Executing<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut executing) = self.0.lock() {
+            *executing = None;
+        }
+    }
+}
+
 /// See the module docs.
 pub struct ProcessorRunner {
     settings: ProcessorSettings,
@@ -107,6 +119,8 @@ pub struct ProcessorRunner {
     reset_handlers: Vec<ResetHandler>,
     run: tokio::sync::Mutex<Option<Run>>,
     held: Mutex<Option<Held>>,
+    /// The operation whose `reset_execute` runs here now (the dead letters do not wait for it).
+    executing: Mutex<Option<String>>,
     /// One control action of this processor at a time, the poll included (a renewal of the held
     /// operation excepted).
     serial: Arc<tokio::sync::Mutex<()>>,
@@ -145,6 +159,7 @@ impl ProcessorRunner {
             reset_handlers,
             run: tokio::sync::Mutex::new(None),
             held: Mutex::new(None),
+            executing: Mutex::new(None),
             serial: Arc::new(tokio::sync::Mutex::new(())),
             finished: Mutex::new(HashMap::new()),
             pause_before_expiry: Mutex::new(None),
@@ -457,10 +472,11 @@ impl ProcessorRunner {
         operation: &str,
         lease: Duration,
     ) -> Result<String, Refusal> {
-        if operation.is_empty() || lease.is_zero() {
+        // The lease is checked by the control, before a renewal too.
+        if operation.is_empty() {
             return Err(Refusal::new(
                 ControlRefusal::Invalid,
-                "a prepare needs an operation id and a positive lease",
+                super::control::BAD_PREPARE,
             ));
         }
         if self.has_ended(operation) {
@@ -498,6 +514,11 @@ impl ProcessorRunner {
                 ))
             }
         }
+    }
+
+    /// The operation whose `reset_execute` runs on this instance now, if any.
+    pub(crate) fn executing(&self) -> Option<String> {
+        self.executing.lock().unwrap().clone()
     }
 
     /// The local operation that holds the lock, if any.
@@ -559,6 +580,8 @@ impl ProcessorRunner {
                 }
             })
         };
+        *self.executing.lock().unwrap() = Some(held.id.clone());
+        let _executing = Executing(&self.executing);
         let result = self.execute_held(&held, target, Instant::now()).await;
         keeper.abort();
         result

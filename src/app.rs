@@ -260,8 +260,8 @@ impl KrakenMessaging {
     }
 
     /// The admin API over the parked saga events (`saga_failures`, ADR 0021 rulings 3, 36): list,
-    /// retry and discard. In a service without sagas it lists what the collection holds and a
-    /// retry fails (no saga type handles the event).
+    /// retry and discard. In a service without sagas (or with them disabled) it lists what the
+    /// collection holds and a retry is refused (`InvalidMessage`), leaving the event as it was.
     pub fn saga_failures(&self) -> SagaFailures {
         let runtime = self.runtime.clone().unwrap_or_else(|| {
             Arc::new(SagaRuntime::new(
@@ -809,6 +809,7 @@ impl KrakenMessagingBuilder {
                 config.sagas_ended_retention,
                 config.sagas_dispatch_retention,
                 config.deadlines_retention,
+                config.sagas_failed_retention,
             )
             .await?;
             // Transactions do not create collections on older servers.

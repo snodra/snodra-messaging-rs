@@ -56,6 +56,8 @@ impl Event for StartAndEnd {}
 message!(Announced, "rl.Announced", Event, { order_id: String });
 impl Event for Announced {}
 message!(QuietStart, "rl.QuietStart", Event, { order_id: String });
+message!(GrumpyStart, "rl.GrumpyStart", Event, { order_id: String });
+impl Event for GrumpyStart {}
 impl Event for QuietStart {}
 message!(DeafStart, "rl.DeafStart", Event, { order_id: String });
 impl Event for DeafStart {}
@@ -156,6 +158,22 @@ fn quiet_saga() -> SagaType {
             command_failed(s, e);
             Ok(())
         })
+        .build()
+        .unwrap()
+}
+
+/// A saga type whose `SagaCommandFailed` handler always fails: the notice is parked.
+fn grumpy_saga() -> SagaType {
+    SagaDefinition::<Order>::new("rl.Grumpy")
+        .start_on::<GrumpyStart>(
+            "orderId",
+            |e| Some(e.order_id.clone()),
+            |s, e, _| {
+                s.order_id = Some(e.order_id.clone());
+                Ok(())
+            },
+        )
+        .on_command_failed(|_, _, _| Err(MessagingError::Storage("the ledger is locked".into())))
         .build()
         .unwrap()
 }
@@ -356,7 +374,7 @@ impl Rl {
         let watcher = Arc::new(Watcher::default());
         let registry = registry(&adapter, with_watcher.then_some(&watcher));
         let runtime = Arc::new(SagaRuntime::new(
-            vec![order_saga(), quiet_saga(), deaf_saga()],
+            vec![order_saga(), quiet_saga(), deaf_saga(), grumpy_saga()],
             store.ports(),
             store.clock.clock(),
             SagaRetry::new(RetryPolicy {
@@ -1195,11 +1213,15 @@ async fn a_failure_notice_that_keeps_failing_is_given_up_after_the_relays_attemp
         [("rl.Charge".to_string(), FailureReason::Failed)]
     );
     assert!(
-        captured
-            .lines()
-            .iter()
-            .any(|l| l.contains("ERROR") && l.contains(&saga.id)),
-        "the give-up is logged at error: {}",
+        captured.lines().iter().any(|l| l.contains("ERROR")
+            && l.contains(&saga.id)
+            && l.contains("the saga may have applied it")),
+        "the give-up is logged at error, without claiming the saga never got it: {}",
+        captured.text()
+    );
+    assert!(
+        !captured.text().contains("never heard of it"),
+        "the sagas run even when an ordinary handler fails: {}",
         captured.text()
     );
     assert_eq!(
@@ -1238,6 +1260,11 @@ async fn an_unhandled_failure_event_is_logged_at_error_and_counted() {
     assert!(
         errors[0].contains("lost:1000") && errors[0].contains("NO_HANDLER"),
         "{}",
+        errors[0]
+    );
+    assert!(
+        errors[0].contains("nothing in this service handles SagaCommandFailed"),
+        "no handler at all, not a missing live saga: {}",
         errors[0]
     );
     assert!(rl.entry("lost:1000").await.failed_at.is_some());
@@ -1336,6 +1363,12 @@ async fn a_failure_event_for_an_ended_saga_or_one_whose_type_has_no_handler_is_l
         errors
             .iter()
             .any(|l| l.contains(&format!("{}:9001", deaf.id)))
+    );
+    assert!(
+        errors
+            .iter()
+            .all(|l| l.contains("no live saga with a SagaCommandFailed handler took it")),
+        "sagas handle the type, but no live instance took it: {errors:?}"
     );
     assert!(
         rl.entry(&format!("{}:9001", ended.id))
@@ -1506,4 +1539,131 @@ async fn the_started_relay_stops_when_cancelled_and_waits_for_the_sends_in_fligh
         rl.entry("s1:1000").await.dispatched_at.is_some(),
         "the send in flight was marked"
     );
+}
+
+#[tokio::test]
+async fn a_failure_notice_whose_saga_handler_fails_is_parked_and_not_reported_as_unhandled() {
+    require_docker!();
+    let rl = Rl::start().await;
+    rl.deliver(
+        &GrumpyStart {
+            order_id: "g1".into(),
+        },
+        "e-g1",
+    )
+    .await;
+    let saga = rl.saga_of("rl.Grumpy", "g1").await;
+    rl.record(&saga.id, 9001, "rl.Nobody", r#"{"ref":"n"}"#)
+        .await;
+    let captured = support::logs::Captured::default();
+    let _guard = captured.install();
+
+    rl.local_relay().poll_once().await.unwrap();
+
+    assert_eq!(
+        rl.store
+            .count(
+                "saga_failures",
+                doc! { "sagaType": "rl.Grumpy", "eventType": <SagaCommandFailed as kraken_messaging::MessageType>::TYPE }
+            )
+            .await,
+        1,
+        "the saga got the notice and its handler failed: parked"
+    );
+    assert!(
+        rl.metrics.unhandled.lock().unwrap().is_empty(),
+        "a parked notice reached its saga: not unhandled"
+    );
+    assert!(
+        !captured.text().contains("took it")
+            && !captured
+                .text()
+                .contains("nothing in this service handles SagaCommandFailed"),
+        "{}",
+        captured.text()
+    );
+    assert!(
+        captured
+            .lines()
+            .iter()
+            .any(|l| l.contains("ERROR") && l.contains("rl.Grumpy") && l.contains("parked")),
+        "the park says what happened: {}",
+        captured.text()
+    );
+    assert_eq!(
+        rl.store
+            .count("saga_dispatch", doc! { "noticePending": true })
+            .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_failure_notice_whose_settling_write_fails_is_retried_on_its_own_and_the_sagas_turn_goes_on()
+ {
+    require_docker!();
+    let rl = Rl::start().await;
+    rl.deliver(
+        &Start {
+            order_id: "o1".into(),
+        },
+        "e-1",
+    )
+    .await;
+    let saga = rl.saga_of("rl.Order", "o1").await;
+    let first = rl.store.dispatch_of(&saga.id).await[0].clone();
+    rl.record_charge(&saga.id, first.seq + 1).await;
+    rl.sender.script(|_| async {
+        RawOutcome::Permanent(FailureReason::Failed, "printer on fire".into())
+    });
+    let captured = support::logs::Captured::default();
+    let _guard = captured.install();
+    let relay = rl.relay();
+    relay.fail_next_notice_write();
+
+    relay.poll_once().await.unwrap();
+
+    assert_eq!(
+        rl.sender.calls().len(),
+        2,
+        "the first command failed for good, so the saga's next one went out in the same turn"
+    );
+    assert!(
+        !captured.text().contains("trying again at the next poll"),
+        "the failed command is never dispatched again: {}",
+        captured.text()
+    );
+    assert!(
+        captured.lines().iter().any(|l| l.contains("WARN")
+            && l.contains(&first.id)
+            && l.contains("Settling the failure notice")),
+        "{}",
+        captured.text()
+    );
+    assert_eq!(
+        rl.entry(&first.id).await.notice_pending,
+        Some(true),
+        "the notice was delivered but could not be settled: it stays pending"
+    );
+    assert_eq!(
+        rl.failures_of("rl.Order", "o1").await,
+        ["rl.Charge:FAILED", "rl.Charge:FAILED"]
+    );
+
+    rl.store.clock.advance(Duration::from_secs(3600));
+    relay.poll_once().await.unwrap();
+
+    assert_eq!(
+        rl.store
+            .count("saga_dispatch", doc! { "noticePending": true })
+            .await,
+        0,
+        "the notice came again when its claim expired and was settled"
+    );
+    assert_eq!(
+        rl.failures_of("rl.Order", "o1").await,
+        ["rl.Charge:FAILED", "rl.Charge:FAILED"],
+        "the repeat was harmless"
+    );
+    assert_eq!(rl.sender.calls().len(), 2);
 }

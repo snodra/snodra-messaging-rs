@@ -148,6 +148,7 @@ pub struct SagaDispatchRelay {
     tracker: TaskTracker,
     stopping: CancellationToken,
     fail_next_mark: AtomicBool,
+    fail_next_notice_write: AtomicBool,
 }
 
 impl SagaDispatchRelay {
@@ -178,6 +179,7 @@ impl SagaDispatchRelay {
             tracker: TaskTracker::new(),
             stopping: CancellationToken::new(),
             fail_next_mark: AtomicBool::new(false),
+            fail_next_notice_write: AtomicBool::new(false),
         }))
     }
 
@@ -186,6 +188,22 @@ impl SagaDispatchRelay {
     #[doc(hidden)]
     pub fn fail_next_mark(&self) {
         self.fail_next_mark.store(true, Ordering::SeqCst);
+    }
+
+    /// Test seam: the next write that settles or reschedules a failure notice fails (the store
+    /// went away right after the notice was dispatched).
+    #[doc(hidden)]
+    pub fn fail_next_notice_write(&self) {
+        self.fail_next_notice_write.store(true, Ordering::SeqCst);
+    }
+
+    fn check_notice_write_injection(&self) -> Result<(), MessagingError> {
+        if self.fail_next_notice_write.swap(false, Ordering::SeqCst) {
+            return Err(MessagingError::Storage(
+                "injected: the failure notice write failed".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn dispatch_collection(&self) -> Collection<SagaDispatchDocument> {
@@ -575,7 +593,10 @@ impl SagaDispatchRelay {
         failed.failure_message = Some(message.to_string());
         failed.notice_pending = Some(true);
         failed.notice_attempts = Some(0);
-        self.deliver_notice(&failed).await
+        // The entry is failed for good: a notice that cannot be settled now is the poll's to retry,
+        // never a reason to end the saga's turn as if the command had to be sent again.
+        self.deliver_notice_quietly(failed).await;
+        Ok(())
     }
 
     /// Claims the pending failure notices that are due (up to a batch), each reserved for this
@@ -607,7 +628,7 @@ impl SagaDispatchRelay {
     async fn deliver_notice_quietly(&self, entry: SagaDispatchDocument) -> usize {
         if let Err(e) = self.deliver_notice(&entry).await {
             tracing::warn!(
-                "Delivering the failure notice of {} failed, trying again when its claim expires: {e}",
+                "Settling the failure notice of {} failed (the store), it is delivered again when its claim expires (its dedupe id makes that harmless): {e}",
                 entry.id
             );
         }
@@ -655,11 +676,16 @@ impl SagaDispatchRelay {
             .await;
         match outcome {
             Err(e) => return self.notice_failed(entry, &e).await,
-            Ok(Outcome::NoInterest | Outcome::Unclaimed) => {
+            Ok(unhandled @ (Outcome::NoInterest | Outcome::Unclaimed)) => {
                 self.metrics
                     .command_failure_unhandled(&entry.type_name, reason);
+                let why = if unhandled == Outcome::NoInterest {
+                    "nothing in this service handles SagaCommandFailed (no saga type with a handler for it, no ordinary handler)"
+                } else {
+                    "no live saga with a SagaCommandFailed handler took it (the saga ended, its type has no such handler, or it no longer associates with its id), and no ordinary handler handles it"
+                };
                 tracing::error!(
-                    "Saga {} command {} ({}) failed with {} and no live saga with a SagaCommandFailed handler and no ordinary handler took it: {}",
+                    "Saga {} command {} ({}) failed with {} and {why}: {}",
                     entry.saga_id,
                     entry.id,
                     entry.type_name,
@@ -673,6 +699,7 @@ impl SagaDispatchRelay {
     }
 
     async fn clear_notice(&self, entry: &SagaDispatchDocument) -> Result<(), MessagingError> {
+        self.check_notice_write_injection()?;
         self.dispatch_collection()
             .update_one(
                 doc! { "_id": &entry.id },
@@ -693,7 +720,7 @@ impl SagaDispatchRelay {
             self.metrics
                 .command_failure_unhandled(&entry.type_name, reason);
             tracing::error!(
-                "Gave up delivering SagaCommandFailed for saga {} command {} ({}, {}) after {attempts} attempts; the saga never heard of it: {error}",
+                "Gave up delivering SagaCommandFailed for saga {} command {} ({}, {}) after {attempts} attempts; the saga may have applied it, but the delivery kept failing: {error}",
                 entry.saga_id,
                 entry.id,
                 entry.type_name,
@@ -707,6 +734,7 @@ impl SagaDispatchRelay {
                 .retry_policy()
                 .jittered_backoff(attempts as u32),
         );
+        self.check_notice_write_injection()?;
         self.dispatch_collection()
             .update_one(
                 doc! { "_id": &entry.id },

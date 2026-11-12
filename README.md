@@ -720,7 +720,10 @@ saga's transaction, for a state that may roll back, with no order, retry or idem
 
 **Handlers block.** A saga handler runs on the consumer's task and holds a tokio worker and the partition while it runs:
 keep it to recording. A panic is a handler error: two attempts, then the event is parked in `saga_failures`
-(`app.saga_failures()`: `list(type)`, `retry(id)`, `retry_all(type)`, `discard(id)`).
+(`app.saga_failures()`: `list(type)`, `retry(id)`, `retry_all(type)`, `discard(id)`). A retry of an event whose saga type
+does not run in this service (not registered, or `KRAKEN_SAGAS_ENABLED=false`) is refused with `InvalidMessage` and
+writes nothing: the event keeps its error and attempts until the type runs again (`retry_all` of such a type: "its
+parked events (N) are left as they were"; with nothing parked it returns 0, as in Kotlin).
 
 **Adapters.** `idempotent_command::<C>(key, external_idempotent, handler)` (and `idempotent_event::<E>`, whose body runs inside
 the ordinary handlers' transaction: prefer commands for slow calls) records each call in `external_calls`.
@@ -730,6 +733,9 @@ reached the partner, a 5xx, a 429) and `MessagingError::UnknownOutcome` when the
 after the request went out); never retry inside the handler. With `external_idempotent = true` the partner de-duplicates by
 the key, so a call that crashed mid-way is made again after the lease instead of reported as `UNKNOWN_OUTCOME`. Every handler
 of a command a saga sends must be idempotent by `idempotency-key`: a crash between sending and marking it sent sends it again.
+A call owns its record through a random `owner` token it writes when it inserts the record or takes it over; a call whose
+lease ran out never settles, overwrites or deletes the record of a later call, also when the record was reset by a
+retryable failure and begun afresh in between (its success is then reported retryable or unknown, never as a success).
 
 **Configuration** (`Config::from_env`, Kotlin's defaults; retentions at least 1 s, intervals at least 1 ms, checked also in a
 service without sagas):
@@ -740,6 +746,7 @@ service without sagas):
 | `KRAKEN_SAGAS_MAX_ATTEMPTS` | 5 | attempts of one (event, saga type) on conflicts before it is parked (200 ms doubling to 5 s); a handler error gets two |
 | `KRAKEN_SAGAS_ENDED_RETENTION_MS` | 30 d | TTL of ended sagas |
 | `KRAKEN_SAGAS_DISPATCH_RETENTION_MS` | 7 d | TTL of dispatched `saga_dispatch` entries |
+| `KRAKEN_SAGAS_FAILED_RETENTION_MS` | 30 d | TTL of what failed for good: `saga_dispatch` entries given up on (`failedAt_ttl`) and parked events in `saga_failures` (`lastFailedAt_ttl`, moved on by a retry that fails again); at least 1000 ms |
 | `KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS` | 500 | how often the relay looks for recorded entries |
 | `KRAKEN_SAGAS_RELAY_LEASE_MS` | 30000 | one saga's dispatch lease, renewed while a send runs |
 | `KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS` | 10 | attempts of a command on transient failures before `EXHAUSTED` |
@@ -897,7 +904,7 @@ list locally.
 | `last_error`, `last_error_at_ms` | `<error variant>: <message>` of the last failure (never the payload), cut at 512 bytes |
 | `event_types`, `dead_letter_mode` | the processor's types (`default` with the saga types), sorted; the mode |
 | `operation_id` | the reset holding the processor's lock (empty when none) |
-| `replaying`, `partitions[].replay_until` | a replay range is open on one of its assigned partitions; per partition the range's `until` (0 when none) |
+| `replaying`, `partitions[].replay_until` | a replay range is open and not yet passed on one of its assigned partitions; per partition the range's `until` (0 when none or passed) |
 
 ## Dead letters
 
@@ -987,8 +994,11 @@ dashboard pause, resume and reset a processor on every instance at once and work
 (see the hub's `hub.md`, "Processor control", for the routes and the write token). Each
 `ControlRequest` is handled off the hub stream's
 read loop (heartbeats and requests never wait for it), one per processor at a time, answered on the
-stream it came on and logged at INFO (`control_id`, processor, action, result). Nothing is
-configured: no environment variable, no setting.
+stream it came on and logged at INFO (`control_id`, processor, action, result). Two never wait
+behind a running reset execute of their processor: the renewal of the reset, and the dead letters
+(a list is read beside the execute; a retry, retry-all or discard is refused `LOCKED` "processor
+'<name>' is executing reset operation <id>; try again when it finished", as in Kotlin). Nothing is configured: no
+environment variable, no setting.
 
 **The state lives in the service's MongoDB**, collection `processor_control`, one document per
 processor (`_id` its name), which every instance reads before its consumer first polls and then
@@ -1035,7 +1045,9 @@ lease passes and the instances release it and consume again by themselves. An in
 (or polls) while an unexpired lock it was not prepared for is held stays out of the group too. A
 renewal that arrives after the finish never takes the lock again: an operation that ended on an
 instance (finished, aborted, its lease passed, its lock lost) is remembered for at least
-max(2 x lease, 60 s), and a prepare of it, or a renewal whose lock is gone, is `NOT_PREPARED`.
+max(2 x lease, 60 s), and a prepare of it, or a renewal whose lock is gone, is `NOT_PREPARED`. A
+prepare or renewal asking for a lease under 1000 ms is `INVALID` (the executor extends its lease every
+half lease, at most every 10 s, and a tiny one would only spin against MongoDB), as in Kotlin.
 
 The execute resolves the target (`earliest` the low watermarks, `latest` the high watermarks, a
 time the first offset at or after it, else the end), refuses while the group has members
@@ -1081,7 +1093,9 @@ KrakenMessaging::builder(config).await?
   replay deletes exactly `{processor, topic, partition, offset in [from, until)}`. Markers
   of local dispatch, sagas, ingress and failure notices have none.
 - **The ranges end.** Once this instance is past a range's `until` on its partition it removes the
-  range from the document; status `replaying` and `replay_until` show the open ones.
+  range from the document (on its 5 s poll); status `replaying` and `replay_until` show the ranges
+  this instance's position (or the group's committed offset) has not passed yet, so a partition stops
+  replaying as soon as its last replayed record is acknowledged.
 - `reset_handler` for a processor without event handlers here fails `start()`.
 
 ## Security
@@ -1182,7 +1196,7 @@ remains (the monotonic clocks, `Instant` and tokio's timers, stand still while a
 service waking after `exp` would otherwise keep serving its cached token), and the refresh loop wakes
 at least every 5 s to look at the wall clock again. A stream the hub ends with `UNAUTHENTICATED` (a
 `Register` or refresh refused, or a later close: "token expired", "unknown signing key", "credentials
-expired") retires the access token it presented (its `Register`'s, or the last refresh it sent; a newer token fetched meanwhile is kept), so the next stream fetches a new one, paced by the normal reconnect backoff; `PERMISSION_DENIED`
+expired") retires the access token it presented (its `Register`'s, or the last refresh it sent; a newer token fetched meanwhile is kept): it is never handed out again, `hub_auth()` shows no token expiry until a new one is fetched, and a new one is fetched by the background refresh at its next wake (within 5 s) or by the next stream (reconnecting at the normal backoff), whichever comes first; `PERMISSION_DENIED`
 (wrong `azp`, no ACL entry) does not, because a new token would not help and the IdP is not to be
 hammered. `KrakenMessaging::shutdown()` closes the provider (`TokenProvider::close`): the refresh loop
 ends and no further request reaches the IdP even if a `Sender` is still held.
@@ -1389,6 +1403,13 @@ Label values come from bounded sets: `type` is a type this service registered (a
 observed from values the library holds anyway (the processor status, the outbox relay's last poll, the hub pool), never
 with a Kafka or MongoDB call in a callback.
 
+An instance that stops (a restart, a crash) exports nothing more, and Prometheus keeps a gauge series that stops at its last
+value for 5 minutes (OTLP carries no staleness markers), so a dead instance would still look connected, running or busy.
+The kraken dashboards therefore read the library gauges as `last_over_time(<gauge>[$instance_seen])` (`$instance_seen`
+3 m by default, like the hub dashboard's `$hub_seen`): a series without a sample in that window drops out. Queries of your
+own should do the same; the export interval (the OpenTelemetry SDK's default 60 s, `OTEL_METRIC_EXPORT_INTERVAL`; the
+sandbox's 5 s) must stay well under the window.
+
 | Series (Prometheus) | Type | Labels | Meaning |
 |---|---|---|---|
 | `kraken_outbox_pending` | gauge | — | outbox documents neither sent nor failed, as the relay's last poll saw them (the batch, or a count of all of them behind a full batch); only where the relay runs, every instance reports the same database: aggregate with `max by (job)` |
@@ -1410,7 +1431,7 @@ with a Kafka or MongoDB call in a callback.
 | `kraken_deadlines_fired_total` | counter | `name` | deadlines whose handler ran |
 | `kraken_deadlines_due` | gauge | `name` | scheduled deadlines past their due time after the scheduler's last poll |
 | `kraken_external_calls_total` | counter | `handler`, `outcome` (`succeeded`, `replayed`, `failed`, `retryable`, `unknown`) | idempotent handler calls (`handler`: the message's wire type) |
-| `kraken_saga_command_failures_total` | counter | `type`, `reason` (`FailureReason`, e.g. `NO_HANDLER`) | `SagaCommandFailed` notices nobody handled |
+| `kraken_saga_command_failures_total` | counter | `type`, `reason` (`FailureReason`, e.g. `NO_HANDLER`) | `SagaCommandFailed` notices nobody handled (no saga instance took it and no ordinary handler handles it, or its delivery was given up; one a saga's handler failed on is parked in `saga_failures` instead) |
 | `kraken_sagas_active` | gauge | `type` | live saga instances (sampled every 15 s) |
 | `kraken_saga_dispatch_pending` | gauge | — | `saga_dispatch` entries neither dispatched nor failed (sampled every 15 s) |
 

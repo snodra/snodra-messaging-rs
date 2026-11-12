@@ -464,6 +464,28 @@ async fn a_service_without_sagas_adapters_or_sources_builds_none_of_it() {
         .unwrap();
     let names = app.database().list_collection_names().await.unwrap();
     assert!(!names.contains(&"sagas".to_string()), "{names:?}");
+    // A parked event of the disabled saga is not retried: the retry is refused and it stays as it was.
+    let parked = doc! {
+        "_id": "app.Banner:e-1", "sagaType": "app.Banner", "eventId": "e-1",
+        "eventType": "app.Shouted", "payload": "{}", "headers": {},
+        "error": "the original error", "attempts": 2,
+        "firstFailedAt": mongodb::bson::DateTime::from_millis(1_000),
+        "lastFailedAt": mongodb::bson::DateTime::from_millis(2_000),
+    };
+    let failures = app.database().collection::<Document>("saga_failures");
+    failures.insert_one(&parked).await.unwrap();
+    let refused = app.saga_failures().retry("app.Banner:e-1").await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("does not run in this service")),
+        "{refused:?}"
+    );
+    assert_eq!(
+        failures.find_one(doc! {}).await.unwrap(),
+        Some(parked),
+        "untouched"
+    );
     app.shutdown().await;
 
     // An idempotent handler brings the external_calls index, and nothing of the sagas.
