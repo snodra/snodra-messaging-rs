@@ -61,22 +61,15 @@ impl From<mongodb::error::Error> for StoreError {
     }
 }
 
-/// Transitional (O0-3 removes it with the MongoDB code of the core; the MongoDB add-on's
-/// `MongoTxExt` replaces it): the [`Tx`] of a Mongo session, as the saga code builds and reads it.
-impl Tx {
-    pub fn from_session(session: ClientSession) -> Tx {
-        Tx::new(session)
-    }
-
-    /// The session of this transaction; an error for [`Tx::none`] (a Mongo port was given an
-    /// in-memory transaction).
-    pub fn session(&mut self) -> Result<&mut ClientSession, StoreError> {
-        self.get_mut::<ClientSession>().ok_or_else(|| {
-            StoreError::Failed(MessagingError::Storage(
-                "a MongoDB saga port needs a transaction with a session".into(),
-            ))
-        })
-    }
+/// The session of a Mongo [`Tx`]; an error for [`Tx::none`] (a Mongo port was given an in-memory
+/// transaction). Transitional: O0-3 removes it with the MongoDB code of the core (the MongoDB
+/// add-on's `MongoTxExt` gives a handler its session).
+fn session(tx: &mut Tx) -> Result<&mut ClientSession, StoreError> {
+    tx.get_mut::<ClientSession>().ok_or_else(|| {
+        StoreError::Failed(MessagingError::Storage(
+            "a MongoDB saga port needs a transaction with a session".into(),
+        ))
+    })
 }
 
 /// The `sagas` collection.
@@ -294,7 +287,7 @@ impl MongoSagaStore {
                 filter,
                 doc! { "$set": { "status": "CANCELLED", "finishedAt": now } },
             )
-            .session(tx.session()?)
+            .session(session(tx)?)
             .await?;
         Ok(())
     }
@@ -305,17 +298,17 @@ impl TxProvider for MongoSagaStore {
         Box::pin(async move {
             let mut session = self.client.start_session().await?;
             session.start_transaction().await?;
-            Ok(Tx::from_session(session))
+            Ok(Tx::new(session))
         })
     }
 
     fn plain(&self) -> BoxFuture<'_, Result<Tx, StoreError>> {
-        Box::pin(async move { Ok(Tx::from_session(self.client.start_session().await?)) })
+        Box::pin(async move { Ok(Tx::new(self.client.start_session().await?)) })
     }
 
     fn commit<'a>(&'a self, tx: &'a mut Tx) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
-            tx.session()?.commit_transaction().await?;
+            session(tx)?.commit_transaction().await?;
             Ok(())
         })
     }
@@ -339,7 +332,7 @@ impl SagaRepository for MongoSagaStore {
             Ok(self
                 .sagas()
                 .find_one(doc! { "_id": id })
-                .session(tx.session()?)
+                .session(session(tx)?)
                 .await?)
         })
     }
@@ -352,7 +345,7 @@ impl SagaRepository for MongoSagaStore {
         value: &'a str,
     ) -> BoxFuture<'a, Result<Vec<SagaDocument>, StoreError>> {
         Box::pin(async move {
-            let session = tx.session()?;
+            let session = session(tx)?;
             let mut cursor = self
                 .sagas()
                 .find(doc! {
@@ -372,7 +365,7 @@ impl SagaRepository for MongoSagaStore {
         saga: &'a SagaDocument,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
-            self.sagas().insert_one(saga).session(tx.session()?).await?;
+            self.sagas().insert_one(saga).session(session(tx)?).await?;
             Ok(())
         })
     }
@@ -387,7 +380,7 @@ impl SagaRepository for MongoSagaStore {
             let result = self
                 .sagas()
                 .replace_one(doc! { "_id": &saga.id, "version": expected_version }, saga)
-                .session(tx.session()?)
+                .session(session(tx)?)
                 .await?;
             Ok(result.matched_count == 1)
         })
@@ -404,7 +397,7 @@ impl DispatchRecorder for MongoSagaStore {
             if !entries.is_empty() {
                 self.dispatch()
                     .insert_many(entries)
-                    .session(tx.session()?)
+                    .session(session(tx)?)
                     .await?;
             }
             Ok(())
@@ -421,7 +414,7 @@ impl DeadlineStore for MongoSagaStore {
         Box::pin(async move {
             self.deadlines()
                 .insert_one(deadline)
-                .session(tx.session()?)
+                .session(session(tx)?)
                 .await?;
             Ok(())
         })
@@ -436,7 +429,7 @@ impl DeadlineStore for MongoSagaStore {
             Ok(self
                 .deadlines()
                 .find_one(doc! { "_id": id, "status": "SCHEDULED" })
-                .session(tx.session()?)
+                .session(session(tx)?)
                 .await?)
         })
     }
@@ -489,7 +482,7 @@ impl DeadlineStore for MongoSagaStore {
                     doc! { "_id": id, "status": "SCHEDULED" },
                     doc! { "$set": { "status": "FIRED", "finishedAt": now } },
                 )
-                .session(tx.session()?)
+                .session(session(tx)?)
                 .await?;
             Ok(result.modified_count == 1)
         })
@@ -506,7 +499,7 @@ impl FailureStore for MongoSagaStore {
             Ok(self
                 .failures()
                 .find_one(doc! { "_id": id })
-                .session(tx.session()?)
+                .session(session(tx)?)
                 .await?)
         })
     }
@@ -520,7 +513,7 @@ impl FailureStore for MongoSagaStore {
             self.failures()
                 .replace_one(doc! { "_id": &failure.id }, failure)
                 .upsert(true)
-                .session(tx.session()?)
+                .session(session(tx)?)
                 .await?;
             Ok(())
         })
@@ -535,7 +528,7 @@ impl FailureStore for MongoSagaStore {
             let result = self
                 .failures()
                 .delete_one(doc! { "_id": id })
-                .session(tx.session()?)
+                .session(session(tx)?)
                 .await?;
             Ok(result.deleted_count == 1)
         })
@@ -559,7 +552,7 @@ impl FailureStore for MongoSagaStore {
                         "$set": { "error": error, "lastFailedAt": now },
                     },
                 )
-                .session(tx.session()?)
+                .session(session(tx)?)
                 .await?;
             Ok(result.matched_count == 1)
         })
@@ -575,7 +568,7 @@ impl FailureStore for MongoSagaStore {
                 Some(t) => doc! { "sagaType": t },
                 None => doc! {},
             };
-            let session = tx.session()?;
+            let session = session(tx)?;
             let mut cursor = self
                 .failures()
                 .find(filter)
@@ -597,7 +590,7 @@ impl MarkerStore for MongoSagaStore {
             Ok(self
                 .markers()
                 .find_one(doc! { "_id": id })
-                .session(tx.session()?)
+                .session(session(tx)?)
                 .await?
                 .is_some())
         })
@@ -613,7 +606,7 @@ impl MarkerStore for MongoSagaStore {
         Box::pin(async move {
             self.markers()
                 .insert_one(doc! { "_id": id, "type": type_name, "processedAt": now })
-                .session(tx.session()?)
+                .session(session(tx)?)
                 .await?;
             Ok(())
         })

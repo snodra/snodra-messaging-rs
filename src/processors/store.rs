@@ -12,13 +12,7 @@ use super::dead_letters::{
     DEAD_LETTERS_COLLECTION, DeadLetterDocument, DeadLetterError, DeadLetterReason,
 };
 use crate::error::MessagingError;
-
-/// Whether [`DeadLetterStore::park`] inserted the letter or found it parked already.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Parked {
-    New,
-    Already,
-}
+use crate::store::Parked;
 
 /// What [`DeadLetterStore::summaries`] reads of a letter.
 #[derive(Clone, Debug, Deserialize)]

@@ -1889,6 +1889,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kraken-messaging-mongo"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "kraken-messaging-rs",
+ "mongodb",
+ "serde",
+ "serde_json",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "kraken-messaging-rs"
 version = "0.1.0"
 dependencies = [

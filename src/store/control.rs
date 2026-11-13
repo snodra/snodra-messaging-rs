@@ -4,6 +4,7 @@
 //! milliseconds.
 
 use futures::future::BoxFuture;
+use serde::{Deserialize, Serialize};
 
 use super::StoreError;
 
@@ -44,7 +45,7 @@ impl ControlOperation {
 }
 
 /// Records of `partition` of `topic` with `from <= offset < until` are a replay.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ReplayRange {
     pub topic: String,
     pub partition: i32,

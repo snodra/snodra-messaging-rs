@@ -13,6 +13,11 @@
 //! names, keys and event ids). The outbox checks claim the whole outbox, so each first relays
 //! whatever another check left pending and leaves nothing pending itself: the store must be the
 //! kit's alone while it runs. Every check is public, so a failing one can be run by itself.
+//!
+//! The kit must run on a multi-thread runtime (`#[tokio::test(flavor = "multi_thread")]`): two
+//! relays claim the outbox at the same time in [`concurrent_relays_publish_each_entry_once`].
+//! Its time bounds leave the store a second or more: a store stamps times with the application
+//! clock, and the kit never compares the host clock with a stamped time at a finer margin.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -22,12 +27,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::FutureExt;
 use mongodb::bson::DateTime;
+use tokio::sync::Barrier;
 
 use super::dead_letters::letter_id;
 use super::{
     ControlOperation, DeadLetter, DeadLetterError, DeadLetterReason, ExternalCall,
     ExternalCallStatus, Locked, MessageStore, OutboxEntry, OutboxStore, Parked, ProcessedMarker,
-    RESET_KIND, ReplayRange,
+    ProcessorControlState, RESET_KIND, ReplayRange,
 };
 use crate::saga::store::{
     Association, DeadlineDocument, DeadlineStatus, DispatchKind, SagaDispatchDocument,
@@ -51,11 +57,16 @@ pub async fn run_store_conformance(store: Arc<dyn MessageStore>) {
         rolled_back_transaction_leaves_no_outbox_entry,
         rolled_back_handler_leaves_no_processed_marker,
         processed_marker_records_once,
+        delete_markers_removes_only_the_range,
         concurrent_relays_publish_each_entry_once,
         expired_lease_is_reclaimed,
         purge_removes_only_sent_before,
         dead_letters_sequence_per_key,
+        dead_letter_parked_inside_rolled_back_transaction_is_kept,
         control_lock_is_exclusive_until_lease_expires,
+        pause_state_round_trips,
+        replay_ranges_round_trip,
+        processor_control_write_inside_rolled_back_transaction_is_kept,
         external_call_idempotency_returns_first_result,
         saga_ports_round_trip,
     );
@@ -123,7 +134,10 @@ pub async fn appended_entry_is_claimed_in_created_seq_order(store: &dyn MessageS
     assert_eq!(found.seq, e1.seq);
     assert_eq!(found.attempts, 0);
 
-    outbox.mark_retry(&e3.id).await.expect("mark_retry");
+    outbox
+        .mark_attempt_failed(&e3.id, "conformance: broker unavailable")
+        .await
+        .expect("mark_attempt_failed");
     let again = outbox
         .claim("relay-a", LONG_LEASE, 10)
         .await
@@ -204,32 +218,59 @@ pub async fn rolled_back_handler_leaves_no_processed_marker(store: &dyn MessageS
             .is_empty(),
         "the rolled-back handler's event is gone"
     );
+    assert!(
+        !processed.exists(&marker.id).await.expect("exists"),
+        "the marker rolled back with the handler"
+    );
     let mut tx = store.tx().begin().await.expect("begin");
     assert!(
         processed.record(&mut tx, &marker).await.expect("record"),
         "the rolled-back handler's marker is gone: the redelivery is recorded"
     );
+    assert!(
+        !processed.exists(&marker.id).await.expect("exists"),
+        "not committed yet"
+    );
     store.tx().commit(&mut tx).await.expect("commit");
+    assert!(
+        processed.exists(&marker.id).await.expect("exists"),
+        "the marker committed with the handler"
+    );
 }
 
-/// A marker records once: a second record of its id (in a later transaction) is false, until a
-/// purge past its time removes it. A purge keeps the markers recorded after its bound.
+/// A marker records once: a second record of its id (in a later transaction, whatever else it
+/// carries) is false, until a purge past its time removes it. A purge keeps the markers recorded
+/// after its bound.
 pub async fn processed_marker_records_once(store: &dyn MessageStore) {
     let processed = store.processed_events();
     let now = now_ms();
-    let first = ProcessedMarker {
-        segment: Some("kraken.events:0".into()),
-        position: Some("42".into()),
-        ..marker(now)
-    };
+    let first = stage_one(
+        &format!("conformance-{}", uuid::Uuid::new_v4()),
+        TOPIC,
+        3,
+        42,
+    );
+    assert!(!processed.exists(&first.id).await.expect("exists"));
     let mut tx = store.tx().begin().await.expect("begin");
     assert!(processed.record(&mut tx, &first).await.expect("record"));
     store.tx().commit(&mut tx).await.expect("commit");
+    assert!(processed.exists(&first.id).await.expect("exists"));
 
     let mut tx = store.tx().begin().await.expect("begin");
     assert!(
         !processed.record(&mut tx, &first).await.expect("record"),
         "a recorded id is a duplicate"
+    );
+    store.tx().abort(&mut tx).await;
+    let mut tx = store.tx().begin().await.expect("begin");
+    let same_id = ProcessedMarker {
+        id: first.id.clone(),
+        type_name: "conformance.Other".into(),
+        ..marker(now - 1)
+    };
+    assert!(
+        !processed.record(&mut tx, &same_id).await.expect("record"),
+        "the id alone decides"
     );
     store.tx().abort(&mut tx).await;
 
@@ -247,6 +288,8 @@ pub async fn processed_marker_records_once(store: &dyn MessageStore) {
     store.tx().commit(&mut tx).await.expect("commit");
     let purged = processed.purge(now - 1_800_000).await.expect("purge");
     assert!(purged >= 1, "the old marker is purged (purged {purged})");
+    assert!(!processed.exists(&old.id).await.expect("exists"));
+    assert!(processed.exists(&first.id).await.expect("exists"));
 
     let mut tx = store.tx().begin().await.expect("begin");
     assert!(
@@ -262,9 +305,106 @@ pub async fn processed_marker_records_once(store: &dyn MessageStore) {
     store.tx().abort(&mut tx).await;
 }
 
-/// Two relays claiming one outbox at the same time: every entry is claimed by exactly one of them.
+/// A reset deletes the stage-1 markers of its processor in its ranges (`[from, until)` of a topic's
+/// partition) and nothing else: neither other offsets, partitions, topics or processors, nor
+/// markers that carry no position.
+pub async fn delete_markers_removes_only_the_range(store: &dyn MessageStore) {
+    let processed = store.processed_events();
+    let processor = format!("conformance-{}", uuid::Uuid::new_v4());
+    let other_processor = format!("conformance-{}", uuid::Uuid::new_v4());
+    let in_range: Vec<ProcessedMarker> = (3..6)
+        .map(|offset| stage_one(&processor, TOPIC, 0, offset))
+        .chain([stage_one(&processor, TOPIC, 2, 7)])
+        .collect();
+    let kept: Vec<ProcessedMarker> = (0..3)
+        .map(|offset| stage_one(&processor, TOPIC, 0, offset))
+        .chain([
+            stage_one(&processor, TOPIC, 0, 6), // the range is [3, 6)
+            stage_one(&processor, TOPIC, 1, 4),
+            stage_one(&processor, "conformance.other", 0, 4),
+            stage_one(&other_processor, TOPIC, 0, 4),
+            ProcessedMarker {
+                id: format!("saga:conformance.Order:{}", uuid::Uuid::new_v4()),
+                ..marker(now_ms())
+            },
+            ProcessedMarker {
+                id: format!("ingress:conformance:{}", uuid::Uuid::new_v4()),
+                ..marker(now_ms())
+            },
+        ])
+        .collect();
+    let mut tx = store.tx().begin().await.expect("begin");
+    for m in in_range.iter().chain(&kept) {
+        assert!(
+            processed.record(&mut tx, m).await.expect("record"),
+            "recorded {}",
+            m.id
+        );
+    }
+    store.tx().commit(&mut tx).await.expect("commit");
+
+    let range = |partition, from, until| ReplayRange {
+        topic: TOPIC.into(),
+        partition,
+        from,
+        until,
+    };
+    assert_eq!(
+        processed
+            .delete_markers(&processor, &[])
+            .await
+            .expect("delete_markers"),
+        0,
+        "no ranges"
+    );
+    assert_eq!(
+        processed
+            .delete_markers(&processor, &[range(0, 100, 200)])
+            .await
+            .expect("delete_markers"),
+        0,
+        "nothing there"
+    );
+    assert_eq!(
+        processed
+            .delete_markers(&processor, &[range(0, 3, 6), range(2, 7, 8)])
+            .await
+            .expect("delete_markers"),
+        4
+    );
+    for m in &in_range {
+        assert!(
+            !processed.exists(&m.id).await.expect("exists"),
+            "{} is deleted",
+            m.id
+        );
+    }
+    for m in &kept {
+        assert!(
+            processed.exists(&m.id).await.expect("exists"),
+            "{} is kept",
+            m.id
+        );
+    }
+    assert_eq!(
+        processed
+            .delete_markers(&processor, &[range(0, 3, 6)])
+            .await
+            .expect("delete_markers"),
+        0,
+        "deleted once"
+    );
+}
+
+/// Two relays claiming one outbox at the same time (started together, on a multi-thread
+/// runtime): every entry is claimed by exactly one of them, and each claims some.
 pub async fn concurrent_relays_publish_each_entry_once(store: &dyn MessageStore) {
     const ENTRIES: usize = 200;
+    assert_eq!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::MultiThread,
+        "run the conformance kit on a multi-thread runtime: #[tokio::test(flavor = \"multi_thread\")]"
+    );
     let outbox = store.outbox();
     drain(&*outbox).await;
     let now = now_ms();
@@ -274,10 +414,13 @@ pub async fn concurrent_relays_publish_each_entry_once(store: &dyn MessageStore)
         appended.insert(e.id.clone());
         outbox.append_now(e).await.expect("append_now");
     }
+    let start = Arc::new(Barrier::new(2));
     let relay = |owner: &'static str| {
         let outbox = Arc::clone(&outbox);
+        let start = Arc::clone(&start);
         tokio::spawn(async move {
             let mut published = Vec::new();
+            start.wait().await; // both relays start claiming together
             loop {
                 let batch = outbox.claim(owner, LONG_LEASE, 7).await.expect("claim");
                 if batch.is_empty() {
@@ -297,6 +440,12 @@ pub async fn concurrent_relays_publish_each_entry_once(store: &dyn MessageStore)
     let b_set: HashSet<String> = b.iter().cloned().collect();
     assert_eq!(a_set.len(), a.len(), "relay-a published an entry twice");
     assert_eq!(b_set.len(), b.len(), "relay-b published an entry twice");
+    assert!(
+        !a.is_empty() && !b.is_empty(),
+        "both relays claimed entries: {} and {}",
+        a.len(),
+        b.len()
+    );
     let both: Vec<&String> = a_set.intersection(&b_set).collect();
     assert!(both.is_empty(), "published by both relays: {both:?}");
     let union: HashSet<String> = a_set.union(&b_set).cloned().collect();
@@ -304,7 +453,7 @@ pub async fn concurrent_relays_publish_each_entry_once(store: &dyn MessageStore)
 }
 
 /// A claimer that stops (crashes) holds its entries until its lease runs out; then another relay
-/// claims them, in order.
+/// claims them, in order, with the attempts counted and without the entry given up on.
 pub async fn expired_lease_is_reclaimed(store: &dyn MessageStore) {
     let outbox = store.outbox();
     drain(&*outbox).await;
@@ -315,11 +464,17 @@ pub async fn expired_lease_is_reclaimed(store: &dyn MessageStore) {
     for e in &entries {
         outbox.append_now(e.clone()).await.expect("append_now");
     }
-    let crashed = outbox
-        .claim("crashed", Duration::from_millis(500), 10)
-        .await
-        .expect("claim");
+    let lease = Duration::from_secs(3);
+    let crashed = outbox.claim("crashed", lease, 10).await.expect("claim");
     assert_eq!(ids(&crashed), ids(&entries));
+    outbox
+        .mark_attempt_failed(&entries[0].id, "conformance: broker unavailable")
+        .await
+        .expect("mark_attempt_failed");
+    outbox
+        .mark_failed(&entries[2].id, "conformance: record too large")
+        .await
+        .expect("mark_failed");
     assert!(
         outbox
             .claim("survivor", LONG_LEASE, 10)
@@ -328,16 +483,18 @@ pub async fn expired_lease_is_reclaimed(store: &dyn MessageStore) {
             .is_empty(),
         "held while the lease runs"
     );
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    tokio::time::sleep(lease + Duration::from_secs(1)).await;
     let reclaimed = outbox
         .claim("survivor", LONG_LEASE, 10)
         .await
         .expect("claim");
     assert_eq!(
         ids(&reclaimed),
-        ids(&entries),
-        "reclaimed in order after the lease"
+        ids(&entries[..2]),
+        "reclaimed in order after the lease, without the failed entry"
     );
+    assert_eq!(reclaimed[0].attempts, 1, "the failed attempt is counted");
+    assert_eq!(reclaimed[1].attempts, 0);
     assert!(
         outbox
             .claim("crashed", LONG_LEASE, 10)
@@ -373,9 +530,9 @@ pub async fn purge_removes_only_sent_before(store: &dyn MessageStore) {
         .mark_sent(std::slice::from_ref(&early.id))
         .await
         .expect("mark_sent");
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
     let bound = now_ms();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
     outbox
         .mark_sent(std::slice::from_ref(&late.id))
         .await
@@ -645,6 +802,50 @@ pub async fn dead_letters_sequence_per_key(store: &dyn MessageStore) {
     assert_eq!(letters.count(Some(&processor)).await.expect("count"), 0);
 }
 
+/// A dead letter commits on its own: parked, or its failure recorded, while a transaction is open
+/// that is then rolled back, it stays.
+pub async fn dead_letter_parked_inside_rolled_back_transaction_is_kept(store: &dyn MessageStore) {
+    let letters = store.dead_letters();
+    let processor = format!("conformance-{}", uuid::Uuid::new_v4());
+    let t0 = now_ms();
+    let parked = letter(
+        &processor,
+        0,
+        1,
+        Some("k1"),
+        DeadLetterReason::HandlerFailed,
+        t0,
+    );
+    let mut tx = store.tx().begin().await.expect("begin");
+    assert_eq!(letters.park(&parked).await.expect("park"), Parked::New);
+    store.tx().abort(&mut tx).await;
+    assert_eq!(
+        letters.get(&parked.id).await.expect("get"),
+        Some(parked.clone()),
+        "a dead letter commits on its own"
+    );
+    assert_eq!(
+        letters.head(&processor, "k1").await.expect("head"),
+        Some(parked.id.clone())
+    );
+
+    let error = DeadLetterError::new("Boom", "failed again");
+    let mut tx = store.tx().begin().await.expect("begin");
+    assert!(
+        letters
+            .record_failure(&parked.id, &error, t0 + 1_000)
+            .await
+            .expect("record_failure")
+    );
+    store.tx().abort(&mut tx).await;
+    assert_eq!(
+        letters.get(&parked.id).await.expect("get").map(|l| l.error),
+        Some(error),
+        "a retry's failure is recorded on its own too"
+    );
+    letters.delete(&parked.id).await.expect("delete");
+}
+
 // ---- processor control -------------------------------------------------------------------------
 
 /// A reset lock is held by one operation until its lease passes: another operation is refused
@@ -782,53 +983,240 @@ pub async fn control_lock_is_exclusive_until_lease_expires(store: &dyn MessageSt
             .operation
             .is_none()
     );
+}
 
-    // The rest of the document beside the lock: pause and replay ranges.
+/// A pause round-trips with who paused and when, and is idempotent; a resume clears both. A pause
+/// leaves the reset lock alone and the lock leaves the pause alone.
+pub async fn pause_state_round_trips(store: &dyn MessageStore) {
+    let control = store.processor_control();
+    let processor = format!("conformance-{}", uuid::Uuid::new_v4());
+    let t0 = 1_800_000_000_000_i64;
     control
-        .set_paused(&processor, true, "control-1", t0 + 21_000)
+        .set_paused(&processor, true, "control-1", t0)
         .await
         .expect("pause");
-    let range = ReplayRange {
+    control
+        .set_paused(&processor, true, "control-1", t0)
+        .await
+        .expect("pause again");
+    let paused = control.get(&processor).await.expect("get");
+    assert_eq!(
+        paused,
+        ProcessorControlState {
+            processor: processor.clone(),
+            paused: true,
+            paused_at_ms: Some(t0),
+            paused_by: Some("control-1".into()),
+            operation: None,
+            replay: Vec::new(),
+            updated_at_ms: Some(t0),
+        }
+    );
+
+    assert_eq!(
+        control
+            .lock(&processor, "op-1", t0 + 30_000, t0 + 1_000)
+            .await
+            .expect("lock"),
+        Locked::Taken
+    );
+    assert!(
+        control.get(&processor).await.expect("get").paused,
+        "a lock leaves the pause alone"
+    );
+    control
+        .set_paused(&processor, false, "control-2", t0 + 2_000)
+        .await
+        .expect("resume");
+    let resumed = control.get(&processor).await.expect("get");
+    assert!(!resumed.paused);
+    assert_eq!((resumed.paused_at_ms, resumed.paused_by), (None, None));
+    assert_eq!(resumed.updated_at_ms, Some(t0 + 2_000));
+    assert_eq!(
+        resumed.operation.map(|op| op.id),
+        Some("op-1".to_string()),
+        "a resume leaves the lock alone"
+    );
+
+    let fresh = format!("conformance-{}", uuid::Uuid::new_v4());
+    control
+        .set_paused(&fresh, false, PAUSED_BY_LOCAL, t0)
+        .await
+        .expect("resume");
+    assert_eq!(
+        control.get(&fresh).await.expect("get"),
+        ProcessorControlState {
+            processor: fresh.clone(),
+            updated_at_ms: Some(t0),
+            ..ProcessorControlState::default()
+        },
+        "a resume of a processor the store did not know: not paused"
+    );
+}
+
+/// The replay ranges round-trip in order; a removal takes exactly that range of that processor,
+/// once; a replacement replaces them all. The ranges leave the lock alone.
+pub async fn replay_ranges_round_trip(store: &dyn MessageStore) {
+    let control = store.processor_control();
+    let processor = format!("conformance-{}", uuid::Uuid::new_v4());
+    let other_processor = format!("conformance-{}", uuid::Uuid::new_v4());
+    let t0 = 1_800_000_000_000_i64;
+    let r1 = ReplayRange {
         topic: TOPIC.into(),
         partition: 0,
         from: 10,
         until: 20,
     };
-    let other = ReplayRange {
+    let r2 = ReplayRange {
         topic: TOPIC.into(),
         partition: 1,
         from: 0,
         until: 5,
     };
+    let r3 = ReplayRange {
+        topic: "conformance.other".into(),
+        partition: 0,
+        from: 10,
+        until: 20,
+    };
+    assert_eq!(
+        control
+            .lock(&processor, "op-1", t0 + 30_000, t0)
+            .await
+            .expect("lock"),
+        Locked::Taken
+    );
     control
-        .set_replay(&processor, &[range.clone(), other.clone()], t0 + 22_000)
+        .set_replay(
+            &processor,
+            &[r1.clone(), r2.clone(), r3.clone()],
+            t0 + 1_000,
+        )
         .await
-        .expect("replay");
+        .expect("set_replay");
     let state = control.get(&processor).await.expect("get");
-    assert!(state.paused);
-    assert_eq!(state.paused_at_ms, Some(t0 + 21_000));
-    assert_eq!(state.paused_by.as_deref(), Some("control-1"));
-    assert_eq!(state.replay, vec![range.clone(), other.clone()]);
-    assert_eq!(state.updated_at_ms, Some(t0 + 22_000));
+    assert_eq!(
+        state.replay,
+        vec![r1.clone(), r2.clone(), r3.clone()],
+        "the ranges, in order"
+    );
+    assert_eq!(state.updated_at_ms, Some(t0 + 1_000));
+    assert_eq!(
+        state.operation.map(|op| op.id),
+        Some("op-1".to_string()),
+        "the lock is untouched"
+    );
+
     assert!(
         control
-            .remove_range(&processor, &range, t0 + 23_000)
+            .remove_range(&processor, &r2, t0 + 2_000)
             .await
             .expect("remove_range")
     );
     assert!(
         !control
-            .remove_range(&processor, &range, t0 + 23_000)
+            .remove_range(&processor, &r2, t0 + 2_000)
             .await
-            .expect("remove_range")
+            .expect("remove_range"),
+        "removed once"
+    );
+    assert!(
+        !control
+            .remove_range(
+                &processor,
+                &ReplayRange {
+                    until: 21,
+                    ..r1.clone()
+                },
+                t0 + 2_000
+            )
+            .await
+            .expect("remove_range"),
+        "exactly that range"
+    );
+    assert!(
+        !control
+            .remove_range(&other_processor, &r1, t0 + 2_000)
+            .await
+            .expect("remove_range"),
+        "another processor's"
+    );
+    assert_eq!(
+        control.get(&processor).await.expect("get").replay,
+        vec![r1, r3]
+    );
+
+    control
+        .set_replay(&processor, std::slice::from_ref(&r2), t0 + 3_000)
+        .await
+        .expect("set_replay");
+    assert_eq!(
+        control.get(&processor).await.expect("get").replay,
+        vec![r2],
+        "set_replay replaces"
     );
     control
-        .set_paused(&processor, false, "control-2", t0 + 24_000)
+        .set_replay(&processor, &[], t0 + 4_000)
         .await
-        .expect("resume");
-    let state = control.get(&processor).await.expect("get");
-    assert!(!state.paused && state.paused_at_ms.is_none() && state.paused_by.is_none());
-    assert_eq!(state.replay, vec![other]);
+        .expect("set_replay");
+    assert!(
+        control
+            .get(&processor)
+            .await
+            .expect("get")
+            .replay
+            .is_empty()
+    );
+}
+
+/// A processor-control write commits on its own: made while a transaction is open that is then
+/// rolled back, it stays.
+pub async fn processor_control_write_inside_rolled_back_transaction_is_kept(
+    store: &dyn MessageStore,
+) {
+    let control = store.processor_control();
+    let paused = format!("conformance-{}", uuid::Uuid::new_v4());
+    let locked = format!("conformance-{}", uuid::Uuid::new_v4());
+    let t0 = 1_800_000_000_000_i64;
+    let range = ReplayRange {
+        topic: TOPIC.into(),
+        partition: 0,
+        from: 1,
+        until: 2,
+    };
+    let mut tx = store.tx().begin().await.expect("begin");
+    control
+        .set_paused(&paused, true, "control-1", t0)
+        .await
+        .expect("pause");
+    assert_eq!(
+        control
+            .lock(&locked, "op-1", t0 + 30_000, t0)
+            .await
+            .expect("lock"),
+        Locked::Taken
+    );
+    control
+        .set_replay(&locked, std::slice::from_ref(&range), t0)
+        .await
+        .expect("set_replay");
+    store.tx().abort(&mut tx).await;
+
+    assert!(
+        control.get(&paused).await.expect("get").paused,
+        "a pause commits on its own"
+    );
+    let state = control.get(&locked).await.expect("get");
+    assert_eq!(
+        state.operation.map(|op| op.id),
+        Some("op-1".to_string()),
+        "a lock commits on its own"
+    );
+    assert_eq!(
+        state.replay,
+        vec![range],
+        "a replay range commits on its own"
+    );
 }
 
 // ---- external calls ----------------------------------------------------------------------------
@@ -1356,6 +1744,8 @@ pub async fn saga_ports_round_trip(store: &dyn MessageStore) {
 // ---- helpers -----------------------------------------------------------------------------------
 
 const TOPIC: &str = "kraken.events";
+/// `paused_by` of a pause made on the instance itself.
+const PAUSED_BY_LOCAL: &str = "local";
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -1410,12 +1800,29 @@ async fn drain(outbox: &dyn OutboxStore) {
     }
 }
 
-fn marker(at_ms: i64) -> ProcessedMarker {
+/// A marker that carries no position.
+fn marker(processed_at_ms: i64) -> ProcessedMarker {
     ProcessedMarker {
         id: format!("processor:conformance:{}", uuid::Uuid::new_v4()),
-        segment: None,
-        position: None,
-        at_ms,
+        type_name: "conformance.Happened".into(),
+        processed_at_ms,
+        processor: None,
+        topic: None,
+        partition: None,
+        offset: None,
+    }
+}
+
+/// The stage-1 marker of the record at `offset` of `partition` of `topic`, handled by `processor`.
+fn stage_one(processor: &str, topic: &str, partition: i32, offset: i64) -> ProcessedMarker {
+    ProcessedMarker {
+        id: format!("processor:{processor}:{}", uuid::Uuid::new_v4()),
+        type_name: "conformance.Happened".into(),
+        processed_at_ms: now_ms(),
+        processor: Some(processor.to_string()),
+        topic: Some(topic.to_string()),
+        partition: Some(partition),
+        offset: Some(offset),
     }
 }
 

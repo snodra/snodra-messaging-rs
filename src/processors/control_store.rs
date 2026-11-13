@@ -10,10 +10,9 @@ use mongodb::{Collection, Database};
 use serde::{Deserialize, Serialize};
 
 use crate::error::MessagingError;
+use crate::store::{ControlOperation, Locked, RESET_KIND, ReplayRange};
 
 pub const PROCESSOR_CONTROL_COLLECTION: &str = "processor_control";
-/// `operation.kind` of a reset, the only kind there is.
-pub const RESET_KIND: &str = "reset";
 /// `pausedBy` of a pause through [`ProcessorControl::pause`](super::ProcessorControl::pause).
 pub const PAUSED_LOCALLY: &str = "local";
 
@@ -56,30 +55,19 @@ impl Operation {
     pub fn holds_at(&self, now: DateTime) -> bool {
         self.lease_until > now
     }
-}
 
-/// Records of `partition` of `topic` with `from <= offset < until` are a replay.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ReplayRange {
-    pub topic: String,
-    pub partition: i32,
-    pub from: i64,
-    pub until: i64,
-}
-
-impl ReplayRange {
-    fn document(&self) -> Document {
-        doc! { "topic": &self.topic, "partition": self.partition, "from": self.from, "until": self.until }
+    fn to_store(&self) -> ControlOperation {
+        ControlOperation {
+            id: self.id.clone(),
+            kind: self.kind.clone(),
+            lease_until_ms: self.lease_until.timestamp_millis(),
+            prepared_at_ms: self.prepared_at.timestamp_millis(),
+        }
     }
 }
 
-/// Whether [`ControlStore::lock`] took (or renewed) the lock.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Locked {
-    /// The operation holds the lock now.
-    Taken,
-    /// Another operation holds it (unexpired).
-    Held(Operation),
+fn range_document(range: &ReplayRange) -> Document {
+    doc! { "topic": &range.topic, "partition": range.partition, "from": range.from, "until": range.until }
 }
 
 /// The `processor_control` operations of the runner and the executor.
@@ -199,7 +187,7 @@ impl ControlStore {
                     return Ok(Locked::Taken);
                 }
                 match self.get(processor).await?.operation {
-                    Some(held) => Ok(Locked::Held(held)),
+                    Some(held) => Ok(Locked::Held(held.to_store())),
                     // Released meanwhile: the caller may try again.
                     None => Err(MessagingError::Storage(format!(
                         "the lock of processor '{processor}' changed while it was taken"
@@ -279,7 +267,7 @@ impl ControlStore {
         ranges: &[ReplayRange],
         now: DateTime,
     ) -> Result<(), MessagingError> {
-        let ranges: Vec<Document> = ranges.iter().map(ReplayRange::document).collect();
+        let ranges: Vec<Document> = ranges.iter().map(range_document).collect();
         self.raw()
             .update_one(
                 doc! { "_id": processor },
@@ -304,8 +292,8 @@ impl ControlStore {
         Ok(self
             .raw()
             .update_one(
-                doc! { "_id": processor, "replay": { "$elemMatch": range.document() } },
-                doc! { "$pull": { "replay": range.document() }, "$set": { "updatedAt": now } },
+                doc! { "_id": processor, "replay": { "$elemMatch": range_document(range) } },
+                doc! { "$pull": { "replay": range_document(range) }, "$set": { "updatedAt": now } },
             )
             .await?
             .modified_count

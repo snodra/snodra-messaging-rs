@@ -41,9 +41,11 @@ pub trait OutboxStore: Send + Sync {
     /// Appends `entry` on its own, outside any transaction.
     fn append_now(&self, entry: OutboxEntry) -> BoxFuture<'_, Result<(), StoreError>>;
 
-    /// At most `limit` pending entries in `(created_at_ms, seq)` order, now held by `owner` until
-    /// `lease` from now: those nobody holds, those whose holder's lease has passed, and those
-    /// `owner` holds already (its lease renewed). Never an entry another owner holds.
+    /// At most `limit` pending entries, now held by `owner` until `lease` from now: those nobody
+    /// holds, those whose holder's lease has passed, and those `owner` holds already (its lease
+    /// renewed); never an entry another owner holds. `(created_at_ms, seq)` is the only order: an
+    /// entry `owner` still holds comes back in its place, so an entry whose send failed is retried
+    /// before the later ones (order per key).
     fn claim<'a>(
         &'a self,
         owner: &'a str,
@@ -55,11 +57,16 @@ pub trait OutboxStore: Send + Sync {
     fn mark_sent<'a>(&'a self, ids: &'a [String]) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// A send of the entry failed and will be retried: `attempts + 1`; the entry stays pending
-    /// (and held by its owner until the lease passes).
-    fn mark_retry<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), StoreError>>;
+    /// (and held by its owner until the lease passes). `error` is for diagnosis; a store may keep
+    /// it or not.
+    fn mark_attempt_failed<'a>(
+        &'a self,
+        id: &'a str,
+        error: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// The entry is given up (out of attempts, or a failure no retry cures): `attempts + 1`,
-    /// never claimed again, never purged.
+    /// never claimed again, never purged. `error` is for diagnosis; a store may keep it or not.
     fn mark_failed<'a>(
         &'a self,
         id: &'a str,

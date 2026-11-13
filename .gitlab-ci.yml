@@ -34,7 +34,7 @@ proto-sync:
 clippy:
   stage: check
   script:
-    - cargo clippy --all-targets --all-features -- -D warnings
+    - cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 test:
   stage: test
@@ -42,7 +42,7 @@ test:
     - echo "$HARBOR_PASSWORD" | docker login -u "$HARBOR_USERNAME" --password-stdin "$HARBOR_HOST"
     - docker pull "$KRAKEN_HUB_IMAGE"
   script:
-    - cargo test --all-features -- --test-threads=1
+    - cargo test --workspace --all-features -- --test-threads=1
 
 release:
   stage: release

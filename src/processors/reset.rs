@@ -20,9 +20,9 @@ use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::{Offset, TopicPartitionList};
 
-use super::control_store::ReplayRange;
 use crate::error::MessagingError;
 use crate::proto;
+use crate::store::ReplayRange;
 
 /// How long one Kafka call of a reset may take.
 const KAFKA_TIMEOUT: Duration = Duration::from_secs(10);

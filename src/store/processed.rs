@@ -3,19 +3,24 @@
 
 use futures::future::BoxFuture;
 
-use super::{StoreError, Tx};
+use super::{ReplayRange, StoreError, Tx};
 
-/// One handled event.
+/// The idempotency marker of a handled event. `id` is the marker id
+/// (`processor:<name>:<eventId>`, `saga:<type>:<eventId>`, `ingress:<source>:<key>`, ...),
+/// `type_name` the event's type, `processed_at_ms` when it was handled (the retention counts from
+/// it). A stage-1 marker of a consumed record also carries the record's `processor`, `topic`,
+/// `partition` and `offset` (ADR 0023), so a reset deletes exactly the markers of its replay
+/// range ([`ProcessedEventStore::delete_markers`]); every other marker leaves them `None`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessedMarker {
-    /// `processor:<name>:<eventId>`.
     pub id: String,
-    /// Where the event was read, when it was read from an event store (a partition).
-    pub segment: Option<String>,
-    /// Its position in `segment` (an offset).
-    pub position: Option<String>,
-    /// When it was handled, epoch milliseconds.
-    pub at_ms: i64,
+    pub type_name: String,
+    /// Epoch milliseconds.
+    pub processed_at_ms: i64,
+    pub processor: Option<String>,
+    pub topic: Option<String>,
+    pub partition: Option<i32>,
+    pub offset: Option<i64>,
 }
 
 pub trait ProcessedEventStore: Send + Sync {
@@ -26,6 +31,17 @@ pub trait ProcessedEventStore: Send + Sync {
         tx: &'a mut Tx,
         marker: &'a ProcessedMarker,
     ) -> BoxFuture<'a, Result<bool, StoreError>>;
+
+    /// Whether a marker with `id` is recorded (committed), read outside any transaction.
+    fn exists<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<bool, StoreError>>;
+
+    /// Deletes the stage-1 markers of `processor` in `ranges` (same topic and partition, offset in
+    /// `[from, until)`), outside any transaction; how many.
+    fn delete_markers<'a>(
+        &'a self,
+        processor: &'a str,
+        ranges: &'a [ReplayRange],
+    ) -> BoxFuture<'a, Result<u64, StoreError>>;
 
     /// Removes the markers handled before `before_ms` (epoch milliseconds); how many.
     fn purge(&self, before_ms: i64) -> BoxFuture<'_, Result<u64, StoreError>>;

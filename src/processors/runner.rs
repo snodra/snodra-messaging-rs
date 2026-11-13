@@ -24,7 +24,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::ProcessorMonitor;
-use super::control_store::{ControlStore, Locked, ReplayRange};
+use super::control_store::ControlStore;
 use super::monitor::cut_bytes;
 use super::reset::{
     GroupAdmin, Plan, ResetContext, ResetFailure, ResetHandler, ResetTarget, range_filter,
@@ -35,6 +35,7 @@ use crate::kafka::{
     ProcessorSettings,
 };
 use crate::proto::{self, ControlRefusal};
+use crate::store::{Locked, ReplayRange};
 
 /// How often the runner reads its processor's control document.
 pub const CONTROL_POLL: Duration = Duration::from_secs(5);
@@ -498,7 +499,7 @@ impl ProcessorRunner {
                     "operation {} holds the lock of processor '{}' until {}",
                     other.id,
                     self.name(),
-                    other.lease_until
+                    DateTime::from_millis(other.lease_until_ms)
                 ),
             )),
             Ok(Locked::Taken) => {

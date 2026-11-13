@@ -25,7 +25,6 @@ pub mod store;
 
 pub use admin::{DEFAULT_LIST_LIMIT, DeadLetters, RetryAllResult, RetryResult};
 pub use control::{MAX_CONTROL_TEXT_BYTES, MAX_LIST_LIMIT, ProcessorControl};
-pub use control_store::ReplayRange;
 pub use monitor::ProcessorMonitor;
 pub use reset::{ResetContext, ResetTarget};
 pub use runner::ProcessorRunner;

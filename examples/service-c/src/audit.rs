@@ -545,7 +545,8 @@ mod tests {
 
     #[test]
     fn a_reset_is_shown_the_way_service_b_shows_it() {
-        use kraken_messaging::processors::{ReplayRange, ResetContext, ResetTarget};
+        use kraken_messaging::processors::{ResetContext, ResetTarget};
+        use kraken_messaging::store::ReplayRange;
         let audit = Audit::default();
         let ctx = |target| ResetContext {
             processor: "audit".into(),

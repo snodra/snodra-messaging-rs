@@ -40,12 +40,12 @@ use crate::error::MessagingError;
 use crate::hub::HandlerRegistry;
 use crate::metrics::{Consumed, Metrics, OTHER, TypeLabels};
 use crate::processors::ProcessorMonitor;
-use crate::processors::control_store::ReplayRange;
 use crate::processors::dead_letters::{
     DeadLetterDocument, DeadLetterError, DeadLetterReason, DeadLetterRecord,
     MAX_ERROR_MESSAGE_CHARS, cut_chars,
 };
-use crate::processors::store::{DeadLetterStore, Parked};
+use crate::processors::store::DeadLetterStore;
+use crate::store::{Parked, ReplayRange};
 
 /// What to do with a record, decided before any database work.
 #[derive(Debug, PartialEq, Eq)]

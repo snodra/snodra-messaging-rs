@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::TryStreamExt;
-use kraken_messaging::processors::{EventOptions, ReplayRange, ResetContext, ResetTarget};
+use kraken_messaging::processors::{EventOptions, ResetContext, ResetTarget};
+use kraken_messaging::store::ReplayRange;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 

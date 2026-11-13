@@ -4,7 +4,9 @@
 //! ([`Tx`]), so they commit or roll back with the service's own writes.
 //!
 //! Payloads cross these interfaces as JSON bytes (or JSON text where the stored contract is
-//! text), times as epoch milliseconds. An add-on proves itself with the conformance kit
+//! text), times as epoch milliseconds. Times a store stamps itself (an outbox entry's sending, a
+//! lease) are the application's clock, never the database's, so the margins of the conformance
+//! kit hold whatever the database's own clock says. An add-on proves itself with the conformance kit
 //! (`conformance`, feature `testing`).
 
 use std::sync::Arc;
