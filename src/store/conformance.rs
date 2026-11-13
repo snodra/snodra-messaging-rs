@@ -34,7 +34,7 @@ use super::{
     ControlOperation, DeadLetter, DeadLetterError, DeadLetterReason, DeadlineStore,
     DispatchFailure, ExternalCall, ExternalCallStatus, Locked, MessageStore, OutboxEntry,
     OutboxStore, Parked, ProcessedMarker, ProcessorControlState, RESET_KIND, ReplayRange,
-    SagaDispatchStore, StoreError,
+    SagaDispatchStore, StoreError, TxProvider,
 };
 use crate::error::MessagingError;
 use crate::saga::FailureReason;
@@ -2298,9 +2298,15 @@ pub async fn two_relays_never_hold_one_saga_lease(store: &dyn MessageStore) {
 /// attempt; a failed one carries its outcome and its failure notice, which is claimed by one
 /// relay at a time until it is cleared. Every write reads back.
 pub async fn dispatch_hands_out_each_saga_in_seq_order(store: &dyn MessageStore) {
-    let sagas = store.sagas();
-    let queue = &*sagas.dispatch;
-    let txs = store.tx();
+    dispatch_hands_out_each_saga_in_seq_order_on(&*store.sagas().dispatch, &*store.tx()).await;
+}
+
+/// [`dispatch_hands_out_each_saga_in_seq_order`] on a dispatch port and its transaction, for the
+/// saga ports outside a [`MessageStore`] (the in-memory ports of `saga::testing`).
+pub async fn dispatch_hands_out_each_saga_in_seq_order_on(
+    queue: &dyn SagaDispatchStore,
+    txs: &dyn TxProvider,
+) {
     let now = now_ms();
     let pending_before = queue.pending().await.expect("pending");
     let older = uuid::Uuid::new_v4().to_string();
@@ -2312,13 +2318,11 @@ pub async fn dispatch_hands_out_each_saga_in_seq_order(store: &dyn MessageStore)
     let event = dispatch_entry(&newer, 1001, DispatchKind::Event, now - 1_000);
     let old = dispatch_entry(&older, 0, DispatchKind::Event, now - 5_000);
     let mut tx = txs.begin().await.expect("begin");
-    sagas
-        .dispatch
+    queue
         .record(&mut tx, &[event.clone(), command.clone()])
         .await
         .expect("record");
-    sagas
-        .dispatch
+    queue
         .record(&mut tx, std::slice::from_ref(&old))
         .await
         .expect("record");

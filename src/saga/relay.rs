@@ -8,9 +8,10 @@
 //! in `seq` order; different sagas go in parallel. An ended saga's entries are dispatched like any.
 //!
 //! - An EVENT entry is inserted into the outbox and marked dispatched **in one transaction**:
-//!   exactly once. One whose payload cannot become an outbox entry (not a JSON object, or one the
-//!   store cannot hold, as a number BSON cannot) fails for good (`failed_at`, `INVALID`, logged at
-//!   error) and the saga's later entries continue (ruling 69).
+//!   exactly once. [`SagaDispatchStore::record`] already refuses an entry the outbox would refuse,
+//!   so one whose payload cannot become an outbox entry (not a JSON object, or one the store cannot
+//!   hold) can only be an entry recorded before that contract: as a backstop, it fails for good
+//!   (`failed_at`, `INVALID`, logged at error) and the saga's later entries continue (ruling 69).
 //! - A COMMAND entry is sent as raw bytes by wire type name ([`RawCommandSender`]; the sender owns
 //!   the no-retry rule, ruling 29) with the headers `idempotency-key` = `<sagaId>:<seq>` (the
 //!   entry's id) and `saga-id`, the entry's routing key and the correlation id of the message that
@@ -361,8 +362,8 @@ impl SagaDispatchRelay {
             Err(e) => return self.fail_event(entry, &e.to_string()).await,
         };
         let mut tx = self.tx.begin().await?;
-        // What only the store refuses (MongoDB: a number BSON cannot hold) can never be published
-        // either.
+        // A backstop for an entry recorded before `record` refused what the outbox refuses: what
+        // the store refuses now can never be published either.
         let refused = match self.events.publish_raw_in(outbox, &mut tx).await {
             Err(MessagingError::InvalidMessage(why)) => Some(why),
             Err(e) => {

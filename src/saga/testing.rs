@@ -1110,3 +1110,16 @@ impl MarkerStore for InMemorySagaStore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The in-memory dispatch port passes the store kit's dispatch check, as a store's does.
+    #[tokio::test]
+    async fn in_memory_dispatch_passes_the_store_kit_check() {
+        let store = Arc::new(InMemorySagaStore::default());
+        crate::store::conformance::dispatch_hands_out_each_saga_in_seq_order_on(&*store, &*store)
+            .await;
+    }
+}
