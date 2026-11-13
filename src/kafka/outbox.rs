@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use super::headers;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
+use crate::event_store::headers;
 use crate::store::{OutboxEntry, OutboxStore, Tx};
 use crate::time::now_ms;
 use crate::types::Event;

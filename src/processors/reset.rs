@@ -20,26 +20,14 @@ use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::{Offset, TopicPartitionList};
 
 use crate::error::MessagingError;
+use crate::event_store::{ReplayRange, ResetTarget};
+use crate::kafka::{kafka_range, replay_range};
 use crate::proto;
-use crate::store::ReplayRange;
 
 /// How long one Kafka call of a reset may take.
 const KAFKA_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Where a reset moves the processor's consumer group.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ResetTarget {
-    /// Every partition's low watermark: everything Kafka still has is a replay.
-    Earliest,
-    /// Every partition's high watermark: nothing is replayed.
-    Latest,
-    /// The first offset at or after this time (ms since the epoch) per partition, else its high
-    /// watermark.
-    Timestamp(i64),
-    /// These partitions to these offsets; a partition not listed keeps its committed offset.
-    Offsets(Vec<(i32, i64)>),
-}
-
+/// On Kafka a segment is a partition and a position an offset, both in decimal.
 impl ResetTarget {
     /// The request's target; `None` when it names none.
     pub fn from_proto(target: Option<&proto::ResetTarget>) -> Option<ResetTarget> {
@@ -48,20 +36,23 @@ impl ResetTarget {
             To::Earliest(_) => ResetTarget::Earliest,
             To::Latest(_) => ResetTarget::Latest,
             To::TimestampMs(ms) => ResetTarget::Timestamp(*ms),
-            To::Offsets(o) => {
-                ResetTarget::Offsets(o.offsets.iter().map(|p| (p.partition, p.offset)).collect())
-            }
+            To::Offsets(o) => ResetTarget::Positions(
+                o.offsets
+                    .iter()
+                    .map(|p| (p.partition.to_string(), p.offset.to_string()))
+                    .collect(),
+            ),
         })
     }
 
-    /// For the log: `earliest`, `latest`, `timestamp 1700000000000`, `offsets 0@12,1@40`.
+    /// For the log: `earliest`, `latest`, `timestamp 1700000000000`, `positions 0@12,1@40`.
     pub fn describe(&self) -> String {
         match self {
             ResetTarget::Earliest => "earliest".into(),
             ResetTarget::Latest => "latest".into(),
             ResetTarget::Timestamp(ms) => format!("timestamp {ms}"),
-            ResetTarget::Offsets(all) => format!(
-                "offsets {}",
+            ResetTarget::Positions(all) => format!(
+                "positions {}",
                 all.iter()
                     .map(|(p, o)| format!("{p}@{o}"))
                     .collect::<Vec<_>>()
@@ -78,8 +69,8 @@ pub struct ResetContext {
     pub processor: String,
     pub operation_id: String,
     pub target: ResetTarget,
-    /// Per partition of the processor's topic, sorted by partition; never empty (a reset that
-    /// replays nothing runs no reset handler).
+    /// Per partition (segment) of the processor's topic (source), sorted by partition; never
+    /// empty (a reset that replays nothing runs no reset handler).
     pub ranges: Vec<ReplayRange>,
 }
 
@@ -127,15 +118,11 @@ impl Plan {
             .map(|(&partition, &(from, before))| {
                 let until = open
                     .iter()
-                    .filter(|r| r.topic == topic && r.partition == partition)
-                    .map(|r| r.until)
+                    .filter_map(|r| kafka_range(r, topic))
+                    .filter(|&(p, _, _)| p == partition)
+                    .map(|(_, _, until)| until)
                     .fold(before, i64::max);
-                ReplayRange {
-                    topic: topic.to_string(),
-                    partition,
-                    from,
-                    until,
-                }
+                replay_range(topic, partition, from, until)
             })
             .collect()
     }
@@ -147,12 +134,20 @@ impl Plan {
             .iter()
             .filter(|r| {
                 !new.iter()
-                    .any(|n| n.topic == r.topic && n.partition == r.partition)
+                    .any(|n| n.source == r.source && n.segment == r.segment)
             })
             .cloned()
             .chain(new.iter().cloned())
             .collect();
-        all.sort_by(|a, b| (&a.topic, a.partition, a.from).cmp(&(&b.topic, b.partition, b.from)));
+        // Partitions and offsets by value.
+        let order = |r: &ReplayRange| {
+            (
+                r.source.clone(),
+                r.segment.parse::<i64>().ok(),
+                r.from.parse::<i64>().ok(),
+            )
+        };
+        all.sort_by_key(order);
         all
     }
 }
@@ -217,11 +212,22 @@ impl GroupAdmin {
                     targets.insert(p, offset);
                 }
             }
-            ResetTarget::Offsets(given) => {
+            ResetTarget::Positions(given) => {
                 if given.is_empty() {
                     return Err(ResetFailure::Invalid("no partition offsets given".into()));
                 }
-                for &(p, offset) in given {
+                for (segment, position) in given {
+                    let Ok(p) = segment.parse::<i32>() else {
+                        return Err(ResetFailure::Invalid(format!(
+                            "topic {} has no partition {segment}",
+                            self.topic
+                        )));
+                    };
+                    let Ok(offset) = position.parse::<i64>() else {
+                        return Err(ResetFailure::Invalid(format!(
+                            "position {position} of partition {p} is not an offset"
+                        )));
+                    };
                     if !partitions.contains(&p) {
                         return Err(ResetFailure::Invalid(format!(
                             "topic {} has no partition {p}",
@@ -344,12 +350,7 @@ mod tests {
     use super::*;
 
     fn range(partition: i32, from: i64, until: i64) -> ReplayRange {
-        ReplayRange {
-            topic: "t".into(),
-            partition,
-            from,
-            until,
-        }
+        replay_range("t", partition, from, until)
     }
 
     fn plan(all: &[(i32, i64, i64)]) -> Plan {
@@ -383,7 +384,7 @@ mod tests {
             range(0, 2, 20),
             range(1, 0, 7),
             ReplayRange {
-                topic: "other".into(),
+                source: "other".into(),
                 ..range(0, 0, 99)
             },
         ];
@@ -395,7 +396,7 @@ mod tests {
             merged,
             [
                 ReplayRange {
-                    topic: "other".into(),
+                    source: "other".into(),
                     ..range(0, 0, 99)
                 },
                 range(0, 4, 20),
@@ -424,7 +425,7 @@ mod tests {
         });
         assert_eq!(
             ResetTarget::from_proto(Some(&t(offsets))).map(|t| t.describe()),
-            Some("offsets 1@4".to_string())
+            Some("positions 1@4".to_string())
         );
         assert_eq!(ResetTarget::from_proto(None), None);
         assert_eq!(

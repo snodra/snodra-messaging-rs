@@ -6,6 +6,7 @@
 use futures::future::BoxFuture;
 
 use super::StoreError;
+use crate::event_store::ReplayRange;
 
 /// `ControlOperation::kind` of a reset, the only kind there is.
 pub const RESET_KIND: &str = "reset";
@@ -41,15 +42,6 @@ impl ControlOperation {
     pub fn holds_at(&self, now_ms: i64) -> bool {
         self.lease_until_ms > now_ms
     }
-}
-
-/// Records of `partition` of `topic` with `from <= offset < until` are a replay.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ReplayRange {
-    pub topic: String,
-    pub partition: i32,
-    pub from: i64,
-    pub until: i64,
 }
 
 /// Whether [`ProcessorControlStore::lock`] took (or renewed) the lock.
@@ -116,7 +108,9 @@ pub trait ProcessorControlStore: Send + Sync {
         now_ms: i64,
     ) -> BoxFuture<'a, Result<bool, StoreError>>;
 
-    /// Replaces the replay ranges of `processor`.
+    /// Replaces the replay ranges of `processor`. A store that keeps a range's partition and
+    /// offsets as numbers (the stored layout before neutral positions) refuses one whose segment
+    /// or positions are not decimal with `InvalidMessage`.
     fn set_replay<'a>(
         &'a self,
         processor: &'a str,

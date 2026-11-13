@@ -23,11 +23,14 @@ use tokio_util::sync::CancellationToken;
 
 use super::ProcessorMonitor;
 use super::monitor::cut_bytes;
-use super::reset::{GroupAdmin, Plan, ResetContext, ResetFailure, ResetHandler, ResetTarget};
+use super::reset::{GroupAdmin, Plan, ResetContext, ResetFailure, ResetHandler};
 use crate::error::MessagingError;
-use crate::kafka::{ConsumerControl, EventConsumer, LocalEventDispatcher, ProcessorSettings};
+use crate::event_store::{ReplayRange, ResetTarget};
+use crate::kafka::{
+    ConsumerControl, EventConsumer, LocalEventDispatcher, ProcessorSettings, kafka_range,
+};
 use crate::proto::{self, ControlRefusal};
-use crate::store::{Locked, ProcessedEventStore, ProcessorControlStore, ReplayRange};
+use crate::store::{Locked, ProcessedEventStore, ProcessorControlStore};
 use crate::time::{after, now_ms as now, rfc3339};
 
 /// How often the runner reads its processor's control document.
@@ -313,13 +316,16 @@ impl ProcessorRunner {
     fn apply_replay(&self, ranges: &[ReplayRange]) {
         let mine: Vec<ReplayRange> = ranges
             .iter()
-            .filter(|r| r.topic == self.settings.topic)
+            .filter(|r| r.source == self.settings.topic)
             .cloned()
             .collect();
         let mut until: BTreeMap<i32, i64> = BTreeMap::new();
-        for r in &mine {
-            let at = until.entry(r.partition).or_insert(r.until);
-            *at = (*at).max(r.until);
+        for (partition, _, end) in mine
+            .iter()
+            .filter_map(|r| kafka_range(r, &self.settings.topic))
+        {
+            let at = until.entry(partition).or_insert(end);
+            *at = (*at).max(end);
         }
         self.control.set_replay(mine);
         self.monitor.set_replay(until);
@@ -327,21 +333,24 @@ impl ProcessorRunner {
 
     /// Removes each open range of an assigned partition this instance is past the end of.
     async fn remove_passed_ranges(&self, ranges: &[ReplayRange]) {
-        for r in ranges.iter().filter(|r| r.topic == self.settings.topic) {
+        for r in ranges {
+            let Some((partition, from, until)) = kafka_range(r, &self.settings.topic) else {
+                continue;
+            };
             if !self
                 .monitor
-                .progress(r.partition)
-                .is_some_and(|at| at >= r.until)
+                .progress(partition)
+                .is_some_and(|at| at >= until)
             {
                 continue;
             }
             match self.store.remove_range(self.name(), r, now()).await {
                 Ok(true) => {
-                    tracing::info!(processor = %self.name(), partition = r.partition, from = r.from, until = r.until, "replay range done")
+                    tracing::info!(processor = %self.name(), partition, from, until, "replay range done")
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    tracing::warn!(processor = %self.name(), partition = r.partition, "cannot remove the replay range: {e}")
+                    tracing::warn!(processor = %self.name(), partition, "cannot remove the replay range: {e}")
                 }
             }
         }
@@ -708,10 +717,11 @@ impl ProcessorRunner {
         Ok(proto::ResetOutcome {
             ranges: ranges
                 .iter()
-                .map(|r| proto::ReplayRange {
-                    partition: r.partition,
-                    from: r.from,
-                    until: r.until,
+                .filter_map(|r| kafka_range(r, &topic))
+                .map(|(partition, from, until)| proto::ReplayRange {
+                    partition,
+                    from,
+                    until,
                 })
                 .collect(),
             markers_deleted,

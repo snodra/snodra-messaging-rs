@@ -3,7 +3,8 @@
 
 use futures::future::BoxFuture;
 
-use super::{ReplayRange, StoreError, Tx};
+use super::{StoreError, Tx};
+use crate::event_store::ReplayRange;
 
 /// The idempotency marker of a handled event. `id` is the marker id
 /// (`processor:<name>:<eventId>`, `saga:<type>:<eventId>`, `ingress:<source>:<key>`, ...),
@@ -35,8 +36,10 @@ pub trait ProcessedEventStore: Send + Sync {
     /// Whether a marker with `id` is recorded (committed), read outside any transaction.
     fn exists<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<bool, StoreError>>;
 
-    /// Deletes the stage-1 markers of `processor` in `ranges` (same topic and partition, offset in
-    /// `[from, until)`), outside any transaction; how many.
+    /// Deletes the stage-1 markers of `processor` in `ranges` (topic = the range's source,
+    /// partition = its segment, offset in `[from, until)`), outside any transaction; how many. A
+    /// store that keeps the marker's partition and offset as numbers refuses a range whose segment
+    /// or positions are not decimal with `InvalidMessage`.
     fn delete_markers<'a>(
         &'a self,
         processor: &'a str,

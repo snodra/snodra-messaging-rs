@@ -25,7 +25,7 @@ pub mod runner;
 pub use admin::{DEFAULT_LIST_LIMIT, DeadLetters, RetryAllResult, RetryResult};
 pub use control::{MAX_CONTROL_TEXT_BYTES, MAX_LIST_LIMIT, PAUSED_LOCALLY, ProcessorControl};
 pub use monitor::ProcessorMonitor;
-pub use reset::{ResetContext, ResetTarget};
+pub use reset::ResetContext;
 pub use runner::ProcessorRunner;
 
 /// How an event handler is registered

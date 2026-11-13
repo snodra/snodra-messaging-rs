@@ -42,7 +42,8 @@ use tokio_util::sync::CancellationToken;
 use crate::codec;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
-use crate::kafka::{LocalEventDispatcher, headers};
+use crate::event_store::headers;
+use crate::kafka::LocalEventDispatcher;
 use crate::types::Event;
 
 /// The consumer properties the library sets itself; a source's `properties` cannot hold them

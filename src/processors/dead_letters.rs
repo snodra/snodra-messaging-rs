@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::kafka::headers;
+use crate::event_store::headers;
 use crate::store::{DeadLetter, DeadLetterError, DeadLetterReason, letter_id};
 
 /// The record a letter is made of, as the consumer read it.

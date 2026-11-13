@@ -13,13 +13,12 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use kraken_messaging::config::DeadLetterMode;
+use kraken_messaging::event_store::headers;
 use kraken_messaging::hub::HandlerRegistry;
 use kraken_messaging::kafka::dispatch::{
     LocalEventDispatcher, NoSagas, Outcome, SagaStage, StageOneDone,
 };
-use kraken_messaging::kafka::{
-    EventConsumer, ProcessorSettings, RecordDisposition, classify_with, headers,
-};
+use kraken_messaging::kafka::{EventConsumer, ProcessorSettings, RecordDisposition, classify_with};
 use kraken_messaging::{Event, MessageContext, MessagingError, message_type};
 use mongodb::Database;
 use mongodb::bson::doc;

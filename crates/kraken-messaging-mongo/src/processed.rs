@@ -2,10 +2,12 @@
 //! `partition` (an Int32) and `offset` (an Int64) on a stage-1 marker of a consumed record.
 
 use futures::future::BoxFuture;
-use kraken_messaging::store::{ProcessedEventStore, ProcessedMarker, ReplayRange, StoreError, Tx};
+use kraken_messaging::event_store::ReplayRange;
+use kraken_messaging::store::{ProcessedEventStore, ProcessedMarker, StoreError, Tx};
 use mongodb::bson::{Document, doc};
 use mongodb::{Collection, Database};
 
+use crate::control::stored_range;
 use crate::{OrStoreError, date, is_duplicate_key, session, store_error};
 
 pub(crate) const PROCESSED_EVENTS_COLLECTION: &str = "processed_events";
@@ -83,13 +85,14 @@ impl ProcessedEventStore for MongoProcessedEventStore {
         Box::pin(async move {
             let mut deleted = 0;
             for range in ranges {
+                let (partition, from, until) = stored_range(range)?;
                 deleted += self
                     .markers
                     .delete_many(doc! {
                         "processor": processor,
-                        "topic": &range.topic,
-                        "partition": range.partition,
-                        "offset": { "$gte": range.from, "$lt": range.until },
+                        "topic": &range.source,
+                        "partition": partition,
+                        "offset": { "$gte": from, "$lt": until },
                     })
                     .await
                     .store()?

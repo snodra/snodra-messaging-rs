@@ -30,10 +30,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use chrono::Utc;
 use kraken_messaging::MessagingError;
+use kraken_messaging::event_store::ResetTarget;
 use kraken_messaging::kafka::EventBus;
-use kraken_messaging::processors::{
-    DEFAULT_LIST_LIMIT, DeadLetters, ResetContext, ResetTarget, RetryResult,
-};
+use kraken_messaging::processors::{DEFAULT_LIST_LIMIT, DeadLetters, ResetContext, RetryResult};
 use kraken_messaging::store::DeadLetter;
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +65,8 @@ pub struct ResetView {
     pub ranges: Vec<RangeView>,
 }
 
+/// A range on Kafka, where a segment is a partition and a position an offset (decimal); -1 for
+/// what is not decimal.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct RangeView {
     pub partition: i32,
@@ -79,7 +80,7 @@ impl From<&ResetContext> for ResetView {
             ResetTarget::Earliest => "earliest".to_string(),
             ResetTarget::Latest => "latest".to_string(),
             ResetTarget::Timestamp(ms) => format!("timestamp {ms}"),
-            ResetTarget::Offsets(all) => format!(
+            ResetTarget::Positions(all) => format!(
                 "offsets {{{}}}",
                 all.iter()
                     .map(|(p, o)| format!("{p}={o}"))
@@ -94,9 +95,9 @@ impl From<&ResetContext> for ResetView {
                 .ranges
                 .iter()
                 .map(|r| RangeView {
-                    partition: r.partition,
-                    from: r.from,
-                    until: r.until,
+                    partition: r.segment.parse().unwrap_or(-1),
+                    from: r.from.parse().unwrap_or(-1),
+                    until: r.until.parse().unwrap_or(-1),
                 })
                 .collect(),
         }
@@ -550,22 +551,25 @@ mod tests {
 
     #[test]
     fn a_reset_is_shown_the_way_service_b_shows_it() {
-        use kraken_messaging::processors::{ResetContext, ResetTarget};
-        use kraken_messaging::store::ReplayRange;
+        use kraken_messaging::event_store::{ReplayRange, ResetTarget};
+        use kraken_messaging::processors::ResetContext;
         let audit = Audit::default();
         let ctx = |target| ResetContext {
             processor: "audit".into(),
             operation_id: "op-1".into(),
             target,
             ranges: vec![ReplayRange {
-                topic: "kraken.events".into(),
-                partition: 1,
-                from: 3,
-                until: 9,
+                source: "kraken.events".into(),
+                segment: "1".into(),
+                from: "3".into(),
+                until: "9".into(),
             }],
         };
         audit.reset(&ctx(ResetTarget::Earliest));
-        audit.reset(&ctx(ResetTarget::Offsets(vec![(0, 12), (1, 3)])));
+        audit.reset(&ctx(ResetTarget::Positions(vec![
+            ("0".into(), "12".into()),
+            ("1".into(), "3".into()),
+        ])));
         audit.reset(&ctx(ResetTarget::Timestamp(1700)));
         let views = serde_json::to_value(audit.resets()).unwrap();
         assert_eq!(

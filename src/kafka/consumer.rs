@@ -31,11 +31,12 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::dispatch::{LocalEventDispatcher, MarkerPosition, RecordDispatch, StageOneDone};
-use super::headers;
 use crate::codec;
 use crate::config::DeadLetterMode;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
+use crate::event_store::ReplayRange;
+use crate::event_store::headers;
 use crate::hub::HandlerRegistry;
 use crate::metrics::{Consumed, Metrics, OTHER, TypeLabels};
 use crate::processors::ProcessorMonitor;
@@ -43,7 +44,6 @@ use crate::processors::dead_letters::{DeadLetterRecord, park};
 use crate::store::dead_letters::cut_chars;
 use crate::store::{
     DeadLetterError, DeadLetterReason, DeadLetterStore, MAX_ERROR_MESSAGE_CHARS, Parked,
-    ReplayRange,
 };
 use crate::time::now_ms;
 
@@ -165,7 +165,8 @@ impl ConsumerControl {
     /// Whether the record at `offset` of `partition` of `topic` is in an open replay range.
     pub fn replays(&self, topic: &str, partition: i32, offset: i64) -> bool {
         self.replay.lock().unwrap().iter().any(|r| {
-            r.topic == topic && r.partition == partition && r.from <= offset && offset < r.until
+            super::kafka_range(r, topic)
+                .is_some_and(|(p, from, until)| p == partition && from <= offset && offset < until)
         })
     }
 }

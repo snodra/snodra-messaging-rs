@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::TryStreamExt;
-use kraken_messaging::processors::{EventOptions, ResetContext, ResetTarget};
-use kraken_messaging::store::ReplayRange;
+use kraken_messaging::event_store::{ReplayRange, ResetTarget};
+use kraken_messaging::processors::{EventOptions, ResetContext};
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 
@@ -783,11 +783,11 @@ async fn a_reset_to_earliest_replays_the_range_once_without_sagas_or_disallowed_
     assert_eq!(ctx.target, ResetTarget::Earliest);
     assert_eq!(
         ctx.ranges,
-        [0, 1].map(|partition| ReplayRange {
-            topic: topic.into(),
-            partition,
-            from: 0,
-            until: 2
+        [0, 1].map(|partition: i32| ReplayRange {
+            source: topic.into(),
+            segment: partition.to_string(),
+            from: "0".into(),
+            until: "2".into()
         })
     );
     let written = replay(&db, "default").await;

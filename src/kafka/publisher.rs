@@ -27,9 +27,9 @@ use rdkafka::util::Timeout;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::headers;
 use crate::config::Config;
 use crate::error::MessagingError;
+use crate::event_store::headers;
 use crate::metrics::{Metrics, OUTBOX_OLDEST_AGE, OUTBOX_PENDING};
 use crate::saga::Clock;
 use crate::store::{OutboxEntry, OutboxStore};

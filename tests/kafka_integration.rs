@@ -6,10 +6,11 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use kraken_messaging::config::DeadLetterMode;
+use kraken_messaging::event_store::headers;
 use kraken_messaging::hub::HandlerRegistry;
 use kraken_messaging::kafka::{
     EventBus, EventConsumer, LocalEventDispatcher, NoSagas, OutboxPublisher,
-    OutboxPublisherSettings, ProcessorSettings, headers,
+    OutboxPublisherSettings, ProcessorSettings,
 };
 use kraken_messaging::metrics::{self, Metrics};
 use kraken_messaging::saga::Clock;

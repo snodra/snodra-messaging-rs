@@ -33,10 +33,11 @@ use super::dead_letters::letter_id;
 use super::{
     ControlOperation, DeadLetter, DeadLetterError, DeadLetterReason, DeadlineStore,
     DispatchFailure, ExternalCall, ExternalCallStatus, Locked, MessageStore, OutboxEntry,
-    OutboxStore, Parked, ProcessedMarker, ProcessorControlState, RESET_KIND, ReplayRange,
-    SagaDispatchStore, StoreError, TxProvider,
+    OutboxStore, Parked, ProcessedMarker, ProcessorControlState, RESET_KIND, SagaDispatchStore,
+    StoreError, TxProvider,
 };
 use crate::error::MessagingError;
+use crate::event_store::ReplayRange;
 use crate::saga::FailureReason;
 use crate::saga::store::{
     Association, DeadlineDocument, DeadlineStatus, DispatchKind, SagaDispatchDocument,
@@ -458,11 +459,11 @@ pub async fn delete_markers_removes_only_the_range(store: &dyn MessageStore) {
     }
     store.tx().commit(&mut tx).await.expect("commit");
 
-    let range = |partition, from, until| ReplayRange {
-        topic: TOPIC.into(),
-        partition,
-        from,
-        until,
+    let range = |partition: i32, from: i64, until: i64| ReplayRange {
+        source: TOPIC.into(),
+        segment: partition.to_string(),
+        from: from.to_string(),
+        until: until.to_string(),
     };
     assert_eq!(
         processed
@@ -1241,22 +1242,22 @@ pub async fn replay_ranges_round_trip(store: &dyn MessageStore) {
     let other_processor = format!("conformance-{}", uuid::Uuid::new_v4());
     let t0 = 1_800_000_000_000_i64;
     let r1 = ReplayRange {
-        topic: TOPIC.into(),
-        partition: 0,
-        from: 10,
-        until: 20,
+        source: TOPIC.into(),
+        segment: "0".into(),
+        from: "10".into(),
+        until: "20".into(),
     };
     let r2 = ReplayRange {
-        topic: TOPIC.into(),
-        partition: 1,
-        from: 0,
-        until: 5,
+        source: TOPIC.into(),
+        segment: "1".into(),
+        from: "0".into(),
+        until: "5".into(),
     };
     let r3 = ReplayRange {
-        topic: "conformance.other".into(),
-        partition: 0,
-        from: 10,
-        until: 20,
+        source: "conformance.other".into(),
+        segment: "0".into(),
+        from: "10".into(),
+        until: "20".into(),
     };
     assert_eq!(
         control
@@ -1304,7 +1305,7 @@ pub async fn replay_ranges_round_trip(store: &dyn MessageStore) {
             .remove_range(
                 &processor,
                 &ReplayRange {
-                    until: 21,
+                    until: "21".into(),
                     ..r1.clone()
                 },
                 t0 + 2_000
@@ -1358,10 +1359,10 @@ pub async fn processor_control_write_inside_rolled_back_transaction_is_kept(
     let locked = format!("conformance-{}", uuid::Uuid::new_v4());
     let t0 = 1_800_000_000_000_i64;
     let range = ReplayRange {
-        topic: TOPIC.into(),
-        partition: 0,
-        from: 1,
-        until: 2,
+        source: TOPIC.into(),
+        segment: "0".into(),
+        from: "1".into(),
+        until: "2".into(),
     };
     let mut tx = store.tx().begin().await.expect("begin");
     control

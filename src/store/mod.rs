@@ -27,7 +27,7 @@ mod tx;
 pub mod conformance;
 
 pub use control::{
-    ControlOperation, Locked, ProcessorControlState, ProcessorControlStore, RESET_KIND, ReplayRange,
+    ControlOperation, Locked, ProcessorControlState, ProcessorControlStore, RESET_KIND,
 };
 pub use dead_letters::{
     DeadLetter, DeadLetterError, DeadLetterReason, DeadLetterStore, DeadLetterSummary,

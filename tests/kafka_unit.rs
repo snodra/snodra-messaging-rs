@@ -3,8 +3,9 @@ mod support;
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
+use kraken_messaging::event_store::headers;
 use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::kafka::{RecordDisposition, classify, headers, new_outbox_entry};
+use kraken_messaging::kafka::{RecordDisposition, classify, new_outbox_entry};
 use kraken_messaging::{Event, Identity, MessageContext, message_type};
 use serde::{Deserialize, Serialize};
 
