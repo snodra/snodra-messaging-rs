@@ -226,7 +226,7 @@ impl DeadLetters {
     ) -> Result<RetryResult, MessagingError> {
         if !self
             .store()?
-            .record_failure(id, &error, crate::store::now_ms())
+            .record_failure(id, &error, crate::time::now_ms())
             .await?
         {
             return Ok(RetryResult::NotFound);

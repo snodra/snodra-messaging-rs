@@ -27,9 +27,8 @@ use super::reset::{GroupAdmin, Plan, ResetContext, ResetFailure, ResetHandler, R
 use crate::error::MessagingError;
 use crate::kafka::{ConsumerControl, EventConsumer, LocalEventDispatcher, ProcessorSettings};
 use crate::proto::{self, ControlRefusal};
-use crate::store::{
-    Locked, ProcessedEventStore, ProcessorControlStore, ReplayRange, now_ms as now,
-};
+use crate::store::{Locked, ProcessedEventStore, ProcessorControlStore, ReplayRange};
+use crate::time::{after, now_ms as now, rfc3339};
 
 /// How often the runner reads its processor's control document.
 pub const CONTROL_POLL: Duration = Duration::from_secs(5);
@@ -819,15 +818,4 @@ async fn blocking<T: Send + 'static>(
             format!("kafka call failed: {e}"),
         )),
     }
-}
-
-fn after(now_ms: i64, lease: Duration) -> i64 {
-    now_ms.saturating_add(i64::try_from(lease.as_millis()).unwrap_or(i64::MAX))
-}
-
-/// An epoch-millisecond time as Kotlin's `Instant.toString()` prints it.
-fn rfc3339(at_ms: i64) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at_ms)
-        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-        .unwrap_or_else(|| at_ms.to_string())
 }

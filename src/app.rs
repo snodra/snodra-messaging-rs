@@ -43,7 +43,8 @@ use crate::hub::{
 };
 use crate::identity::{Guard, IdentityResolver, JwksVerifier};
 use crate::kafka::{
-    EventBus, LocalEventDispatcher, NoSagas, OutboxPublisher, ProcessorSettings, SagaStage,
+    EventBus, LocalEventDispatcher, NoSagas, OutboxPublisher, OutboxPublisherSettings,
+    ProcessorSettings, SagaStage,
 };
 use crate::metrics::Metrics;
 use crate::processors::reset::ResetHandler;
@@ -730,15 +731,18 @@ impl KrakenMessagingBuilder {
     /// (also one taken before this call) appends to its outbox. Publishing an event, an event
     /// handler, a saga, an idempotent handler and a partner topic need one
     /// ([`start`](Self::start) fails naming what needs it); commands and queries do not. The
-    /// add-on's schema (MongoDB: its indexes) is the service's to prepare before `start`.
+    /// store's schema (MongoDB: its indexes) is prepared by `start` unless
+    /// `Config::store_init_schema` is false (`KRAKEN_STORE_INIT_SCHEMA`), and the store stamps its
+    /// own times with the builder's [`clock`](Self::clock).
     pub fn store(mut self, store: Arc<dyn MessageStore>) -> Self {
         self.events.bind(store.outbox());
         self.store = Some(store);
         self
     }
 
-    /// Registers with the hub (in the background), starts the outbox publisher and the
-    /// consumer. Does not wait for the hub: see [`KrakenMessaging::await_hub`].
+    /// Prepares the message store's schema (unless `Config::store_init_schema` is false), registers
+    /// with the hub (in the background), starts the outbox publisher and the consumer. Does not
+    /// wait for the hub: see [`KrakenMessaging::await_hub`].
     pub async fn start(self) -> Result<KrakenMessaging, MessagingError> {
         let KrakenMessagingBuilder {
             config,
@@ -778,6 +782,13 @@ impl KrakenMessagingBuilder {
         } else {
             Vec::new()
         };
+        // The store stamps its own times with the application's clock, and gets its schema.
+        if let Some(store) = &store {
+            store.use_clock(clock.clone());
+            if config.store_init_schema {
+                store.init_schema(&config).await?;
+            }
+        }
         let saga_metrics: Arc<dyn SagaMetrics> =
             Arc::new(OtelSagaMetrics::new(&metrics, stats.clone()));
         if let Some(store) = store
@@ -963,12 +974,8 @@ impl KrakenMessagingBuilder {
         if let Some(store) = store.as_ref().filter(|_| config.outbox_enabled) {
             let publisher = OutboxPublisher::new(
                 store.outbox(),
-                &config.kafka_bootstrap,
-                &config.kafka_topic,
-                &config.service_name,
-                config.outbox_poll_interval,
-                config.outbox_batch_size,
-                config.outbox_max_attempts,
+                OutboxPublisherSettings::from(&config),
+                clock.clone(),
                 &metrics,
             )?;
             tasks.push(publisher.start(cancel.clone()));
@@ -988,7 +995,7 @@ impl KrakenMessagingBuilder {
             ));
             let relay = SagaDispatchRelay::new(
                 store.tx(),
-                Arc::clone(&sagas.dispatch_queue),
+                Arc::clone(&sagas.dispatch),
                 commands,
                 events.clone(),
                 Arc::clone(&local),
@@ -1007,7 +1014,7 @@ impl KrakenMessagingBuilder {
             saga_tasks.push(scheduler.start(saga_cancel.clone()));
             saga_tasks.push(stats.start_sampler(
                 sagas.sagas,
-                sagas.dispatch_queue,
+                sagas.dispatch,
                 SAMPLE_INTERVAL,
                 saga_cancel.clone(),
             ));

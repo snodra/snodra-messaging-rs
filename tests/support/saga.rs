@@ -7,14 +7,15 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::TryStreamExt;
+use kraken_messaging::Config;
 use kraken_messaging::MessageContext;
 use kraken_messaging::saga::store::{
     DeadlineDocument, SagaDispatchDocument, SagaDocument, SagaFailureDocument,
 };
 use kraken_messaging::saga::{ManualClock, SagaPorts};
 use kraken_messaging::store::MessageStore;
+use kraken_messaging_mongo::MongoStore;
 use kraken_messaging_mongo::documents::{DeadlineDoc, DispatchDoc, FailureDoc, SagaDoc};
-use kraken_messaging_mongo::{MongoIndexSettings, MongoStore};
 use mongodb::bson::{Document, doc};
 use mongodb::{Client, Database};
 use serde::de::DeserializeOwned;
@@ -44,19 +45,11 @@ impl Store {
         // The store stamps the outbox with the system clock, as a service's does: the manual
         // clock is the saga runtime's, relay's and scheduler's.
         let store = MongoStore::new(client.clone(), db.clone());
+        // What `start()` does: the indexes, which create the collections transactions write to.
         store
-            .ensure_indexes(&MongoIndexSettings::default())
+            .init_schema(&Config::new("saga-tests", "127.0.0.1:1", "127.0.0.1:1"))
             .await
             .unwrap();
-        // Transactions need the collections to exist.
-        for name in [
-            "processed_events",
-            "saga_failures",
-            "outbox",
-            "external_calls",
-        ] {
-            let _ = db.create_collection(name).await;
-        }
         Store {
             client,
             db,

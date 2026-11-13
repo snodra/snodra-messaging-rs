@@ -27,7 +27,7 @@ use chrono::Utc;
 use kraken_messaging::external::{ExternalSource, IdempotencyKey};
 use kraken_messaging::processors::EventOptions;
 use kraken_messaging::{Config, KrakenMessaging, MessagingError};
-use kraken_messaging_mongo::{MongoIndexSettings, MongoStore};
+use kraken_messaging_mongo::MongoStore;
 use messages::{
     BannerFailed, BannerPrinted, Counter, GreetingDelivered, IncrementCounter, Inventory,
     OpenSubscriptions, PollBannerJob, PrintBanner, Reverse, Reversed, Rows, Shout, ShoutAudit,
@@ -103,8 +103,8 @@ async fn main() -> Result<(), MessagingError> {
     let (watch_counters, increment_counters) = (counters.clone(), counters);
     let (count_service, count_instance) = (service.clone(), instance.clone());
     let increment_service = service.clone();
-    // The message store: the service's own MongoDB database (a replica set), its indexes with
-    // the retentions of the config.
+    // The message store: the service's own MongoDB database (a replica set); `start` creates its
+    // indexes with the retentions of the config.
     let mongo = mongodb::Client::with_uri_str(&required_env("KRAKEN_MONGODB_URI")?)
         .await
         .map_err(|e| MessagingError::Storage(e.to_string()))?;
@@ -112,9 +112,6 @@ async fn main() -> Result<(), MessagingError> {
         MessagingError::InvalidMessage("KRAKEN_MONGODB_URI must name a database".into())
     })?;
     let store = MongoStore::new(mongo, db);
-    store
-        .ensure_indexes(&MongoIndexSettings::from(&config))
-        .await?;
     let builder = KrakenMessaging::builder(config)
         .await?
         .store(Arc::new(store));

@@ -13,8 +13,8 @@ pub use consumer::{
     classify, classify_with,
 };
 pub use dispatch::{LocalEventDispatcher, NoSagas, SagaStage};
-pub(crate) use outbox::check_payload;
 pub use outbox::{EventBus, new_outbox_entry};
-pub use publisher::OutboxPublisher;
+pub(crate) use outbox::{check_payload, check_payload_text};
+pub use publisher::{OUTBOX_SEND_TIMEOUT, OutboxPublisher, OutboxPublisherSettings};
 
 pub const EVENTS_TOPIC: &str = "kraken.events";

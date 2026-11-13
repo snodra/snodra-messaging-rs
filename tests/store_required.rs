@@ -13,6 +13,15 @@ use kraken_messaging::{
 use serde::{Deserialize, Serialize};
 use support::fake_hub::FakeHub;
 
+macro_rules! require_docker {
+    () => {
+        if !support::docker_available() {
+            eprintln!("docker not available, skipping");
+            return;
+        }
+    };
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Happened {
     n: u32,
@@ -174,4 +183,67 @@ async fn commands_and_queries_need_no_store() {
     );
     app.shutdown().await;
     hub.stop();
+}
+
+/// `start()` prepares the store's schema (MongoDB: its indexes, which create its collections),
+/// unless `store_init_schema` is false: then the library creates nothing.
+#[tokio::test]
+async fn start_prepares_the_store_schema_unless_turned_off() {
+    require_docker!();
+    let mongo = support::containers::mongo().await;
+    let start = |uri: String, init: bool| async move {
+        let mut config = Config::new("store-required", "127.0.0.1:1", "127.0.0.1:1");
+        config.outbox_enabled = false;
+        config.store_init_schema = init;
+        KrakenMessaging::builder(config)
+            .await
+            .unwrap()
+            .store(support::mongo_store_bare(&uri).await)
+            .command::<Shout, _, _>(|c, _| async move { Ok(c.text) })
+            .start()
+            .await
+            .unwrap()
+    };
+
+    let uri = mongo.uri_for("prepared");
+    let app = start(uri.clone(), true).await;
+    let db = support::mongo_db(&uri).await;
+    let mut names = db.list_collection_names().await.unwrap();
+    names.sort();
+    for collection in [
+        "dead_letters",
+        "deadlines",
+        "external_calls",
+        "outbox",
+        "processed_events",
+        "saga_dispatch",
+        "saga_dispatch_leases",
+        "saga_failures",
+        "sagas",
+    ] {
+        assert!(
+            names.contains(&collection.to_string()),
+            "{collection}: {names:?}"
+        );
+    }
+    let outbox: Vec<String> = db
+        .collection::<mongodb::bson::Document>("outbox")
+        .list_index_names()
+        .await
+        .unwrap();
+    assert!(
+        outbox.contains(&"sentAt_1_createdAt_1_seq_1".to_string()),
+        "{outbox:?}"
+    );
+    app.shutdown().await;
+
+    let uri = mongo.uri_for("unprepared");
+    let app = start(uri.clone(), false).await;
+    let names = support::mongo_db(&uri)
+        .await
+        .list_collection_names()
+        .await
+        .unwrap();
+    assert!(names.is_empty(), "{names:?}");
+    app.shutdown().await;
 }

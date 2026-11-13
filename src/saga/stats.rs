@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::failed::FailureReason;
 use super::metrics::{EventOutcome, ExternalOutcome, SagaMetrics};
-use super::ports::{DispatchQueue, SagaRepository};
+use super::ports::{SagaDispatchStore, SagaRepository};
 use crate::error::MessagingError;
 
 /// How often the sampled gauges are counted (ruling 16: a constant).
@@ -257,14 +257,14 @@ impl SagaStats {
         self.gauge(SAGA_DISPATCH_PENDING, &[])
     }
 
-    /// Counts the live (not ended) instances per saga type ([`SagaRepository::count_live`]) and
-    /// the pending dispatch entries ([`DispatchQueue::pending`]) and sets the two sampled gauges.
+    /// Counts the live (not ended) instances per saga type ([`SagaRepository::count_live_by_type`]) and
+    /// the pending dispatch entries ([`SagaDispatchStore::pending`]) and sets the two sampled gauges.
     pub async fn sample_once(
         &self,
         sagas: &dyn SagaRepository,
-        queue: &dyn DispatchQueue,
+        queue: &dyn SagaDispatchStore,
     ) -> Result<(), MessagingError> {
-        let by_type = sagas.count_live().await?;
+        let by_type = sagas.count_live_by_type().await?;
         let pending = queue.pending().await?;
         self.set_gauges(SAGAS_ACTIVE, "type", &by_type);
         self.inner()
@@ -277,7 +277,7 @@ impl SagaStats {
     pub fn start_sampler(
         &self,
         sagas: Arc<dyn SagaRepository>,
-        queue: Arc<dyn DispatchQueue>,
+        queue: Arc<dyn SagaDispatchStore>,
         interval: Duration,
         cancel: CancellationToken,
     ) -> JoinHandle<()> {

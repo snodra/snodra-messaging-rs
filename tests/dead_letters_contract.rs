@@ -495,7 +495,7 @@ fn the_error_message_is_cut_at_2000_characters_and_a_repeated_header_keeps_its_l
         e,
         None,
         1,
-        kraken_messaging::store::now_ms(),
+        kraken_messaging::time::now_ms(),
         Duration::from_secs(1),
     );
     assert_eq!(

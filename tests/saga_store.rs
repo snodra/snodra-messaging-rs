@@ -123,9 +123,9 @@ fn a_kotlin_shaped_document_of_each_collection_deserialises() {
     assert!(pending.failure_reason.is_none() && pending.notice_pending.is_none());
 
     let lease: LeaseDoc = read("saga_dispatch_leases");
-    assert_eq!(lease.id, saga.id);
-    assert_eq!(lease.owner, "relay-instance-1");
-    assert_eq!(lease.until.timestamp_millis(), at("2026-11-03T10:06:30Z"));
+    assert_eq!(lease.saga_id(), saga.id);
+    assert_eq!(lease.owner(), "relay-instance-1");
+    assert_eq!(lease.until_ms(), at("2026-11-03T10:06:30Z"));
 
     let deadline: DeadlineDocument = record::<DeadlineDoc, _>("deadlines");
     assert_eq!(deadline.saga_type, "PaymentSaga");

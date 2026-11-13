@@ -129,7 +129,10 @@ impl DeadlineScheduler {
 
     /// The SCHEDULED deadlines past their due time, per name.
     async fn overdue(&self) -> Result<HashMap<String, u64>, MessagingError> {
-        Ok(self.deadlines.count_overdue(self.clock.now_ms()).await?)
+        Ok(self
+            .deadlines
+            .count_overdue_by_name(self.clock.now_ms())
+            .await?)
     }
 
     /// Runs the polling loop as a tokio task until `cancel` is cancelled; the pass in progress

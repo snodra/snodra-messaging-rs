@@ -143,7 +143,7 @@ fn bump(order_id: &str, tag: &str) -> Bump {
 
 /// Epoch milliseconds.
 fn dt(t: std::time::SystemTime) -> i64 {
-    kraken_messaging::saga::epoch_ms(t)
+    kraken_messaging::time::epoch_ms(t)
 }
 
 #[tokio::test]

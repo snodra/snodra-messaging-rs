@@ -310,7 +310,24 @@ impl From<FailureDoc> for SagaFailureDocument {
 pub struct LeaseDoc {
     /// The saga id.
     #[serde(rename = "_id")]
-    pub id: String,
-    pub owner: String,
-    pub until: DateTime,
+    id: String,
+    owner: String,
+    until: DateTime,
+}
+
+impl LeaseDoc {
+    /// The saga whose dispatch order it leases.
+    pub fn saga_id(&self) -> &str {
+        &self.id
+    }
+
+    /// The relay holding it.
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    /// Until when, epoch milliseconds.
+    pub fn until_ms(&self) -> i64 {
+        ms(self.until)
+    }
 }

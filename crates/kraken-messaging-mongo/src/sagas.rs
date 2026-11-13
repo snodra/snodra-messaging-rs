@@ -8,11 +8,11 @@ use std::collections::HashMap;
 use futures::TryStreamExt;
 use futures::future::BoxFuture;
 use kraken_messaging::saga::store::{
-    DeadlineDocument, SagaDispatchDocument, SagaDocument, SagaFailureDocument,
+    DeadlineDocument, DispatchKind, SagaDispatchDocument, SagaDocument, SagaFailureDocument,
 };
 use kraken_messaging::store::{
-    DeadlineStore, DispatchFailure, DispatchQueue, DispatchRecorder, FailureStore, MarkerStore,
-    SagaRepository, StoreError, Tx,
+    DeadlineStore, DispatchFailure, FailureStore, MarkerStore, SagaDispatchStore, SagaRepository,
+    StoreError, Tx,
 };
 use mongodb::bson::{Bson, Document, doc};
 use mongodb::options::ReturnDocument;
@@ -166,7 +166,7 @@ impl SagaRepository for MongoSagaStore {
         })
     }
 
-    fn count_live(&self) -> BoxFuture<'_, Result<HashMap<String, u64>, StoreError>> {
+    fn count_live_by_type(&self) -> BoxFuture<'_, Result<HashMap<String, u64>, StoreError>> {
         Box::pin(async move {
             let groups: Vec<Document> = self
                 .db
@@ -199,25 +199,6 @@ fn counts(groups: Vec<Document>) -> HashMap<String, u64> {
             Some((name, n))
         })
         .collect()
-}
-
-impl DispatchRecorder for MongoSagaStore {
-    fn record<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        entries: &'a [SagaDispatchDocument],
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
-        Box::pin(async move {
-            if !entries.is_empty() {
-                self.dispatch()
-                    .insert_many(entries.iter().map(DispatchDoc::from))
-                    .session(session(tx)?)
-                    .await
-                    .store()?;
-            }
-            Ok(())
-        })
-    }
 }
 
 impl DeadlineStore for MongoSagaStore {
@@ -333,7 +314,7 @@ impl DeadlineStore for MongoSagaStore {
         })
     }
 
-    fn count_overdue(
+    fn count_overdue_by_name(
         &self,
         now_ms: i64,
     ) -> BoxFuture<'_, Result<HashMap<String, u64>, StoreError>> {
@@ -493,7 +474,28 @@ fn pending() -> Document {
     doc! { "dispatchedAt": null, "failedAt": null }
 }
 
-impl DispatchQueue for MongoSagaStore {
+impl SagaDispatchStore for MongoSagaStore {
+    fn record<'a>(
+        &'a self,
+        tx: &'a mut Tx,
+        entries: &'a [SagaDispatchDocument],
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            // What the outbox would refuse, refused now: the saga's attempt fails, nothing commits.
+            for e in entries.iter().filter(|e| e.kind == DispatchKind::Event) {
+                crate::outbox::payload_document(&e.type_name, e.payload.as_bytes())?;
+            }
+            if !entries.is_empty() {
+                self.dispatch()
+                    .insert_many(entries.iter().map(DispatchDoc::from))
+                    .session(session(tx)?)
+                    .await
+                    .store()?;
+            }
+            Ok(())
+        })
+    }
+
     fn due_sagas<'a>(
         &'a self,
         now_ms: i64,
@@ -533,7 +535,7 @@ impl DispatchQueue for MongoSagaStore {
         })
     }
 
-    fn first_pending<'a>(
+    fn next_pending<'a>(
         &'a self,
         saga_id: &'a str,
     ) -> BoxFuture<'a, Result<Option<SagaDispatchDocument>, StoreError>> {
@@ -569,7 +571,7 @@ impl DispatchQueue for MongoSagaStore {
         })
     }
 
-    fn retry_later<'a>(
+    fn schedule_retry<'a>(
         &'a self,
         id: &'a str,
         attempts: i32,
@@ -581,7 +583,7 @@ impl DispatchQueue for MongoSagaStore {
         ))
     }
 
-    fn fail<'a>(
+    fn mark_failed<'a>(
         &'a self,
         id: &'a str,
         failure: &'a DispatchFailure,
@@ -639,7 +641,7 @@ impl DispatchQueue for MongoSagaStore {
         ))
     }
 
-    fn notice_failed<'a>(
+    fn schedule_notice_retry<'a>(
         &'a self,
         id: &'a str,
         notice_attempts: i32,

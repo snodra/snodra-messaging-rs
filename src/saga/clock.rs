@@ -3,7 +3,9 @@
 //! test fixture) move a [`ManualClock`].
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
+
+use crate::time::epoch_ms;
 
 /// A source of the current time, cheap to clone and share.
 #[derive(Clone)]
@@ -27,14 +29,6 @@ impl Clock {
     /// `now()` as epoch milliseconds (the precision the stores keep).
     pub fn now_ms(&self) -> i64 {
         epoch_ms(self.now())
-    }
-}
-
-/// `at` as epoch milliseconds (before 1970: negative).
-pub fn epoch_ms(at: SystemTime) -> i64 {
-    match at.duration_since(UNIX_EPOCH) {
-        Ok(d) => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
-        Err(e) => -i64::try_from(e.duration().as_millis()).unwrap_or(i64::MAX),
     }
 }
 

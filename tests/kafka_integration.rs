@@ -8,10 +8,11 @@ use chrono::{DateTime, Utc};
 use kraken_messaging::config::DeadLetterMode;
 use kraken_messaging::hub::HandlerRegistry;
 use kraken_messaging::kafka::{
-    EventBus, EventConsumer, LocalEventDispatcher, NoSagas, OutboxPublisher, ProcessorSettings,
-    headers,
+    EventBus, EventConsumer, LocalEventDispatcher, NoSagas, OutboxPublisher,
+    OutboxPublisherSettings, ProcessorSettings, headers,
 };
 use kraken_messaging::metrics::{self, Metrics};
+use kraken_messaging::saga::Clock;
 use kraken_messaging::store::MessageStore;
 use kraken_messaging::{Event, message_type};
 use mongodb::bson::doc;
@@ -105,12 +106,16 @@ async fn outbox_relays_to_kafka_with_kotlin_headers() {
     let meter = TestMeter::new();
     let publisher = OutboxPublisher::new(
         store.outbox(),
-        &kafka.bootstrap,
-        TOPIC,
-        "svc-a",
-        Duration::from_millis(100),
-        100,
-        10,
+        OutboxPublisherSettings {
+            bootstrap_servers: kafka.bootstrap.clone(),
+            topic: TOPIC.into(),
+            source: "svc-a".into(),
+            poll_interval: Duration::from_millis(100),
+            batch_size: 100,
+            max_attempts: 10,
+            lease: Duration::from_secs(120),
+        },
+        Clock::system(),
         &Metrics::new(meter.meter()),
     )
     .unwrap();
@@ -425,12 +430,16 @@ async fn failed_send_marks_attempts() {
     let meter = TestMeter::new();
     let publisher = OutboxPublisher::new(
         store.outbox(),
-        "127.0.0.1:1",
-        TOPIC,
-        "svc-a",
-        Duration::from_millis(100),
-        2,
-        10,
+        OutboxPublisherSettings {
+            bootstrap_servers: "127.0.0.1:1".to_string(),
+            topic: TOPIC.into(),
+            source: "svc-a".into(),
+            poll_interval: Duration::from_millis(100),
+            batch_size: 2,
+            max_attempts: 10,
+            lease: Duration::from_secs(120),
+        },
+        Clock::system(),
         &Metrics::new(meter.meter()),
     )
     .unwrap();
@@ -498,12 +507,16 @@ async fn non_retriable_send_marks_failed_immediately() {
     .unwrap();
     let publisher = OutboxPublisher::new(
         store.outbox(),
-        "127.0.0.1:1",
-        TOPIC,
-        "svc-a",
-        Duration::from_millis(100),
-        100,
-        10,
+        OutboxPublisherSettings {
+            bootstrap_servers: "127.0.0.1:1".to_string(),
+            topic: TOPIC.into(),
+            source: "svc-a".into(),
+            poll_interval: Duration::from_millis(100),
+            batch_size: 100,
+            max_attempts: 10,
+            lease: Duration::from_secs(120),
+        },
+        Clock::system(),
         &Metrics::global(),
     )
     .unwrap();

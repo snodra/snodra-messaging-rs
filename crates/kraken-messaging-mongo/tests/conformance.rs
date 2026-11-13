@@ -48,7 +48,8 @@ async fn the_outbox_stamps_its_times_with_the_application_clock() {
     let db = client.database(&format!("t{}", uuid::Uuid::new_v4().simple()));
     let at = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
     let clock = ManualClock::new(at);
-    let store = MongoStore::new(client, db.clone()).with_clock(clock.clock());
+    let store = MongoStore::new(client, db.clone());
+    store.use_clock(clock.clock());
     let outbox = store.outbox();
     let entry = |id: &str| OutboxEntry {
         id: id.into(),

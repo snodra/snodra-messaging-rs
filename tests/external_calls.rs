@@ -16,7 +16,6 @@ use kraken_messaging::identity::IdentityResolver;
 use kraken_messaging::kafka::dispatch::{LocalEventDispatcher, NoSagas};
 use kraken_messaging::kafka::{EventBus, SagaStage};
 use kraken_messaging::proto::{ErrorCode, Reply, Request, RequestKind, reply};
-use kraken_messaging::saga::epoch_ms;
 use kraken_messaging::saga::store::{DispatchKind, SagaDispatchDocument};
 use kraken_messaging::saga::{
     ExternalOutcome, FailureReason, LocalRawCommandSender, NoopSagaMetrics, RETRYABLE_MARKER,
@@ -25,6 +24,7 @@ use kraken_messaging::saga::{
     classify_failure,
 };
 use kraken_messaging::store::{ExternalCall, ExternalCallStatus, MessageStore};
+use kraken_messaging::time::epoch_ms;
 use kraken_messaging::{Command, Event, MessagingError, RetryPolicy, SendOptions, message_type};
 use kraken_messaging_mongo::documents::DispatchDoc;
 use mongodb::bson::doc;
@@ -229,7 +229,6 @@ struct Ex {
 impl Ex {
     async fn start() -> Ex {
         let store = Store::start().await;
-        let _ = store.db.create_collection("external_calls").await;
         let adapter = Adapter::new();
         let metrics = Arc::new(ExternalMetrics::default());
         let calls = ExternalCalls::new(
@@ -827,7 +826,7 @@ async fn harness() -> Harness {
         Arc::new(LocalRawCommandSender::new(Arc::clone(&registry)));
     let relay = SagaDispatchRelay::new(
         ex.store.store.tx(),
-        ex.store.store.sagas().dispatch_queue,
+        ex.store.store.sagas().dispatch,
         sender,
         EventBus::over(ex.store.store.outbox()),
         local,

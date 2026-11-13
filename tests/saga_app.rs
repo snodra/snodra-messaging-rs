@@ -440,10 +440,11 @@ async fn a_service_without_sagas_adapters_or_sources_builds_none_of_it() {
     assert!(e.to_string().contains("need a message store"), "{e}");
     app.shutdown().await;
 
-    // Disabled sagas are not built, even when registered: the library writes nothing in the
-    // store (its indexes are the service's to create, and none were).
+    // Disabled sagas are not built, even when registered: with the schema setup turned off, the
+    // library writes nothing in the store.
     let mut disabled = config(&hub.address(), "127.0.0.1:1");
     disabled.sagas_enabled = false;
+    disabled.store_init_schema = false;
     let uri = mongo.uri_for("disabled");
     let app = KrakenMessaging::builder(disabled)
         .await
@@ -485,7 +486,9 @@ async fn a_service_without_sagas_adapters_or_sources_builds_none_of_it() {
 
     // An idempotent handler starts with its store and builds nothing of the sagas.
     let uri = mongo.uri_for("adapter");
-    let app = KrakenMessaging::builder(config(&hub.address(), "127.0.0.1:1"))
+    let mut unprepared = config(&hub.address(), "127.0.0.1:1");
+    unprepared.store_init_schema = false;
+    let app = KrakenMessaging::builder(unprepared)
         .await
         .unwrap()
         .store(support::mongo_store_bare(&uri).await)

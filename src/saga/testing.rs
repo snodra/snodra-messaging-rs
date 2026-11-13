@@ -28,7 +28,8 @@ use super::definition::SagaDefinition;
 use super::failed::{FailureReason, SagaCommandFailed};
 use super::metrics::NoopSagaMetrics;
 use super::ports::{
-    DeadlineStore, DispatchRecorder, FailureStore, MarkerStore, SagaPorts, SagaRepository,
+    DeadlineStore, DispatchFailure, FailureStore, MarkerStore, SagaDispatchStore, SagaPorts,
+    SagaRepository,
 };
 use super::retry::SagaRetry;
 use super::runtime::SagaRuntime;
@@ -261,7 +262,7 @@ impl<S: Serialize + DeserializeOwned + Default + Send + 'static> SagaTestFixture
     /// When a deadline handler fails, or more than 10 000 deadlines fall due in one step.
     pub fn when_time_elapses(&mut self, duration: Duration) -> &mut Self {
         let target = self.clock.now() + duration;
-        let target_ms = super::clock::epoch_ms(target);
+        let target_ms = crate::time::epoch_ms(target);
         let mut fired = 0usize;
         loop {
             let next = {
@@ -351,7 +352,7 @@ impl<S: Serialize + DeserializeOwned + Default + Send + 'static> SagaTestFixture
 
     /// A deadline `name` is scheduled to fire at exactly `at` (to the millisecond, as stored).
     pub fn expect_scheduled_deadline(&mut self, name: &str, at: SystemTime) -> &mut Self {
-        let at = super::clock::epoch_ms(at);
+        let at = crate::time::epoch_ms(at);
         let scheduled = self.scheduled();
         if !scheduled
             .iter()
@@ -359,7 +360,7 @@ impl<S: Serialize + DeserializeOwned + Default + Send + 'static> SagaTestFixture
         {
             self.fail(format!(
                 "expected a deadline '{name}' at {} but found {}",
-                rfc3339(at),
+                crate::time::rfc3339(at),
                 describe_deadlines(&scheduled)
             ));
         }
@@ -504,12 +505,17 @@ fn describe_deadlines(deadlines: &[DeadlineDocument]) -> String {
     }
     let shown: Vec<String> = deadlines
         .iter()
-        .map(|d| format!("'{}' at {}", d.name, rfc3339(d.due_at_ms)))
+        .map(|d| format!("'{}' at {}", d.name, crate::time::rfc3339(d.due_at_ms)))
         .collect();
     format!("[{}]", shown.join(", "))
 }
 
 // ---- the in-memory ports ---------------------------------------------------------------------
+
+/// Neither dispatched nor failed.
+fn pending(e: &SagaDispatchDocument) -> bool {
+    e.dispatched_at_ms.is_none() && e.failed_at_ms.is_none()
+}
 
 /// What [`InMemorySagaStore`] holds: the documents of the saga collections, in insertion order.
 #[derive(Clone, Debug, Default)]
@@ -519,6 +525,8 @@ pub struct InMemoryData {
     pub deadlines: Vec<DeadlineDocument>,
     pub failures: Vec<SagaFailureDocument>,
     pub markers: HashSet<String>,
+    /// The dispatch leases: saga id to (owner, until epoch ms).
+    pub leases: std::collections::HashMap<String, (String, i64)>,
 }
 
 /// The saga persistence ports in memory, and their transaction: [`TxProvider::begin`] takes a
@@ -547,6 +555,12 @@ impl InMemorySagaStore {
     /// The documents, locked for reading (or changing) them.
     pub fn data(&self) -> MutexGuard<'_, InMemoryData> {
         self.data.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn update_entry(&self, id: &str, change: impl FnOnce(&mut SagaDispatchDocument)) {
+        if let Some(e) = self.data().dispatch.iter_mut().find(|e| e.id == id) {
+            change(e);
+        }
     }
 
     fn cancel_where(&self, now: i64, matches: impl Fn(&DeadlineDocument) -> bool) {
@@ -664,7 +678,7 @@ impl SagaRepository for InMemorySagaStore {
         ready(Ok(updated))
     }
 
-    fn count_live(
+    fn count_live_by_type(
         &self,
     ) -> BoxFuture<'_, Result<std::collections::HashMap<String, u64>, StoreError>> {
         let mut counts = std::collections::HashMap::new();
@@ -675,14 +689,207 @@ impl SagaRepository for InMemorySagaStore {
     }
 }
 
-impl DispatchRecorder for InMemorySagaStore {
+impl SagaDispatchStore for InMemorySagaStore {
     fn record<'a>(
         &'a self,
         _tx: &'a mut Tx,
         entries: &'a [SagaDispatchDocument],
     ) -> BoxFuture<'a, Result<(), StoreError>> {
+        // What the outbox would refuse, as every store refuses it.
+        for e in entries.iter().filter(|e| e.kind == DispatchKind::Event) {
+            if let Err(refused) =
+                crate::kafka::check_payload_text(&e.type_name, e.payload.as_bytes())
+            {
+                return ready(Err(StoreError::Failed(refused)));
+            }
+        }
         self.data().dispatch.extend_from_slice(entries);
         ready(Ok(()))
+    }
+
+    fn due_sagas<'a>(
+        &'a self,
+        now_ms: i64,
+        except: &'a [String],
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<String>, StoreError>> {
+        let data = self.data();
+        let mut first: std::collections::HashMap<&str, &SagaDispatchDocument> =
+            std::collections::HashMap::new();
+        for e in data.dispatch.iter().filter(|e| pending(e)) {
+            let slot = first.entry(e.saga_id.as_str()).or_insert(e);
+            if e.seq < slot.seq {
+                *slot = e;
+            }
+        }
+        let mut due: Vec<&SagaDispatchDocument> = first
+            .into_values()
+            .filter(|e| !except.contains(&e.saga_id))
+            .filter(|e| e.next_attempt_at_ms.is_none_or(|next| next <= now_ms))
+            .collect();
+        due.sort_by(|a, b| (a.created_at_ms, &a.saga_id).cmp(&(b.created_at_ms, &b.saga_id)));
+        ready(Ok(due
+            .into_iter()
+            .take(limit)
+            .map(|e| e.saga_id.clone())
+            .collect()))
+    }
+
+    fn next_pending<'a>(
+        &'a self,
+        saga_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<SagaDispatchDocument>, StoreError>> {
+        ready(Ok(self
+            .data()
+            .dispatch
+            .iter()
+            .filter(|e| e.saga_id == saga_id && pending(e))
+            .min_by_key(|e| e.seq)
+            .cloned()))
+    }
+
+    fn mark_dispatched<'a>(
+        &'a self,
+        _tx: &'a mut Tx,
+        id: &'a str,
+        now_ms: i64,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        self.update_entry(id, |e| e.dispatched_at_ms = Some(now_ms));
+        ready(Ok(()))
+    }
+
+    fn schedule_retry<'a>(
+        &'a self,
+        id: &'a str,
+        attempts: i32,
+        next_attempt_at_ms: i64,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        self.update_entry(id, |e| {
+            e.attempts = attempts;
+            e.next_attempt_at_ms = Some(next_attempt_at_ms);
+        });
+        ready(Ok(()))
+    }
+
+    fn mark_failed<'a>(
+        &'a self,
+        id: &'a str,
+        failure: &'a DispatchFailure,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        self.update_entry(id, |e| {
+            e.failed_at_ms = Some(failure.failed_at_ms);
+            e.failure_reason = Some(failure.reason);
+            e.failure_message = Some(failure.message.clone());
+            if let Some(attempts) = failure.attempts {
+                e.attempts = attempts;
+            }
+            if let Some(at) = failure.notice_at_ms {
+                e.notice_pending = Some(true);
+                e.notice_attempts = Some(0);
+                e.notice_next_at_ms = Some(at);
+            }
+        });
+        ready(Ok(()))
+    }
+
+    fn claim_due_notice<'a>(
+        &'a self,
+        now_ms: i64,
+        reserve_until_ms: i64,
+    ) -> BoxFuture<'a, Result<Option<SagaDispatchDocument>, StoreError>> {
+        let mut data = self.data();
+        let claimed = data
+            .dispatch
+            .iter_mut()
+            .filter(|e| {
+                e.notice_pending == Some(true) && e.notice_next_at_ms.is_none_or(|at| at <= now_ms)
+            })
+            .min_by_key(|e| e.notice_next_at_ms)
+            .map(|e| {
+                e.notice_next_at_ms = Some(reserve_until_ms);
+                e.clone()
+            });
+        ready(Ok(claimed))
+    }
+
+    fn clear_notice<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), StoreError>> {
+        self.update_entry(id, |e| {
+            e.notice_pending = None;
+            e.notice_attempts = None;
+            e.notice_next_at_ms = None;
+        });
+        ready(Ok(()))
+    }
+
+    fn schedule_notice_retry<'a>(
+        &'a self,
+        id: &'a str,
+        notice_attempts: i32,
+        next_at_ms: i64,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        self.update_entry(id, |e| {
+            e.notice_attempts = Some(notice_attempts);
+            e.notice_next_at_ms = Some(next_at_ms);
+        });
+        ready(Ok(()))
+    }
+
+    fn claim_lease<'a>(
+        &'a self,
+        saga_id: &'a str,
+        owner: &'a str,
+        now_ms: i64,
+        until_ms: i64,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        let mut data = self.data();
+        let free = data
+            .leases
+            .get(saga_id)
+            .is_none_or(|(_, until)| *until < now_ms);
+        if free {
+            data.leases
+                .insert(saga_id.to_string(), (owner.to_string(), until_ms));
+        }
+        ready(Ok(free))
+    }
+
+    fn renew_lease<'a>(
+        &'a self,
+        saga_id: &'a str,
+        owner: &'a str,
+        until_ms: i64,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        let mut data = self.data();
+        let renewed = match data.leases.get_mut(saga_id) {
+            Some((holder, until)) if holder == owner => {
+                *until = until_ms;
+                true
+            }
+            _ => false,
+        };
+        ready(Ok(renewed))
+    }
+
+    fn release_lease<'a>(
+        &'a self,
+        saga_id: &'a str,
+        owner: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        let mut data = self.data();
+        if data
+            .leases
+            .get(saga_id)
+            .is_some_and(|(holder, _)| holder == owner)
+        {
+            data.leases.remove(saga_id);
+        }
+        ready(Ok(()))
+    }
+
+    fn pending(&self) -> BoxFuture<'_, Result<u64, StoreError>> {
+        ready(Ok(
+            self.data().dispatch.iter().filter(|e| pending(e)).count() as u64,
+        ))
     }
 }
 
@@ -789,7 +996,7 @@ impl DeadlineStore for InMemorySagaStore {
         ready(Ok(claimed))
     }
 
-    fn count_overdue(
+    fn count_overdue_by_name(
         &self,
         now: i64,
     ) -> BoxFuture<'_, Result<std::collections::HashMap<String, u64>, StoreError>> {
@@ -902,11 +1109,4 @@ impl MarkerStore for InMemorySagaStore {
             ready(Err(StoreError::Conflict(format!("marker {id} exists"))))
         }
     }
-}
-
-/// An epoch-millisecond time as Kotlin's `Instant.toString()` prints it.
-fn rfc3339(at_ms: i64) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at_ms)
-        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-        .unwrap_or_else(|| at_ms.to_string())
 }

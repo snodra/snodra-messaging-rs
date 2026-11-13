@@ -9,12 +9,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use kraken_messaging::kafka::SagaStage;
-use kraken_messaging::saga::epoch_ms;
 use kraken_messaging::saga::store::{DeadlineDocument, DeadlineStatus, DispatchKind, SagaDocument};
 use kraken_messaging::saga::{
     DeadlineScheduler, DeadlineSettings, SagaDefinition, SagaRetry, SagaRuntime, SagaType,
 };
 use kraken_messaging::store::MessageStore;
+use kraken_messaging::time::epoch_ms;
 use kraken_messaging::{Command, Event, RetryPolicy, message_type};
 use kraken_messaging_mongo::documents::DeadlineDoc;
 use mongodb::bson::doc;

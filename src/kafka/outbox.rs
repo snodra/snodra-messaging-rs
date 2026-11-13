@@ -7,7 +7,8 @@ use std::sync::{Arc, OnceLock};
 use super::headers;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
-use crate::store::{OutboxEntry, OutboxStore, Tx, now_ms};
+use crate::store::{OutboxEntry, OutboxStore, Tx};
+use crate::time::now_ms;
 use crate::types::Event;
 
 /// What publishing without a store fails with.
@@ -49,27 +50,52 @@ pub fn new_outbox_entry<E: Event>(
     })
 }
 
-/// An outbox payload must be a JSON object (the outbox contract, [`OutboxEntry::payload`]).
-/// Anything else (a unit struct's `null`, an array, a bare value) is `InvalidMessage` naming the
-/// event type: no retry can change it.
+/// An outbox payload must be a JSON object whose integers fit in a signed 64-bit integer (the
+/// outbox contract, [`OutboxEntry::payload`]). Anything else (a unit struct's `null`, an array,
+/// a bare value, an integer above `i64::MAX`) is `InvalidMessage` naming the event type: no retry
+/// can change it.
 pub(crate) fn check_payload(
     type_name: &str,
     json: &serde_json::Value,
 ) -> Result<(), MessagingError> {
-    if json.is_object() {
-        return Ok(());
-    }
     let found = match json {
+        serde_json::Value::Object(_) => {
+            return match too_big(json) {
+                None => Ok(()),
+                Some(n) => Err(MessagingError::InvalidMessage(format!(
+                    "the payload of event {type_name} holds the integer {n}, above i64::MAX, so it cannot be an outbox entry"
+                ))),
+            };
+        }
         serde_json::Value::Null => "null",
         serde_json::Value::Bool(_) => "a boolean",
         serde_json::Value::Number(_) => "a number",
         serde_json::Value::String(_) => "a string",
         serde_json::Value::Array(_) => "an array",
-        serde_json::Value::Object(_) => "an object",
     };
     Err(MessagingError::InvalidMessage(format!(
         "the payload of event {type_name} is {found}, not a JSON object, so it cannot be an outbox entry"
     )))
+}
+
+/// The first integer of `json` no `i64` holds.
+fn too_big(json: &serde_json::Value) -> Option<&serde_json::Number> {
+    match json {
+        serde_json::Value::Number(n) if n.is_u64() && !n.is_i64() => Some(n),
+        serde_json::Value::Array(items) => items.iter().find_map(too_big),
+        serde_json::Value::Object(fields) => fields.values().find_map(too_big),
+        _ => None,
+    }
+}
+
+/// [`check_payload`] of a JSON text.
+pub(crate) fn check_payload_text(type_name: &str, payload: &[u8]) -> Result<(), MessagingError> {
+    let json: serde_json::Value = serde_json::from_slice(payload).map_err(|e| {
+        MessagingError::InvalidMessage(format!(
+            "the payload of event {type_name} is not JSON, so it cannot be an outbox entry: {e}"
+        ))
+    })?;
+    check_payload(type_name, &json)
 }
 
 /// The publishing side of events: appends to the message store's outbox, inside the caller's
@@ -158,12 +184,7 @@ impl EventBus {
         payload_json: &str,
         correlation_id: &str,
     ) -> Result<OutboxEntry, MessagingError> {
-        let json: serde_json::Value = serde_json::from_str(payload_json).map_err(|e| {
-            MessagingError::InvalidMessage(format!(
-                "the payload of event {type_name} is not JSON, so it cannot be an outbox entry: {e}"
-            ))
-        })?;
-        check_payload(type_name, &json)?;
+        check_payload_text(type_name, payload_json.as_bytes())?;
         let mut hdrs = HashMap::new();
         hdrs.insert(
             headers::CORRELATION_ID.to_string(),

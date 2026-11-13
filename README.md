@@ -163,6 +163,8 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 | `KRAKEN_KAFKA_DEAD_LETTER_MODE` | `collection` | where a record a processor cannot handle goes (see [Dead letters](#dead-letters)): `collection` (`dead_letters`, sequenced per key, admin API), `topic` (`<topic>.dlt`) or `log` (logged and skipped); case-insensitive, anything else is a startup error |
 | `KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS` | 2592000000 (30 d) | how long a letter is kept (`expireAt` = `parkedAt` + this; a TTL index removes it then, which unblocks its key); at least 1000 (a startup error otherwise, also when set in code) |
 | `KRAKEN_OUTBOX_ENABLED`, `KRAKEN_OUTBOX_POLL_INTERVAL_MS`, `KRAKEN_OUTBOX_BATCH_SIZE`, `KRAKEN_OUTBOX_MAX_ATTEMPTS` | true, 200, 100, 10 | |
+| `KRAKEN_OUTBOX_LEASE_MS` | 120000 | how long a batch the relay claims stays its own; longer than a send (40 s), else a startup error. A batch stops before its lease could run out under a send; the next claim renews what the relay still holds |
+| `KRAKEN_STORE_INIT_SCHEMA` | true | `start()` prepares the message store's schema (the MongoDB store: its indexes, with the retentions below); `false` when it is managed elsewhere |
 | `KRAKEN_FORWARD_JWT` | true | |
 
 ## Semantics worth knowing
@@ -192,7 +194,8 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
   unauthorized topic). Delivery budget per attempt is 30 s, as in the Kotlin producer. `userId` header is `""` when anonymous.
 - **Stored records** keep the Kotlin field names; the MongoDB store writes the Kotlin documents (BSON types, no
   `_class`). The service keeps its own database handles: the store is built from them, and a transaction passed to
-  `events.publish_in` must be the store's.
+  `events.publish_in` must be the store's (with MongoDB, a handler's own writes use the store's client). `start()`
+  hands the store the builder's clock and prepares its schema (`KRAKEN_STORE_INIT_SCHEMA`).
 - **Verified identity** checks signature, `exp`, `nbf` and `iss`; `aud` is not validated (Keycloak sets it, Spring's
   decoder ignores it too). A JWKS outage is `UNAUTHENTICATED` for the caller, never an internal error with a URL.
 - **Shutdown** drains in-flight handlers (10 s bound), closes every hub stream, fails this instance's outgoing requests still in flight with `HubConnectionLost`, stops the publisher and the consumer.

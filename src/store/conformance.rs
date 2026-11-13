@@ -15,7 +15,8 @@
 //! kit's alone while it runs. Every check is public, so a failing one can be run by itself.
 //!
 //! The kit must run on a multi-thread runtime (`#[tokio::test(flavor = "multi_thread")]`): two
-//! relays claim the outbox at the same time in [`concurrent_relays_publish_each_entry_once`].
+//! tasks race in [`concurrent_relays_publish_each_entry_once`],
+//! [`two_schedulers_claim_each_due_deadline_once`] and [`two_relays_never_hold_one_saga_lease`].
 //! Its time bounds leave the store a second or more: a store stamps times with the application
 //! clock, and the kit never compares the host clock with a stamped time at a finer margin.
 
@@ -23,7 +24,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use futures::FutureExt;
 use tokio::sync::Barrier;
@@ -31,9 +32,9 @@ use tokio::sync::Barrier;
 use super::dead_letters::letter_id;
 use super::{
     ControlOperation, DeadLetter, DeadLetterError, DeadLetterReason, DeadlineStore,
-    DispatchFailure, DispatchQueue, ExternalCall, ExternalCallStatus, Locked, MessageStore,
-    OutboxEntry, OutboxStore, Parked, ProcessedMarker, ProcessorControlState, RESET_KIND,
-    ReplayRange, StoreError,
+    DispatchFailure, ExternalCall, ExternalCallStatus, Locked, MessageStore, OutboxEntry,
+    OutboxStore, Parked, ProcessedMarker, ProcessorControlState, RESET_KIND, ReplayRange,
+    SagaDispatchStore, StoreError,
 };
 use crate::error::MessagingError;
 use crate::saga::FailureReason;
@@ -41,6 +42,7 @@ use crate::saga::store::{
     Association, DeadlineDocument, DeadlineStatus, DispatchKind, SagaDispatchDocument,
     SagaDocument, SagaFailureDocument,
 };
+use crate::time::now_ms;
 
 /// The lease of a claim that must not run out while a check runs.
 const LONG_LEASE: Duration = Duration::from_secs(60);
@@ -77,8 +79,11 @@ pub async fn run_store_conformance(store: Arc<dyn MessageStore>) {
         processor_control_write_inside_rolled_back_transaction_is_kept,
         external_call_idempotency_returns_first_result,
         saga_ports_round_trip,
+        saga_dispatch_store_refuses_an_event_the_outbox_would_refuse,
         due_deadline_is_claimed_once_until_its_lease_passes,
-        dispatch_queue_hands_out_each_saga_in_seq_order,
+        two_schedulers_claim_each_due_deadline_once,
+        dispatch_hands_out_each_saga_in_seq_order,
+        two_relays_never_hold_one_saga_lease,
     );
 }
 
@@ -174,13 +179,19 @@ pub async fn appended_entry_is_claimed_in_created_seq_order(store: &dyn MessageS
     );
 }
 
-/// An outbox payload is a JSON object: anything else (not JSON, an array, a bare value) is
-/// refused with `InvalidMessage`, appended on its own or in a transaction, and nothing is
-/// appended.
+/// An outbox payload is a JSON object whose integers fit in an `i64`: anything else (not JSON,
+/// an array, a bare value, an integer above `i64::MAX`) is refused with `InvalidMessage`,
+/// appended on its own or in a transaction, and nothing is appended.
 pub async fn outbox_rejects_a_payload_that_is_not_a_json_object(store: &dyn MessageStore) {
     let outbox = store.outbox();
     drain(&*outbox).await;
-    for payload in [&b"not json"[..], b"[1,2]", b"\"text\"", b"null"] {
+    for payload in [
+        &b"not json"[..],
+        b"[1,2]",
+        b"\"text\"",
+        b"null",
+        b"{\"n\":18446744073709551615}",
+    ] {
         let shown = String::from_utf8_lossy(payload).into_owned();
         let bad = OutboxEntry {
             payload: payload.to_vec(),
@@ -212,21 +223,25 @@ pub async fn outbox_rejects_a_payload_that_is_not_a_json_object(store: &dyn Mess
     assert!(claimed.is_empty(), "nothing appended: {:?}", ids(&claimed));
 }
 
-/// `pending` counts the entries neither sent nor failed, held by a relay or not.
+/// `pending` counts the entries neither sent nor failed, held by a relay or not, and
+/// `oldest_pending` is the `created_at_ms` of the oldest of them.
 pub async fn pending_counts_entries_neither_sent_nor_failed(store: &dyn MessageStore) {
     let outbox = store.outbox();
     drain(&*outbox).await;
+    let oldest = || async { outbox.oldest_pending().await.expect("oldest_pending") };
     assert_eq!(outbox.pending().await.expect("pending"), 0, "drained");
+    assert_eq!(oldest().await, None, "none pending");
     let now = now_ms();
     let (e1, e2, e3) = (
-        entry("conformance.Pending", now, 1),
-        entry("conformance.Pending", now, 2),
-        entry("conformance.Pending", now, 3),
+        entry("conformance.Pending", now - 3_000, 1),
+        entry("conformance.Pending", now - 2_000, 2),
+        entry("conformance.Pending", now - 1_000, 3),
     );
-    for e in [&e1, &e2, &e3] {
+    for e in [&e3, &e1, &e2] {
         outbox.append_now(e.clone()).await.expect("append_now");
     }
     assert_eq!(outbox.pending().await.expect("pending"), 3);
+    assert_eq!(oldest().await, Some(now - 3_000));
     let held = outbox.claim("relay-a", LONG_LEASE, 3).await.expect("claim");
     assert_eq!(held.len(), 3);
     assert_eq!(
@@ -234,16 +249,19 @@ pub async fn pending_counts_entries_neither_sent_nor_failed(store: &dyn MessageS
         3,
         "held is pending"
     );
+    assert_eq!(oldest().await, Some(now - 3_000), "held is pending");
     outbox
         .mark_sent(std::slice::from_ref(&e1.id))
         .await
         .expect("mark_sent");
     assert_eq!(outbox.pending().await.expect("pending"), 2, "sent is not");
+    assert_eq!(oldest().await, Some(now - 2_000), "sent is not");
     outbox
         .mark_failed(&e2.id, "conformance: rejected")
         .await
         .expect("mark_failed");
     assert_eq!(outbox.pending().await.expect("pending"), 1, "failed is not");
+    assert_eq!(oldest().await, Some(now - 1_000), "failed is not");
     outbox
         .mark_attempt_failed(&e3.id, "conformance: retry")
         .await
@@ -258,6 +276,7 @@ pub async fn pending_counts_entries_neither_sent_nor_failed(store: &dyn MessageS
         .await
         .expect("mark_sent");
     assert_eq!(outbox.pending().await.expect("pending"), 0);
+    assert_eq!(oldest().await, None);
 }
 
 /// An entry appended in a transaction that is rolled back never reaches the relay; one appended
@@ -1626,9 +1645,9 @@ pub async fn saga_ports_round_trip(store: &dyn MessageStore) {
     assert_eq!(
         sagas
             .sagas
-            .count_live()
+            .count_live_by_type()
             .await
-            .expect("count_live")
+            .expect("count_live_by_type")
             .get(&type_name),
         Some(&1),
         "one live instance of the type"
@@ -1725,10 +1744,10 @@ pub async fn saga_ports_round_trip(store: &dyn MessageStore) {
     txs.commit(&mut tx).await.expect("commit");
     assert_eq!(
         sagas
-            .dispatch_queue
-            .first_pending(&saga.id)
+            .dispatch
+            .next_pending(&saga.id)
             .await
-            .expect("first_pending"),
+            .expect("next_pending"),
         Some(dispatch.clone()),
         "the recorded entry reads back"
     );
@@ -1943,20 +1962,80 @@ pub async fn saga_ports_round_trip(store: &dyn MessageStore) {
     assert_eq!(
         sagas
             .sagas
-            .count_live()
+            .count_live_by_type()
             .await
-            .expect("count_live")
+            .expect("count_live_by_type")
             .get(&type_name),
         None,
         "no live instance of the type"
     );
     let mut tx = txs.begin().await.expect("begin");
     sagas
-        .dispatch_queue
+        .dispatch
         .mark_dispatched(&mut tx, &dispatch.id, later)
         .await
         .expect("mark_dispatched");
     txs.commit(&mut tx).await.expect("commit");
+}
+
+/// `SagaDispatchStore::record` refuses an EVENT entry whose payload the outbox would refuse (not a
+/// JSON object, an integer above `i64::MAX`) with `InvalidMessage`, inside the saga's transaction:
+/// nothing of the attempt commits. A COMMAND entry's payload is not the outbox's.
+pub async fn saga_dispatch_store_refuses_an_event_the_outbox_would_refuse(
+    store: &dyn MessageStore,
+) {
+    let sagas = store.sagas();
+    let txs = store.tx();
+    let now = now_ms();
+    for (n, payload) in ["[1]", "null", "{\"n\":18446744073709551615}"]
+        .into_iter()
+        .enumerate()
+    {
+        let saga_id = uuid::Uuid::new_v4().to_string();
+        let fine = dispatch_entry(&saga_id, 1000, DispatchKind::Event, now);
+        let refused = SagaDispatchDocument {
+            payload: payload.to_string(),
+            ..dispatch_entry(&saga_id, 1001, DispatchKind::Event, now)
+        };
+        let mut tx = txs.begin().await.expect("begin");
+        let recorded = sagas.dispatch.record(&mut tx, &[fine, refused]).await;
+        txs.abort(&mut tx).await;
+        assert!(
+            matches!(
+                &recorded,
+                Err(StoreError::Failed(MessagingError::InvalidMessage(_)))
+            ),
+            "{n}: {payload}: {recorded:?}"
+        );
+        assert_eq!(
+            sagas
+                .dispatch
+                .next_pending(&saga_id)
+                .await
+                .expect("next_pending"),
+            None,
+            "{payload}: nothing recorded"
+        );
+    }
+    // A command's payload is the command's, whatever its JSON.
+    let saga_id = uuid::Uuid::new_v4().to_string();
+    let command = SagaDispatchDocument {
+        payload: "null".into(),
+        ..dispatch_entry(&saga_id, 1000, DispatchKind::Command, now)
+    };
+    let mut tx = txs.begin().await.expect("begin");
+    sagas
+        .dispatch
+        .record(&mut tx, std::slice::from_ref(&command))
+        .await
+        .expect("a command records");
+    txs.commit(&mut tx).await.expect("commit");
+    let mut tx = txs.plain().await.expect("plain");
+    sagas
+        .dispatch
+        .mark_dispatched(&mut tx, &command.id, now)
+        .await
+        .expect("mark_dispatched");
 }
 
 /// The deadline scheduler's port: the due deadline is claimed by one scheduler at a time, the
@@ -1994,9 +2073,9 @@ pub async fn due_deadline_is_claimed_once_until_its_lease_passes(store: &dyn Mes
     txs.commit(&mut tx).await.expect("commit");
     let overdue = sagas
         .deadlines
-        .count_overdue(now)
+        .count_overdue_by_name(now)
         .await
-        .expect("count_overdue");
+        .expect("count_overdue_by_name");
     assert_eq!(
         (overdue.get(&first_name), overdue.get(&second_name)),
         (Some(&1), Some(&1)),
@@ -2024,9 +2103,9 @@ pub async fn due_deadline_is_claimed_once_until_its_lease_passes(store: &dyn Mes
     );
     let overdue = sagas
         .deadlines
-        .count_overdue(now)
+        .count_overdue_by_name(now)
         .await
-        .expect("count_overdue");
+        .expect("count_overdue_by_name");
     assert_eq!(
         (overdue.get(&first_name), overdue.get(&second_name)),
         (Some(&1), Some(&1)),
@@ -2065,9 +2144,9 @@ pub async fn due_deadline_is_claimed_once_until_its_lease_passes(store: &dyn Mes
     );
     let overdue = sagas
         .deadlines
-        .count_overdue(far)
+        .count_overdue_by_name(far)
         .await
-        .expect("count_overdue");
+        .expect("count_overdue_by_name");
     assert_eq!(
         (overdue.get(&first_name), overdue.get(&second_name)),
         (Some(&1), None),
@@ -2082,14 +2161,145 @@ pub async fn due_deadline_is_claimed_once_until_its_lease_passes(store: &dyn Mes
     txs.commit(&mut tx).await.expect("commit");
 }
 
+/// Two schedulers claiming at the same time (started together, on a multi-thread runtime): every
+/// due deadline is claimed by exactly one of them, and each claims some while the other holds its
+/// first claim.
+pub async fn two_schedulers_claim_each_due_deadline_once(store: &dyn MessageStore) {
+    const DEADLINES: usize = 40;
+    let sagas = store.sagas();
+    let txs = store.tx();
+    let now = now_ms();
+    let saga_id = uuid::Uuid::new_v4().to_string();
+    let mut mine = HashSet::new();
+    let mut tx = txs.begin().await.expect("begin");
+    for n in 0..DEADLINES {
+        let d = DeadlineDocument {
+            id: uuid::Uuid::new_v4().to_string(),
+            saga_type: "conformance.Raced".into(),
+            saga_id: saga_id.clone(),
+            name: "raced".into(),
+            payload: None,
+            payload_type: None,
+            due_at_ms: now - 10_000 + n as i64,
+            status: DeadlineStatus::Scheduled,
+            claimed_by: None,
+            claimed_until_ms: None,
+            finished_at_ms: None,
+            correlation_id: None,
+        };
+        mine.insert(d.id.clone());
+        sagas.deadlines.insert(&mut tx, &d).await.expect("insert");
+    }
+    txs.commit(&mut tx).await.expect("commit");
+
+    let start = Arc::new(Barrier::new(2));
+    let claimed = Arc::new(Barrier::new(2));
+    let scheduler = |owner: &'static str| {
+        let deadlines = Arc::clone(&sagas.deadlines);
+        let (start, claimed, saga_id) = (Arc::clone(&start), Arc::clone(&claimed), saga_id.clone());
+        tokio::spawn(async move {
+            let mut got = Vec::new();
+            tokio::time::timeout(BARRIER_WAIT, start.wait())
+                .await
+                .expect("the other scheduler never started");
+            let mut first = true;
+            loop {
+                let next = deadlines
+                    .claim_due(owner, now, now + 60_000)
+                    .await
+                    .expect("claim_due");
+                if std::mem::take(&mut first) {
+                    tokio::time::timeout(BARRIER_WAIT, claimed.wait())
+                        .await
+                        .expect("the other scheduler never made its first claim");
+                }
+                match next {
+                    Some(d) if d.saga_id == saga_id => got.push(d.id),
+                    Some(_) => {}
+                    None => return got,
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    let (a, b) = tokio::join!(scheduler("scheduler-a"), scheduler("scheduler-b"));
+    let (a, b) = (a.expect("scheduler-a"), b.expect("scheduler-b"));
+    let a_set: HashSet<String> = a.iter().cloned().collect();
+    let b_set: HashSet<String> = b.iter().cloned().collect();
+    assert_eq!(a_set.len(), a.len(), "scheduler-a claimed a deadline twice");
+    assert_eq!(b_set.len(), b.len(), "scheduler-b claimed a deadline twice");
+    assert!(
+        !a.is_empty() && !b.is_empty(),
+        "both schedulers claimed deadlines: {} and {}",
+        a.len(),
+        b.len()
+    );
+    let both: Vec<&String> = a_set.intersection(&b_set).collect();
+    assert!(both.is_empty(), "claimed by both: {both:?}");
+    let union: HashSet<String> = a_set.union(&b_set).cloned().collect();
+    assert_eq!(union, mine, "every due deadline is claimed");
+    let mut tx = txs.begin().await.expect("begin");
+    sagas
+        .deadlines
+        .cancel_all(&mut tx, &saga_id, now)
+        .await
+        .expect("cancel_all");
+    txs.commit(&mut tx).await.expect("commit");
+}
+
+/// Two relays claiming the dispatch leases of the same sagas at the same time (started
+/// together, on a multi-thread runtime): each saga's lease goes to exactly one of them.
+pub async fn two_relays_never_hold_one_saga_lease(store: &dyn MessageStore) {
+    const SAGAS: usize = 40;
+    let queue = store.sagas().dispatch;
+    let now = now_ms();
+    let ids: Arc<Vec<String>> = Arc::new(
+        (0..SAGAS)
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect(),
+    );
+    let start = Arc::new(Barrier::new(2));
+    let relay = |owner: &'static str| {
+        let (queue, start, ids) = (Arc::clone(&queue), Arc::clone(&start), Arc::clone(&ids));
+        tokio::spawn(async move {
+            tokio::time::timeout(BARRIER_WAIT, start.wait())
+                .await
+                .expect("the other relay never started");
+            let mut held = HashSet::new();
+            for id in ids.iter() {
+                if queue
+                    .claim_lease(id, owner, now, now + 60_000)
+                    .await
+                    .expect("claim_lease")
+                {
+                    held.insert(id.clone());
+                }
+                tokio::task::yield_now().await;
+            }
+            held
+        })
+    };
+    let (a, b) = tokio::join!(relay("relay-a"), relay("relay-b"));
+    let (a, b) = (a.expect("relay-a"), b.expect("relay-b"));
+    let both: Vec<&String> = a.intersection(&b).collect();
+    assert!(both.is_empty(), "held by both relays: {both:?}");
+    let all: HashSet<String> = ids.iter().cloned().collect();
+    let union: HashSet<String> = a.union(&b).cloned().collect();
+    assert_eq!(union, all, "every lease has a holder");
+    for id in ids.iter() {
+        let owner = if a.contains(id) { "relay-a" } else { "relay-b" };
+        queue.release_lease(id, owner).await.expect("release_lease");
+    }
+}
+
 /// The dispatch relay's port: a saga's pending entries come in `seq` order, the sagas whose first
 /// pending entry is due oldest first; a saga's lease is held by one relay until it passes; an
 /// entry dispatched in a rolled-back transaction stays pending; a retried entry waits for its next
 /// attempt; a failed one carries its outcome and its failure notice, which is claimed by one
 /// relay at a time until it is cleared. Every write reads back.
-pub async fn dispatch_queue_hands_out_each_saga_in_seq_order(store: &dyn MessageStore) {
+pub async fn dispatch_hands_out_each_saga_in_seq_order(store: &dyn MessageStore) {
     let sagas = store.sagas();
-    let queue = &*sagas.dispatch_queue;
+    let queue = &*sagas.dispatch;
     let txs = store.tx();
     let now = now_ms();
     let pending_before = queue.pending().await.expect("pending");
@@ -2130,7 +2340,7 @@ pub async fn dispatch_queue_hands_out_each_saga_in_seq_order(store: &dyn Message
         "a saga in flight is left out"
     );
     assert_eq!(
-        queue.first_pending(&newer).await.expect("first_pending"),
+        queue.next_pending(&newer).await.expect("next_pending"),
         Some(command.clone()),
         "the lowest seq first, as recorded"
     );
@@ -2222,7 +2432,7 @@ pub async fn dispatch_queue_hands_out_each_saga_in_seq_order(store: &dyn Message
         .expect("mark_dispatched");
     txs.abort(&mut tx).await;
     assert_eq!(
-        queue.first_pending(&newer).await.expect("first_pending"),
+        queue.next_pending(&newer).await.expect("next_pending"),
         Some(command.clone()),
         "rolled back: still pending"
     );
@@ -2233,18 +2443,18 @@ pub async fn dispatch_queue_hands_out_each_saga_in_seq_order(store: &dyn Message
         .expect("mark_dispatched");
     txs.commit(&mut tx).await.expect("commit");
     assert_eq!(
-        queue.first_pending(&newer).await.expect("first_pending"),
+        queue.next_pending(&newer).await.expect("next_pending"),
         Some(event.clone()),
         "the next entry of the saga"
     );
 
     // A retry later: the saga waits until then.
     queue
-        .retry_later(&event.id, 1, now + 60_000)
+        .schedule_retry(&event.id, 1, now + 60_000)
         .await
-        .expect("retry_later");
+        .expect("schedule_retry");
     assert_eq!(
-        queue.first_pending(&newer).await.expect("first_pending"),
+        queue.next_pending(&newer).await.expect("next_pending"),
         Some(SagaDispatchDocument {
             attempts: 1,
             next_attempt_at_ms: Some(now + 60_000),
@@ -2276,9 +2486,12 @@ pub async fn dispatch_queue_hands_out_each_saga_in_seq_order(store: &dyn Message
         failed_at_ms: now,
         notice_at_ms: Some(now + 30_000),
     };
-    queue.fail(&event.id, &failure).await.expect("fail");
+    queue
+        .mark_failed(&event.id, &failure)
+        .await
+        .expect("mark_failed");
     assert_eq!(
-        queue.first_pending(&newer).await.expect("first_pending"),
+        queue.next_pending(&newer).await.expect("next_pending"),
         None
     );
     assert_eq!(
@@ -2308,9 +2521,9 @@ pub async fn dispatch_queue_hands_out_each_saga_in_seq_order(store: &dyn Message
         "a reserved notice is claimed once"
     );
     queue
-        .notice_failed(&event.id, 1, now + 100_000)
+        .schedule_notice_retry(&event.id, 1, now + 100_000)
         .await
-        .expect("notice_failed");
+        .expect("schedule_notice_retry");
     assert_eq!(
         claim_notice(queue, now + 100_000, now + 160_000, &event.id).await,
         Some(SagaDispatchDocument {
@@ -2329,7 +2542,7 @@ pub async fn dispatch_queue_hands_out_each_saga_in_seq_order(store: &dyn Message
 
     // An event given up on has no notice.
     queue
-        .fail(
+        .mark_failed(
             &old.id,
             &DispatchFailure {
                 attempts: None,
@@ -2340,9 +2553,9 @@ pub async fn dispatch_queue_hands_out_each_saga_in_seq_order(store: &dyn Message
             },
         )
         .await
-        .expect("fail");
+        .expect("mark_failed");
     assert_eq!(
-        queue.first_pending(&older).await.expect("first_pending"),
+        queue.next_pending(&older).await.expect("next_pending"),
         None
     );
     assert_eq!(
@@ -2385,10 +2598,10 @@ async fn claim_mine(
     }
 }
 
-/// [`DispatchQueue::claim_due_notice`] until it hands out the notice of `id` (another's it claims
+/// [`SagaDispatchStore::claim_due_notice`] until it hands out the notice of `id` (another's it claims
 /// on the way stay reserved) or nothing.
 async fn claim_notice(
-    queue: &dyn DispatchQueue,
+    queue: &dyn SagaDispatchStore,
     now_ms: i64,
     reserve_until_ms: i64,
     id: &str,
@@ -2433,13 +2646,6 @@ fn dispatch_entry(
         notice_attempts: None,
         notice_next_at_ms: None,
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
 }
 
 fn entry(type_name: &str, created_at_ms: i64, seq: i64) -> OutboxEntry {

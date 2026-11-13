@@ -10,8 +10,8 @@
 //!
 //! The background workers have ports of their own, outside any transaction: the deadline
 //! scheduler claims due deadlines ([`DeadlineStore::claim_due`]), the dispatch relay works the
-//! saga-side outbox ([`DispatchQueue`]), and the statistics count live sagas
-//! ([`SagaRepository::count_live`]) and pending entries ([`DispatchQueue::pending`]).
+//! saga-side outbox ([`SagaDispatchStore`]), and the statistics count live sagas
+//! ([`SagaRepository::count_live_by_type`]) and pending entries ([`SagaDispatchStore::pending`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,17 +58,7 @@ pub trait SagaRepository: Send + Sync {
 
     /// How many live (not ended) instances there are per saga type, outside any transaction
     /// (the `kraken.sagas.active` gauge); a type without one is absent.
-    fn count_live(&self) -> BoxFuture<'_, Result<HashMap<String, u64>, StoreError>>;
-}
-
-/// The saga-side outbox `saga_dispatch`: where the runtime records what a saga sends (the relay
-/// reads it).
-pub trait DispatchRecorder: Send + Sync {
-    fn record<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        entries: &'a [SagaDispatchDocument],
-    ) -> BoxFuture<'a, Result<(), StoreError>>;
+    fn count_live_by_type(&self) -> BoxFuture<'_, Result<HashMap<String, u64>, StoreError>>;
 }
 
 /// The `deadlines` collection, as far as the runtime writes it.
@@ -133,8 +123,10 @@ pub trait DeadlineStore: Send + Sync {
 
     /// How many SCHEDULED deadlines are due (`due_at_ms <= now_ms`), per name, claimed or not
     /// (the `kraken.deadlines.due` gauge); a name without one is absent.
-    fn count_overdue(&self, now_ms: i64)
-    -> BoxFuture<'_, Result<HashMap<String, u64>, StoreError>>;
+    fn count_overdue_by_name(
+        &self,
+        now_ms: i64,
+    ) -> BoxFuture<'_, Result<HashMap<String, u64>, StoreError>>;
 }
 
 /// The `saga_failures` collection: parked events.
@@ -192,7 +184,7 @@ pub trait MarkerStore: Send + Sync {
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 }
 
-/// How the relay gives an entry up ([`DispatchQueue::fail`]): `failed_at_ms`, the reason and
+/// How the relay gives an entry up ([`SagaDispatchStore::mark_failed`]): `failed_at_ms`, the reason and
 /// the message, with `attempts` when given, and a pending failure notice due at `notice_at_ms`
 /// when given (`notice_pending` true, `notice_attempts` 0): a command's failure has one, an
 /// event's none.
@@ -205,12 +197,23 @@ pub struct DispatchFailure {
     pub notice_at_ms: Option<i64>,
 }
 
-/// The dispatch relay's side of the saga-side outbox (`saga_dispatch`) and of the per-saga
-/// dispatch leases (`saga_dispatch_leases`). An entry is *pending* until it is dispatched or
-/// failed. Every operation is a write of its own, outside any transaction, but
-/// [`mark_dispatched`](Self::mark_dispatched), which joins the transaction the relay appends the
-/// event to the outbox in.
-pub trait DispatchQueue: Send + Sync {
+/// The saga-side outbox (`saga_dispatch`) and its per-saga dispatch leases
+/// (`saga_dispatch_leases`): the runtime records what a saga sends in the saga's transaction
+/// ([`record`](Self::record)); the dispatch relay works through it. An entry is *pending* until
+/// it is dispatched or failed. Every relay operation is a write of its own, outside any
+/// transaction, but [`mark_dispatched`](Self::mark_dispatched), which joins the transaction the
+/// relay appends the event to the outbox in.
+pub trait SagaDispatchStore: Send + Sync {
+    /// Records `entries` in `tx`. An EVENT entry whose payload the outbox would refuse
+    /// ([`OutboxEntry::payload`](crate::store::OutboxEntry::payload): not a JSON object, or an
+    /// integer above `i64::MAX`) is refused with `InvalidMessage`
+    /// ([`StoreError::Failed`]): the saga's attempt fails and nothing of it commits.
+    fn record<'a>(
+        &'a self,
+        tx: &'a mut Tx,
+        entries: &'a [SagaDispatchDocument],
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
     /// The sagas whose first pending entry (lowest `seq`) is due (`next_attempt_at_ms` absent or
     /// `<= now_ms`), oldest first pending entry first (its `created_at_ms`, then the saga id), at
     /// most `limit`, leaving out the sagas in `except` (in flight on this instance).
@@ -222,7 +225,7 @@ pub trait DispatchQueue: Send + Sync {
     ) -> BoxFuture<'a, Result<Vec<String>, StoreError>>;
 
     /// The first pending entry of `saga_id` (lowest `seq`), due or not.
-    fn first_pending<'a>(
+    fn next_pending<'a>(
         &'a self,
         saga_id: &'a str,
     ) -> BoxFuture<'a, Result<Option<SagaDispatchDocument>, StoreError>>;
@@ -236,7 +239,7 @@ pub trait DispatchQueue: Send + Sync {
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// A transient failure: `attempts` and the next attempt at `next_attempt_at_ms`.
-    fn retry_later<'a>(
+    fn schedule_retry<'a>(
         &'a self,
         id: &'a str,
         attempts: i32,
@@ -244,7 +247,7 @@ pub trait DispatchQueue: Send + Sync {
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// Gives the entry up: see [`DispatchFailure`].
-    fn fail<'a>(
+    fn mark_failed<'a>(
         &'a self,
         id: &'a str,
         failure: &'a DispatchFailure,
@@ -264,7 +267,7 @@ pub trait DispatchQueue: Send + Sync {
     fn clear_notice<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// A delivery of the notice failed: `notice_attempts` and its next try at `next_at_ms`.
-    fn notice_failed<'a>(
+    fn schedule_notice_retry<'a>(
         &'a self,
         id: &'a str,
         notice_attempts: i32,
@@ -305,7 +308,7 @@ pub trait DispatchQueue: Send + Sync {
 pub struct SagaPorts {
     pub tx: Arc<dyn TxProvider>,
     pub sagas: Arc<dyn SagaRepository>,
-    pub dispatch: Arc<dyn DispatchRecorder>,
+    pub dispatch: Arc<dyn SagaDispatchStore>,
     pub deadlines: Arc<dyn DeadlineStore>,
     pub failures: Arc<dyn FailureStore>,
     pub markers: Arc<dyn MarkerStore>,

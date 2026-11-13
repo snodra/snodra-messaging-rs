@@ -25,7 +25,7 @@ fn event() -> Happened {
 
 #[test]
 fn entry_matches_kotlin_shape() {
-    let before = kraken_messaging::store::now_ms();
+    let before = kraken_messaging::time::now_ms();
     let entry = new_outbox_entry(&event(), Some("k1"), None, 42).unwrap();
     assert_eq!(entry.type_name, "t.Happened");
     assert_eq!(entry.key.as_deref(), Some("k1"));
@@ -62,6 +62,22 @@ fn an_event_that_is_not_a_json_object_is_invalid() {
         e.to_string(),
         "the payload of event t.Unit is null, not a JSON object, so it cannot be an outbox entry"
     );
+}
+
+#[test]
+fn an_event_with_an_integer_above_i64_max_is_invalid() {
+    #[derive(Serialize, Deserialize)]
+    struct Big {
+        n: u64,
+    }
+    message_type!(Big, "t.Big");
+    impl Event for Big {}
+    let e = new_outbox_entry(&Big { n: u64::MAX }, None, None, 1).unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "the payload of event t.Big holds the integer 18446744073709551615, above i64::MAX, so it cannot be an outbox entry"
+    );
+    assert!(new_outbox_entry(&Big { n: i64::MAX as u64 }, None, None, 1).is_ok());
 }
 
 #[test]

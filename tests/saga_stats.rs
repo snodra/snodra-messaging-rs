@@ -284,7 +284,7 @@ async fn the_pending_dispatch_and_active_saga_gauges_follow_the_stored_state() {
     st.stats
         .sample_once(
             &*st.store.message_store().sagas().sagas,
-            &*st.store.message_store().sagas().dispatch_queue,
+            &*st.store.message_store().sagas().dispatch,
         )
         .await
         .unwrap();
@@ -313,7 +313,7 @@ async fn the_pending_dispatch_and_active_saga_gauges_follow_the_stored_state() {
     st.stats
         .sample_once(
             &*st.store.message_store().sagas().sagas,
-            &*st.store.message_store().sagas().dispatch_queue,
+            &*st.store.message_store().sagas().dispatch,
         )
         .await
         .unwrap();
@@ -334,7 +334,7 @@ async fn the_pending_dispatch_and_active_saga_gauges_follow_the_stored_state() {
     let cancel = tokio_util::sync::CancellationToken::new();
     let sampler = st.stats.start_sampler(
         st.store.message_store().sagas().sagas,
-        st.store.message_store().sagas().dispatch_queue,
+        st.store.message_store().sagas().dispatch,
         Duration::from_millis(20),
         cancel.clone(),
     );
@@ -355,7 +355,7 @@ async fn an_unhandled_command_failure_is_counted_by_command_type_and_reason() {
     let registry = Arc::new(HandlerRegistry::new()); // nobody handles rt.DoIt
     let relay = SagaDispatchRelay::new(
         st.store.message_store().tx(),
-        st.store.message_store().sagas().dispatch_queue,
+        st.store.message_store().sagas().dispatch,
         Arc::new(LocalRawCommandSender::new(Arc::clone(&registry))),
         EventBus::over(st.store.message_store().outbox()),
         Arc::new(LocalEventDispatcher::new(

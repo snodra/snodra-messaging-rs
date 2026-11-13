@@ -5,21 +5,24 @@
 //! stays readable without a migration. Transactions are MongoDB sessions: they need a replica set.
 //!
 //! ```ignore
-//! let store = MongoStore::new(client, db);
-//! store.ensure_indexes(&MongoIndexSettings::from(&config)).await?;
-//! let app = KrakenMessaging::builder(config).await?.store(Arc::new(store)) /* ... */;
+//! let app = KrakenMessaging::builder(config).await?
+//!     .store(Arc::new(MongoStore::new(client, db))) /* ... */;
 //! ```
+//!
+//! `start()` creates the indexes ([`MessageStore::init_schema`], with the retentions of the
+//! `Config`) unless `KRAKEN_STORE_INIT_SCHEMA=false`; [`MongoStore::ensure_indexes`] does it by hand.
 //!
 //! A handler that writes its own documents in the transaction of the event it handles gets the
 //! session with [`MongoTxExt::session`] (`ctx.tx.lock().await.session()`).
 //!
 //! Times a store stamps itself (an outbox entry's `sentAt`, `failedAt` and lease) are the
-//! application's clock ([`MongoStore::with_clock`]; the system clock by default), never the
-//! database's.
+//! application's clock (the builder's, [`MessageStore::use_clock`]; the system clock until then),
+//! never the database's.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use futures::future::BoxFuture;
+use kraken_messaging::Config;
 use kraken_messaging::error::MessagingError;
 use kraken_messaging::saga::Clock;
 use kraken_messaging::store::{
@@ -32,6 +35,7 @@ use mongodb::{Client, ClientSession, Database};
 
 mod control;
 mod dead_letters;
+#[doc(hidden)]
 pub mod documents;
 mod external;
 mod indexes;
@@ -45,6 +49,8 @@ pub use indexes::MongoIndexSettings;
 #[derive(Clone)]
 pub struct MongoStore {
     db: Database,
+    /// What the outbox stamps its times with.
+    clock: Arc<RwLock<Clock>>,
     tx: Arc<MongoTx>,
     outbox: Arc<outbox::MongoOutboxStore>,
     processed: Arc<processed::MongoProcessedEventStore>,
@@ -57,9 +63,11 @@ pub struct MongoStore {
 impl MongoStore {
     /// The stores over `db`; `client` (the one `db` comes from) starts the sessions.
     pub fn new(client: Client, db: Database) -> MongoStore {
+        let clock = Arc::new(RwLock::new(Clock::system()));
         MongoStore {
             tx: Arc::new(MongoTx { client }),
-            outbox: Arc::new(outbox::MongoOutboxStore::new(&db, Clock::system())),
+            outbox: Arc::new(outbox::MongoOutboxStore::new(&db, Arc::clone(&clock))),
+            clock,
             processed: Arc::new(processed::MongoProcessedEventStore::new(&db)),
             dead_letters: Arc::new(dead_letters::MongoDeadLetterStore::new(&db)),
             control: Arc::new(control::MongoProcessorControlStore::new(&db)),
@@ -67,13 +75,6 @@ impl MongoStore {
             sagas: Arc::new(sagas::MongoSagaStore::new(&db)),
             db,
         }
-    }
-
-    /// The store stamping its own times (an outbox entry's `sentAt`, `failedAt` and lease) with
-    /// `clock`, the application's (the one given to the builder).
-    pub fn with_clock(mut self, clock: Clock) -> MongoStore {
-        self.outbox = Arc::new(outbox::MongoOutboxStore::new(&self.db, clock));
-        self
     }
 
     /// Creates the indexes of every collection (idempotent): the outbox relay index, the dead
@@ -86,6 +87,20 @@ impl MongoStore {
 impl MessageStore for MongoStore {
     fn name(&self) -> &'static str {
         "mongo"
+    }
+
+    /// The indexes of every collection ([`ensure_indexes`](MongoStore::ensure_indexes)) with the
+    /// retentions of `config`; creating them creates every collection a transaction writes to
+    /// (older servers create none inside one).
+    fn init_schema<'a>(&'a self, config: &'a Config) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move { self.ensure_indexes(&MongoIndexSettings::from(config)).await })
+    }
+
+    fn use_clock(&self, clock: Clock) {
+        *self
+            .clock
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = clock;
     }
 
     fn tx(&self) -> Arc<dyn TxProvider> {
@@ -116,7 +131,6 @@ impl MessageStore for MongoStore {
         SagaStores {
             sagas: self.sagas.clone(),
             dispatch: self.sagas.clone(),
-            dispatch_queue: self.sagas.clone(),
             deadlines: self.sagas.clone(),
             failures: self.sagas.clone(),
             markers: self.sagas.clone(),

@@ -17,9 +17,10 @@ pub struct OutboxEntry {
     pub type_name: String,
     pub key: Option<String>,
     pub headers: HashMap<String, String>,
-    /// The event as JSON: always a JSON object. A store refuses any other payload (not JSON, or
-    /// JSON that is not an object) with [`MessagingError::InvalidMessage`], and may refuse an
-    /// object it cannot hold the same way (MongoDB: an integer above `i64::MAX`).
+    /// The event as JSON: always a JSON object whose integers fit in a signed 64-bit integer
+    /// (what both libraries and every store hold). A store refuses any other payload (not JSON,
+    /// JSON that is not an object, an integer above `i64::MAX`) with
+    /// [`MessagingError::InvalidMessage`].
     ///
     /// [`MessagingError::InvalidMessage`]: crate::error::MessagingError::InvalidMessage
     pub payload: Vec<u8>,
@@ -84,4 +85,8 @@ pub trait OutboxStore: Send + Sync {
     /// How many entries are pending (neither sent nor failed), held or not: the outbox backlog
     /// gauge.
     fn pending(&self) -> BoxFuture<'_, Result<u64, StoreError>>;
+
+    /// `created_at_ms` of the oldest pending entry (neither sent nor failed, held or not); `None`
+    /// when none is pending: the outbox age gauge.
+    fn oldest_pending(&self) -> BoxFuture<'_, Result<Option<i64>, StoreError>>;
 }

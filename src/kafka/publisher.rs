@@ -1,20 +1,26 @@
 //! Relays pending outbox entries to Kafka in order, marking them sent or failed.
 //!
 //! Each poll claims a batch from the message store's outbox ([`OutboxStore::claim`]) under a
-//! lease of [`RELAY_LEASE`] held by this publisher, so two instances relaying one outbox never
-//! both send an entry while both live, and a crashed one's entries are relayed after its lease.
-//! Order holds per key for what one instance relays (ADR 0028).
+//! lease ([`OutboxPublisherSettings::lease`], `KRAKEN_OUTBOX_LEASE_MS`) held by this publisher, so
+//! two instances relaying one outbox never both send an entry while both live, and a crashed
+//! one's entries are relayed after its lease. A batch stops before its lease could run out under
+//! a send ([`OUTBOX_SEND_TIMEOUT`] before its end, by the injected clock); the next poll claims
+//! again, which renews the lease of what this publisher still holds. Order holds per key for what
+//! one instance relays (ADR 0028).
 //!
 //! Metrics (ADR 0026): every publish attempt counts in `kraken.outbox.published{outcome}`; the
 //! gauges `kraken.outbox.pending` and `kraken.outbox.oldest.age` read what the last poll saw (the
-//! batch it claimed, or the store's count of every pending entry when the batch is full), less
-//! what it relayed since: no query of their own.
+//! batch it claimed, or, when the batch is full, the store's count of every pending entry and its
+//! oldest one, [`OutboxStore::pending`] and [`OutboxStore::oldest_pending`]), less what it relayed
+//! since: no query of their own.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use rdkafka::config::ClientConfig;
+use rdkafka::error::KafkaError;
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
@@ -22,13 +28,46 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::headers;
+use crate::config::Config;
 use crate::error::MessagingError;
 use crate::metrics::{Metrics, OUTBOX_OLDEST_AGE, OUTBOX_PENDING};
-use crate::store::{OutboxEntry, OutboxStore, now_ms};
+use crate::saga::Clock;
+use crate::store::{OutboxEntry, OutboxStore};
+use crate::time::{after, now_ms, rfc3339};
 
-/// How long a claimed batch stays this publisher's: long past a batch's sends (it stops at the
-/// first failed send, each bounded by the 40 s delivery budget), renewed by every poll.
-pub const RELAY_LEASE: Duration = Duration::from_secs(120);
+/// The most one send to Kafka takes: the producer's delivery budget (as Kotlin's `max.block.ms`
+/// 10 s + `delivery.timeout.ms` 30 s). The outbox lease must be longer.
+pub const OUTBOX_SEND_TIMEOUT: Duration = Duration::from_secs(40);
+
+/// What an [`OutboxPublisher`] relays, where to and how (`Config`'s `outbox_*` and Kafka
+/// settings, [`From<&Config>`]).
+#[derive(Clone, Debug)]
+pub struct OutboxPublisherSettings {
+    pub bootstrap_servers: String,
+    pub topic: String,
+    /// The `source` header: the service name.
+    pub source: String,
+    pub poll_interval: Duration,
+    pub batch_size: usize,
+    /// Sends of one entry in all before it is given up.
+    pub max_attempts: u32,
+    /// How long a claimed batch stays this publisher's; longer than [`OUTBOX_SEND_TIMEOUT`].
+    pub lease: Duration,
+}
+
+impl From<&Config> for OutboxPublisherSettings {
+    fn from(config: &Config) -> Self {
+        OutboxPublisherSettings {
+            bootstrap_servers: config.kafka_bootstrap.clone(),
+            topic: config.kafka_topic.clone(),
+            source: config.service_name.clone(),
+            poll_interval: config.outbox_poll_interval,
+            batch_size: config.outbox_batch_size,
+            max_attempts: config.outbox_max_attempts,
+            lease: config.outbox_lease,
+        }
+    }
+}
 
 pub struct OutboxPublisher {
     outbox: Arc<dyn OutboxStore>,
@@ -40,6 +79,9 @@ pub struct OutboxPublisher {
     poll_interval: Duration,
     batch_size: i64,
     max_attempts: i32,
+    lease: Duration,
+    /// What "now" is for a batch's deadline.
+    clock: Clock,
     metrics: Metrics,
     backlog: Arc<Backlog>,
 }
@@ -97,20 +139,23 @@ impl Backlog {
 }
 
 impl OutboxPublisher {
-    /// The relay of `outbox` to `topic`; its metrics are recorded on `metrics`.
-    #[allow(clippy::too_many_arguments)]
+    /// The relay of `outbox` as `settings` say, its batches timed by `clock`; its metrics are
+    /// recorded on `metrics`. `InvalidMessage` for a lease not longer than a send.
     pub fn new(
         outbox: Arc<dyn OutboxStore>,
-        bootstrap_servers: &str,
-        topic: &str,
-        source: &str,
-        poll_interval: Duration,
-        batch_size: usize,
-        max_attempts: u32,
+        settings: OutboxPublisherSettings,
+        clock: Clock,
         metrics: &Metrics,
     ) -> Result<Arc<OutboxPublisher>, MessagingError> {
+        if settings.lease <= OUTBOX_SEND_TIMEOUT {
+            return Err(MessagingError::InvalidMessage(format!(
+                "the outbox lease ({:?}) must be longer than a send ({} s)",
+                settings.lease,
+                OUTBOX_SEND_TIMEOUT.as_secs()
+            )));
+        }
         let producer: FutureProducer = ClientConfig::new()
-            .set("bootstrap.servers", bootstrap_servers)
+            .set("bootstrap.servers", &settings.bootstrap_servers)
             // Same budget as the Kotlin producer (max.block.ms 10 s + delivery.timeout.ms 30 s): a broker
             // restart must not exhaust the 10 attempts.
             .set("message.timeout.ms", "30000")
@@ -123,11 +168,13 @@ impl OutboxPublisher {
             outbox,
             owner: uuid::Uuid::new_v4().to_string(),
             producer,
-            topic: topic.to_string(),
-            source: source.to_string(),
-            poll_interval,
-            batch_size: batch_size as i64,
-            max_attempts: max_attempts as i32,
+            topic: settings.topic,
+            source: settings.source,
+            poll_interval: settings.poll_interval,
+            batch_size: settings.batch_size as i64,
+            max_attempts: settings.max_attempts as i32,
+            lease: settings.lease,
+            clock,
             metrics: metrics.clone(),
             backlog,
         }))
@@ -157,58 +204,75 @@ impl OutboxPublisher {
 
     /// Claims one batch of pending entries and sends it sequentially; returns how many were
     /// sent. Stops at the first retriable failure so per-key order holds (the entry stays this
-    /// publisher's and comes first in its next claim); an entry failing `max_attempts` times is
-    /// marked failed and skipped from then on.
+    /// publisher's and comes first in its next claim), and before the batch's lease could run out
+    /// under the next send; an entry failing `max_attempts` times is marked failed and skipped
+    /// from then on.
     pub async fn relay_once(&self) -> Result<usize, MessagingError> {
+        let claimed_at_ms = self.clock.now_ms();
         let batch: Vec<OutboxEntry> = self
             .outbox
-            .claim(&self.owner, RELAY_LEASE, self.batch_size as usize)
+            .claim(&self.owner, self.lease, self.batch_size as usize)
             .await?;
-        // The backlog for the gauges: the batch, or every pending entry behind a full one.
+        self.relay_batch(batch, claimed_at_ms, |prepared| {
+            Box::pin(self.send(prepared))
+        })
+        .await
+    }
+
+    /// Sends `batch`, claimed at `claimed_at_ms`, through `send`, in order; see
+    /// [`relay_once`](Self::relay_once).
+    async fn relay_batch<'s, F>(
+        &'s self,
+        batch: Vec<OutboxEntry>,
+        claimed_at_ms: i64,
+        mut send: F,
+    ) -> Result<usize, MessagingError>
+    where
+        F: FnMut(Prepared) -> BoxFuture<'s, Result<(), KafkaError>>,
+    {
+        // The backlog for the gauges: the batch, or every pending entry behind a full one (and the
+        // oldest of them, which another instance may hold).
         let mut backlog = batch.len() as u64;
+        let mut oldest = batch.first().map(|d| d.created_at_ms);
         if batch.len() as i64 >= self.batch_size {
             match self.outbox.pending().await {
                 Ok(n) => backlog = n.max(backlog),
                 Err(e) => tracing::debug!("outbox backlog not counted: {e}"),
             }
+            match self.outbox.oldest_pending().await {
+                Ok(Some(at)) => oldest = Some(oldest.map_or(at, |first| first.min(at))),
+                Ok(None) => {}
+                Err(e) => tracing::debug!("oldest outbox entry not read: {e}"),
+            }
         }
-        self.backlog
-            .set(backlog, batch.first().map(|d| d.created_at_ms));
+        self.backlog.set(backlog, oldest);
         // An entry left the backlog (sent, or failed for good): the next of the batch is the
         // oldest now; past the batch, the last one stands in until the next poll.
         let left = |backlog: u64, i: usize| {
             let next = batch.get(i + 1).or(batch.get(i).filter(|_| backlog > 0));
             self.backlog.set(backlog, next.map(|d| d.created_at_ms));
         };
+        // A send started from then on could outlast the lease: the rest waits for the next claim.
+        let send_until_ms = after(claimed_at_ms, self.lease - OUTBOX_SEND_TIMEOUT);
         let mut sent = 0usize;
         for (i, d) in batch.iter().enumerate() {
-            let prepared = self.record(d)?;
-            let mut owned = OwnedHeaders::new();
-            for (k, v) in &prepared.headers {
-                owned = owned.insert(Header {
-                    key: k,
-                    value: Some(v),
-                });
+            if self.clock.now_ms() >= send_until_ms {
+                tracing::debug!(
+                    sent,
+                    left = batch.len() - i,
+                    "outbox batch stops before its lease could run out"
+                );
+                break;
             }
-            let mut record = FutureRecord::to(&self.topic)
-                .payload(&prepared.payload)
-                .headers(owned);
-            if let Some(k) = &prepared.key {
-                record = record.key(k);
-            }
-            match self
-                .producer
-                .send(record, Timeout::After(Duration::from_secs(40)))
-                .await
-            {
-                Ok(_) => {
+            match send(self.record(d)?).await {
+                Ok(()) => {
                     self.metrics.outbox_published(true);
                     self.outbox.mark_sent(std::slice::from_ref(&d.id)).await?;
                     sent += 1;
                     backlog = backlog.saturating_sub(1);
                     left(backlog, i);
                 }
-                Err((e, _)) => {
+                Err(e) => {
                     self.metrics.outbox_published(false);
                     let attempt = d.attempts + 1;
                     if attempt >= self.max_attempts || !is_retriable(&e) {
@@ -227,6 +291,28 @@ impl OutboxPublisher {
             }
         }
         Ok(sent)
+    }
+
+    /// One record to Kafka, within [`OUTBOX_SEND_TIMEOUT`].
+    async fn send(&self, prepared: Prepared) -> Result<(), KafkaError> {
+        let mut owned = OwnedHeaders::new();
+        for (k, v) in &prepared.headers {
+            owned = owned.insert(Header {
+                key: k,
+                value: Some(v),
+            });
+        }
+        let mut record = FutureRecord::to(&self.topic)
+            .payload(&prepared.payload)
+            .headers(owned);
+        if let Some(k) = &prepared.key {
+            record = record.key(k);
+        }
+        self.producer
+            .send(record, Timeout::After(OUTBOX_SEND_TIMEOUT))
+            .await
+            .map(|_| ())
+            .map_err(|(e, _)| e)
     }
 
     fn record(&self, d: &OutboxEntry) -> Result<Prepared, MessagingError> {
@@ -282,9 +368,153 @@ struct Prepared {
     headers: Vec<(String, String)>,
 }
 
-/// `createdAt` as Kotlin's `Instant.toString()` would print it (millisecond precision).
-fn rfc3339(at_ms: i64) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at_ms)
-        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-        .unwrap_or_default()
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::time::UNIX_EPOCH;
+
+    use super::*;
+    use crate::saga::ManualClock;
+    use crate::store::{StoreError, Tx};
+
+    /// An outbox that records which entries were marked sent.
+    #[derive(Default)]
+    struct Recorded {
+        sent: Mutex<Vec<String>>,
+    }
+
+    fn done<'a, T: Send + 'a>(value: T) -> BoxFuture<'a, Result<T, StoreError>> {
+        Box::pin(async move { Ok(value) })
+    }
+
+    impl OutboxStore for Recorded {
+        fn append<'a>(
+            &'a self,
+            _: &'a mut Tx,
+            _: OutboxEntry,
+        ) -> BoxFuture<'a, Result<(), StoreError>> {
+            done(())
+        }
+        fn append_now(&self, _: OutboxEntry) -> BoxFuture<'_, Result<(), StoreError>> {
+            done(())
+        }
+        fn claim<'a>(
+            &'a self,
+            _: &'a str,
+            _: Duration,
+            _: usize,
+        ) -> BoxFuture<'a, Result<Vec<OutboxEntry>, StoreError>> {
+            done(Vec::new())
+        }
+        fn mark_sent<'a>(&'a self, ids: &'a [String]) -> BoxFuture<'a, Result<(), StoreError>> {
+            self.sent.lock().unwrap().extend_from_slice(ids);
+            done(())
+        }
+        fn mark_attempt_failed<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<(), StoreError>> {
+            done(())
+        }
+        fn mark_failed<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<(), StoreError>> {
+            done(())
+        }
+        fn purge(&self, _: i64) -> BoxFuture<'_, Result<u64, StoreError>> {
+            done(0)
+        }
+        fn pending(&self) -> BoxFuture<'_, Result<u64, StoreError>> {
+            done(0)
+        }
+        fn oldest_pending(&self) -> BoxFuture<'_, Result<Option<i64>, StoreError>> {
+            done(None)
+        }
+    }
+
+    fn entry(n: usize) -> OutboxEntry {
+        OutboxEntry {
+            id: format!("e-{n}"),
+            type_name: "t.Happened".into(),
+            key: None,
+            headers: Default::default(),
+            payload: b"{}".to_vec(),
+            created_at_ms: 0,
+            seq: n as i64,
+            attempts: 0,
+        }
+    }
+
+    fn publisher(outbox: Arc<Recorded>, clock: &ManualClock) -> Arc<OutboxPublisher> {
+        OutboxPublisher::new(
+            outbox,
+            OutboxPublisherSettings {
+                bootstrap_servers: "127.0.0.1:1".into(),
+                topic: "kraken.events".into(),
+                source: "svc".into(),
+                poll_interval: Duration::from_millis(100),
+                batch_size: 10,
+                max_attempts: 10,
+                lease: Duration::from_secs(120),
+            },
+            clock.clock(),
+            &Metrics::global(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_batch_stops_before_its_lease_could_run_out_under_a_send() {
+        let clock = ManualClock::new(UNIX_EPOCH + Duration::from_secs(1_793_700_000));
+        let outbox = Arc::new(Recorded::default());
+        let relay = publisher(Arc::clone(&outbox), &clock);
+        let claimed_at = clock.clock().now_ms();
+        let batch: Vec<OutboxEntry> = (0..5).map(entry).collect();
+        // Each send takes 30 s: sends start at +0, +30 and +60 s; at +90 s a send could end past
+        // the lease (120 s), so the deadline is +80 s.
+        let ticking = clock.clone();
+        let sent = relay
+            .relay_batch(batch, claimed_at, move |_| {
+                ticking.advance(Duration::from_secs(30));
+                Box::pin(async { Ok(()) })
+            })
+            .await
+            .unwrap();
+        assert_eq!(sent, 3);
+        assert_eq!(*outbox.sent.lock().unwrap(), ["e-0", "e-1", "e-2"]);
+
+        // Fast sends: the whole batch.
+        let claimed_at = clock.clock().now_ms();
+        let batch: Vec<OutboxEntry> = (5..10).map(entry).collect();
+        let sent = relay
+            .relay_batch(batch, claimed_at, |_| Box::pin(async { Ok(()) }))
+            .await
+            .unwrap();
+        assert_eq!(sent, 5);
+    }
+
+    #[test]
+    fn a_lease_not_longer_than_a_send_is_refused() {
+        let clock = ManualClock::new(UNIX_EPOCH);
+        let e = OutboxPublisher::new(
+            Arc::new(Recorded::default()),
+            OutboxPublisherSettings {
+                bootstrap_servers: "127.0.0.1:1".into(),
+                topic: "kraken.events".into(),
+                source: "svc".into(),
+                poll_interval: Duration::from_millis(100),
+                batch_size: 10,
+                max_attempts: 10,
+                lease: OUTBOX_SEND_TIMEOUT,
+            },
+            clock.clock(),
+            &Metrics::global(),
+        )
+        .err()
+        .expect("refused");
+        assert!(e.to_string().contains("longer than a send"), "{e}");
+    }
 }

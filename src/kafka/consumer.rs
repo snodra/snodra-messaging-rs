@@ -43,8 +43,9 @@ use crate::processors::dead_letters::{DeadLetterRecord, park};
 use crate::store::dead_letters::cut_chars;
 use crate::store::{
     DeadLetterError, DeadLetterReason, DeadLetterStore, MAX_ERROR_MESSAGE_CHARS, Parked,
-    ReplayRange, now_ms,
+    ReplayRange,
 };
+use crate::time::now_ms;
 
 /// What to do with a record, decided before any database work.
 #[derive(Debug, PartialEq, Eq)]

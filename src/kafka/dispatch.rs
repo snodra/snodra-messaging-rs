@@ -23,7 +23,8 @@ use tokio::sync::Mutex;
 use crate::context::{CURRENT, MessageContext};
 use crate::error::MessagingError;
 use crate::hub::{EventContext, HandlerRegistry};
-use crate::store::{MessageStore, ProcessedMarker, Tx, now_ms};
+use crate::store::{MessageStore, ProcessedMarker, Tx};
+use crate::time::now_ms;
 
 /// What running an event handler without a store fails with.
 pub(crate) const HANDLER_NEEDS_STORE: &str =

@@ -11,6 +11,11 @@
 
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
+
+use crate::config::Config;
+use crate::saga::Clock;
+
 pub mod control;
 pub mod dead_letters;
 pub mod external;
@@ -34,20 +39,11 @@ pub use processed::{ProcessedEventStore, ProcessedMarker};
 pub use tx::{Tx, TxProvider};
 
 pub use crate::saga::ports::{
-    DeadlineStore, DispatchFailure, DispatchQueue, DispatchRecorder, FailureStore, MarkerStore,
-    SagaPorts, SagaRepository,
+    DeadlineStore, DispatchFailure, FailureStore, MarkerStore, SagaDispatchStore, SagaPorts,
+    SagaRepository,
 };
 
 use crate::error::MessagingError;
-
-/// The system clock as epoch milliseconds: the times the core hands the stores where no
-/// injected [`Clock`](crate::saga::Clock) applies.
-pub fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
-}
 
 /// What a store operation or a transaction fails with.
 #[derive(Debug)]
@@ -103,13 +99,11 @@ impl From<serde_json::Error> for StoreError {
 }
 
 /// The saga ports (ADR 0021) a store provides; their transaction is the store's
-/// [`MessageStore::tx`]. `dispatch_queue` is the dispatch relay's side of what `dispatch`
-/// records.
+/// [`MessageStore::tx`].
 #[derive(Clone)]
 pub struct SagaStores {
     pub sagas: Arc<dyn SagaRepository>,
-    pub dispatch: Arc<dyn DispatchRecorder>,
-    pub dispatch_queue: Arc<dyn DispatchQueue>,
+    pub dispatch: Arc<dyn SagaDispatchStore>,
     pub deadlines: Arc<dyn DeadlineStore>,
     pub failures: Arc<dyn FailureStore>,
     pub markers: Arc<dyn MarkerStore>,
@@ -117,9 +111,22 @@ pub struct SagaStores {
 
 /// A store add-on: every store the library uses, in the service's own database, sharing one
 /// transaction.
+///
+/// [`KrakenMessagingBuilder::start`](crate::KrakenMessagingBuilder::start) hands the store the
+/// application's clock ([`use_clock`](Self::use_clock)), then prepares its schema
+/// ([`init_schema`](Self::init_schema)) unless `Config::store_init_schema` is false.
 pub trait MessageStore: Send + Sync {
     /// The add-on's name (`mongo`, `postgres`, `mysql`, `memory`), for logs and errors.
     fn name(&self) -> &'static str;
+
+    /// Prepares what the store needs in its database, idempotently: indexes (MongoDB, with the
+    /// retentions of `config` as TTLs), tables (SQL), nothing (in memory).
+    fn init_schema<'a>(&'a self, config: &'a Config) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// The application's clock: what the store stamps the times it sets itself with (an outbox
+    /// entry's sending, a claim's lease). Until called, the system clock.
+    fn use_clock(&self, clock: Clock);
+
     fn tx(&self) -> Arc<dyn TxProvider>;
     fn outbox(&self) -> Arc<dyn OutboxStore>;
     fn processed_events(&self) -> Arc<dyn ProcessedEventStore>;

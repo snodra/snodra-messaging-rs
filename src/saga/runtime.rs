@@ -391,7 +391,7 @@ impl SagaRuntime {
         retry_of: Option<&SagaFailureDocument>,
     ) -> Result<Applied, StoreError> {
         let now = self.clock.now();
-        let now_ms = super::clock::epoch_ms(now);
+        let now_ms = crate::time::epoch_ms(now);
         match retry_of {
             Some(failure) => {
                 if !self.ports.failures.delete(tx, &failure.id).await? {
@@ -618,7 +618,7 @@ impl SagaRuntime {
         claimed: &DeadlineDocument,
     ) -> Result<bool, StoreError> {
         let now = self.clock.now();
-        let now_ms = super::clock::epoch_ms(now);
+        let now_ms = crate::time::epoch_ms(now);
         if self
             .ports
             .deadlines
@@ -934,7 +934,7 @@ fn plan(
     now: SystemTime,
     start_key: Option<String>,
 ) -> Planned {
-    let now_ms = super::clock::epoch_ms(now);
+    let now_ms = crate::time::epoch_ms(now);
     let effects = sctx.take_effects();
     for change in effects.associations {
         match change {
@@ -1024,7 +1024,7 @@ fn plan(
                 name,
                 payload,
                 payload_type,
-                due_at_ms: super::clock::epoch_ms(due_at),
+                due_at_ms: crate::time::epoch_ms(due_at),
                 status: DeadlineStatus::Scheduled,
                 claimed_by: None,
                 claimed_until_ms: None,

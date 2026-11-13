@@ -137,6 +137,15 @@ pub struct Config {
     pub outbox_poll_interval: Duration,
     pub outbox_batch_size: usize,
     pub outbox_max_attempts: u32,
+    /// How long a batch the relay claims stays its own (`KRAKEN_OUTBOX_LEASE_MS`, default 2 min):
+    /// longer than one send can take ([`OUTBOX_SEND_TIMEOUT`](crate::kafka::OUTBOX_SEND_TIMEOUT),
+    /// 40 s; a startup error otherwise). The relay stops a batch before its lease could run out
+    /// under a send, and its next claim renews what it still holds.
+    pub outbox_lease: Duration,
+    /// Whether `start()` prepares the message store's schema (`KRAKEN_STORE_INIT_SCHEMA`, default
+    /// true; Kotlin's `kraken.messaging.store.init-schema`): the MongoDB store's indexes, an SQL
+    /// store's tables. `false` when the schema is managed elsewhere (migrations).
+    pub store_init_schema: bool,
     /// The retentions (`outbox_retention`, `idempotency_retention`, `sagas_*_retention`,
     /// `deadlines_retention`, `external_calls_retention`) are the message store's to apply as it
     /// can (ADR 0028: the MongoDB add-on's TTL indexes, built from this config); the core only
@@ -220,6 +229,8 @@ impl Config {
             outbox_poll_interval: Duration::from_millis(200),
             outbox_batch_size: 100,
             outbox_max_attempts: 10,
+            outbox_lease: Duration::from_secs(120),
+            store_init_schema: true,
             outbox_retention: Duration::from_secs(7 * 86_400),
             idempotency_retention: Duration::from_secs(30 * 86_400),
             jwks_url: None,
@@ -289,7 +300,8 @@ impl Config {
     /// `KRAKEN_KAFKA_DEAD_LETTER_MODE` (`collection`, `topic` or `log`),
     /// `KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS`,
     /// `KRAKEN_OUTBOX_ENABLED`, `KRAKEN_OUTBOX_POLL_INTERVAL_MS`, `KRAKEN_OUTBOX_BATCH_SIZE`,
-    /// `KRAKEN_OUTBOX_MAX_ATTEMPTS`, `KRAKEN_FORWARD_JWT`, `KRAKEN_HUB_LOAD_FACTOR`,
+    /// `KRAKEN_OUTBOX_MAX_ATTEMPTS`, `KRAKEN_OUTBOX_LEASE_MS`, `KRAKEN_STORE_INIT_SCHEMA`,
+    /// `KRAKEN_FORWARD_JWT`, `KRAKEN_HUB_LOAD_FACTOR`,
     /// `KRAKEN_HUB_TAGS` (`k=v,k=v`), `KRAKEN_HUB_PRIORITIES` (`type=n,type=n`),
     /// `KRAKEN_HUB_RETRY_ENABLED`, `KRAKEN_HUB_RETRY_MAX_ATTEMPTS`,
     /// `KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS`, `KRAKEN_HUB_RETRY_MULTIPLIER`,
@@ -488,6 +500,12 @@ impl Config {
         if let Some(v) = optional("KRAKEN_OUTBOX_MAX_ATTEMPTS") {
             c.outbox_max_attempts = number("KRAKEN_OUTBOX_MAX_ATTEMPTS", &v)? as u32;
         }
+        if let Some(v) = optional("KRAKEN_OUTBOX_LEASE_MS") {
+            c.outbox_lease = millis("KRAKEN_OUTBOX_LEASE_MS", &v)?;
+        }
+        if let Some(v) = optional("KRAKEN_STORE_INIT_SCHEMA") {
+            c.store_init_schema = flag("KRAKEN_STORE_INIT_SCHEMA", &v)?;
+        }
         if let Some(v) = optional("KRAKEN_FORWARD_JWT") {
             c.forward_jwt = flag("KRAKEN_FORWARD_JWT", &v)?;
         }
@@ -590,6 +608,13 @@ impl Config {
             return Err(MessagingError::InvalidMessage(format!(
                 "reconnect_backoff_min (KRAKEN_RECONNECT_BACKOFF_MIN_MS, {:?}) must not exceed reconnect_backoff_max (KRAKEN_RECONNECT_BACKOFF_MAX_MS, {:?})",
                 self.reconnect_backoff_min, self.reconnect_backoff_max
+            )));
+        }
+        if self.outbox_lease <= crate::kafka::OUTBOX_SEND_TIMEOUT {
+            return Err(MessagingError::InvalidMessage(format!(
+                "outbox_lease (KRAKEN_OUTBOX_LEASE_MS, {:?}) must be longer than a send ({} s)",
+                self.outbox_lease,
+                crate::kafka::OUTBOX_SEND_TIMEOUT.as_secs()
             )));
         }
         if self.hub_status_interval.is_zero() {
@@ -1837,5 +1862,32 @@ mod tests {
         let e = c.validate().unwrap_err().to_string();
         assert!(e.contains("dead_letter_retention"), "{e}");
         assert!(e.contains("KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS"), "{e}");
+    }
+
+    #[test]
+    fn the_outbox_lease_and_the_schema_setup_default_and_come_from_env() {
+        let c = code_config();
+        assert_eq!(c.outbox_lease, Duration::from_secs(120));
+        assert!(c.store_init_schema);
+        let c = from(&[
+            ("KRAKEN_OUTBOX_LEASE_MS", "90000"),
+            ("KRAKEN_STORE_INIT_SCHEMA", "false"),
+        ]);
+        assert_eq!(c.outbox_lease, Duration::from_secs(90));
+        assert!(!c.store_init_schema);
+    }
+
+    #[test]
+    fn an_outbox_lease_not_longer_than_a_send_is_rejected() {
+        let e = try_from(&[("KRAKEN_OUTBOX_LEASE_MS", "40000")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("KRAKEN_OUTBOX_LEASE_MS") && e.contains("40 s"),
+            "{e}"
+        );
+        let mut c = code_config();
+        c.outbox_lease = Duration::from_secs(41);
+        assert!(c.validate().is_ok());
     }
 }

@@ -430,7 +430,7 @@ impl Rl {
         ));
         SagaDispatchRelay::new(
             self.store.message_store().tx(),
-            self.store.message_store().sagas().dispatch_queue,
+            self.store.message_store().sagas().dispatch,
             commands,
             EventBus::over(self.store.message_store().outbox()),
             dispatcher,
@@ -725,7 +725,7 @@ async fn the_lease_of_a_saga_is_renewed_while_its_send_is_alive_so_another_relay
             .find::<LeaseDoc>("saga_dispatch_leases", doc! { "_id": "slow" })
             .await
             .remove(0);
-        lease.until > mongodb::bson::DateTime::from_system_time(rl.store.clock.now())
+        lease.until_ms() > kraken_messaging::time::epoch_ms(rl.store.clock.now())
     })
     .await;
 
@@ -782,7 +782,7 @@ async fn a_step_in_retry_holds_back_that_sagas_later_steps_only() {
     );
     let first = rl.entry("a:1000").await;
     assert_eq!(first.attempts, 1);
-    assert!(first.next_attempt_at_ms.unwrap() > kraken_messaging::saga::epoch_ms(t0()));
+    assert!(first.next_attempt_at_ms.unwrap() > kraken_messaging::time::epoch_ms(t0()));
     assert!(rl.entry("a:2000").await.dispatched_at_ms.is_none());
     assert!(rl.entry("b:1000").await.dispatched_at_ms.is_some());
 

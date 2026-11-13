@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use kraken_messaging::kafka::SagaStage;
-use kraken_messaging::saga::epoch_ms;
 use kraken_messaging::saga::ports::SagaPorts;
 use kraken_messaging::saga::store::SagaFailureDocument;
 use kraken_messaging::saga::{NoopSagaMetrics, SagaFailures, SagaRetry, SagaRuntime, SagaType};
 use kraken_messaging::store::{StoreError, Tx, TxProvider};
+use kraken_messaging::time::epoch_ms;
 use kraken_messaging::{MessageType, MessagingError, RetryPolicy};
 use kraken_messaging_mongo::documents::FailureDoc;
 use mongodb::bson::doc;

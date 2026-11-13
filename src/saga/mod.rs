@@ -25,7 +25,7 @@ pub mod store;
 #[cfg(feature = "testing")]
 pub mod testing;
 
-pub use clock::{Clock, ManualClock, epoch_ms};
+pub use clock::{Clock, ManualClock};
 pub use context::SagaContext;
 pub use definition::{SagaDefinition, SagaType};
 pub use failed::{FailureReason, SagaCommandFailed};

@@ -133,9 +133,9 @@ impl SagaContext {
         key: Option<&str>,
     ) -> Result<(), MessagingError> {
         // The relay turns the entry into an outbox entry: what cannot become one (a unit struct,
-        // a payload that is no JSON object) fails the handler now, naming the event, instead of
-        // the entry later (ruling 69). What only the store refuses (MongoDB: a number BSON cannot
-        // hold) the relay gives up on when it appends it.
+        // a payload that is no JSON object, an integer above i64::MAX) fails the handler now,
+        // naming the event, instead of the entry later (ruling 69). The store's
+        // `SagaDispatchStore::record` refuses it too, in the saga's transaction.
         crate::kafka::check_payload(E::TYPE, &serde_json::to_value(event)?)?;
         self.record(DispatchKind::Event, E::TYPE, event, key)
     }

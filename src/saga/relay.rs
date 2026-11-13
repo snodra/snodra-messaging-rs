@@ -1,7 +1,7 @@
 //! The saga dispatch relay: sends what sagas recorded in `saga_dispatch` after their transactions
 //! committed, in order per saga (ADR 0021 rulings 7-11, 28-31, 34).
 //!
-//! The saga-side outbox lives in the message store, behind [`DispatchQueue`]. A poll finds the
+//! The saga-side outbox lives in the message store, behind [`SagaDispatchStore`]. A poll finds the
 //! sagas whose first pending entry (lowest `seq` neither dispatched nor failed) is due, oldest
 //! work first (ruling 31), claims each one with a lease (so two service instances never dispatch
 //! one saga's entries at once) and works through its entries
@@ -52,7 +52,7 @@ use tokio_util::task::TaskTracker;
 use super::clock::Clock;
 use super::failed::{FailureReason, SagaCommandFailed};
 use super::metrics::SagaMetrics;
-use super::ports::{DispatchFailure, DispatchQueue};
+use super::ports::{DispatchFailure, SagaDispatchStore};
 use super::raw::{RawCommandSender, RawOutcome};
 use super::runtime::DISPATCH_CORRELATION_HEADER;
 use super::store::{DispatchKind, SagaDispatchDocument};
@@ -62,6 +62,7 @@ use crate::hub::SendOptions;
 use crate::kafka::{EventBus, LocalEventDispatcher, dispatch::Outcome};
 use crate::retry::RetryPolicy;
 use crate::store::TxProvider;
+use crate::time::{after, rfc3339};
 use crate::types::MessageType;
 
 const STOP_JOIN: Duration = Duration::from_secs(15);
@@ -130,7 +131,7 @@ impl RelaySettings {
 /// See the module docs.
 pub struct SagaDispatchRelay {
     tx: Arc<dyn TxProvider>,
-    queue: Arc<dyn DispatchQueue>,
+    queue: Arc<dyn SagaDispatchStore>,
     commands: Arc<dyn RawCommandSender>,
     events: EventBus,
     local: Arc<LocalEventDispatcher>,
@@ -152,7 +153,7 @@ impl SagaDispatchRelay {
     /// (one store's).
     pub fn new(
         tx: Arc<dyn TxProvider>,
-        queue: Arc<dyn DispatchQueue>,
+        queue: Arc<dyn SagaDispatchStore>,
         commands: Arc<dyn RawCommandSender>,
         events: EventBus,
         local: Arc<LocalEventDispatcher>,
@@ -302,7 +303,7 @@ impl SagaDispatchRelay {
         let mut dealt = 0;
         let outcome: Result<(), MessagingError> = async {
             while !self.stopping.is_cancelled() {
-                let Some(entry) = self.first_pending(saga_id).await? else {
+                let Some(entry) = self.next_pending(saga_id).await? else {
                     break;
                 };
                 if entry
@@ -398,7 +399,7 @@ impl SagaDispatchRelay {
         message: &str,
     ) -> Result<(), MessagingError> {
         self.queue
-            .fail(
+            .mark_failed(
                 &entry.id,
                 &DispatchFailure {
                     attempts: None,
@@ -484,7 +485,7 @@ impl SagaDispatchRelay {
                 self.mark_dispatched(entry).await?;
                 Ok(true)
             }
-            RawOutcome::Transient(message) => self.retry_later(entry, &message).await,
+            RawOutcome::Transient(message) => self.schedule_retry(entry, &message).await,
             RawOutcome::Permanent(reason, message) => {
                 self.fail(entry, reason, &message, entry.attempts).await?;
                 Ok(true)
@@ -494,7 +495,7 @@ impl SagaDispatchRelay {
 
     /// A transient failure: another attempt later, or `EXHAUSTED` when the limit is reached.
     /// False: the entry waits.
-    async fn retry_later(
+    async fn schedule_retry(
         &self,
         entry: &SagaDispatchDocument,
         error: &str,
@@ -516,7 +517,7 @@ impl SagaDispatchRelay {
                 .retry_policy()
                 .jittered_backoff(attempts as u32),
         );
-        self.queue.retry_later(&entry.id, attempts, next).await?;
+        self.queue.schedule_retry(&entry.id, attempts, next).await?;
         tracing::warn!(
             "Command {} ({}) failed attempt {attempts} of {}, next at {}: {error}",
             entry.id,
@@ -541,7 +542,7 @@ impl SagaDispatchRelay {
         let now = self.now();
         let reason_text = reason_name(reason);
         self.queue
-            .fail(
+            .mark_failed(
                 &entry.id,
                 &DispatchFailure {
                     attempts: Some(attempts),
@@ -639,7 +640,7 @@ impl SagaDispatchRelay {
             .dispatch(&dedupe, type_name, &serde_json::to_vec(&failed)?, &ctx)
             .await;
         match outcome {
-            Err(e) => return self.notice_failed(entry, &e).await,
+            Err(e) => return self.schedule_notice_retry(entry, &e).await,
             Ok(unhandled @ (Outcome::NoInterest | Outcome::Unclaimed)) => {
                 self.metrics
                     .command_failure_unhandled(&entry.type_name, reason);
@@ -668,7 +669,7 @@ impl SagaDispatchRelay {
         Ok(())
     }
 
-    async fn notice_failed(
+    async fn schedule_notice_retry(
         &self,
         entry: &SagaDispatchDocument,
         error: &MessagingError,
@@ -694,7 +695,9 @@ impl SagaDispatchRelay {
                 .jittered_backoff(attempts as u32),
         );
         self.check_notice_write_injection()?;
-        self.queue.notice_failed(&entry.id, attempts, next).await?;
+        self.queue
+            .schedule_notice_retry(&entry.id, attempts, next)
+            .await?;
         tracing::warn!(
             "Delivering SagaCommandFailed for command {} failed attempt {attempts} of {}, next at {}: {error}",
             entry.id,
@@ -704,11 +707,11 @@ impl SagaDispatchRelay {
         Ok(())
     }
 
-    async fn first_pending(
+    async fn next_pending(
         &self,
         saga_id: &str,
     ) -> Result<Option<SagaDispatchDocument>, MessagingError> {
-        Ok(self.queue.first_pending(saga_id).await?)
+        Ok(self.queue.next_pending(saga_id).await?)
     }
 
     // ---- the saga's dispatch lease -----------------------------------------------------------
@@ -792,15 +795,4 @@ fn reason_name(reason: FailureReason) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_else(|| format!("{reason:?}"))
-}
-
-fn after(now_ms: i64, by: Duration) -> i64 {
-    now_ms.saturating_add(i64::try_from(by.as_millis()).unwrap_or(i64::MAX))
-}
-
-/// An epoch-millisecond time as Kotlin's `Instant.toString()` prints it (for the logs).
-fn rfc3339(at_ms: i64) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at_ms)
-        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-        .unwrap_or_else(|| at_ms.to_string())
 }

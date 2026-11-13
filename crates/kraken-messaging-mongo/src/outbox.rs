@@ -3,6 +3,7 @@
 //! `leaseUntil` while a relay holds an entry (absent: nobody holds it).
 
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use futures::TryStreamExt;
@@ -81,7 +82,7 @@ impl OutboxDocument {
 /// The BSON document an event's JSON payload becomes: it must be a JSON object whose numbers BSON
 /// can hold (an integer above `i64::MAX` it cannot). Anything else is `InvalidMessage` naming the
 /// event type: no retry can change it.
-fn payload_document(type_name: &str, payload: &[u8]) -> Result<Document, StoreError> {
+pub(crate) fn payload_document(type_name: &str, payload: &[u8]) -> Result<Document, StoreError> {
     let invalid = |why: String| {
         StoreError::Failed(MessagingError::InvalidMessage(format!(
             "the payload of event {type_name} {why}"
@@ -104,11 +105,11 @@ fn payload_document(type_name: &str, payload: &[u8]) -> Result<Document, StoreEr
 pub(crate) struct MongoOutboxStore {
     docs: Collection<OutboxDocument>,
     /// What stamps `sentAt`, `failedAt` and the leases: the application's clock.
-    clock: Clock,
+    clock: Arc<RwLock<Clock>>,
 }
 
 impl MongoOutboxStore {
-    pub(crate) fn new(db: &Database, clock: Clock) -> MongoOutboxStore {
+    pub(crate) fn new(db: &Database, clock: Arc<RwLock<Clock>>) -> MongoOutboxStore {
         MongoOutboxStore {
             docs: db.collection(OUTBOX_COLLECTION),
             clock,
@@ -116,7 +117,11 @@ impl MongoOutboxStore {
     }
 
     fn now(&self) -> DateTime {
-        date(self.clock.now_ms())
+        let clock = self
+            .clock
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        date(clock.now_ms())
     }
 
     /// Neither sent nor given up on (a missing field is null).
@@ -275,6 +280,18 @@ impl OutboxStore for MongoOutboxStore {
 
     fn pending(&self) -> BoxFuture<'_, Result<u64, StoreError>> {
         Box::pin(async move { self.docs.count_documents(Self::unfinished()).await.store() })
+    }
+
+    fn oldest_pending(&self) -> BoxFuture<'_, Result<Option<i64>, StoreError>> {
+        Box::pin(async move {
+            Ok(self
+                .docs
+                .find_one(Self::unfinished())
+                .sort(doc! { "createdAt": 1, "seq": 1 })
+                .await
+                .store()?
+                .map(|d| d.created_at.timestamp_millis()))
+        })
     }
 }
 
