@@ -18,24 +18,18 @@ use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 
-use mongodb::bson::{DateTime, Document};
-use mongodb::{Collection, Database};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::ProcessorMonitor;
-use super::control_store::ControlStore;
 use super::monitor::cut_bytes;
-use super::reset::{
-    GroupAdmin, Plan, ResetContext, ResetFailure, ResetHandler, ResetTarget, range_filter,
-};
+use super::reset::{GroupAdmin, Plan, ResetContext, ResetFailure, ResetHandler, ResetTarget};
 use crate::error::MessagingError;
-use crate::kafka::{
-    ConsumerControl, EventConsumer, LocalEventDispatcher, PROCESSED_EVENTS_COLLECTION,
-    ProcessorSettings,
-};
+use crate::kafka::{ConsumerControl, EventConsumer, LocalEventDispatcher, ProcessorSettings};
 use crate::proto::{self, ControlRefusal};
-use crate::store::{Locked, ReplayRange};
+use crate::store::{
+    Locked, ProcessedEventStore, ProcessorControlStore, ReplayRange, now_ms as now,
+};
 
 /// How often the runner reads its processor's control document.
 pub const CONTROL_POLL: Duration = Duration::from_secs(5);
@@ -68,7 +62,7 @@ impl Refusal {
         }
     }
 
-    pub(crate) fn failed(e: &MessagingError) -> Refusal {
+    pub(crate) fn failed(e: &impl std::fmt::Display) -> Refusal {
         Refusal::new(ControlRefusal::Failed, e.to_string())
     }
 }
@@ -115,8 +109,8 @@ pub struct ProcessorRunner {
     dispatcher: Arc<LocalEventDispatcher>,
     monitor: Arc<ProcessorMonitor>,
     control: Arc<ConsumerControl>,
-    store: ControlStore,
-    markers: Collection<Document>,
+    store: Arc<dyn ProcessorControlStore>,
+    markers: Arc<dyn ProcessedEventStore>,
     reset_handlers: Vec<ResetHandler>,
     run: tokio::sync::Mutex<Option<Run>>,
     held: Mutex<Option<Held>>,
@@ -139,7 +133,8 @@ impl ProcessorRunner {
     pub fn new(
         settings: ProcessorSettings,
         dispatcher: Arc<LocalEventDispatcher>,
-        db: &Database,
+        control: Arc<dyn ProcessorControlStore>,
+        markers: Arc<dyn ProcessedEventStore>,
         reset_handlers: Vec<ResetHandler>,
         cancel: CancellationToken,
     ) -> Arc<ProcessorRunner> {
@@ -155,8 +150,8 @@ impl ProcessorRunner {
             dispatcher,
             monitor,
             control: Arc::new(ConsumerControl::default()),
-            store: ControlStore::new(db),
-            markers: db.collection(PROCESSED_EVENTS_COLLECTION),
+            store: control,
+            markers,
             reset_handlers,
             run: tokio::sync::Mutex::new(None),
             held: Mutex::new(None),
@@ -242,7 +237,7 @@ impl ProcessorRunner {
                 return;
             }
         };
-        let now = DateTime::now();
+        let now = now();
         self.apply_replay(&doc.replay);
         let mut held = self.held.lock().unwrap().clone();
         if let Some(h) = &held {
@@ -341,11 +336,7 @@ impl ProcessorRunner {
             {
                 continue;
             }
-            match self
-                .store
-                .remove_range(self.name(), r, DateTime::now())
-                .await
-            {
+            match self.store.remove_range(self.name(), r, now()).await {
                 Ok(true) => {
                     tracing::info!(processor = %self.name(), partition = r.partition, from = r.from, until = r.until, "replay range done")
                 }
@@ -414,7 +405,7 @@ impl ProcessorRunner {
     /// applied. The caller holds `serial`.
     pub(crate) async fn pause(&self, paused: bool, by: &str) -> Result<(), MessagingError> {
         self.store
-            .set_paused(self.name(), paused, by, DateTime::now())
+            .set_paused(self.name(), paused, by, now())
             .await?;
         self.set_paused(paused).await;
         Ok(())
@@ -431,7 +422,7 @@ impl ProcessorRunner {
         if held.id != operation {
             return None;
         }
-        let now = DateTime::now();
+        let now = now();
         match self
             .store
             .extend(self.name(), operation, after(now, lease), now)
@@ -486,7 +477,7 @@ impl ProcessorRunner {
                 format!("operation {operation} already finished on this instance"),
             ));
         }
-        let now = DateTime::now();
+        let now = now();
         match self
             .store
             .lock(self.name(), operation, after(now, lease), now)
@@ -499,7 +490,7 @@ impl ProcessorRunner {
                     "operation {} holds the lock of processor '{}' until {}",
                     other.id,
                     self.name(),
-                    DateTime::from_millis(other.lease_until_ms)
+                    rfc3339(other.lease_until_ms)
                 ),
             )),
             Ok(Locked::Taken) => {
@@ -574,7 +565,7 @@ impl ProcessorRunner {
                         tracing::warn!(processor = %name, operation = %op, "the reset runs longer than {} s: its lease is no longer extended", LEASE_KEEP_MAX.as_secs());
                         return;
                     }
-                    let now = DateTime::now();
+                    let now = now();
                     if let Err(e) = store.extend(&name, &op, after(now, lease), now).await {
                         tracing::warn!(processor = %name, operation = %op, "cannot extend the lease while the reset runs: {e}");
                     }
@@ -598,7 +589,7 @@ impl ProcessorRunner {
                 LEASE_KEEP_MAX.as_secs()
             )));
         }
-        let now = DateTime::now();
+        let now = now();
         match self
             .store
             .extend(self.name(), &held.id, after(now, held.lease), now)
@@ -686,15 +677,14 @@ impl ProcessorRunner {
         let markers = &self.markers;
         let finished = async {
             self.keep_lease(held, started).await?;
-            for range in &ranges {
+            if !ranges.is_empty() {
                 done.markers_deleted += markers
-                    .delete_many(range_filter(&name, range))
+                    .delete_markers(&name, &ranges)
                     .await
-                    .map_err(|e| Refusal::failed(&e.into()))?
-                    .deleted_count;
+                    .map_err(|e| Refusal::failed(&e))?;
             }
             self.store
-                .set_replay(&name, &Plan::merged(&open, &ranges), DateTime::now())
+                .set_replay(&name, &Plan::merged(&open, &ranges), now())
                 .await
                 .map_err(|e| Refusal::failed(&e))?;
             done.ranges_written = !ranges.is_empty();
@@ -738,7 +728,7 @@ impl ProcessorRunner {
             return Err(self.not_prepared(operation, Some(h)));
         }
         self.store
-            .release(self.name(), operation, DateTime::now())
+            .release(self.name(), operation, now())
             .await
             .map_err(|e| Refusal::failed(&e))?;
         *self.held.lock().unwrap() = None;
@@ -831,9 +821,13 @@ async fn blocking<T: Send + 'static>(
     }
 }
 
-fn after(now: DateTime, lease: Duration) -> DateTime {
-    DateTime::from_millis(
-        now.timestamp_millis()
-            .saturating_add(i64::try_from(lease.as_millis()).unwrap_or(i64::MAX)),
-    )
+fn after(now_ms: i64, lease: Duration) -> i64 {
+    now_ms.saturating_add(i64::try_from(lease.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// An epoch-millisecond time as Kotlin's `Instant.toString()` prints it.
+fn rfc3339(at_ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at_ms)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_else(|| at_ms.to_string())
 }

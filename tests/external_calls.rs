@@ -16,17 +16,18 @@ use kraken_messaging::identity::IdentityResolver;
 use kraken_messaging::kafka::dispatch::{LocalEventDispatcher, NoSagas};
 use kraken_messaging::kafka::{EventBus, SagaStage};
 use kraken_messaging::proto::{ErrorCode, Reply, Request, RequestKind, reply};
-use kraken_messaging::saga::store::{
-    DispatchKind, ExternalCallDocument, ExternalCallStatus, SagaDispatchDocument,
-};
+use kraken_messaging::saga::epoch_ms;
+use kraken_messaging::saga::store::{DispatchKind, SagaDispatchDocument};
 use kraken_messaging::saga::{
     ExternalOutcome, FailureReason, LocalRawCommandSender, NoopSagaMetrics, RETRYABLE_MARKER,
     RawCommandSender, RawOutcome, RelaySettings, SagaCommandFailed, SagaDefinition,
     SagaDispatchRelay, SagaMetrics, SagaRetry, SagaRuntime, SagaType, UNKNOWN_OUTCOME_MARKER,
     classify_failure,
 };
+use kraken_messaging::store::{ExternalCall, ExternalCallStatus, MessageStore};
 use kraken_messaging::{Command, Event, MessagingError, RetryPolicy, SendOptions, message_type};
-use mongodb::bson::{DateTime, doc};
+use kraken_messaging_mongo::documents::DispatchDoc;
+use mongodb::bson::doc;
 use serde::{Deserialize, Serialize};
 use support::saga::{Store, event_ctx, state, t0};
 
@@ -232,7 +233,7 @@ impl Ex {
         let adapter = Adapter::new();
         let metrics = Arc::new(ExternalMetrics::default());
         let calls = ExternalCalls::new(
-            store.db.clone(),
+            store.store.external_calls(),
             store.clock.clock(),
             ExternalCallSettings { lease: LEASE },
             metrics.clone(),
@@ -278,36 +279,34 @@ impl Ex {
             .await
     }
 
-    async fn record(&self, key: &str) -> Option<ExternalCallDocument> {
-        self.store
-            .find::<ExternalCallDocument>("external_calls", doc! { "_id": key })
-            .await
-            .pop()
+    async fn record(&self, key: &str) -> Option<ExternalCall> {
+        self.store.store.external_calls().find(key).await.unwrap()
     }
 
     async fn insert_in_progress(&self, key: &str) {
-        let start = DateTime::from_system_time(t0());
-        self.store
-            .db
-            .collection::<ExternalCallDocument>("external_calls")
-            .insert_one(ExternalCallDocument {
-                id: key.into(),
+        let start = epoch_ms(t0());
+        let inserted = self
+            .store
+            .store
+            .external_calls()
+            .insert(&ExternalCall {
+                key: key.into(),
                 status: ExternalCallStatus::InProgress,
                 reply: None,
                 error: None,
                 attempts: 1,
-                updated_at: start,
-                lease_until: Some(DateTime::from_system_time(t0() + LEASE)),
+                updated_at_ms: start,
+                lease_until_ms: Some(epoch_ms(t0() + LEASE)),
                 owner: Some("an earlier call".into()),
             })
             .await
             .unwrap();
+        assert!(inserted);
     }
 
     fn local_dispatcher(&self) -> LocalEventDispatcher {
         LocalEventDispatcher::new(
-            self.store.client.clone(),
-            self.store.db.clone(),
+            Some(self.store.message_store()),
             Arc::clone(&self.registry),
             Arc::new(NoSagas),
         )
@@ -354,7 +353,7 @@ async fn a_second_call_with_the_same_key_returns_the_stored_reply_without_runnin
     let stored = ex.record("job-1").await.unwrap();
     assert_eq!(stored.status, ExternalCallStatus::Succeeded);
     assert_eq!(stored.attempts, 1);
-    assert_eq!(stored.lease_until, None);
+    assert_eq!(stored.lease_until_ms, None);
     assert_eq!(
         stored.reply.as_deref(),
         Some(r#"{"jobId":"j1","ticket":1000}"#)
@@ -521,7 +520,7 @@ async fn an_in_progress_record_past_its_lease_becomes_unknown_and_the_call_fails
     assert_eq!(ex.adapter.bodies(), 0, "never called again automatically");
     let stored = ex.record("job-1").await.unwrap();
     assert_eq!(stored.status, ExternalCallStatus::Unknown);
-    assert_eq!(stored.lease_until, None);
+    assert_eq!(stored.lease_until_ms, None);
     let again = failure(&ex.print(Some("job-1")).await);
     assert!(is_unknown(&again.2));
     assert_eq!(ex.adapter.bodies(), 0);
@@ -820,18 +819,17 @@ async fn harness() -> Harness {
         Arc::new(NoopSagaMetrics),
     ));
     let local = Arc::new(LocalEventDispatcher::new(
-        ex.store.client.clone(),
-        ex.store.db.clone(),
+        Some(ex.store.message_store()),
         Arc::clone(&registry),
         runtime.clone(),
     ));
     let sender: Arc<dyn RawCommandSender> =
         Arc::new(LocalRawCommandSender::new(Arc::clone(&registry)));
     let relay = SagaDispatchRelay::new(
-        ex.store.client.clone(),
-        ex.store.db.clone(),
+        ex.store.store.tx(),
+        ex.store.store.sagas().dispatch_queue,
         sender,
-        EventBus::new(ex.store.db.clone()),
+        EventBus::over(ex.store.store.outbox()),
         local,
         ex.store.clock.clock(),
         RelaySettings {
@@ -855,11 +853,16 @@ async fn harness() -> Harness {
 
 impl Harness {
     async fn entry(&self) -> SagaDispatchDocument {
-        self.ex
+        let found: Vec<DispatchDoc> = self
+            .ex
             .store
-            .find::<SagaDispatchDocument>("saga_dispatch", doc! { "kind": "COMMAND" })
-            .await
-            .remove(0)
+            .find("saga_dispatch", doc! { "kind": "COMMAND" })
+            .await;
+        found
+            .into_iter()
+            .map(SagaDispatchDocument::from)
+            .next()
+            .unwrap()
     }
 }
 
@@ -872,7 +875,10 @@ async fn a_crash_between_the_send_and_the_mark_re_sends_with_the_same_key_and_th
     h.relay.fail_next_mark();
 
     h.relay.poll_once().await.unwrap();
-    assert!(h.entry().await.dispatched_at.is_none(), "the mark was lost");
+    assert!(
+        h.entry().await.dispatched_at_ms.is_none(),
+        "the mark was lost"
+    );
     assert_eq!(h.charges.load(Ordering::SeqCst), 1);
     h.relay.poll_once().await.unwrap();
 
@@ -881,7 +887,7 @@ async fn a_crash_between_the_send_and_the_mark_re_sends_with_the_same_key_and_th
         1,
         "the same key: the stored reply, the body did not run again"
     );
-    assert!(h.entry().await.dispatched_at.is_some());
+    assert!(h.entry().await.dispatched_at_ms.is_some());
     assert_eq!(
         h.ex.record(&entry.id).await.unwrap().status,
         ExternalCallStatus::Succeeded
@@ -909,7 +915,7 @@ async fn the_relay_maps_an_unknown_outcome_to_saga_command_failed_unknown_outcom
         0,
         "an unknown outcome is not called again"
     );
-    assert!(h.entry().await.failed_at.is_some());
+    assert!(h.entry().await.failed_at_ms.is_some());
     assert_eq!(
         h.ex.store
             .count(

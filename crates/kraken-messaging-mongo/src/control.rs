@@ -32,7 +32,7 @@ struct ControlDocument {
     #[serde(default)]
     operation: Option<OperationDocument>,
     #[serde(default)]
-    replay: Vec<ReplayRange>,
+    replay: Vec<RangeDocument>,
     #[serde(default)]
     updated_at: Option<DateTime>,
 }
@@ -45,7 +45,7 @@ impl ControlDocument {
             paused_at_ms: self.paused_at.map(|t| t.timestamp_millis()),
             paused_by: self.paused_by,
             operation: self.operation.map(OperationDocument::into_operation),
-            replay: self.replay,
+            replay: self.replay.into_iter().map(ReplayRange::from).collect(),
             updated_at_ms: self.updated_at.map(|t| t.timestamp_millis()),
         }
     }
@@ -68,6 +68,26 @@ impl OperationDocument {
             kind: self.kind,
             lease_until_ms: self.lease_until.timestamp_millis(),
             prepared_at_ms: self.prepared_at.timestamp_millis(),
+        }
+    }
+}
+
+/// A replay range: `{topic, partition, from, until}`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RangeDocument {
+    topic: String,
+    partition: i32,
+    from: i64,
+    until: i64,
+}
+
+impl From<RangeDocument> for ReplayRange {
+    fn from(r: RangeDocument) -> Self {
+        ReplayRange {
+            topic: r.topic,
+            partition: r.partition,
+            from: r.from,
+            until: r.until,
         }
     }
 }

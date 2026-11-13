@@ -131,8 +131,7 @@ impl Ek {
             Arc::new(NoopSagaMetrics),
         ));
         let dispatcher = Arc::new(LocalEventDispatcher::new(
-            store.client.clone(),
-            store.db.clone(),
+            Some(store.message_store()),
             Arc::new(registry),
             runtime,
         ));
@@ -433,12 +432,8 @@ fn two_sources_of_one_name_fail_the_startup() {
     // Creating consumers connects to nothing, so no broker is needed.
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let client = mongodb::Client::with_uri_str("mongodb://127.0.0.1:1/x")
-            .await
-            .unwrap();
         let dispatcher = Arc::new(LocalEventDispatcher::new(
-            client.clone(),
-            client.database("x"),
+            None,
             Arc::new(HandlerRegistry::new()),
             Arc::new(kraken_messaging::kafka::NoSagas),
         ));

@@ -3,9 +3,10 @@
 //! [`EventConsumer`](super::EventConsumer) and, in the later S2 tasks, the partner-topic
 //! consumers, the webhook ingress and the relay's `SagaCommandFailed` notices (ADR 0021 ruling 2).
 //!
-//! Stage 1 is the consumer's own behaviour: the idempotency marker (`processed_events`, id
-//! `processor:<processor>:<dedupe_id>`) is inserted and the handlers run inside one Mongo transaction; a duplicate marker
-//! skips the stage, a handler failure rolls the marker back. Stage 2 runs after stage 1 committed,
+//! Stage 1 is the consumer's own behaviour: the idempotency marker (the message store's processed
+//! events, id `processor:<processor>:<dedupe_id>`) is recorded and the handlers run inside one
+//! transaction of the store; a duplicate marker skips the stage, a handler failure rolls the
+//! marker back. Stage 2 runs after stage 1 committed,
 //! with markers and transactions of its own, so a redelivered record whose stage 1 is done goes
 //! straight to it. **Stage 2 runs even when stage 1 failed** (ruling 26): the failure is held,
 //! stage 2 runs, and then the failure is returned, so the caller redelivers or skips the record by
@@ -17,15 +18,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
-use mongodb::bson::{DateTime, doc};
-use mongodb::error::{ErrorKind, WriteFailure};
-use mongodb::{Client, ClientSession, Database};
 use tokio::sync::Mutex;
 
-use super::PROCESSED_EVENTS_COLLECTION;
 use crate::context::{CURRENT, MessageContext};
 use crate::error::MessagingError;
 use crate::hub::{EventContext, HandlerRegistry};
+use crate::store::{MessageStore, ProcessedMarker, Tx, now_ms};
+
+/// What running an event handler without a store fails with.
+pub(crate) const HANDLER_NEEDS_STORE: &str =
+    "an event handler needs a message store: add .store(...)";
 
 /// What [`LocalEventDispatcher::dispatch`] did with an event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,8 +87,8 @@ impl SagaStage for NoSagas {
 
 /// See the module docs.
 pub struct LocalEventDispatcher {
-    client: Client,
-    db: Database,
+    /// `None` only in a service without event handlers and sagas (nothing reaches stage 1).
+    store: Option<Arc<dyn MessageStore>>,
     registry: Arc<HandlerRegistry>,
     stage: Arc<dyn SagaStage>,
     /// Put before every stage-1 marker id: `processor:<name>:` (ADR 0022).
@@ -152,27 +154,19 @@ pub(crate) enum StageOneThen {
 
 /// The work a retried stage 1 does in its transaction after the handlers succeeded; `Ok(false)`
 /// aborts it.
-pub(crate) type FinishInTransaction<'a> = Box<
-    dyn for<'s> FnOnce(&'s mut ClientSession) -> BoxFuture<'s, Result<bool, MessagingError>>
-        + Send
-        + 'a,
->;
-
-enum MarkError {
-    Duplicate,
-    Other(MessagingError),
-}
+pub(crate) type FinishInTransaction<'a> =
+    Box<dyn for<'s> FnOnce(&'s mut Tx) -> BoxFuture<'s, Result<bool, MessagingError>> + Send + 'a>;
 
 impl LocalEventDispatcher {
+    /// The dispatcher of `registry`'s handlers and `stage`, recording its markers in `store`
+    /// (`None`: a service without event handlers, where nothing reaches stage 1).
     pub fn new(
-        client: Client,
-        db: Database,
+        store: Option<Arc<dyn MessageStore>>,
         registry: Arc<HandlerRegistry>,
         stage: Arc<dyn SagaStage>,
     ) -> LocalEventDispatcher {
         LocalEventDispatcher {
-            client,
-            db,
+            store,
             registry,
             stage,
             marker_prefix: crate::processors::marker_prefix(crate::processors::DEFAULT_PROCESSOR),
@@ -409,37 +403,42 @@ impl LocalEventDispatcher {
         record: RecordDispatch<'_>,
         finish: Option<FinishInTransaction<'_>>,
     ) -> Result<StageOneThen, MessagingError> {
-        let mut session = self.client.start_session().await?;
-        session.start_transaction().await?;
-        match self
-            .mark_processed(
-                &mut session,
-                &self.marker_id(dedupe_id),
-                type_name,
-                record.position,
-            )
-            .await
-        {
-            Ok(()) => {}
-            Err(MarkError::Duplicate) => {
-                let _ = session.abort_transaction().await;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| MessagingError::InvalidMessage(HANDLER_NEEDS_STORE.into()))?;
+        let txs = store.tx();
+        let mut tx = txs.begin().await?;
+        let marker = ProcessedMarker {
+            id: self.marker_id(dedupe_id),
+            type_name: type_name.to_string(),
+            processed_at_ms: now_ms(),
+            processor: record.position.map(|p| p.processor.clone()),
+            topic: record.position.map(|p| p.topic.clone()),
+            partition: record.position.map(|p| p.partition),
+            offset: record.position.map(|p| p.offset),
+        };
+        match store.processed_events().record(&mut tx, &marker).await {
+            Ok(true) => {}
+            Ok(false) => {
+                txs.abort(&mut tx).await;
                 return Ok(StageOneThen::Duplicate);
             }
-            Err(MarkError::Other(e)) => {
-                let _ = session.abort_transaction().await;
-                return Err(e);
+            Err(e) => {
+                txs.abort(&mut tx).await;
+                return Err(e.into());
             }
         }
-        let session = Arc::new(Mutex::new(session));
+        let tx = Arc::new(Mutex::new(tx));
         let result = self
-            .run_handlers(type_name, payload, ctx, record.replay, Arc::clone(&session))
+            .run_handlers(type_name, payload, ctx, record.replay, Arc::clone(&tx))
             .await;
-        let mut guard = session.lock().await;
+        let mut guard = tx.lock().await;
         let result = match (result, finish) {
             (Ok(()), Some(finish)) => match finish(&mut guard).await {
                 Ok(true) => Ok(()),
                 Ok(false) => {
-                    let _ = guard.abort_transaction().await;
+                    txs.abort(&mut guard).await;
                     return Ok(StageOneThen::Declined);
                 }
                 Err(e) => Err(e),
@@ -448,11 +447,11 @@ impl LocalEventDispatcher {
         };
         match result {
             Ok(()) => {
-                guard.commit_transaction().await?;
+                txs.commit(&mut guard).await?;
                 Ok(StageOneThen::Committed)
             }
             Err(e) => {
-                let _ = guard.abort_transaction().await;
+                txs.abort(&mut guard).await;
                 Err(e)
             }
         }
@@ -464,7 +463,7 @@ impl LocalEventDispatcher {
         payload: &[u8],
         ctx: &MessageContext,
         replay: bool,
-        session: Arc<Mutex<ClientSession>>,
+        tx: Arc<Mutex<Tx>>,
     ) -> Result<(), MessagingError> {
         // In a replay the handlers that disallow it are left out; the marker is still written, so
         // the record counts as handled for them too.
@@ -472,7 +471,7 @@ impl LocalEventDispatcher {
         for handler in handlers {
             let ectx = EventContext {
                 message: ctx.clone(),
-                session: Arc::clone(&session),
+                tx: Arc::clone(&tx),
             };
             let bytes = payload.to_vec();
             let task =
@@ -496,33 +495,6 @@ impl LocalEventDispatcher {
         }
         Ok(())
     }
-
-    async fn mark_processed(
-        &self,
-        session: &mut ClientSession,
-        id: &str,
-        type_name: &str,
-        position: Option<&MarkerPosition>,
-    ) -> Result<(), MarkError> {
-        let mut marker = doc! { "_id": id, "type": type_name, "processedAt": DateTime::now() };
-        if let Some(p) = position {
-            marker.insert("processor", &p.processor);
-            marker.insert("topic", &p.topic);
-            marker.insert("partition", p.partition);
-            marker.insert("offset", p.offset);
-        }
-        match self
-            .db
-            .collection::<mongodb::bson::Document>(PROCESSED_EVENTS_COLLECTION)
-            .insert_one(marker)
-            .session(&mut *session)
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(e) if is_duplicate_key(&e) => Err(MarkError::Duplicate),
-            Err(e) => Err(MarkError::Other(e.into())),
-        }
-    }
 }
 
 /// A local dispatch: no position, stage 1 asked for, not a replay.
@@ -531,7 +503,3 @@ const LOCAL: RecordDispatch<'static> = RecordDispatch {
     stage_one: true,
     replay: false,
 };
-
-fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
-    matches!(&*e.kind, ErrorKind::Write(WriteFailure::WriteError(w)) if w.code == 11000)
-}

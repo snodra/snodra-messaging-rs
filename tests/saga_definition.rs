@@ -23,15 +23,20 @@ fn order_id(e: &OrderPlaced) -> Option<String> {
     Some(e.order_id.clone())
 }
 
-/// A builder that has not touched the network (the clients connect lazily).
+/// A builder that has not touched the network (the clients connect lazily), with a MongoDB store
+/// that is never reached.
 async fn builder() -> KrakenMessagingBuilder {
-    let config = Config::new(
-        "svc",
-        "static://127.0.0.1:1",
-        "127.0.0.1:1",
-        "mongodb://127.0.0.1:1/db",
-    );
-    KrakenMessaging::builder(config).await.unwrap()
+    let config = Config::new("svc", "static://127.0.0.1:1", "127.0.0.1:1");
+    let client = mongodb::Client::with_uri_str("mongodb://127.0.0.1:1/db")
+        .await
+        .unwrap();
+    let db = client.default_database().unwrap();
+    KrakenMessaging::builder(config)
+        .await
+        .unwrap()
+        .store(std::sync::Arc::new(
+            kraken_messaging_mongo::MongoStore::new(client, db),
+        ))
 }
 
 /// The error `start()` refuses with: the checks run before indexes or connections.

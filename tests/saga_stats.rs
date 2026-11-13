@@ -235,7 +235,7 @@ async fn deadlines_fired_and_overdue_are_counted() {
     )
     .await;
     let scheduler = DeadlineScheduler::new(
-        st.store.db.clone(),
+        st.store.message_store().sagas().deadlines,
         Arc::clone(&runtime),
         st.store.clock.clock(),
         DeadlineSettings {
@@ -281,7 +281,13 @@ async fn the_pending_dispatch_and_active_saga_gauges_follow_the_stored_state() {
 
     deliver(&runtime, &placed("o4")).await; // records a command and an event
     deliver(&runtime, &placed("o5")).await;
-    st.stats.sample_once(&st.store.db).await.unwrap();
+    st.stats
+        .sample_once(
+            &*st.store.message_store().sagas().sagas,
+            &*st.store.message_store().sagas().dispatch_queue,
+        )
+        .await
+        .unwrap();
     assert_eq!(
         st.stats.gauge(SAGAS_ACTIVE, &[("type", "rt.Order")]),
         Some(2)
@@ -304,7 +310,13 @@ async fn the_pending_dispatch_and_active_saga_gauges_follow_the_stored_state() {
         )
         .await
         .unwrap();
-    st.stats.sample_once(&st.store.db).await.unwrap();
+    st.stats
+        .sample_once(
+            &*st.store.message_store().sagas().sagas,
+            &*st.store.message_store().sagas().dispatch_queue,
+        )
+        .await
+        .unwrap();
     assert_eq!(st.stats.active("rt.Order"), Some(1));
     assert_eq!(
         st.stats.dispatch_pending(),
@@ -321,7 +333,8 @@ async fn the_pending_dispatch_and_active_saga_gauges_follow_the_stored_state() {
         .unwrap();
     let cancel = tokio_util::sync::CancellationToken::new();
     let sampler = st.stats.start_sampler(
-        st.store.db.clone(),
+        st.store.message_store().sagas().sagas,
+        st.store.message_store().sagas().dispatch_queue,
         Duration::from_millis(20),
         cancel.clone(),
     );
@@ -341,13 +354,12 @@ async fn an_unhandled_command_failure_is_counted_by_command_type_and_reason() {
     let runtime = st.runtime(vec![order_saga(&st.gate)]);
     let registry = Arc::new(HandlerRegistry::new()); // nobody handles rt.DoIt
     let relay = SagaDispatchRelay::new(
-        st.store.client.clone(),
-        st.store.db.clone(),
+        st.store.message_store().tx(),
+        st.store.message_store().sagas().dispatch_queue,
         Arc::new(LocalRawCommandSender::new(Arc::clone(&registry))),
-        EventBus::new(st.store.db.clone()),
+        EventBus::over(st.store.message_store().outbox()),
         Arc::new(LocalEventDispatcher::new(
-            st.store.client.clone(),
-            st.store.db.clone(),
+            Some(st.store.message_store()),
             registry,
             runtime.clone(),
         )),
@@ -383,7 +395,7 @@ async fn adapter_calls_are_counted_by_handler_and_outcome() {
     require_docker!();
     let st = St::start().await;
     let calls = ExternalCalls::new(
-        st.store.db.clone(),
+        st.store.message_store().external_calls(),
         st.store.clock.clock(),
         ExternalCallSettings::default(),
         Arc::new(st.stats.clone()),

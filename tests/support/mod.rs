@@ -105,3 +105,47 @@ pub fn docker_available() -> bool {
 }
 
 pub mod containers;
+
+/// The MongoDB message store of the database `uri` names (a client of its own), its indexes in
+/// place: what a service built on the MongoDB add-on hands the builder.
+pub async fn mongo_store(uri: &str) -> std::sync::Arc<dyn kraken_messaging::store::MessageStore> {
+    let db = mongo_db(uri).await;
+    let store = kraken_messaging_mongo::MongoStore::new(db.client().clone(), db);
+    store
+        .ensure_indexes(&kraken_messaging_mongo::MongoIndexSettings::default())
+        .await
+        .expect("indexes");
+    std::sync::Arc::new(store)
+}
+
+/// The database `uri` names, for a test that reads what the store wrote.
+pub async fn mongo_db(uri: &str) -> mongodb::Database {
+    mongodb::Client::with_uri_str(uri)
+        .await
+        .expect("mongo client")
+        .default_database()
+        .expect("the uri names a database")
+}
+
+/// A MongoDB message store whose server is never reached (the driver connects lazily): for the
+/// checks that refuse before any store call.
+pub async fn mongo_store_unreached() -> std::sync::Arc<dyn kraken_messaging::store::MessageStore> {
+    let client =
+        mongodb::Client::with_uri_str("mongodb://127.0.0.1:1/x?serverSelectionTimeoutMS=200")
+            .await
+            .expect("mongo client");
+    let db = client.database("x");
+    std::sync::Arc::new(kraken_messaging_mongo::MongoStore::new(client, db))
+}
+
+/// The MongoDB message store of the database `uri` names, without its indexes: nothing is created
+/// in the database until the library writes there.
+pub async fn mongo_store_bare(
+    uri: &str,
+) -> std::sync::Arc<dyn kraken_messaging::store::MessageStore> {
+    let db = mongo_db(uri).await;
+    std::sync::Arc::new(kraken_messaging_mongo::MongoStore::new(
+        db.client().clone(),
+        db,
+    ))
+}

@@ -23,7 +23,9 @@ use kraken_messaging::proto::control_request::Action;
 use kraken_messaging::proto::{
     self, ControlRefusal, ControlReply, ProcessorState, ProcessorStatus, reset_target,
 };
-use kraken_messaging::{Config, Event, KrakenMessaging, MessagingError, message_type};
+use kraken_messaging::{
+    Config, Event, KrakenMessaging, KrakenMessagingBuilder, MessagingError, message_type,
+};
 use mongodb::bson::{Bson, Document, doc};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
@@ -49,8 +51,22 @@ struct Noted {
 message_type!(Noted, "c.Noted");
 impl Event for Noted {}
 
-fn config(service: &str, hub: &str, kafka: &str, mongo: &str, topic: &str) -> Config {
-    let mut c = Config::new(service, hub, kafka, mongo);
+/// The service's builder with the MongoDB message store of `mongo`.
+async fn builder(
+    service: &str,
+    hub: &str,
+    kafka: &str,
+    mongo: &str,
+    topic: &str,
+) -> KrakenMessagingBuilder {
+    KrakenMessaging::builder(config(service, hub, kafka, topic))
+        .await
+        .unwrap()
+        .store(support::mongo_store(mongo).await)
+}
+
+fn config(service: &str, hub: &str, kafka: &str, topic: &str) -> Config {
+    let mut c = Config::new(service, hub, kafka);
     c.kafka_topic = topic.to_string();
     c.consumer_max_attempts = 1;
     c.outbox_enabled = false;
@@ -345,21 +361,20 @@ async fn markers_carry_the_processor_and_the_records_position() {
     let topic = "pos.events";
     let (default, audit) = (Handler::default(), Handler::default());
     audit.fail("n-2");
-    let app = KrakenMessaging::builder(config(
+    let app = builder(
         "svc-pos",
         &hub.address(),
         &kafka.bootstrap,
         &mongo.uri_for("pos"),
         topic,
-    ))
+    )
     .await
-    .unwrap()
     .event::<Noted, _, _>(default.handle())
     .event_in::<Noted, _, _>("audit", audit.handle())
     .start()
     .await
     .unwrap();
-    let db = app.database();
+    let db = support::mongo_db(&mongo.uri_for("pos")).await;
     let p = producer(&kafka.bootstrap);
     for note in ["n-1", "n-2"] {
         produce(&p, topic, None, note).await;
@@ -412,23 +427,16 @@ async fn a_pause_holds_the_records_everywhere_and_survives_a_restart_until_the_r
     let uri = mongo.uri_for("pause");
     let handler = Handler::default();
     let start = || async {
-        KrakenMessaging::builder(config(
-            "svc-pause",
-            &hub.address(),
-            &kafka.bootstrap,
-            &uri,
-            topic,
-        ))
-        .await
-        .unwrap()
-        .event::<Noted, _, _>(handler.handle())
-        .start()
-        .await
-        .unwrap()
+        builder("svc-pause", &hub.address(), &kafka.bootstrap, &uri, topic)
+            .await
+            .event::<Noted, _, _>(handler.handle())
+            .start()
+            .await
+            .unwrap()
     };
     let app = start().await;
     assert!(app.await_hub(Duration::from_secs(30)).await);
-    let db = app.database();
+    let db = support::mongo_db(&uri).await;
     let p = producer(&kafka.bootstrap);
     produce(&p, topic, None, "n-1").await;
     eventually("n-1 handled", WITHIN, || async {
@@ -525,24 +533,17 @@ async fn a_prepare_leaves_the_group_until_the_finish_or_the_lease_expiry() {
     let uri = mongo.uri_for("lease");
     let handler = Handler::default();
     let start = || async {
-        KrakenMessaging::builder(config(
-            "svc-lease",
-            &hub.address(),
-            &kafka.bootstrap,
-            &uri,
-            topic,
-        ))
-        .await
-        .unwrap()
-        .event_in::<Noted, _, _>("audit", handler.handle())
-        .start()
-        .await
-        .unwrap()
+        builder("svc-lease", &hub.address(), &kafka.bootstrap, &uri, topic)
+            .await
+            .event_in::<Noted, _, _>("audit", handler.handle())
+            .start()
+            .await
+            .unwrap()
     };
     let group = "svc-lease.audit";
     let app = start().await;
     assert!(app.await_hub(Duration::from_secs(30)).await);
-    let db = app.database();
+    let db = support::mongo_db(&uri).await;
     let p = producer(&kafka.bootstrap);
     produce(&p, topic, None, "n-1").await;
     eventually("n-1 handled", WITHIN, || async {
@@ -688,44 +689,37 @@ async fn a_reset_to_earliest_replays_the_range_once_without_sagas_or_disallowed_
     let saga_runs = Arc::new(AtomicUsize::new(0));
     let start = || async {
         let (resets, runs) = (Arc::clone(&resets), Arc::clone(&saga_runs));
-        KrakenMessaging::builder(config(
-            "svc-replay",
-            &hub.address(),
-            &kafka.bootstrap,
-            &uri,
-            topic,
-        ))
-        .await
-        .unwrap()
-        .event::<Noted, _, _>(projection.handle())
-        .event_with::<Noted, _, _>(EventOptions::new().disallow_replay(), mailer.handle())
-        .event_in::<Noted, _, _>("audit", audit.handle())
-        .saga::<Seen>("c.Seen", move |d| {
-            d.start_on::<Noted>(
-                "note",
-                |e| Some(e.note.clone()),
-                move |s, e, _| {
-                    runs.fetch_add(1, Ordering::SeqCst);
-                    s.note = Some(e.note.clone());
+        builder("svc-replay", &hub.address(), &kafka.bootstrap, &uri, topic)
+            .await
+            .event::<Noted, _, _>(projection.handle())
+            .event_with::<Noted, _, _>(EventOptions::new().disallow_replay(), mailer.handle())
+            .event_in::<Noted, _, _>("audit", audit.handle())
+            .saga::<Seen>("c.Seen", move |d| {
+                d.start_on::<Noted>(
+                    "note",
+                    |e| Some(e.note.clone()),
+                    move |s, e, _| {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        s.note = Some(e.note.clone());
+                        Ok(())
+                    },
+                )
+            })
+            .reset_handler("default", move |ctx| {
+                let resets = Arc::clone(&resets);
+                async move {
+                    resets.lock().unwrap().push(ctx);
                     Ok(())
-                },
-            )
-        })
-        .reset_handler("default", move |ctx| {
-            let resets = Arc::clone(&resets);
-            async move {
-                resets.lock().unwrap().push(ctx);
-                Ok(())
-            }
-        })
-        .start()
-        .await
-        .unwrap()
+                }
+            })
+            .start()
+            .await
+            .unwrap()
     };
     let (first, second) = (start().await, start().await);
     assert!(first.await_hub(Duration::from_secs(30)).await);
     assert!(second.await_hub(Duration::from_secs(30)).await);
-    let db = first.database();
+    let db = support::mongo_db(&uri).await;
     let p = producer(&kafka.bootstrap);
     for (partition, note) in [(0, "n-1"), (0, "n-2"), (1, "n-3"), (1, "n-4")] {
         produce(&p, topic, Some(partition), note).await;
@@ -892,15 +886,14 @@ async fn reset_targets_and_refusals() {
         Arc::clone(&panic_reset),
         Arc::clone(&resets),
     );
-    let app = KrakenMessaging::builder(config(
+    let app = builder(
         "svc-targets",
         &hub.address(),
         &kafka.bootstrap,
         &mongo.uri_for("targets"),
         topic,
-    ))
+    )
     .await
-    .unwrap()
     .event_in::<Noted, _, _>("audit", handler.handle())
     .reset_handler("audit", move |_| {
         let (fail, panics, count) = (Arc::clone(&fail), Arc::clone(&panics), Arc::clone(&count));
@@ -919,7 +912,7 @@ async fn reset_targets_and_refusals() {
     .await
     .unwrap();
     assert!(app.await_hub(Duration::from_secs(30)).await);
-    let db = app.database();
+    let db = support::mongo_db(&mongo.uri_for("targets")).await;
     let group = "svc-targets.audit";
     let p = producer(&kafka.bootstrap);
     for note in ["n-1", "n-2"] {
@@ -1132,15 +1125,14 @@ async fn the_dead_letters_through_control_requests() {
         audit.fail(note);
     }
     default.fail("d-1");
-    let app = KrakenMessaging::builder(config(
+    let app = builder(
         "svc-dlq",
         &hub.address(),
         &kafka.bootstrap,
         &mongo.uri_for("dlq"),
         topic,
-    ))
+    )
     .await
-    .unwrap()
     .event::<Noted, _, _>(default.handle())
     .event_in::<Noted, _, _>("audit", audit.handle())
     .start()
@@ -1278,29 +1270,27 @@ async fn control_requests_never_hold_the_hub_stream_and_renewals_never_wait() {
     let release = Arc::new(tokio::sync::Notify::new());
     let entered = Arc::new(tokio::sync::Notify::new());
     let (wait, enter) = (Arc::clone(&release), Arc::clone(&entered));
-    let c = config(
+    let app = builder(
         "svc-stream",
         &hub.address(),
         &kafka.bootstrap,
         &mongo.uri_for("stream"),
         topic,
-    );
-    let app = KrakenMessaging::builder(c)
-        .await
-        .unwrap()
-        .command::<Ping, _, _>(|_, _| async { Ok(Pong { pong: true }) })
-        .event::<Noted, _, _>(handler.handle())
-        .reset_handler("default", move |_| {
-            let (wait, enter) = (Arc::clone(&wait), Arc::clone(&enter));
-            async move {
-                enter.notify_one();
-                wait.notified().await;
-                Ok(())
-            }
-        })
-        .start()
-        .await
-        .unwrap();
+    )
+    .await
+    .command::<Ping, _, _>(|_, _| async { Ok(Pong { pong: true }) })
+    .event::<Noted, _, _>(handler.handle())
+    .reset_handler("default", move |_| {
+        let (wait, enter) = (Arc::clone(&wait), Arc::clone(&enter));
+        async move {
+            enter.notify_one();
+            wait.notified().await;
+            Ok(())
+        }
+    })
+    .start()
+    .await
+    .unwrap();
     assert!(app.await_hub(Duration::from_secs(30)).await);
     let p = producer(&kafka.bootstrap);
     produce(&p, topic, None, "n-1").await;
@@ -1428,9 +1418,8 @@ async fn audit_app(
     handler: &Handler,
     once: Option<&Handler>,
 ) -> KrakenMessaging {
-    let mut builder = KrakenMessaging::builder(config(service, &hub.address(), kafka, uri, topic))
+    let mut builder = builder(service, &hub.address(), kafka, uri, topic)
         .await
-        .unwrap()
         .event_in::<Noted, _, _>("audit", handler.handle());
     if let Some(once) = once {
         builder = builder.event_with::<Noted, _, _>(
@@ -1465,7 +1454,7 @@ async fn a_late_renewal_never_takes_the_lock_again() {
         None,
     )
     .await;
-    let db = app.database();
+    let db = support::mongo_db(&uri).await;
     let group = "svc-late.audit";
     produce(&producer(&kafka.bootstrap), topic, None, "n-0").await;
     eventually("n-0 handled", WITHIN, || async {
@@ -1554,7 +1543,7 @@ async fn a_lease_renewed_before_its_clear_keeps_the_instance_prepared() {
         None,
     )
     .await;
-    let db = app.database();
+    let db = support::mongo_db(&uri).await;
     let group = "svc-renewed.audit";
     produce(&producer(&kafka.bootstrap), topic, None, "n-0").await;
     eventually("n-0 handled", WITHIN, || async {
@@ -1617,15 +1606,14 @@ async fn a_lease_lost_while_the_reset_handlers_run_stops_the_reset_before_the_ma
         .unwrap()
         .database("lost")
         .collection::<Document>("processor_control");
-    let app = KrakenMessaging::builder(config(
+    let app = builder(
         "svc-lost",
         &hub.address(),
         &kafka.bootstrap,
         &uri,
         topic,
-    ))
+    )
     .await
-    .unwrap()
     .event_in::<Noted, _, _>("audit", handler.handle())
     .reset_handler("audit", move |_| {
         let thief = thief.clone();
@@ -1646,7 +1634,7 @@ async fn a_lease_lost_while_the_reset_handlers_run_stops_the_reset_before_the_ma
     .await
     .unwrap();
     assert!(app.await_hub(Duration::from_secs(30)).await);
-    let db = app.database();
+    let db = support::mongo_db(&uri).await;
     let group = "svc-lost.audit";
     let p = producer(&kafka.bootstrap);
     for note in ["n-1", "n-2"] {
@@ -1694,7 +1682,7 @@ async fn a_letter_parked_during_a_replay_is_retried_as_a_replay() {
         Some(&once),
     )
     .await;
-    let db = app.database();
+    let db = support::mongo_db(&uri).await;
     let group = "svc-replayed.audit";
     let p = producer(&kafka.bootstrap);
     produce(&p, topic, None, "n-1").await;

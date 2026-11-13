@@ -1,5 +1,6 @@
 //! Idempotent adapter handlers (ADR 0021 rulings 12, 17, 38, 39, 41-43): a command or event
-//! handler that calls an external system, recorded in `external_calls` under its idempotency key
+//! handler that calls an external system, recorded in the message store's external calls
+//! ([`ExternalCallStore`]) under its idempotency key
 //! so a repeat of the key never reaches the external system twice. The Rust form of the Kotlin
 //! `@IdempotentHandler` and its `IdempotencyInterceptor`.
 //!
@@ -29,7 +30,7 @@
 //!    expired-lease change to `UNKNOWN` reads the record again when it matched nothing (the slow
 //!    call finished meanwhile).
 //!
-//! Every write of the record is a single-document write of its own, outside any session: a
+//! Every write of the record is a write of its own, outside any transaction: a
 //! rollback of the caller's transaction (an event handler runs inside stage 1's) never forgets a
 //! call that happened. The body itself runs where the caller runs it: an event handler's inside
 //! stage 1's transaction (ruling 43, so a slow call there holds that transaction open), a command
@@ -45,17 +46,14 @@ use std::time::Duration;
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use mongodb::bson::{Bson, DateTime, doc};
-use mongodb::options::ReturnDocument;
-use mongodb::{Collection, Database};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::codec;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
-use crate::saga::store::{EXTERNAL_CALLS_COLLECTION, ExternalCallDocument, ExternalCallStatus};
 use crate::saga::{Clock, ExternalOutcome, SagaMetrics};
+use crate::store::{ExternalCall, ExternalCallStatus, ExternalCallStore, StoreError};
 
 /// The header the saga relay puts the idempotency key (`<sagaId>:<seq>`) in.
 pub const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
@@ -158,7 +156,7 @@ enum Begin {
 /// The bookkeeping of the idempotent handlers over `external_calls`; see the module docs. One per
 /// service, shared by its idempotent handlers through an [`ExternalCallsHandle`].
 pub struct ExternalCalls {
-    calls: Collection<ExternalCallDocument>,
+    calls: Arc<dyn ExternalCallStore>,
     clock: Clock,
     settings: ExternalCallSettings,
     metrics: Arc<dyn SagaMetrics>,
@@ -168,14 +166,14 @@ pub struct ExternalCalls {
 
 impl ExternalCalls {
     pub fn new(
-        db: Database,
+        calls: Arc<dyn ExternalCallStore>,
         clock: Clock,
         settings: ExternalCallSettings,
         metrics: Arc<dyn SagaMetrics>,
     ) -> Result<Arc<ExternalCalls>, MessagingError> {
         settings.validate()?;
         Ok(Arc::new(ExternalCalls {
-            calls: db.collection(EXTERNAL_CALLS_COLLECTION),
+            calls,
             clock,
             settings,
             metrics,
@@ -272,12 +270,13 @@ impl ExternalCalls {
         Ok(result)
     }
 
-    fn now(&self) -> DateTime {
-        self.clock.now_bson()
+    fn now(&self) -> i64 {
+        self.clock.now_ms()
     }
 
-    fn lease_from_now(&self) -> DateTime {
-        DateTime::from_system_time(self.clock.now() + self.settings.lease)
+    fn lease_from_now(&self) -> i64 {
+        self.now()
+            .saturating_add(i64::try_from(self.settings.lease.as_millis()).unwrap_or(i64::MAX))
     }
 
     async fn begin(
@@ -287,7 +286,7 @@ impl ExternalCalls {
         label: &str,
     ) -> Result<Begin, MessagingError> {
         // The body has not run yet, so a store failure here is safe to retry.
-        let store_down = |e: mongodb::error::Error| {
+        let store_down = |e: StoreError| {
             self.metrics
                 .external_call(label, ExternalOutcome::Retryable);
             MessagingError::RetryableExternal(format!(
@@ -297,38 +296,33 @@ impl ExternalCalls {
         for _ in 0..MAX_BEGIN_ROUNDS {
             let now = self.now();
             let owner = uuid::Uuid::new_v4().to_string();
-            let record = ExternalCallDocument {
-                id: key.to_string(),
+            let record = ExternalCall {
+                key: key.to_string(),
                 status: ExternalCallStatus::InProgress,
                 reply: None,
                 error: None,
                 attempts: 1,
-                updated_at: now,
-                lease_until: Some(self.lease_from_now()),
+                updated_at_ms: now,
+                lease_until_ms: Some(self.lease_from_now()),
                 owner: Some(owner.clone()),
             };
-            match self.calls.insert_one(&record).await {
-                Ok(_) => return Ok(Begin::Run { attempts: 1, owner }),
-                Err(e) if crate::saga::ports::is_duplicate_key(&e) => {} // an earlier call exists
+            match self.calls.insert(&record).await {
+                Ok(true) => return Ok(Begin::Run { attempts: 1, owner }),
+                Ok(false) => {} // an earlier call exists
                 Err(e) => return Err(store_down(e)),
             }
-            let Some(existing) = self
-                .calls
-                .find_one(doc! { "_id": key })
-                .await
-                .map_err(store_down)?
-            else {
+            let Some(existing) = self.calls.find(key).await.map_err(store_down)? else {
                 continue; // reset or expired meanwhile: insert again
             };
             match existing.status {
-                ExternalCallStatus::Succeeded => return Ok(Begin::Replay(existing.reply)),
+                ExternalCallStatus::Succeeded => return Ok(Begin::Replay(existing.reply.clone())),
                 ExternalCallStatus::Failed => {
                     self.metrics.external_call(label, ExternalOutcome::Failed);
                     return Err(handler_error(label, stored_message(&existing)));
                 }
                 ExternalCallStatus::Unknown => return Err(self.unknown(key, label)),
                 ExternalCallStatus::InProgress => {
-                    let lease = existing.lease_until;
+                    let lease = existing.lease_until_ms;
                     if lease.is_some_and(|until| until > now) {
                         self.metrics
                             .external_call(label, ExternalOutcome::Retryable);
@@ -337,27 +331,10 @@ impl ExternalCalls {
                         )));
                     }
                     self.maybe_pause_before_expired_write().await;
-                    let same_record = doc! {
-                        "_id": key,
-                        "status": "IN_PROGRESS",
-                        "owner": existing.owner.map(Bson::String).unwrap_or(Bson::Null),
-                        "leaseUntil": lease.map(Bson::DateTime).unwrap_or(Bson::Null),
-                    };
                     if external_idempotent {
                         let taken = self
                             .calls
-                            .find_one_and_update(
-                                same_record,
-                                doc! {
-                                    "$set": {
-                                        "leaseUntil": self.lease_from_now(),
-                                        "updatedAt": now,
-                                        "owner": &owner,
-                                    },
-                                    "$inc": { "attempts": 1 },
-                                },
-                            )
-                            .return_document(ReturnDocument::After)
+                            .take_over(&existing, &owner, self.lease_from_now(), now)
                             .await
                             .map_err(store_down)?;
                         if let Some(taken) = taken {
@@ -366,21 +343,13 @@ impl ExternalCalls {
                                 owner,
                             });
                         }
-                    } else {
-                        let changed = self
-                            .calls
-                            .update_one(
-                                same_record,
-                                doc! {
-                                    "$set": { "status": "UNKNOWN", "updatedAt": now },
-                                    "$unset": { "leaseUntil": "", "owner": "" },
-                                },
-                            )
-                            .await
-                            .map_err(store_down)?;
-                        if changed.matched_count == 1 {
-                            return Err(self.unknown(key, label));
-                        }
+                    } else if self
+                        .calls
+                        .expire(&existing, now)
+                        .await
+                        .map_err(store_down)?
+                    {
+                        return Err(self.unknown(key, label));
                     }
                     // The record changed since it was read (the slow call finished, another call
                     // took it over or settled it): read it again.
@@ -409,15 +378,9 @@ impl ExternalCalls {
         let reply = reply?;
         let written = self
             .calls
-            .update_one(
-                owned.filter(),
-                doc! {
-                    "$set": { "status": "SUCCEEDED", "reply": reply, "updatedAt": self.now() },
-                    "$unset": { "leaseUntil": "", "owner": "", "error": "" },
-                },
-            )
+            .succeed(owned.key, owned.owner, &reply, self.now())
             .await?;
-        Ok(owned.wrote(written.matched_count, "SUCCEEDED"))
+        Ok(owned.wrote(written, "SUCCEEDED"))
     }
 
     /// The body succeeded but the record is no longer this call's (its lease ran out and another
@@ -475,17 +438,11 @@ impl ExternalCalls {
     async fn mark_unknown(&self, owned: &Owned<'_>) {
         match self
             .calls
-            .update_one(
-                owned.filter(),
-                doc! {
-                    "$set": { "status": "UNKNOWN", "updatedAt": self.now() },
-                    "$unset": { "leaseUntil": "", "owner": "" },
-                },
-            )
+            .mark_unknown(owned.key, owned.owner, self.now())
             .await
         {
             Ok(written) => {
-                owned.wrote(written.matched_count, "UNKNOWN");
+                owned.wrote(written, "UNKNOWN");
             }
             Err(e) => {
                 tracing::warn!(key = %owned.key, "could not mark the call UNKNOWN (its lease will): {e}")
@@ -500,9 +457,12 @@ impl ExternalCalls {
             MessagingError::RetryableExternal(_) => {
                 self.metrics
                     .external_call(label, ExternalOutcome::Retryable);
-                self.calls.delete_one(owned.filter()).await.map(|deleted| {
-                    owned.wrote(deleted.deleted_count, "deleted");
-                })
+                self.calls
+                    .reset(owned.key, owned.owner)
+                    .await
+                    .map(|deleted| {
+                        owned.wrote(deleted, "deleted");
+                    })
             }
             MessagingError::UnknownOutcome(_) => {
                 // The adapter cannot tell whether the partner acted: not FAILED (a redelivery would
@@ -517,16 +477,10 @@ impl ExternalCalls {
                 let error =
                     serde_json::json!({ "code": "HANDLER_ERROR", "message": message }).to_string();
                 self.calls
-                    .update_one(
-                        owned.filter(),
-                        doc! {
-                            "$set": { "status": "FAILED", "error": error, "updatedAt": self.now() },
-                            "$unset": { "leaseUntil": "", "owner": "" },
-                        },
-                    )
+                    .fail(owned.key, owned.owner, &error, self.now())
                     .await
                     .map(|written| {
-                        owned.wrote(written.matched_count, "FAILED");
+                        owned.wrote(written, "FAILED");
                     })
             }
         };
@@ -547,25 +501,21 @@ struct Owned<'a> {
 }
 
 impl Owned<'_> {
-    fn filter(&self) -> mongodb::bson::Document {
-        doc! { "_id": self.key, "status": "IN_PROGRESS", "owner": self.owner }
-    }
-
     /// Whether a write matched the owned record; when it did not, says so at warn.
-    fn wrote(&self, matched: u64, what: &str) -> bool {
-        if matched == 0 {
+    fn wrote(&self, matched: bool, what: &str) -> bool {
+        if !matched {
             tracing::warn!(
                 key = %self.key,
                 attempts = self.attempts,
                 "the call's record is no longer its own (its lease ran out and another call took it over, settled it or began it afresh): not {what}"
             );
         }
-        matched > 0
+        matched
     }
 }
 
 /// The message of a stored `FAILED` call's error.
-fn stored_message(doc: &ExternalCallDocument) -> String {
+fn stored_message(doc: &ExternalCall) -> String {
     doc.error
         .as_deref()
         .and_then(|e| serde_json::from_str::<serde_json::Value>(e).ok())
@@ -574,7 +524,7 @@ fn stored_message(doc: &ExternalCallDocument) -> String {
                 .and_then(|m| m.as_str())
                 .map(str::to_string)
         })
-        .unwrap_or_else(|| format!("The call with key '{}' failed earlier", doc.id))
+        .unwrap_or_else(|| format!("The call with key '{}' failed earlier", doc.key))
 }
 
 /// Where an idempotent handler finds the [`ExternalCalls`] it records in: registered handlers

@@ -85,12 +85,7 @@ async fn the_hub_pauses_resets_and_retries_a_processor_with_its_write_token() {
     let kafka = support::containers::kafka().await;
     let mongo = support::containers::mongo().await;
     let topic = "e2e.ctl.events";
-    let mut config = Config::new(
-        SERVICE,
-        &hub.address,
-        &kafka.bootstrap,
-        &mongo.uri_for("ctl"),
-    );
+    let mut config = Config::new(SERVICE, &hub.address, &kafka.bootstrap);
     config.kafka_topic = topic.to_string();
     config.outbox_enabled = false;
     config.consumer_max_attempts = 1;
@@ -108,6 +103,7 @@ async fn the_hub_pauses_resets_and_retries_a_processor_with_its_write_token() {
     let app = KrakenMessaging::builder(config)
         .await
         .unwrap()
+        .store(support::mongo_store(&mongo.uri_for("ctl")).await)
         .event_in::<Noted, _, _>("audit", move |e, _| {
             let (seen, failing) = (Arc::clone(&s), Arc::clone(&f));
             async move {

@@ -9,22 +9,21 @@
 //!   [`event_in`](crate::KrakenMessagingBuilder::event_in). It runs stage 1 only (no sagas).
 //!
 //! Processor control (ADR 0023, P6b): a processor is paused and resumed on every instance, and
-//! reset to a position as a leased operation (its range replayed), through its document in
-//! `processor_control` ([`control_store`]); the hub sends the requests ([`ProcessorControl`]).
+//! reset to a position as a leased operation (its range replayed), through its state in the
+//! message store ([`ProcessorControlStore`](crate::store::ProcessorControlStore)); the hub sends
+//! the requests ([`ProcessorControl`]).
 
 use crate::error::MessagingError;
 
 mod admin;
 mod control;
-pub mod control_store;
 pub mod dead_letters;
 pub mod monitor;
 pub mod reset;
 pub mod runner;
-pub mod store;
 
 pub use admin::{DEFAULT_LIST_LIMIT, DeadLetters, RetryAllResult, RetryResult};
-pub use control::{MAX_CONTROL_TEXT_BYTES, MAX_LIST_LIMIT, ProcessorControl};
+pub use control::{MAX_CONTROL_TEXT_BYTES, MAX_LIST_LIMIT, PAUSED_LOCALLY, ProcessorControl};
 pub use monitor::ProcessorMonitor;
 pub use reset::{ResetContext, ResetTarget};
 pub use runner::ProcessorRunner;

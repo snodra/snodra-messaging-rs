@@ -133,12 +133,14 @@ pub struct Config {
     /// How long a dead letter is kept (`KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS`, default 30 d, at
     /// least 1 s): the TTL index on `expireAt` removes it then, which unblocks its key.
     pub dead_letter_retention: Duration,
-    /// Must name a database: `mongodb://host:27017/<service>?replicaSet=rs0`.
-    pub mongodb_uri: String,
     pub outbox_enabled: bool,
     pub outbox_poll_interval: Duration,
     pub outbox_batch_size: usize,
     pub outbox_max_attempts: u32,
+    /// The retentions (`outbox_retention`, `idempotency_retention`, `sagas_*_retention`,
+    /// `deadlines_retention`, `external_calls_retention`) are the message store's to apply as it
+    /// can (ADR 0028: the MongoDB add-on's TTL indexes, built from this config); the core only
+    /// reads `dead_letter_retention` (a letter's expiry).
     pub outbox_retention: Duration,
     pub idempotency_retention: Duration,
     /// When set (with `issuer`), forwarded tokens are verified; otherwise read unverified.
@@ -188,12 +190,7 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn new(
-        service_name: &str,
-        hub_address: &str,
-        kafka_bootstrap: &str,
-        mongodb_uri: &str,
-    ) -> Config {
+    pub fn new(service_name: &str, hub_address: &str, kafka_bootstrap: &str) -> Config {
         Config {
             service_name: service_name.to_string(),
             instance_id: uuid::Uuid::new_v4().to_string(),
@@ -219,7 +216,6 @@ impl Config {
             consumer_max_attempts: 5,
             dead_letter_mode: DeadLetterMode::Collection,
             dead_letter_retention: Duration::from_secs(30 * 86_400),
-            mongodb_uri: mongodb_uri.to_string(),
             outbox_enabled: true,
             outbox_poll_interval: Duration::from_millis(200),
             outbox_batch_size: 100,
@@ -284,7 +280,7 @@ impl Config {
         }
     }
 
-    /// `KRAKEN_SERVICE_NAME` and `KRAKEN_MONGODB_URI` are required; `KRAKEN_HUB_ADDRESS` defaults to
+    /// `KRAKEN_SERVICE_NAME` is required; `KRAKEN_HUB_ADDRESS` defaults to
     /// `static://kraken-hub:7000`, `KRAKEN_KAFKA_BOOTSTRAP` to `kafka:19092`. Optional:
     /// `KRAKEN_INSTANCE_ID`, `KRAKEN_KAFKA_TOPIC`, `KRAKEN_JWKS_URL`, `KRAKEN_ISSUER`, `KRAKEN_HUB_REQUEST_TIMEOUT_MS`,
     /// `KRAKEN_HUB_STATUS_INTERVAL_MS`, `KRAKEN_RECONNECT_BACKOFF_MIN_MS`,
@@ -333,7 +329,6 @@ impl Config {
             &required("KRAKEN_SERVICE_NAME")?,
             &optional("KRAKEN_HUB_ADDRESS").unwrap_or_else(|| "static://kraken-hub:7000".into()),
             &optional("KRAKEN_KAFKA_BOOTSTRAP").unwrap_or_else(|| "kafka:19092".into()),
-            &required("KRAKEN_MONGODB_URI")?,
         );
         if let Some(id) = optional("KRAKEN_INSTANCE_ID") {
             c.instance_id = id;
@@ -909,14 +904,11 @@ mod tests {
     }
 
     fn try_from(vars: &[(&str, &str)]) -> Result<Config, MessagingError> {
-        let vars: Vec<(String, String)> = [
-            ("KRAKEN_SERVICE_NAME", "svc"),
-            ("KRAKEN_MONGODB_URI", "mongodb://m/db"),
-        ]
-        .iter()
-        .chain(vars)
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
+        let vars: Vec<(String, String)> = [("KRAKEN_SERVICE_NAME", "svc")]
+            .iter()
+            .chain(vars)
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         Config::from_lookup(|n| {
             vars.iter()
                 .rev()
@@ -926,7 +918,7 @@ mod tests {
     }
 
     fn code_config() -> Config {
-        Config::new("svc", "static://hub:7000", "kafka:19092", "mongodb://m/db")
+        Config::new("svc", "static://hub:7000", "kafka:19092")
     }
 
     #[test]
@@ -1004,7 +996,7 @@ mod tests {
 
     #[test]
     fn flow_control_routing_and_retry_defaults() {
-        let c = Config::new("svc", "static://hub:7000", "kafka:19092", "mongodb://m/db");
+        let c = Config::new("svc", "static://hub:7000", "kafka:19092");
         assert_eq!(c.hub_load_factor, 100);
         assert!(c.hub_tags.is_empty());
         assert!(c.hub_priorities.is_empty());
@@ -1128,10 +1120,6 @@ mod tests {
         ] {
             let vars = [
                 ("KRAKEN_SERVICE_NAME".to_string(), "svc".to_string()),
-                (
-                    "KRAKEN_MONGODB_URI".to_string(),
-                    "mongodb://m/db".to_string(),
-                ),
                 (name.to_string(), value.to_string()),
             ];
             let result =
@@ -1268,7 +1256,7 @@ mod tests {
 
     #[test]
     fn hub_defaults() {
-        let c = Config::new("svc", "static://hub:7000", "kafka:19092", "mongodb://m/db");
+        let c = Config::new("svc", "static://hub:7000", "kafka:19092");
         // No chosen timeout: the hub decides (per-type override or its default).
         assert_eq!(c.hub_request_timeout, None);
         // F2: the backoff is capped at 5 s.

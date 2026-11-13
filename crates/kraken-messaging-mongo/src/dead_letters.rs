@@ -11,20 +11,75 @@ use futures::TryStreamExt;
 use futures::future::BoxFuture;
 use kraken_messaging::store::{
     DeadLetter, DeadLetterError, DeadLetterReason, DeadLetterStore, DeadLetterSummary, Parked,
-    StoreError,
+    StoreError, Tx,
 };
 use mongodb::bson::{Binary, Bson, DateTime, Document, doc, spec::BinarySubtype};
 use mongodb::{Collection, Database};
 use serde::{Deserialize, Serialize};
 
-use crate::{OrStoreError, date, is_duplicate_key, store_error};
+use crate::{OrStoreError, date, is_duplicate_key, session, store_error};
 
 pub(crate) const DEAD_LETTERS_COLLECTION: &str = "dead_letters";
 
-/// One parked record; see the module docs.
+/// A letter's `reason`, by its Kotlin name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ReasonDocument {
+    HandlerFailed,
+    Sequenced,
+    Invalid,
+}
+
+impl From<DeadLetterReason> for ReasonDocument {
+    fn from(r: DeadLetterReason) -> Self {
+        match r {
+            DeadLetterReason::HandlerFailed => ReasonDocument::HandlerFailed,
+            DeadLetterReason::Sequenced => ReasonDocument::Sequenced,
+            DeadLetterReason::Invalid => ReasonDocument::Invalid,
+        }
+    }
+}
+
+impl From<ReasonDocument> for DeadLetterReason {
+    fn from(r: ReasonDocument) -> Self {
+        match r {
+            ReasonDocument::HandlerFailed => DeadLetterReason::HandlerFailed,
+            ReasonDocument::Sequenced => DeadLetterReason::Sequenced,
+            ReasonDocument::Invalid => DeadLetterReason::Invalid,
+        }
+    }
+}
+
+/// A letter's `error`: `{type, message}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ErrorDocument {
+    #[serde(rename = "type")]
+    type_name: String,
+    message: String,
+}
+
+impl From<&DeadLetterError> for ErrorDocument {
+    fn from(e: &DeadLetterError) -> Self {
+        ErrorDocument {
+            type_name: e.type_name.clone(),
+            message: e.message.clone(),
+        }
+    }
+}
+
+impl From<ErrorDocument> for DeadLetterError {
+    fn from(e: ErrorDocument) -> Self {
+        DeadLetterError {
+            type_name: e.type_name,
+            message: e.message,
+        }
+    }
+}
+
+/// One parked record (`dead_letters`); see the module docs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct DeadLetterDocument {
+pub struct DeadLetterDocument {
     #[serde(rename = "_id")]
     id: String,
     processor: String,
@@ -43,8 +98,8 @@ struct DeadLetterDocument {
     payload: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     payload_binary: Option<Binary>,
-    reason: DeadLetterReason,
-    error: DeadLetterError,
+    reason: ReasonDocument,
+    error: ErrorDocument,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blocked_by: Option<String>,
     attempts: i32,
@@ -85,8 +140,8 @@ impl DeadLetterDocument {
             headers: letter.headers.clone(),
             payload,
             payload_binary,
-            reason: letter.reason,
-            error: letter.error.clone(),
+            reason: letter.reason.into(),
+            error: (&letter.error).into(),
             blocked_by: letter.blocked_by.clone(),
             attempts: letter.attempts,
             parked_at: date(letter.parked_at_ms),
@@ -113,8 +168,8 @@ impl DeadLetterDocument {
             event_type: self.event_type,
             headers: self.headers,
             payload,
-            reason: self.reason,
-            error: self.error,
+            reason: self.reason.into(),
+            error: self.error.into(),
             blocked_by: self.blocked_by,
             attempts: self.attempts,
             parked_at_ms: self.parked_at.timestamp_millis(),
@@ -122,6 +177,18 @@ impl DeadLetterDocument {
             expire_at_ms: self.expire_at.timestamp_millis(),
             replay: self.replay,
         }
+    }
+}
+
+impl From<&DeadLetter> for DeadLetterDocument {
+    fn from(letter: &DeadLetter) -> Self {
+        DeadLetterDocument::from_letter(letter)
+    }
+}
+
+impl From<DeadLetterDocument> for DeadLetter {
+    fn from(doc: DeadLetterDocument) -> Self {
+        doc.into_letter()
     }
 }
 
@@ -134,7 +201,7 @@ struct SummaryDocument {
     #[serde(default)]
     key: Option<String>,
     offset: i64,
-    reason: DeadLetterReason,
+    reason: ReasonDocument,
     parked_at: DateTime,
 }
 
@@ -301,7 +368,7 @@ impl DeadLetterStore for MongoDeadLetterStore {
                     id: d.id,
                     key: d.key,
                     offset: d.offset,
-                    reason: d.reason,
+                    reason: d.reason.into(),
                     parked_at_ms: d.parked_at.timestamp_millis(),
                 })
                 .collect())
@@ -322,6 +389,23 @@ impl DeadLetterStore for MongoDeadLetterStore {
             Ok(self
                 .letters
                 .delete_one(doc! { "_id": id })
+                .await
+                .store()?
+                .deleted_count
+                == 1)
+        })
+    }
+
+    fn delete_in<'a>(
+        &'a self,
+        tx: &'a mut Tx,
+        id: &'a str,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        Box::pin(async move {
+            Ok(self
+                .letters
+                .delete_one(doc! { "_id": id })
+                .session(session(tx)?)
                 .await
                 .store()?
                 .deleted_count

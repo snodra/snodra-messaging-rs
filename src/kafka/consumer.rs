@@ -1,8 +1,8 @@
 //! Consumes `kraken.events` for one event processor's group (ADR 0022): one record at a time;
-//! the dedupe marker is inserted first, then the handlers run, all in one Mongo transaction; the
-//! offset is committed after. A record whose handlers fail on every attempt, a malformed one and,
+//! the dedupe marker is recorded first, then the handlers run, all in one transaction of the
+//! message store; the offset is committed after. A record whose handlers fail on every attempt, a malformed one and,
 //! in mode `collection`, one whose key has a parked letter go to the processor's dead letters
-//! before the offset is committed. When the dead letters cannot take it (MongoDB or the DLT
+//! before the offset is committed. When the dead letters cannot take it (the store or the DLT
 //! unreachable), the record is not committed: its partition is sought back to it and the consumer
 //! polls again, so the record comes back after a second while the poll loop keeps the group
 //! membership (and the other partitions flow).
@@ -17,7 +17,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mongodb::Database;
 use opentelemetry::Value;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{
@@ -40,12 +39,12 @@ use crate::error::MessagingError;
 use crate::hub::HandlerRegistry;
 use crate::metrics::{Consumed, Metrics, OTHER, TypeLabels};
 use crate::processors::ProcessorMonitor;
-use crate::processors::dead_letters::{
-    DeadLetterDocument, DeadLetterError, DeadLetterReason, DeadLetterRecord,
-    MAX_ERROR_MESSAGE_CHARS, cut_chars,
+use crate::processors::dead_letters::{DeadLetterRecord, park};
+use crate::store::dead_letters::cut_chars;
+use crate::store::{
+    DeadLetterError, DeadLetterReason, DeadLetterStore, MAX_ERROR_MESSAGE_CHARS, Parked,
+    ReplayRange, now_ms,
 };
-use crate::processors::store::DeadLetterStore;
-use crate::store::{Parked, ReplayRange};
 
 /// What to do with a record, decided before any database work.
 #[derive(Debug, PartialEq, Eq)]
@@ -134,8 +133,8 @@ pub struct ProcessorSettings {
     pub backoff: Duration,
     pub dead_letter_mode: DeadLetterMode,
     pub dead_letter_retention: Duration,
-    /// Where `dead_letters` lives (mode `collection`).
-    pub db: Option<Database>,
+    /// The message store's dead letters (mode `collection`).
+    pub dead_letters: Option<Arc<dyn DeadLetterStore>>,
     /// What the consumer records `kraken.events.consumed` and `kraken.event.handler.duration`
     /// on (ADR 0026).
     pub metrics: Metrics,
@@ -240,7 +239,7 @@ enum Sink {
         topic: String,
     },
     Collection {
-        store: DeadLetterStore,
+        store: Arc<dyn DeadLetterStore>,
         retention: Duration,
     },
 }
@@ -347,11 +346,11 @@ impl EventConsumer {
                 topic: format!("{}.dlt", settings.topic),
             },
             DeadLetterMode::Collection => Sink::Collection {
-                store: DeadLetterStore::new(settings.db.as_ref().ok_or_else(|| {
-                    MessagingError::Storage(
-                        "dead-letter mode collection needs the service's database".into(),
+                store: settings.dead_letters.clone().ok_or_else(|| {
+                    MessagingError::InvalidMessage(
+                        "dead-letter mode collection needs a message store: add .store(...)".into(),
                     )
-                })?),
+                })?,
                 retention: settings.dead_letter_retention,
             },
         };
@@ -927,9 +926,9 @@ impl EventConsumer {
                 let replay = self
                     .control
                     .replays(msg.topic(), msg.partition(), msg.offset());
-                let letter = DeadLetterDocument {
+                let letter = crate::store::DeadLetter {
                     replay,
-                    ..DeadLetterDocument::park(
+                    ..park(
                         DeadLetterRecord {
                             processor: self.name.clone(),
                             topic: msg.topic().to_string(),
@@ -943,7 +942,7 @@ impl EventConsumer {
                         error,
                         blocked_by,
                         attempts,
-                        mongodb::bson::DateTime::now(),
+                        now_ms(),
                         *retention,
                     )
                 };
@@ -1034,7 +1033,7 @@ impl EventConsumer {
     /// `countDocuments({processor})` at start, every [`DEAD_LETTERS_SAMPLE`] and after a park.
     async fn sample_dead_letters(
         self: Arc<Self>,
-        store: DeadLetterStore,
+        store: Arc<dyn DeadLetterStore>,
         cancel: CancellationToken,
     ) {
         loop {

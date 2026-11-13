@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use kraken_messaging::Config;
 use kraken_messaging::store::StoreError;
 use mongodb::bson::{Document, doc};
 use mongodb::options::IndexOptions;
@@ -40,6 +41,21 @@ pub struct MongoIndexSettings {
 }
 
 const DAY: Duration = Duration::from_secs(86_400);
+
+/// The retentions of the service's [`Config`] (`KRAKEN_*_RETENTION_MS`).
+impl From<&Config> for MongoIndexSettings {
+    fn from(config: &Config) -> Self {
+        MongoIndexSettings {
+            outbox_retention: config.outbox_retention,
+            idempotency_retention: config.idempotency_retention,
+            external_calls_retention: config.external_calls_retention,
+            sagas_ended_retention: config.sagas_ended_retention,
+            sagas_dispatch_retention: config.sagas_dispatch_retention,
+            sagas_failed_retention: config.sagas_failed_retention,
+            deadlines_retention: config.deadlines_retention,
+        }
+    }
+}
 
 impl Default for MongoIndexSettings {
     fn default() -> Self {

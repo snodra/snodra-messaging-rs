@@ -47,12 +47,17 @@ pub(crate) struct SubscriptionHandler {
     pub decode: QueryDecoder,
 }
 
-/// What an event handler receives: the message metadata plus the Mongo session of the transaction
-/// the consumer opened, so the handler's own writes commit together with the dedupe marker.
+/// What an event handler receives: the message metadata plus the transaction of the message
+/// store the consumer opened, so the handler's own writes commit together with the dedupe marker.
+/// The store add-on gives the handler its own handle on it (the MongoDB add-on:
+/// `ctx.tx.lock().await.session()` with `MongoTxExt`), and [`EventBus::publish_in`] appends to the
+/// outbox in it.
+///
+/// [`EventBus::publish_in`]: crate::kafka::EventBus::publish_in
 #[derive(Clone)]
 pub struct EventContext {
     pub message: MessageContext,
-    pub session: Arc<Mutex<mongodb::ClientSession>>,
+    pub tx: Arc<Mutex<crate::store::Tx>>,
 }
 
 #[derive(Default)]

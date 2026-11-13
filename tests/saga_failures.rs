@@ -9,12 +9,14 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use kraken_messaging::kafka::SagaStage;
+use kraken_messaging::saga::epoch_ms;
 use kraken_messaging::saga::ports::SagaPorts;
 use kraken_messaging::saga::store::SagaFailureDocument;
 use kraken_messaging::saga::{NoopSagaMetrics, SagaFailures, SagaRetry, SagaRuntime, SagaType};
 use kraken_messaging::store::{StoreError, Tx, TxProvider};
 use kraken_messaging::{MessageType, MessagingError, RetryPolicy};
-use mongodb::bson::{DateTime, doc};
+use kraken_messaging_mongo::documents::FailureDoc;
+use mongodb::bson::doc;
 use support::order_saga::*;
 use support::saga::{Store, event_ctx, state, t0};
 
@@ -146,10 +148,10 @@ async fn a_retry_that_fails_again_keeps_it_parked_with_attempts_increased() {
     let after = fx.failures.list(Some("rt.Flaky")).await.unwrap().remove(0);
     assert_eq!(after.attempts, 4);
     assert_eq!(
-        after.last_failed_at,
-        DateTime::from_system_time(t0() + Duration::from_secs(60))
+        after.last_failed_at_ms,
+        epoch_ms(t0() + Duration::from_secs(60))
     );
-    assert_eq!(after.first_failed_at, before.first_failed_at);
+    assert_eq!(after.first_failed_at_ms, before.first_failed_at_ms);
     assert!(after.error.contains("flaky on f2"), "{}", after.error);
     assert_eq!(fx.store.sagas("rt.Flaky").await.len(), 0);
     assert_eq!(after.payload, before.payload);
@@ -266,8 +268,8 @@ async fn retry_all_retries_every_failure_of_a_type() {
     other.saga_type = "rt.Other".into();
     fx.store
         .db
-        .collection::<SagaFailureDocument>("saga_failures")
-        .insert_one(other)
+        .collection::<FailureDoc>("saga_failures")
+        .insert_one(FailureDoc::from(&other))
         .await
         .unwrap();
     fx.broken.store(false, Ordering::SeqCst);
@@ -326,8 +328,8 @@ async fn a_failure_of_a_saga_type_this_service_does_not_have_is_refused_and_left
     gone.saga_type = "rt.Gone".into();
     fx.store
         .db
-        .collection::<SagaFailureDocument>("saga_failures")
-        .insert_one(&gone)
+        .collection::<FailureDoc>("saga_failures")
+        .insert_one(FailureDoc::from(&gone))
         .await
         .unwrap();
 

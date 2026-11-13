@@ -26,15 +26,17 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::FutureExt;
-use mongodb::bson::DateTime;
 use tokio::sync::Barrier;
 
 use super::dead_letters::letter_id;
 use super::{
-    ControlOperation, DeadLetter, DeadLetterError, DeadLetterReason, ExternalCall,
-    ExternalCallStatus, Locked, MessageStore, OutboxEntry, OutboxStore, Parked, ProcessedMarker,
-    ProcessorControlState, RESET_KIND, ReplayRange,
+    ControlOperation, DeadLetter, DeadLetterError, DeadLetterReason, DeadlineStore,
+    DispatchFailure, DispatchQueue, ExternalCall, ExternalCallStatus, Locked, MessageStore,
+    OutboxEntry, OutboxStore, Parked, ProcessedMarker, ProcessorControlState, RESET_KIND,
+    ReplayRange, StoreError,
 };
+use crate::error::MessagingError;
+use crate::saga::FailureReason;
 use crate::saga::store::{
     Association, DeadlineDocument, DeadlineStatus, DispatchKind, SagaDispatchDocument,
     SagaDocument, SagaFailureDocument,
@@ -42,6 +44,9 @@ use crate::saga::store::{
 
 /// The lease of a claim that must not run out while a check runs.
 const LONG_LEASE: Duration = Duration::from_secs(60);
+/// The longest a check waits at a barrier for the other task: a failing claim fails the check
+/// rather than hanging it.
+const BARRIER_WAIT: Duration = Duration::from_secs(30);
 
 /// Runs every check on `store`, by name; the first failing check panics naming itself and the
 /// store.
@@ -54,6 +59,8 @@ pub async fn run_store_conformance(store: Arc<dyn MessageStore>) {
     }
     run!(
         appended_entry_is_claimed_in_created_seq_order,
+        outbox_rejects_a_payload_that_is_not_a_json_object,
+        pending_counts_entries_neither_sent_nor_failed,
         rolled_back_transaction_leaves_no_outbox_entry,
         rolled_back_handler_leaves_no_processed_marker,
         processed_marker_records_once,
@@ -63,12 +70,15 @@ pub async fn run_store_conformance(store: Arc<dyn MessageStore>) {
         purge_removes_only_sent_before,
         dead_letters_sequence_per_key,
         dead_letter_parked_inside_rolled_back_transaction_is_kept,
+        dead_letter_deleted_in_a_transaction_goes_with_it,
         control_lock_is_exclusive_until_lease_expires,
         pause_state_round_trips,
         replay_ranges_round_trip,
         processor_control_write_inside_rolled_back_transaction_is_kept,
         external_call_idempotency_returns_first_result,
         saga_ports_round_trip,
+        due_deadline_is_claimed_once_until_its_lease_passes,
+        dispatch_queue_hands_out_each_saga_in_seq_order,
     );
 }
 
@@ -162,6 +172,92 @@ pub async fn appended_entry_is_claimed_in_created_seq_order(store: &dyn MessageS
             .is_empty(),
         "a sent entry is never claimed"
     );
+}
+
+/// An outbox payload is a JSON object: anything else (not JSON, an array, a bare value) is
+/// refused with `InvalidMessage`, appended on its own or in a transaction, and nothing is
+/// appended.
+pub async fn outbox_rejects_a_payload_that_is_not_a_json_object(store: &dyn MessageStore) {
+    let outbox = store.outbox();
+    drain(&*outbox).await;
+    for payload in [&b"not json"[..], b"[1,2]", b"\"text\"", b"null"] {
+        let shown = String::from_utf8_lossy(payload).into_owned();
+        let bad = OutboxEntry {
+            payload: payload.to_vec(),
+            ..entry("conformance.Invalid", now_ms(), 0)
+        };
+        let refused = outbox.append_now(bad.clone()).await;
+        assert!(
+            matches!(
+                &refused,
+                Err(StoreError::Failed(MessagingError::InvalidMessage(_)))
+            ),
+            "{shown} on its own: {refused:?}"
+        );
+        let mut tx = store.tx().begin().await.expect("begin");
+        let refused = outbox.append(&mut tx, bad).await;
+        store.tx().abort(&mut tx).await;
+        assert!(
+            matches!(
+                &refused,
+                Err(StoreError::Failed(MessagingError::InvalidMessage(_)))
+            ),
+            "{shown} in a transaction: {refused:?}"
+        );
+    }
+    let claimed = outbox
+        .claim("relay-a", LONG_LEASE, 100)
+        .await
+        .expect("claim");
+    assert!(claimed.is_empty(), "nothing appended: {:?}", ids(&claimed));
+}
+
+/// `pending` counts the entries neither sent nor failed, held by a relay or not.
+pub async fn pending_counts_entries_neither_sent_nor_failed(store: &dyn MessageStore) {
+    let outbox = store.outbox();
+    drain(&*outbox).await;
+    assert_eq!(outbox.pending().await.expect("pending"), 0, "drained");
+    let now = now_ms();
+    let (e1, e2, e3) = (
+        entry("conformance.Pending", now, 1),
+        entry("conformance.Pending", now, 2),
+        entry("conformance.Pending", now, 3),
+    );
+    for e in [&e1, &e2, &e3] {
+        outbox.append_now(e.clone()).await.expect("append_now");
+    }
+    assert_eq!(outbox.pending().await.expect("pending"), 3);
+    let held = outbox.claim("relay-a", LONG_LEASE, 3).await.expect("claim");
+    assert_eq!(held.len(), 3);
+    assert_eq!(
+        outbox.pending().await.expect("pending"),
+        3,
+        "held is pending"
+    );
+    outbox
+        .mark_sent(std::slice::from_ref(&e1.id))
+        .await
+        .expect("mark_sent");
+    assert_eq!(outbox.pending().await.expect("pending"), 2, "sent is not");
+    outbox
+        .mark_failed(&e2.id, "conformance: rejected")
+        .await
+        .expect("mark_failed");
+    assert_eq!(outbox.pending().await.expect("pending"), 1, "failed is not");
+    outbox
+        .mark_attempt_failed(&e3.id, "conformance: retry")
+        .await
+        .expect("mark_attempt_failed");
+    assert_eq!(
+        outbox.pending().await.expect("pending"),
+        1,
+        "retried still is"
+    );
+    outbox
+        .mark_sent(std::slice::from_ref(&e3.id))
+        .await
+        .expect("mark_sent");
+    assert_eq!(outbox.pending().await.expect("pending"), 0);
 }
 
 /// An entry appended in a transaction that is rolled back never reaches the relay; one appended
@@ -397,7 +493,8 @@ pub async fn delete_markers_removes_only_the_range(store: &dyn MessageStore) {
 }
 
 /// Two relays claiming one outbox at the same time (started together, on a multi-thread
-/// runtime): every entry is claimed by exactly one of them, and each claims some.
+/// runtime): every entry is claimed by exactly one of them, and each claims some while the other
+/// holds its first batch (a barrier after both first claims, before any entry is marked sent).
 pub async fn concurrent_relays_publish_each_entry_once(store: &dyn MessageStore) {
     const ENTRIES: usize = 200;
     assert_eq!(
@@ -415,14 +512,26 @@ pub async fn concurrent_relays_publish_each_entry_once(store: &dyn MessageStore)
         outbox.append_now(e).await.expect("append_now");
     }
     let start = Arc::new(Barrier::new(2));
+    let claimed = Arc::new(Barrier::new(2));
     let relay = |owner: &'static str| {
         let outbox = Arc::clone(&outbox);
-        let start = Arc::clone(&start);
+        let (start, claimed) = (Arc::clone(&start), Arc::clone(&claimed));
         tokio::spawn(async move {
             let mut published = Vec::new();
-            start.wait().await; // both relays start claiming together
+            // Both relays start claiming together.
+            tokio::time::timeout(BARRIER_WAIT, start.wait())
+                .await
+                .expect("the other relay never started");
+            let mut first = true;
             loop {
                 let batch = outbox.claim(owner, LONG_LEASE, 7).await.expect("claim");
+                if std::mem::take(&mut first) {
+                    // Both first claims are made before either relay marks anything sent: each
+                    // claimed while the other held its batch.
+                    tokio::time::timeout(BARRIER_WAIT, claimed.wait())
+                        .await
+                        .expect("the other relay never made its first claim");
+                }
                 if batch.is_empty() {
                     return published;
                 }
@@ -844,6 +953,57 @@ pub async fn dead_letter_parked_inside_rolled_back_transaction_is_kept(store: &d
         "a retry's failure is recorded on its own too"
     );
     letters.delete(&parked.id).await.expect("delete");
+}
+
+/// A retry deletes its letter in the record's transaction: a rollback keeps the letter, a commit
+/// removes it.
+pub async fn dead_letter_deleted_in_a_transaction_goes_with_it(store: &dyn MessageStore) {
+    let letters = store.dead_letters();
+    let processor = format!("conformance-{}", uuid::Uuid::new_v4());
+    let parked = letter(
+        &processor,
+        0,
+        7,
+        Some("k1"),
+        DeadLetterReason::HandlerFailed,
+        now_ms(),
+    );
+    assert_eq!(letters.park(&parked).await.expect("park"), Parked::New);
+    let mut tx = store.tx().begin().await.expect("begin");
+    assert!(
+        letters
+            .delete_in(&mut tx, &parked.id)
+            .await
+            .expect("delete_in")
+    );
+    store.tx().abort(&mut tx).await;
+    assert_eq!(
+        letters.get(&parked.id).await.expect("get"),
+        Some(parked.clone()),
+        "rolled back: the letter stays"
+    );
+    let mut tx = store.tx().begin().await.expect("begin");
+    assert!(
+        letters
+            .delete_in(&mut tx, &parked.id)
+            .await
+            .expect("delete_in")
+    );
+    store.tx().commit(&mut tx).await.expect("commit");
+    assert_eq!(
+        letters.get(&parked.id).await.expect("get"),
+        None,
+        "committed: gone"
+    );
+    let mut tx = store.tx().begin().await.expect("begin");
+    assert!(
+        !letters
+            .delete_in(&mut tx, &parked.id)
+            .await
+            .expect("delete_in"),
+        "no letter to delete"
+    );
+    store.tx().abort(&mut tx).await;
 }
 
 // ---- processor control -------------------------------------------------------------------------
@@ -1407,7 +1567,7 @@ pub async fn external_call_idempotency_returns_first_result(store: &dyn MessageS
 pub async fn saga_ports_round_trip(store: &dyn MessageStore) {
     let sagas = store.sagas();
     let txs = store.tx();
-    let now = DateTime::from_millis(now_ms());
+    let now = now_ms();
     let type_name = format!("conformance.Saga{}", uuid::Uuid::new_v4().simple());
     let saga = SagaDocument {
         id: uuid::Uuid::new_v4().to_string(),
@@ -1416,10 +1576,10 @@ pub async fn saga_ports_round_trip(store: &dyn MessageStore) {
         associations: vec![Association::new("orderId", "o-1")],
         start_key: Some(format!("{type_name}|orderId=o-1")),
         ended: false,
-        ended_at: None,
+        ended_at_ms: None,
         version: 0,
-        created_at: now,
-        updated_at: now,
+        created_at_ms: now,
+        updated_at_ms: now,
     };
     let mut tx = txs.begin().await.expect("begin");
     sagas.sagas.insert(&mut tx, &saga).await.expect("insert");
@@ -1463,6 +1623,16 @@ pub async fn saga_ports_round_trip(store: &dyn MessageStore) {
             .expect("update")
     );
     txs.commit(&mut tx).await.expect("commit");
+    assert_eq!(
+        sagas
+            .sagas
+            .count_live()
+            .await
+            .expect("count_live")
+            .get(&type_name),
+        Some(&1),
+        "one live instance of the type"
+    );
     let mut tx = txs.begin().await.expect("begin");
     assert!(
         !sagas
@@ -1518,16 +1688,7 @@ pub async fn saga_ports_round_trip(store: &dyn MessageStore) {
         payload: "{\"amount\":42}".into(),
         headers: HashMap::from([("correlation-id".to_string(), "c-1".to_string())]),
         routing_key: Some("o-1".into()),
-        created_at: now,
-        dispatched_at: None,
-        attempts: 0,
-        next_attempt_at: None,
-        failed_at: None,
-        failure_reason: None,
-        failure_message: None,
-        notice_pending: None,
-        notice_attempts: None,
-        notice_next_at: None,
+        ..dispatch_entry(&saga.id, 1000, DispatchKind::Command, now)
     };
     let deadline = |name: &str| DeadlineDocument {
         id: uuid::Uuid::new_v4().to_string(),
@@ -1536,11 +1697,11 @@ pub async fn saga_ports_round_trip(store: &dyn MessageStore) {
         name: name.to_string(),
         payload: Some("{\"why\":\"timeout\"}".into()),
         payload_type: Some("conformance.Timeout".into()),
-        due_at: DateTime::from_millis(now.timestamp_millis() + 60_000),
+        due_at_ms: now + 60_000,
         status: DeadlineStatus::Scheduled,
         claimed_by: None,
-        claimed_until: None,
-        finished_at: None,
+        claimed_until_ms: None,
+        finished_at_ms: None,
         correlation_id: Some("c-1".into()),
     };
     let fired = deadline("fired");
@@ -1562,8 +1723,17 @@ pub async fn saga_ports_round_trip(store: &dyn MessageStore) {
         sagas.deadlines.insert(&mut tx, d).await.expect("insert");
     }
     txs.commit(&mut tx).await.expect("commit");
+    assert_eq!(
+        sagas
+            .dispatch_queue
+            .first_pending(&saga.id)
+            .await
+            .expect("first_pending"),
+        Some(dispatch.clone()),
+        "the recorded entry reads back"
+    );
 
-    let later = DateTime::from_millis(now.timestamp_millis() + 1_000);
+    let later = now + 1_000;
     let mut tx = txs.begin().await.expect("begin");
     assert_eq!(
         sagas
@@ -1636,8 +1806,8 @@ pub async fn saga_ports_round_trip(store: &dyn MessageStore) {
         headers: HashMap::from([("correlationId".to_string(), "c-1".to_string())]),
         error: "boom".into(),
         attempts: 3,
-        first_failed_at: now,
-        last_failed_at: now,
+        first_failed_at_ms: now,
+        last_failed_at_ms: now,
     };
     let mut tx = txs.begin().await.expect("begin");
     sagas.failures.save(&mut tx, &failure).await.expect("save");
@@ -1665,7 +1835,11 @@ pub async fn saga_ports_round_trip(store: &dyn MessageStore) {
         .expect("find")
         .expect("failure");
     assert_eq!(
-        (again.attempts, again.error.as_str(), again.last_failed_at),
+        (
+            again.attempts,
+            again.error.as_str(),
+            again.last_failed_at_ms
+        ),
         (5, "boom again", later)
     );
     assert_eq!(
@@ -1739,6 +1913,448 @@ pub async fn saga_ports_round_trip(store: &dyn MessageStore) {
         "a marker inserts once: {duplicate:?}"
     );
     txs.abort(&mut tx).await;
+
+    // An ended instance is no longer live (it keeps its end time).
+    let ended = SagaDocument {
+        ended: true,
+        ended_at_ms: Some(later),
+        version: 2,
+        updated_at_ms: later,
+        ..updated.clone()
+    };
+    let mut tx = txs.begin().await.expect("begin");
+    assert!(
+        sagas
+            .sagas
+            .update(&mut tx, &ended, 1)
+            .await
+            .expect("update")
+    );
+    txs.commit(&mut tx).await.expect("commit");
+    let mut tx = txs.plain().await.expect("plain");
+    assert_eq!(
+        sagas
+            .sagas
+            .find_by_id(&mut tx, &saga.id)
+            .await
+            .expect("find"),
+        Some(ended)
+    );
+    assert_eq!(
+        sagas
+            .sagas
+            .count_live()
+            .await
+            .expect("count_live")
+            .get(&type_name),
+        None,
+        "no live instance of the type"
+    );
+    let mut tx = txs.begin().await.expect("begin");
+    sagas
+        .dispatch_queue
+        .mark_dispatched(&mut tx, &dispatch.id, later)
+        .await
+        .expect("mark_dispatched");
+    txs.commit(&mut tx).await.expect("commit");
+}
+
+/// The deadline scheduler's port: the due deadline is claimed by one scheduler at a time, the
+/// earliest first, until its claim passes; one not yet due, fired or cancelled never is. The
+/// overdue count counts the due SCHEDULED deadlines per name, claimed or not. Times are the
+/// caller's.
+pub async fn due_deadline_is_claimed_once_until_its_lease_passes(store: &dyn MessageStore) {
+    let sagas = store.sagas();
+    let txs = store.tx();
+    let now = now_ms();
+    let saga_id = uuid::Uuid::new_v4().to_string();
+    let first_name = format!("first-{}", uuid::Uuid::new_v4().simple());
+    let second_name = format!("second-{}", uuid::Uuid::new_v4().simple());
+    let deadline = |name: &str, due_at_ms: i64| DeadlineDocument {
+        id: uuid::Uuid::new_v4().to_string(),
+        saga_type: "conformance.Deadlines".into(),
+        saga_id: saga_id.clone(),
+        name: name.to_string(),
+        payload: None,
+        payload_type: None,
+        due_at_ms,
+        status: DeadlineStatus::Scheduled,
+        claimed_by: None,
+        claimed_until_ms: None,
+        finished_at_ms: None,
+        correlation_id: None,
+    };
+    let first = deadline(&first_name, now - 2_000);
+    let second = deadline(&second_name, now - 1_000);
+    let later = deadline(&first_name, now + 60_000);
+    let mut tx = txs.begin().await.expect("begin");
+    for d in [&second, &later, &first] {
+        sagas.deadlines.insert(&mut tx, d).await.expect("insert");
+    }
+    txs.commit(&mut tx).await.expect("commit");
+    let overdue = sagas
+        .deadlines
+        .count_overdue(now)
+        .await
+        .expect("count_overdue");
+    assert_eq!(
+        (overdue.get(&first_name), overdue.get(&second_name)),
+        (Some(&1), Some(&1)),
+        "one due deadline of each name (the later one is not due)"
+    );
+
+    let until = now + 30_000;
+    let deadlines = &*sagas.deadlines;
+    let a = claim_mine(deadlines, "scheduler-a", now, until, &saga_id).await;
+    assert_eq!(
+        a,
+        Some(DeadlineDocument {
+            claimed_by: Some("scheduler-a".into()),
+            claimed_until_ms: Some(until),
+            ..first.clone()
+        }),
+        "the earliest due deadline, claimed"
+    );
+    let b = claim_mine(deadlines, "scheduler-b", now, until, &saga_id).await;
+    assert_eq!(b.map(|d| d.id), Some(second.id.clone()), "the next one");
+    assert_eq!(
+        claim_mine(deadlines, "scheduler-a", now, until, &saga_id).await,
+        None,
+        "both due deadlines are held, the later one is not due"
+    );
+    let overdue = sagas
+        .deadlines
+        .count_overdue(now)
+        .await
+        .expect("count_overdue");
+    assert_eq!(
+        (overdue.get(&first_name), overdue.get(&second_name)),
+        (Some(&1), Some(&1)),
+        "claimed deadlines are still overdue"
+    );
+
+    // Past the claims, another scheduler takes them again, the earliest first.
+    let past = until + 1;
+    let again = claim_mine(deadlines, "scheduler-b", past, past + 30_000, &saga_id).await;
+    assert_eq!(
+        again.map(|d| d.id),
+        Some(first.id.clone()),
+        "a passed claim is claimed again"
+    );
+    let mut tx = txs.begin().await.expect("begin");
+    assert!(
+        sagas
+            .deadlines
+            .mark_fired(&mut tx, &first.id, past)
+            .await
+            .expect("mark_fired")
+    );
+    sagas
+        .deadlines
+        .cancel(&mut tx, &saga_id, &second.id, past)
+        .await
+        .expect("cancel");
+    txs.commit(&mut tx).await.expect("commit");
+    let far = now + 3_600_000;
+    assert_eq!(
+        claim_mine(deadlines, "scheduler-a", far, far + 30_000, &saga_id)
+            .await
+            .map(|d| d.id),
+        Some(later.id.clone()),
+        "a fired or cancelled deadline is never claimed; the later one is, once due"
+    );
+    let overdue = sagas
+        .deadlines
+        .count_overdue(far)
+        .await
+        .expect("count_overdue");
+    assert_eq!(
+        (overdue.get(&first_name), overdue.get(&second_name)),
+        (Some(&1), None),
+        "only the later one is still SCHEDULED"
+    );
+    let mut tx = txs.begin().await.expect("begin");
+    sagas
+        .deadlines
+        .cancel_all(&mut tx, &saga_id, far)
+        .await
+        .expect("cancel_all");
+    txs.commit(&mut tx).await.expect("commit");
+}
+
+/// The dispatch relay's port: a saga's pending entries come in `seq` order, the sagas whose first
+/// pending entry is due oldest first; a saga's lease is held by one relay until it passes; an
+/// entry dispatched in a rolled-back transaction stays pending; a retried entry waits for its next
+/// attempt; a failed one carries its outcome and its failure notice, which is claimed by one
+/// relay at a time until it is cleared. Every write reads back.
+pub async fn dispatch_queue_hands_out_each_saga_in_seq_order(store: &dyn MessageStore) {
+    let sagas = store.sagas();
+    let queue = &*sagas.dispatch_queue;
+    let txs = store.tx();
+    let now = now_ms();
+    let pending_before = queue.pending().await.expect("pending");
+    let older = uuid::Uuid::new_v4().to_string();
+    let newer = uuid::Uuid::new_v4().to_string();
+    let command = SagaDispatchDocument {
+        routing_key: Some("o-1".into()),
+        ..dispatch_entry(&newer, 1000, DispatchKind::Command, now - 1_000)
+    };
+    let event = dispatch_entry(&newer, 1001, DispatchKind::Event, now - 1_000);
+    let old = dispatch_entry(&older, 0, DispatchKind::Event, now - 5_000);
+    let mut tx = txs.begin().await.expect("begin");
+    sagas
+        .dispatch
+        .record(&mut tx, &[event.clone(), command.clone()])
+        .await
+        .expect("record");
+    sagas
+        .dispatch
+        .record(&mut tx, std::slice::from_ref(&old))
+        .await
+        .expect("record");
+    txs.commit(&mut tx).await.expect("commit");
+    assert_eq!(queue.pending().await.expect("pending"), pending_before + 3);
+
+    let due = queue.due_sagas(now, &[], 10_000).await.expect("due_sagas");
+    let at = |id: &str| due.iter().position(|s| s == id);
+    assert!(
+        matches!((at(&older), at(&newer)), (Some(o), Some(n)) if o < n),
+        "both sagas are due, the older work first: {due:?}"
+    );
+    assert!(
+        !queue
+            .due_sagas(now, std::slice::from_ref(&older), 10_000)
+            .await
+            .expect("due_sagas")
+            .contains(&older),
+        "a saga in flight is left out"
+    );
+    assert_eq!(
+        queue.first_pending(&newer).await.expect("first_pending"),
+        Some(command.clone()),
+        "the lowest seq first, as recorded"
+    );
+
+    // The saga's lease.
+    let lease = now + 60_000;
+    assert!(
+        queue
+            .claim_lease(&newer, "relay-a", now, lease)
+            .await
+            .expect("claim_lease")
+    );
+    assert!(
+        !queue
+            .claim_lease(&newer, "relay-b", now, lease)
+            .await
+            .expect("claim_lease"),
+        "held by relay-a"
+    );
+    assert!(
+        !queue
+            .renew_lease(&newer, "relay-b", lease)
+            .await
+            .expect("renew_lease"),
+        "only the holder renews"
+    );
+    assert!(
+        queue
+            .renew_lease(&newer, "relay-a", now + 120_000)
+            .await
+            .expect("renew_lease")
+    );
+    assert!(
+        !queue
+            .claim_lease(&newer, "relay-b", now + 61_000, now + 121_000)
+            .await
+            .expect("claim_lease"),
+        "the renewed lease still runs"
+    );
+    queue
+        .release_lease(&newer, "relay-b")
+        .await
+        .expect("release_lease");
+    assert!(
+        !queue
+            .claim_lease(&newer, "relay-b", now, lease)
+            .await
+            .expect("claim_lease"),
+        "only the holder releases"
+    );
+    queue
+        .release_lease(&newer, "relay-a")
+        .await
+        .expect("release_lease");
+    assert!(
+        queue
+            .claim_lease(&newer, "relay-b", now, lease)
+            .await
+            .expect("claim_lease"),
+        "a released lease is free"
+    );
+    queue
+        .release_lease(&newer, "relay-b")
+        .await
+        .expect("release_lease");
+    assert!(
+        queue
+            .claim_lease(&older, "relay-a", now, now + 1_000)
+            .await
+            .expect("claim_lease")
+    );
+    assert!(
+        queue
+            .claim_lease(&older, "relay-b", now + 2_000, now + 5_000)
+            .await
+            .expect("claim_lease"),
+        "a passed lease is free"
+    );
+    queue
+        .release_lease(&older, "relay-b")
+        .await
+        .expect("release_lease");
+
+    // Dispatched: in a transaction, rolled back or committed.
+    let mut tx = txs.begin().await.expect("begin");
+    queue
+        .mark_dispatched(&mut tx, &command.id, now)
+        .await
+        .expect("mark_dispatched");
+    txs.abort(&mut tx).await;
+    assert_eq!(
+        queue.first_pending(&newer).await.expect("first_pending"),
+        Some(command.clone()),
+        "rolled back: still pending"
+    );
+    let mut tx = txs.begin().await.expect("begin");
+    queue
+        .mark_dispatched(&mut tx, &command.id, now)
+        .await
+        .expect("mark_dispatched");
+    txs.commit(&mut tx).await.expect("commit");
+    assert_eq!(
+        queue.first_pending(&newer).await.expect("first_pending"),
+        Some(event.clone()),
+        "the next entry of the saga"
+    );
+
+    // A retry later: the saga waits until then.
+    queue
+        .retry_later(&event.id, 1, now + 60_000)
+        .await
+        .expect("retry_later");
+    assert_eq!(
+        queue.first_pending(&newer).await.expect("first_pending"),
+        Some(SagaDispatchDocument {
+            attempts: 1,
+            next_attempt_at_ms: Some(now + 60_000),
+            ..event.clone()
+        })
+    );
+    assert!(
+        !queue
+            .due_sagas(now, &[], 10_000)
+            .await
+            .expect("due_sagas")
+            .contains(&newer),
+        "not due before its next attempt"
+    );
+    assert!(
+        queue
+            .due_sagas(now + 60_000, &[], 10_000)
+            .await
+            .expect("due_sagas")
+            .contains(&newer),
+        "due at its next attempt"
+    );
+
+    // Given up, with a notice due at now + 30 s.
+    let failure = DispatchFailure {
+        attempts: Some(2),
+        reason: FailureReason::Exhausted,
+        message: "gave up".into(),
+        failed_at_ms: now,
+        notice_at_ms: Some(now + 30_000),
+    };
+    queue.fail(&event.id, &failure).await.expect("fail");
+    assert_eq!(
+        queue.first_pending(&newer).await.expect("first_pending"),
+        None
+    );
+    assert_eq!(
+        claim_notice(queue, now, now + 90_000, &event.id).await,
+        None,
+        "the notice is not due yet"
+    );
+    let failed = SagaDispatchDocument {
+        attempts: 2,
+        next_attempt_at_ms: Some(now + 60_000),
+        failed_at_ms: Some(now),
+        failure_reason: Some(FailureReason::Exhausted),
+        failure_message: Some("gave up".into()),
+        notice_pending: Some(true),
+        notice_attempts: Some(0),
+        notice_next_at_ms: Some(now + 90_000),
+        ..event.clone()
+    };
+    assert_eq!(
+        claim_notice(queue, now + 30_000, now + 90_000, &event.id).await,
+        Some(failed.clone()),
+        "the due notice, reserved until now + 90 s"
+    );
+    assert_eq!(
+        claim_notice(queue, now + 30_000, now + 90_000, &event.id).await,
+        None,
+        "a reserved notice is claimed once"
+    );
+    queue
+        .notice_failed(&event.id, 1, now + 100_000)
+        .await
+        .expect("notice_failed");
+    assert_eq!(
+        claim_notice(queue, now + 100_000, now + 160_000, &event.id).await,
+        Some(SagaDispatchDocument {
+            notice_attempts: Some(1),
+            notice_next_at_ms: Some(now + 160_000),
+            ..failed.clone()
+        }),
+        "a failed delivery is tried again at its next time"
+    );
+    queue.clear_notice(&event.id).await.expect("clear_notice");
+    assert_eq!(
+        claim_notice(queue, now + 3_600_000, now + 3_660_000, &event.id).await,
+        None,
+        "a cleared notice is never claimed"
+    );
+
+    // An event given up on has no notice.
+    queue
+        .fail(
+            &old.id,
+            &DispatchFailure {
+                attempts: None,
+                reason: FailureReason::Invalid,
+                message: "not a JSON object".into(),
+                failed_at_ms: now,
+                notice_at_ms: None,
+            },
+        )
+        .await
+        .expect("fail");
+    assert_eq!(
+        queue.first_pending(&older).await.expect("first_pending"),
+        None
+    );
+    assert_eq!(
+        claim_notice(queue, now + 3_600_000, now + 3_660_000, &old.id).await,
+        None,
+        "no notice for an event"
+    );
+    assert_eq!(
+        queue.pending().await.expect("pending"),
+        pending_before,
+        "neither dispatched nor failed: none left"
+    );
 }
 
 // ---- helpers -----------------------------------------------------------------------------------
@@ -1746,6 +2362,78 @@ pub async fn saga_ports_round_trip(store: &dyn MessageStore) {
 const TOPIC: &str = "kraken.events";
 /// `paused_by` of a pause made on the instance itself.
 const PAUSED_BY_LOCAL: &str = "local";
+
+/// [`DeadlineStore::claim_due`] until it hands out a deadline of `saga_id` (another check's
+/// deadlines it claims on the way are left claimed) or nothing.
+async fn claim_mine(
+    deadlines: &dyn DeadlineStore,
+    owner: &str,
+    now_ms: i64,
+    until_ms: i64,
+    saga_id: &str,
+) -> Option<DeadlineDocument> {
+    loop {
+        match deadlines
+            .claim_due(owner, now_ms, until_ms)
+            .await
+            .expect("claim_due")
+        {
+            Some(d) if d.saga_id == saga_id => return Some(d),
+            Some(_) => continue,
+            None => return None,
+        }
+    }
+}
+
+/// [`DispatchQueue::claim_due_notice`] until it hands out the notice of `id` (another's it claims
+/// on the way stay reserved) or nothing.
+async fn claim_notice(
+    queue: &dyn DispatchQueue,
+    now_ms: i64,
+    reserve_until_ms: i64,
+    id: &str,
+) -> Option<SagaDispatchDocument> {
+    loop {
+        match queue
+            .claim_due_notice(now_ms, reserve_until_ms)
+            .await
+            .expect("claim_due_notice")
+        {
+            Some(e) if e.id == id => return Some(e),
+            Some(_) => continue,
+            None => return None,
+        }
+    }
+}
+
+/// A pending entry of `saga_id` with `seq`, recorded at `created_at_ms`.
+fn dispatch_entry(
+    saga_id: &str,
+    seq: i64,
+    kind: DispatchKind,
+    created_at_ms: i64,
+) -> SagaDispatchDocument {
+    SagaDispatchDocument {
+        id: format!("{saga_id}:{seq}"),
+        saga_id: saga_id.to_string(),
+        seq,
+        kind,
+        type_name: "conformance.Dispatched".into(),
+        payload: "{\"amount\":42}".into(),
+        headers: HashMap::from([("correlation-id".to_string(), "c-1".to_string())]),
+        routing_key: None,
+        created_at_ms,
+        dispatched_at_ms: None,
+        attempts: 0,
+        next_attempt_at_ms: None,
+        failed_at_ms: None,
+        failure_reason: None,
+        failure_message: None,
+        notice_pending: None,
+        notice_attempts: None,
+        notice_next_at_ms: None,
+    }
+}
 
 fn now_ms() -> i64 {
     SystemTime::now()

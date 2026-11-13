@@ -1,5 +1,7 @@
-//! The storage contract of ADR 0021 for sagas (S2): the documents of `sagas`, `saga_dispatch`,
-//! `saga_dispatch_leases`, `deadlines`, `saga_failures` and `external_calls`, and their indexes.
+//! The storage contract of ADR 0021 for sagas (S2) in the MongoDB message store: the documents of
+//! `sagas`, `saga_dispatch`, `saga_dispatch_leases`, `deadlines`, `saga_failures` and
+//! `external_calls` (`kraken_messaging_mongo::documents`, read back into the core's records), and
+//! their indexes.
 //! The fixtures in `tests/fixtures/saga_contract` are written by hand from the ADR's table, in the
 //! shape Spring Data writes them (`_class` included); Rust writes no `_class` and no nulls.
 
@@ -8,12 +10,16 @@ mod support;
 use std::time::Duration;
 
 use futures::TryStreamExt;
+use kraken_messaging::saga::FailureReason;
 use kraken_messaging::saga::store::{
-    Association, DeadlineDocument, DeadlineStatus, DispatchKind, ExternalCallDocument,
-    ExternalCallStatus, SagaDispatchDocument, SagaDispatchLeaseDocument, SagaDocument,
-    SagaFailureDocument,
+    Association, DeadlineDocument, DeadlineStatus, DispatchKind, SagaDispatchDocument,
+    SagaDocument, SagaFailureDocument,
 };
-use kraken_messaging::saga::{FailureReason, ensure_external_call_indexes, ensure_saga_indexes};
+use kraken_messaging::store::{ExternalCall, ExternalCallStatus};
+use kraken_messaging_mongo::documents::{
+    DeadlineDoc, DispatchDoc, ExternalCallDocument, FailureDoc, LeaseDoc, SagaDoc,
+};
+use kraken_messaging_mongo::{MongoIndexSettings, MongoStore};
 use mongodb::bson::{Bson, DateTime, Document, doc};
 use mongodb::{Database, IndexModel};
 use serde::Serialize;
@@ -46,13 +52,21 @@ fn read<T: DeserializeOwned>(name: &str) -> T {
     mongodb::bson::from_document(fixture(name)).unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 
-fn at(rfc3339: &str) -> DateTime {
-    DateTime::parse_rfc3339_str(rfc3339).unwrap()
+/// Epoch milliseconds.
+fn at(rfc3339: &str) -> i64 {
+    DateTime::parse_rfc3339_str(rfc3339)
+        .unwrap()
+        .timestamp_millis()
+}
+
+/// A fixture read as the store reads it: its document, then the core's record.
+fn record<D: DeserializeOwned, T: From<D>>(name: &str) -> T {
+    T::from(read::<D>(name))
 }
 
 #[test]
 fn a_kotlin_shaped_document_of_each_collection_deserialises() {
-    let saga: SagaDocument = read("sagas");
+    let saga: SagaDocument = record::<SagaDoc, _>("sagas");
     assert_eq!(saga.id, "7f6c1f0e-5a53-4f3e-9a0a-1d2f6f0c9b11");
     assert_eq!(saga.type_name, "PaymentSaga");
     // The state is JSON text, kept exactly (a decimal's scale, a key with a dot).
@@ -68,17 +82,17 @@ fn a_kotlin_shaped_document_of_each_collection_deserialises() {
         ]
     );
     assert_eq!(saga.start_key.as_deref(), Some("PaymentSaga|orderId=o-1"));
-    assert!(!saga.ended && saga.ended_at.is_none());
+    assert!(!saga.ended && saga.ended_at_ms.is_none());
     assert_eq!(saga.version, 3);
-    assert_eq!(saga.created_at, at("2026-11-03T10:00:00Z"));
-    assert_eq!(saga.updated_at, at("2026-11-03T10:05:00.250Z"));
+    assert_eq!(saga.created_at_ms, at("2026-11-03T10:00:00Z"));
+    assert_eq!(saga.updated_at_ms, at("2026-11-03T10:05:00.250Z"));
 
-    let ended: SagaDocument = read("sagas_ended");
+    let ended: SagaDocument = record::<SagaDoc, _>("sagas_ended");
     assert!(ended.ended && ended.start_key.is_none() && ended.associations.is_empty());
-    assert_eq!(ended.ended_at, Some(at("2026-11-03T11:00:00Z")));
+    assert_eq!(ended.ended_at_ms, Some(at("2026-11-03T11:00:00Z")));
     assert_eq!(ended.version, 0);
 
-    let dispatch: SagaDispatchDocument = read("saga_dispatch");
+    let dispatch: SagaDispatchDocument = record::<DispatchDoc, _>("saga_dispatch");
     assert_eq!(dispatch.id, "7f6c1f0e-5a53-4f3e-9a0a-1d2f6f0c9b11:3001");
     assert_eq!(dispatch.saga_id, saga.id);
     assert_eq!(dispatch.seq, 3001);
@@ -88,9 +102,12 @@ fn a_kotlin_shaped_document_of_each_collection_deserialises() {
     assert_eq!(dispatch.headers["correlation-id"], "corr-1");
     assert_eq!(dispatch.routing_key.as_deref(), Some("j-1"));
     assert_eq!(dispatch.attempts, 10);
-    assert!(dispatch.dispatched_at.is_none());
-    assert_eq!(dispatch.next_attempt_at, Some(at("2026-11-03T10:06:00Z")));
-    assert_eq!(dispatch.failed_at, Some(at("2026-11-03T10:06:01Z")));
+    assert!(dispatch.dispatched_at_ms.is_none());
+    assert_eq!(
+        dispatch.next_attempt_at_ms,
+        Some(at("2026-11-03T10:06:00Z"))
+    );
+    assert_eq!(dispatch.failed_at_ms, Some(at("2026-11-03T10:06:01Z")));
     assert_eq!(dispatch.failure_reason, Some(FailureReason::UnknownOutcome));
     assert_eq!(
         dispatch.failure_message.as_deref(),
@@ -98,32 +115,32 @@ fn a_kotlin_shaped_document_of_each_collection_deserialises() {
     );
     assert_eq!(dispatch.notice_pending, Some(true));
     assert_eq!(dispatch.notice_attempts, Some(2));
-    assert_eq!(dispatch.notice_next_at, Some(at("2026-11-03T10:06:30Z")));
+    assert_eq!(dispatch.notice_next_at_ms, Some(at("2026-11-03T10:06:30Z")));
 
-    let pending: SagaDispatchDocument = read("saga_dispatch_pending");
+    let pending: SagaDispatchDocument = record::<DispatchDoc, _>("saga_dispatch_pending");
     assert_eq!(pending.kind, DispatchKind::Event);
-    assert!(pending.routing_key.is_none() && pending.failed_at.is_none());
+    assert!(pending.routing_key.is_none() && pending.failed_at_ms.is_none());
     assert!(pending.failure_reason.is_none() && pending.notice_pending.is_none());
 
-    let lease: SagaDispatchLeaseDocument = read("saga_dispatch_leases");
+    let lease: LeaseDoc = read("saga_dispatch_leases");
     assert_eq!(lease.id, saga.id);
     assert_eq!(lease.owner, "relay-instance-1");
-    assert_eq!(lease.until, at("2026-11-03T10:06:30Z"));
+    assert_eq!(lease.until.timestamp_millis(), at("2026-11-03T10:06:30Z"));
 
-    let deadline: DeadlineDocument = read("deadlines");
+    let deadline: DeadlineDocument = record::<DeadlineDoc, _>("deadlines");
     assert_eq!(deadline.saga_type, "PaymentSaga");
     assert_eq!(deadline.saga_id, saga.id);
     assert_eq!(deadline.name, "charge-timeout");
     assert_eq!(deadline.payload.as_deref(), Some(r#"{"attempt":2}"#));
     assert_eq!(deadline.payload_type.as_deref(), Some("io.example.Retry"));
-    assert_eq!(deadline.due_at, at("2026-11-03T10:35:00Z"));
+    assert_eq!(deadline.due_at_ms, at("2026-11-03T10:35:00Z"));
     assert_eq!(deadline.status, DeadlineStatus::Fired);
     assert_eq!(deadline.claimed_by.as_deref(), Some("scheduler-instance-1"));
-    assert_eq!(deadline.claimed_until, Some(at("2026-11-03T10:35:30Z")));
-    assert_eq!(deadline.finished_at, Some(at("2026-11-03T10:35:01Z")));
+    assert_eq!(deadline.claimed_until_ms, Some(at("2026-11-03T10:35:30Z")));
+    assert_eq!(deadline.finished_at_ms, Some(at("2026-11-03T10:35:01Z")));
     assert_eq!(deadline.correlation_id.as_deref(), Some("corr-1"));
 
-    let failure: SagaFailureDocument = read("saga_failures");
+    let failure: SagaFailureDocument = record::<FailureDoc, _>("saga_failures");
     assert_eq!(failure.id, "PaymentSaga:evt-9");
     assert_eq!(
         (failure.saga_type.as_str(), failure.event_id.as_str()),
@@ -133,10 +150,10 @@ fn a_kotlin_shaped_document_of_each_collection_deserialises() {
     assert_eq!(failure.payload, r#"{"orderId":"o-9"}"#);
     assert_eq!(failure.headers["userId"], "u-1");
     assert_eq!(failure.attempts, 2);
-    assert_eq!(failure.first_failed_at, at("2026-11-03T10:10:00Z"));
-    assert_eq!(failure.last_failed_at, at("2026-11-03T10:10:00.100Z"));
+    assert_eq!(failure.first_failed_at_ms, at("2026-11-03T10:10:00Z"));
+    assert_eq!(failure.last_failed_at_ms, at("2026-11-03T10:10:00.100Z"));
 
-    let call: ExternalCallDocument = read("external_calls");
+    let call: ExternalCall = record::<ExternalCallDocument, _>("external_calls");
     assert_eq!(call.status, ExternalCallStatus::InProgress);
     assert_eq!(call.reply.as_deref(), Some(r#"{"printed":true}"#));
     assert_eq!(
@@ -144,8 +161,8 @@ fn a_kotlin_shaped_document_of_each_collection_deserialises() {
         Some(r#"{"code":"HANDLER_ERROR","message":"no paper"}"#)
     );
     assert_eq!(call.attempts, 1);
-    assert_eq!(call.updated_at, at("2026-11-03T10:05:01Z"));
-    assert_eq!(call.lease_until, Some(at("2026-11-03T10:10:01Z")));
+    assert_eq!(call.updated_at_ms, at("2026-11-03T10:05:01Z"));
+    assert_eq!(call.lease_until_ms, Some(at("2026-11-03T10:10:01Z")));
     assert_eq!(
         call.owner.as_deref(),
         Some("0b9e2c7a-3d41-4f7e-8c55-6a1f2e9d4b70")
@@ -190,9 +207,9 @@ fn to_doc<T: Serialize>(value: &T) -> Document {
 #[test]
 fn a_document_rust_writes_has_exactly_the_contracts_field_names_and_bson_types_and_no_nulls() {
     // Full: every optional field set, from the Kotlin fixtures (which also proves the round trip).
-    let saga: SagaDocument = read("sagas");
-    let ended: SagaDocument = read("sagas_ended");
-    let written = to_doc(&saga);
+    let saga: SagaDocument = record::<SagaDoc, _>("sagas");
+    let ended: SagaDocument = record::<SagaDoc, _>("sagas_ended");
+    let written = to_doc(&SagaDoc::from(&saga));
     assert_shape(
         &written,
         &[
@@ -212,7 +229,7 @@ fn a_document_rust_writes_has_exactly_the_contracts_field_names_and_bson_types_a
         .unwrap();
     assert_shape(association, &[("k", "string"), ("v", "string")]);
     assert_shape(
-        &to_doc(&ended),
+        &to_doc(&SagaDoc::from(&ended)),
         &[
             ("_id", "string"),
             ("type", "string"),
@@ -226,7 +243,9 @@ fn a_document_rust_writes_has_exactly_the_contracts_field_names_and_bson_types_a
         ],
     );
 
-    let dispatch: SagaDispatchDocument = read("saga_dispatch");
+    let dispatch = DispatchDoc::from(&record::<DispatchDoc, SagaDispatchDocument>(
+        "saga_dispatch",
+    ));
     assert_shape(
         &to_doc(&dispatch),
         &[
@@ -254,7 +273,9 @@ fn a_document_rust_writes_has_exactly_the_contracts_field_names_and_bson_types_a
         to_doc(&dispatch).get_str("failureReason"),
         Ok("UNKNOWN_OUTCOME")
     );
-    let pending: SagaDispatchDocument = read("saga_dispatch_pending");
+    let pending = DispatchDoc::from(&record::<DispatchDoc, SagaDispatchDocument>(
+        "saga_dispatch_pending",
+    ));
     assert_shape(
         &to_doc(&pending),
         &[
@@ -271,13 +292,13 @@ fn a_document_rust_writes_has_exactly_the_contracts_field_names_and_bson_types_a
     );
     assert_eq!(to_doc(&pending).get_str("kind"), Ok("EVENT"));
 
-    let lease: SagaDispatchLeaseDocument = read("saga_dispatch_leases");
+    let lease: LeaseDoc = read("saga_dispatch_leases");
     assert_shape(
         &to_doc(&lease),
         &[("_id", "string"), ("owner", "string"), ("until", "date")],
     );
 
-    let deadline: DeadlineDocument = read("deadlines");
+    let deadline = DeadlineDoc::from(&record::<DeadlineDoc, DeadlineDocument>("deadlines"));
     assert_shape(
         &to_doc(&deadline),
         &[
@@ -303,13 +324,14 @@ fn a_document_rust_writes_has_exactly_the_contracts_field_names_and_bson_types_a
         name: "timeout".into(),
         payload: None,
         payload_type: None,
-        due_at: at("2026-11-03T12:00:00Z"),
+        due_at_ms: at("2026-11-03T12:00:00Z"),
         status: DeadlineStatus::Scheduled,
         claimed_by: None,
-        claimed_until: None,
-        finished_at: None,
+        claimed_until_ms: None,
+        finished_at_ms: None,
         correlation_id: None,
     };
+    let scheduled = DeadlineDoc::from(&scheduled);
     assert_shape(
         &to_doc(&scheduled),
         &[
@@ -323,7 +345,7 @@ fn a_document_rust_writes_has_exactly_the_contracts_field_names_and_bson_types_a
     );
     assert_eq!(to_doc(&scheduled).get_str("status"), Ok("SCHEDULED"));
 
-    let failure: SagaFailureDocument = read("saga_failures");
+    let failure = FailureDoc::from(&record::<FailureDoc, SagaFailureDocument>("saga_failures"));
     assert_shape(
         &to_doc(&failure),
         &[
@@ -340,7 +362,9 @@ fn a_document_rust_writes_has_exactly_the_contracts_field_names_and_bson_types_a
         ],
     );
 
-    let call: ExternalCallDocument = read("external_calls");
+    let call = ExternalCallDocument::from(&record::<ExternalCallDocument, ExternalCall>(
+        "external_calls",
+    ));
     assert_shape(
         &to_doc(&call),
         &[
@@ -355,16 +379,16 @@ fn a_document_rust_writes_has_exactly_the_contracts_field_names_and_bson_types_a
         ],
     );
     assert_eq!(to_doc(&call).get_str("status"), Ok("IN_PROGRESS"));
-    let started = ExternalCallDocument {
-        id: "k-1".into(),
+    let started = ExternalCallDocument::from(&ExternalCall {
+        key: "k-1".into(),
         status: ExternalCallStatus::Unknown,
         reply: None,
         error: None,
         attempts: 1,
-        updated_at: at("2026-11-03T12:00:00Z"),
-        lease_until: None,
+        updated_at_ms: at("2026-11-03T12:00:00Z"),
+        lease_until_ms: None,
         owner: None,
-    };
+    });
     assert_shape(
         &to_doc(&started),
         &[
@@ -386,11 +410,12 @@ async fn db(uri: &str) -> Database {
 
 const DAY: Duration = Duration::from_secs(86_400);
 
+/// Every index of the store (the saga and external-call ones among them), default retentions.
 async fn ensure_all(db: &Database) {
-    ensure_saga_indexes(db, 30 * DAY, 7 * DAY, 7 * DAY, 30 * DAY)
+    MongoStore::new(db.client().clone(), db.clone())
+        .ensure_indexes(&MongoIndexSettings::default())
         .await
         .unwrap();
-    ensure_external_call_indexes(db, 30 * DAY).await.unwrap();
 }
 
 async fn indexes(db: &Database, collection: &str) -> Vec<IndexModel> {
@@ -543,10 +568,10 @@ fn saga(id: &str, start_key: Option<&str>, ended: bool) -> SagaDocument {
         associations: vec![],
         start_key: start_key.map(str::to_string),
         ended,
-        ended_at: ended.then_some(now),
+        ended_at_ms: ended.then_some(now),
         version: 0,
-        created_at: now,
-        updated_at: now,
+        created_at_ms: now,
+        updated_at_ms: now,
     }
 }
 
@@ -561,22 +586,23 @@ async fn two_live_instances_with_one_start_key_are_refused() {
     let mongo = support::containers::mongo().await;
     let db = db(&mongo.uri).await;
     ensure_all(&db).await;
-    let sagas = db.collection::<SagaDocument>("sagas");
+    let sagas = db.collection::<SagaDoc>("sagas");
     let key = Some("PaymentSaga|orderId=o-1");
+    let doc = |id, key, ended| SagaDoc::from(&saga(id, key, ended));
 
     // Ended instances do not hold the key.
-    sagas.insert_one(saga("s-1", key, true)).await.unwrap();
-    sagas.insert_one(saga("s-2", key, true)).await.unwrap();
-    sagas.insert_one(saga("s-3", key, false)).await.unwrap();
+    sagas.insert_one(doc("s-1", key, true)).await.unwrap();
+    sagas.insert_one(doc("s-2", key, true)).await.unwrap();
+    sagas.insert_one(doc("s-3", key, false)).await.unwrap();
 
-    let refused = sagas.insert_one(saga("s-4", key, false)).await.unwrap_err();
+    let refused = sagas.insert_one(doc("s-4", key, false)).await.unwrap_err();
     assert!(is_duplicate_key(&refused), "{refused:?}");
 
     // forceNew instances carry no start key: any number may be live; other keys are independent.
-    sagas.insert_one(saga("s-5", None, false)).await.unwrap();
-    sagas.insert_one(saga("s-6", None, false)).await.unwrap();
+    sagas.insert_one(doc("s-5", None, false)).await.unwrap();
+    sagas.insert_one(doc("s-6", None, false)).await.unwrap();
     sagas
-        .insert_one(saga("s-7", Some("PaymentSaga|orderId=o-2"), false))
+        .insert_one(doc("s-7", Some("PaymentSaga|orderId=o-2"), false))
         .await
         .unwrap();
     // Ending the live one frees the key.
@@ -584,7 +610,7 @@ async fn two_live_instances_with_one_start_key_are_refused() {
         .update_one(doc! { "_id": "s-3" }, doc! { "$set": { "ended": true } })
         .await
         .unwrap();
-    sagas.insert_one(saga("s-8", key, false)).await.unwrap();
+    sagas.insert_one(doc("s-8", key, false)).await.unwrap();
 }
 
 #[tokio::test]
@@ -596,19 +622,21 @@ async fn kotlin_shaped_documents_are_read_back_through_the_driver_and_rewritten_
     let raw = db.collection::<Document>("sagas");
     raw.insert_one(fixture("sagas")).await.unwrap();
 
-    let typed = db.collection::<SagaDocument>("sagas");
-    let mut saga = typed
-        .find_one(doc! { "_id": "7f6c1f0e-5a53-4f3e-9a0a-1d2f6f0c9b11" })
-        .await
-        .unwrap()
-        .expect("the Kotlin document");
+    let typed = db.collection::<SagaDoc>("sagas");
+    let mut saga = SagaDocument::from(
+        typed
+            .find_one(doc! { "_id": "7f6c1f0e-5a53-4f3e-9a0a-1d2f6f0c9b11" })
+            .await
+            .unwrap()
+            .expect("the Kotlin document"),
+    );
     assert_eq!(saga.version, 3);
     assert_eq!(saga.associations.len(), 2);
 
     // Rust replaces it: its own shape, no `_class`, state text untouched.
     saga.version += 1;
     typed
-        .replace_one(doc! { "_id": &saga.id }, &saga)
+        .replace_one(doc! { "_id": &saga.id }, SagaDoc::from(&saga))
         .await
         .unwrap();
     let stored = raw

@@ -8,13 +8,14 @@ use std::time::Duration;
 use futures::TryStreamExt;
 use futures::future::BoxFuture;
 use kraken_messaging::error::MessagingError;
+use kraken_messaging::saga::Clock;
 use kraken_messaging::store::{OutboxEntry, OutboxStore, StoreError, Tx};
 use mongodb::bson::{Bson, DateTime, Document, doc};
 use mongodb::options::ReturnDocument;
 use mongodb::{Collection, Database};
 use serde::{Deserialize, Serialize};
 
-use crate::{OrStoreError, date, now, session};
+use crate::{OrStoreError, date, session};
 
 pub(crate) const OUTBOX_COLLECTION: &str = "outbox";
 
@@ -102,13 +103,20 @@ fn payload_document(type_name: &str, payload: &[u8]) -> Result<Document, StoreEr
 
 pub(crate) struct MongoOutboxStore {
     docs: Collection<OutboxDocument>,
+    /// What stamps `sentAt`, `failedAt` and the leases: the application's clock.
+    clock: Clock,
 }
 
 impl MongoOutboxStore {
-    pub(crate) fn new(db: &Database) -> MongoOutboxStore {
+    pub(crate) fn new(db: &Database, clock: Clock) -> MongoOutboxStore {
         MongoOutboxStore {
             docs: db.collection(OUTBOX_COLLECTION),
+            clock,
         }
+    }
+
+    fn now(&self) -> DateTime {
+        date(self.clock.now_ms())
     }
 
     /// Neither sent nor given up on (a missing field is null).
@@ -165,7 +173,7 @@ impl OutboxStore for MongoOutboxStore {
         Box::pin(async move {
             let mut won: Vec<OutboxDocument> = Vec::new();
             while won.len() < limit {
-                let at = now();
+                let at = self.now();
                 let won_ids: Vec<&str> = won.iter().map(|d| d.id.as_str()).collect();
                 let mut filter = Self::unfinished();
                 filter.extend(Self::claimable_by(owner, at));
@@ -184,7 +192,7 @@ impl OutboxStore for MongoOutboxStore {
                     break;
                 }
                 for candidate in candidates {
-                    let at = now();
+                    let at = self.now();
                     let lease_ms = i64::try_from(lease.as_millis()).unwrap_or(i64::MAX);
                     let until = date(at.timestamp_millis().saturating_add(lease_ms));
                     let mut filter = Self::unfinished();
@@ -215,7 +223,7 @@ impl OutboxStore for MongoOutboxStore {
             self.docs
                 .update_many(
                     doc! { "_id": { "$in": ids.to_vec() } },
-                    doc! { "$set": { "sentAt": now() } },
+                    doc! { "$set": { "sentAt": self.now() } },
                 )
                 .await
                 .store()?;
@@ -246,7 +254,7 @@ impl OutboxStore for MongoOutboxStore {
             self.docs
                 .update_one(
                     doc! { "_id": id },
-                    doc! { "$inc": { "attempts": 1 }, "$set": { "failedAt": now() } },
+                    doc! { "$inc": { "attempts": 1 }, "$set": { "failedAt": self.now() } },
                 )
                 .await
                 .store()?;
@@ -263,5 +271,92 @@ impl OutboxStore for MongoOutboxStore {
                 .store()?
                 .deleted_count)
         })
+    }
+
+    fn pending(&self) -> BoxFuture<'_, Result<u64, StoreError>> {
+        Box::pin(async move { self.docs.count_documents(Self::unfinished()).await.store() })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refusal(payload: &[u8]) -> String {
+        match payload_document("t.Happened", payload) {
+            Err(StoreError::Failed(MessagingError::InvalidMessage(why))) => why,
+            other => panic!("expected InvalidMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_payload_that_is_not_json_is_invalid() {
+        let why = refusal(b"{not json");
+        assert!(
+            why.starts_with("the payload of event t.Happened is not JSON"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn a_payload_that_is_not_an_object_is_invalid() {
+        for payload in [&b"[1,2]"[..], b"null", b"\"text\"", b"42"] {
+            let why = refusal(payload);
+            assert!(why.contains("is not a JSON object"), "{why}");
+        }
+    }
+
+    #[test]
+    fn a_number_bson_cannot_hold_is_invalid() {
+        let why = refusal(format!("{{\"n\":{}}}", u64::MAX).as_bytes());
+        assert!(
+            why.starts_with("the payload of event t.Happened cannot be an outbox document"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn an_entry_is_written_in_the_kotlin_shape() {
+        let entry = OutboxEntry {
+            id: "e-1".into(),
+            type_name: "t.Happened".into(),
+            key: Some("k1".into()),
+            headers: HashMap::from([("userId".to_string(), String::new())]),
+            payload: br#"{"id":"e-1"}"#.to_vec(),
+            created_at_ms: 1_762_250_000_000,
+            seq: 42,
+            attempts: 0,
+        };
+        let doc = mongodb::bson::to_document(&OutboxDocument::from_entry(entry).unwrap()).unwrap();
+        let mut keys: Vec<&str> = doc.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "_id",
+                "attempts",
+                "createdAt",
+                "failedAt",
+                "headers",
+                "key",
+                "payload",
+                "sentAt",
+                "seq",
+                "type"
+            ],
+            "no owner nor lease until a relay claims it"
+        );
+        assert!(matches!(doc.get("createdAt"), Some(Bson::DateTime(_))));
+        assert_eq!(doc.get_document("payload").unwrap(), &doc! { "id": "e-1" });
+        assert_eq!(doc.get_i64("seq"), Ok(42));
+        assert_eq!(doc.get_i32("attempts"), Ok(0));
+        assert_eq!(doc.get("sentAt"), Some(&Bson::Null));
+        assert_eq!(doc.get("failedAt"), Some(&Bson::Null));
+    }
+
+    #[test]
+    fn a_json_object_becomes_a_document() {
+        let doc = payload_document("t.Happened", br#"{"n":1,"s":"x"}"#).expect("a document");
+        assert_eq!(doc, doc! { "n": 1_i64, "s": "x" });
     }
 }

@@ -4,9 +4,8 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::kafka::{RecordDisposition, classify, headers, new_outbox_document};
+use kraken_messaging::kafka::{RecordDisposition, classify, headers, new_outbox_entry};
 use kraken_messaging::{Event, Identity, MessageContext, message_type};
-use mongodb::bson::Bson;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -25,47 +24,44 @@ fn event() -> Happened {
 }
 
 #[test]
-fn document_matches_kotlin_shape() {
-    let doc = new_outbox_document(&event(), Some("k1"), None, 42).unwrap();
-    let bson = mongodb::bson::to_document(&doc).unwrap();
-    let mut keys: Vec<&str> = bson.keys().map(String::as_str).collect();
-    keys.sort();
-    assert_eq!(
-        keys,
-        vec![
-            "_id",
-            "attempts",
-            "createdAt",
-            "failedAt",
-            "headers",
-            "key",
-            "payload",
-            "sentAt",
-            "seq",
-            "type"
-        ]
-    );
+fn entry_matches_kotlin_shape() {
+    let before = kraken_messaging::store::now_ms();
+    let entry = new_outbox_entry(&event(), Some("k1"), None, 42).unwrap();
+    assert_eq!(entry.type_name, "t.Happened");
+    assert_eq!(entry.key.as_deref(), Some("k1"));
+    assert_eq!(entry.seq, 42);
+    assert_eq!(entry.attempts, 0);
+    assert!(entry.created_at_ms >= before);
+    let payload: serde_json::Value = serde_json::from_slice(&entry.payload).unwrap();
     assert!(
-        matches!(bson.get("createdAt"), Some(Bson::DateTime(_))),
-        "createdAt is a BSON date"
+        payload["id"] == "e-1" && payload["at"].is_string(),
+        "the event as a JSON object: {payload}"
     );
-    assert!(
-        matches!(bson.get("payload"), Some(Bson::Document(p)) if p.get_str("id") == Ok("e-1") && p.get_str("at").is_ok())
-    );
-    assert_eq!(bson.get_str("type").unwrap(), "t.Happened");
-    assert_eq!(bson.get_str("key").unwrap(), "k1");
-    assert_eq!(bson.get_i64("seq").unwrap(), 42);
-    assert_eq!(bson.get_i32("attempts").unwrap(), 0);
-    assert_eq!(bson.get("sentAt"), Some(&Bson::Null));
-    assert_eq!(bson.get("failedAt"), Some(&Bson::Null));
-    let headers = bson.get_document("headers").unwrap();
     assert_eq!(
-        headers.get_str("userId").unwrap(),
-        "",
+        entry.headers.get("userId").map(String::as_str),
+        Some(""),
         "anonymous publisher writes an empty userId like Kotlin"
     );
-    assert!(!headers.get_str("correlationId").unwrap().is_empty());
-    assert!(uuid::Uuid::parse_str(bson.get_str("_id").unwrap()).is_ok());
+    assert!(!entry.headers["correlationId"].is_empty());
+    assert!(uuid::Uuid::parse_str(&entry.id).is_ok());
+}
+
+#[test]
+fn an_event_that_is_not_a_json_object_is_invalid() {
+    #[derive(Serialize)]
+    struct Unit;
+    message_type!(Unit, "t.Unit");
+    impl Event for Unit {}
+    impl<'de> Deserialize<'de> for Unit {
+        fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+            Ok(Unit)
+        }
+    }
+    let e = new_outbox_entry(&Unit, None, None, 1).unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "the payload of event t.Unit is null, not a JSON object, so it cannot be an outbox entry"
+    );
 }
 
 #[test]
@@ -80,7 +76,7 @@ fn document_takes_correlation_and_user_from_context() {
         headers: HashMap::from([("traceparent".to_string(), "00-abc-def-01".to_string())]),
         ..Default::default()
     };
-    let doc = new_outbox_document(&event(), None, Some(&ctx), 1).unwrap();
+    let doc = new_outbox_entry(&event(), None, Some(&ctx), 1).unwrap();
     assert_eq!(doc.headers.get("correlationId").unwrap(), "c-7");
     assert_eq!(doc.headers.get("userId").unwrap(), "u-7");
     assert_eq!(doc.headers.get("traceparent").unwrap(), "00-abc-def-01");

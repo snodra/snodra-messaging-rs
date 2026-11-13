@@ -25,7 +25,8 @@ pub use control::{
     ControlOperation, Locked, ProcessorControlState, ProcessorControlStore, RESET_KIND, ReplayRange,
 };
 pub use dead_letters::{
-    DeadLetter, DeadLetterError, DeadLetterReason, DeadLetterStore, DeadLetterSummary, Parked,
+    DeadLetter, DeadLetterError, DeadLetterReason, DeadLetterStore, DeadLetterSummary,
+    MAX_ERROR_MESSAGE_CHARS, Parked, letter_id,
 };
 pub use external::{ExternalCall, ExternalCallStatus, ExternalCallStore};
 pub use outbox::{OutboxEntry, OutboxStore};
@@ -33,10 +34,20 @@ pub use processed::{ProcessedEventStore, ProcessedMarker};
 pub use tx::{Tx, TxProvider};
 
 pub use crate::saga::ports::{
-    DeadlineStore, DispatchRecorder, FailureStore, MarkerStore, SagaPorts, SagaRepository,
+    DeadlineStore, DispatchFailure, DispatchQueue, DispatchRecorder, FailureStore, MarkerStore,
+    SagaPorts, SagaRepository,
 };
 
 use crate::error::MessagingError;
+
+/// The system clock as epoch milliseconds: the times the core hands the stores where no
+/// injected [`Clock`](crate::saga::Clock) applies.
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
 
 /// What a store operation or a transaction fails with.
 #[derive(Debug)]
@@ -73,6 +84,12 @@ impl std::fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
+impl From<StoreError> for MessagingError {
+    fn from(e: StoreError) -> Self {
+        e.into_messaging()
+    }
+}
+
 impl From<MessagingError> for StoreError {
     fn from(e: MessagingError) -> Self {
         StoreError::Failed(e)
@@ -86,11 +103,13 @@ impl From<serde_json::Error> for StoreError {
 }
 
 /// The saga ports (ADR 0021) a store provides; their transaction is the store's
-/// [`MessageStore::tx`].
+/// [`MessageStore::tx`]. `dispatch_queue` is the dispatch relay's side of what `dispatch`
+/// records.
 #[derive(Clone)]
 pub struct SagaStores {
     pub sagas: Arc<dyn SagaRepository>,
     pub dispatch: Arc<dyn DispatchRecorder>,
+    pub dispatch_queue: Arc<dyn DispatchQueue>,
     pub deadlines: Arc<dyn DeadlineStore>,
     pub failures: Arc<dyn FailureStore>,
     pub markers: Arc<dyn MarkerStore>,

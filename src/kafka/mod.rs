@@ -1,10 +1,9 @@
-//! Events on Kafka (`kraken.events`) with the Mongo outbox and the idempotent consumer, byte- and
-//! document-compatible with the Kotlin starter (`OutboxEventBus`, `OutboxPublisher`, `EventConsumer`).
+//! Events on Kafka (`kraken.events`) with the message store's outbox and the idempotent consumer,
+//! byte-compatible with the Kotlin starter (`OutboxEventBus`, `OutboxPublisher`, `EventConsumer`).
 
 mod consumer;
 pub mod dispatch;
 pub mod headers;
-mod indexes;
 mod outbox;
 mod publisher;
 
@@ -14,11 +13,8 @@ pub use consumer::{
     classify, classify_with,
 };
 pub use dispatch::{LocalEventDispatcher, NoSagas, SagaStage};
-pub use indexes::ensure_indexes;
-pub(crate) use outbox::payload_document;
-pub use outbox::{EventBus, OutboxDocument, new_outbox_document};
+pub(crate) use outbox::check_payload;
+pub use outbox::{EventBus, new_outbox_entry};
 pub use publisher::OutboxPublisher;
 
 pub const EVENTS_TOPIC: &str = "kraken.events";
-pub const OUTBOX_COLLECTION: &str = "outbox";
-pub const PROCESSED_EVENTS_COLLECTION: &str = "processed_events";

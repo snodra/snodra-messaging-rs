@@ -17,7 +17,11 @@ pub struct OutboxEntry {
     pub type_name: String,
     pub key: Option<String>,
     pub headers: HashMap<String, String>,
-    /// The event as JSON (an object).
+    /// The event as JSON: always a JSON object. A store refuses any other payload (not JSON, or
+    /// JSON that is not an object) with [`MessagingError::InvalidMessage`], and may refuse an
+    /// object it cannot hold the same way (MongoDB: an integer above `i64::MAX`).
+    ///
+    /// [`MessagingError::InvalidMessage`]: crate::error::MessagingError::InvalidMessage
     pub payload: Vec<u8>,
     /// Epoch milliseconds.
     pub created_at_ms: i64,
@@ -31,7 +35,8 @@ pub struct OutboxEntry {
 /// under a lease, so two instances relaying one outbox never both hold an entry, and a crashed
 /// one's entries are claimed again once its lease has passed.
 pub trait OutboxStore: Send + Sync {
-    /// Appends `entry` in the caller's transaction: rolled back with it.
+    /// Appends `entry` in the caller's transaction: rolled back with it. A payload that is not a
+    /// JSON object is refused ([`OutboxEntry::payload`]).
     fn append<'a>(
         &'a self,
         tx: &'a mut Tx,
@@ -75,4 +80,8 @@ pub trait OutboxStore: Send + Sync {
 
     /// Removes the entries sent before `sent_before_ms` (epoch milliseconds); how many.
     fn purge(&self, sent_before_ms: i64) -> BoxFuture<'_, Result<u64, StoreError>>;
+
+    /// How many entries are pending (neither sent nor failed), held or not: the outbox backlog
+    /// gauge.
+    fn pending(&self) -> BoxFuture<'_, Result<u64, StoreError>>;
 }

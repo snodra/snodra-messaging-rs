@@ -11,15 +11,20 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use kraken_messaging::config::DeadLetterMode;
 use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::kafka::{LocalEventDispatcher, NoSagas, SagaStage, ensure_indexes};
-use kraken_messaging::processors::dead_letters::{
-    DEAD_LETTERS_COLLECTION, DeadLetterDocument, DeadLetterError, DeadLetterReason,
-    DeadLetterRecord, ensure_dead_letter_indexes,
-};
+use kraken_messaging::kafka::{LocalEventDispatcher, NoSagas, SagaStage};
+use kraken_messaging::processors::dead_letters::{DeadLetterRecord, park};
 use kraken_messaging::processors::{DeadLetters, RetryAllResult, RetryResult};
+use kraken_messaging::store::{DeadLetter, DeadLetterError, DeadLetterReason, MessageStore};
 use kraken_messaging::{Event, MessageContext, MessagingError, message_type};
-use mongodb::bson::{DateTime, Document, doc};
+use kraken_messaging_mongo::MongoTxExt;
+use mongodb::bson::{Document, doc};
 use mongodb::{Client, Database};
+
+const DEAD_LETTERS_COLLECTION: &str = "dead_letters";
+
+fn storage(e: mongodb::error::Error) -> MessagingError {
+    MessagingError::Storage(e.to_string())
+}
 use serde::{Deserialize, Serialize};
 
 macro_rules! require_docker {
@@ -41,8 +46,8 @@ impl Event for Placed {}
 /// Handled by a stage-1 handler that records the order (in its transaction, as an `effects`
 /// document) and fails for the orders in `failing`.
 struct Fixture {
-    client: Client,
     db: Database,
+    store: Arc<dyn MessageStore>,
     failing: Arc<Mutex<Vec<String>>>,
     seen: Arc<Mutex<Vec<String>>>,
     /// Deleted by the handler outside its transaction (another instance's discard).
@@ -58,20 +63,19 @@ impl Fixture {
         let mongo = support::containers::mongo().await;
         let client = Client::with_uri_str(&mongo.uri).await.unwrap();
         let db = client.default_database().unwrap();
-        ensure_indexes(
-            &db,
-            Duration::from_secs(86_400),
-            Duration::from_secs(86_400),
-        )
-        .await
-        .unwrap();
-        ensure_dead_letter_indexes(&db).await.unwrap();
+        // The handler's own writes join the store's sessions: one client for both.
+        let store = kraken_messaging_mongo::MongoStore::new(client.clone(), db.clone());
+        store
+            .ensure_indexes(&kraken_messaging_mongo::MongoIndexSettings::default())
+            .await
+            .unwrap();
+        let store: Arc<dyn MessageStore> = Arc::new(store);
         for name in ["processed_events", "effects", DEAD_LETTERS_COLLECTION] {
             let _ = db.create_collection(name).await;
         }
         Fixture {
-            client,
             db,
+            store,
             failing: Arc::default(),
             seen: Arc::default(),
             vanish: Arc::default(),
@@ -102,24 +106,27 @@ impl Fixture {
                     return Err(MessagingError::Storage(format!("cannot place {}", e.order)));
                 }
                 {
-                    let mut session = ctx.session.lock().await;
+                    let mut tx = ctx.tx.lock().await;
                     db.collection::<Document>("effects")
                         .insert_one(doc! { "order": &e.order })
-                        .session(&mut *session)
-                        .await?;
+                        .session(tx.session())
+                        .await
+                        .map_err(storage)?;
                 }
                 let gone = vanish.lock().unwrap().take();
                 if let Some(id) = gone {
                     db.collection::<Document>(DEAD_LETTERS_COLLECTION)
                         .delete_one(doc! { "_id": id })
-                        .await?;
+                        .await
+                        .map_err(storage)?;
                 }
                 let fixed = rewrite.lock().unwrap().take();
                 if let Some((id, order)) = fixed {
                     let payload = serde_json::to_string(&Placed { order }).unwrap();
                     db.collection::<Document>(DEAD_LETTERS_COLLECTION)
                         .update_one(doc! { "_id": id }, doc! { "$set": { "payload": payload } })
-                        .await?;
+                        .await
+                        .map_err(storage)?;
                 }
                 seen.lock().unwrap().push(e.order);
                 Ok(())
@@ -130,14 +137,14 @@ impl Fixture {
 
     fn dispatcher(&self, name: &str, stage: Arc<dyn SagaStage>) -> Arc<LocalEventDispatcher> {
         Arc::new(
-            LocalEventDispatcher::new(self.client.clone(), self.db.clone(), self.registry(), stage)
+            LocalEventDispatcher::new(Some(Arc::clone(&self.store)), self.registry(), stage)
                 .with_marker_prefix(kraken_messaging::processors::marker_prefix(name)),
         )
     }
 
     fn admin(&self, mode: DeadLetterMode) -> DeadLetters {
         DeadLetters::new(
-            self.db.clone(),
+            Some(self.store.dead_letters()),
             mode,
             vec![
                 (
@@ -153,22 +160,13 @@ impl Fixture {
     }
 
     async fn park(&self, letter: &Letter<'_>) -> String {
-        let doc = letter.document();
-        let id = doc.id.clone();
-        self.db
-            .collection::<DeadLetterDocument>(DEAD_LETTERS_COLLECTION)
-            .insert_one(doc)
-            .await
-            .unwrap();
-        id
+        let letter = letter.document();
+        self.store.dead_letters().park(&letter).await.unwrap();
+        letter.id
     }
 
-    async fn letter(&self, id: &str) -> Option<DeadLetterDocument> {
-        self.db
-            .collection::<DeadLetterDocument>(DEAD_LETTERS_COLLECTION)
-            .find_one(doc! { "_id": id })
-            .await
-            .unwrap()
+    async fn letter(&self, id: &str) -> Option<DeadLetter> {
+        self.store.dead_letters().get(id).await.unwrap()
     }
 
     async fn markers(&self) -> Vec<String> {
@@ -240,7 +238,7 @@ impl<'a> Letter<'a> {
         self
     }
 
-    fn document(&self) -> DeadLetterDocument {
+    fn document(&self) -> DeadLetter {
         let mut headers = vec![("type".to_string(), self.type_name.as_bytes().to_vec())];
         if let Some(id) = self.event_id {
             headers.push(("id".to_string(), id.as_bytes().to_vec()));
@@ -251,7 +249,7 @@ impl<'a> Letter<'a> {
             DeadLetterReason::Sequenced => DeadLetterError::sequenced("head"),
             DeadLetterReason::Invalid => DeadLetterError::invalid("payload is not a JSON object"),
         };
-        DeadLetterDocument::park(
+        park(
             DeadLetterRecord {
                 processor: self.processor.to_string(),
                 topic: "kraken.events".to_string(),
@@ -272,25 +270,22 @@ impl<'a> Letter<'a> {
             } else {
                 0
             },
-            DateTime::from_millis(1_762_250_000_000 + self.parked),
+            1_762_250_000_000 + self.parked,
             Duration::from_secs(86_400),
         )
     }
 }
 
-fn names(letters: &[DeadLetterDocument]) -> Vec<&str> {
+fn names(letters: &[DeadLetter]) -> Vec<&str> {
     letters.iter().map(|l| l.id.as_str()).collect()
 }
 
 #[tokio::test]
 async fn outside_mode_collection_every_call_is_an_error_naming_the_mode() {
-    // No database is reached: the URI is never connected to.
-    let client = Client::with_uri_str("mongodb://127.0.0.1:1/x")
-        .await
-        .unwrap();
-    let db = client.default_database().unwrap();
+    // No store is reached.
+    let store = support::mongo_store_unreached().await;
     for mode in [DeadLetterMode::Topic, DeadLetterMode::Log] {
-        let admin = DeadLetters::new(db.clone(), mode, vec![]);
+        let admin = DeadLetters::new(Some(store.dead_letters()), mode, vec![]);
         let errors = [
             admin.list(None, 100).await.unwrap_err(),
             admin.get("x").await.unwrap_err(),
@@ -308,12 +303,9 @@ async fn outside_mode_collection_every_call_is_an_error_naming_the_mode() {
 /// Kotlin's `require(limit >= 1)`: a limit of 0 is an error, never "no limit".
 #[tokio::test]
 async fn a_list_limit_below_one_is_an_error() {
-    // No database is reached: the URI is never connected to.
-    let client = Client::with_uri_str("mongodb://127.0.0.1:1/x")
-        .await
-        .unwrap();
+    // No store is reached.
     let admin = DeadLetters::new(
-        client.default_database().unwrap(),
+        Some(support::mongo_store_unreached().await.dead_letters()),
         DeadLetterMode::Collection,
         vec![],
     );
@@ -429,9 +421,9 @@ async fn every_retry_result() {
     assert_eq!(after.error.type_name, "Storage");
     assert!(after.error.message.contains("cannot place o-12"));
     assert!(after.blocked_by.is_none(), "blockedBy is SEQUENCED only");
-    assert!(after.last_attempt_at > before.last_attempt_at);
-    assert_eq!(after.parked_at, before.parked_at);
-    assert_eq!(after.expire_at, before.expire_at);
+    assert!(after.last_attempt_at_ms > before.last_attempt_at_ms);
+    assert_eq!(after.parked_at_ms, before.parked_at_ms);
+    assert_eq!(after.expire_at_ms, before.expire_at_ms);
     assert_eq!(f.markers().await, ["processor:orders:o-10"]);
     assert_eq!(f.effects().await, 1);
 
@@ -496,7 +488,7 @@ async fn a_default_letter_retries_stage_one_only_with_its_marker() {
     let f = Fixture::start().await;
     let stage = Arc::new(CountingStage::default());
     let admin = DeadLetters::new(
-        f.db.clone(),
+        Some(f.store.dead_letters()),
         DeadLetterMode::Collection,
         vec![(
             "default".to_string(),
@@ -535,13 +527,12 @@ async fn a_letter_whose_type_has_no_handler_any_more_fails_its_retry() {
     require_docker!();
     let f = Fixture::start().await;
     let empty = Arc::new(LocalEventDispatcher::new(
-        f.client.clone(),
-        f.db.clone(),
+        Some(Arc::clone(&f.store)),
         Arc::new(HandlerRegistry::new()),
         Arc::new(NoSagas),
     ));
     let admin = DeadLetters::new(
-        f.db.clone(),
+        Some(f.store.dead_letters()),
         DeadLetterMode::Collection,
         vec![("orders".to_string(), empty)],
     );

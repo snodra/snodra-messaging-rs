@@ -1,8 +1,9 @@
-//! Shared helpers of the saga integration tests: a MongoDB with the saga collections and indexes,
-//! a clock the test moves, and small readers over the collections.
+//! Shared helpers of the saga integration tests: the MongoDB message store with its indexes, a
+//! clock the test moves, and small readers over the collections.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::TryStreamExt;
@@ -10,7 +11,10 @@ use kraken_messaging::MessageContext;
 use kraken_messaging::saga::store::{
     DeadlineDocument, SagaDispatchDocument, SagaDocument, SagaFailureDocument,
 };
-use kraken_messaging::saga::{ManualClock, SagaPorts, ensure_saga_indexes};
+use kraken_messaging::saga::{ManualClock, SagaPorts};
+use kraken_messaging::store::MessageStore;
+use kraken_messaging_mongo::documents::{DeadlineDoc, DispatchDoc, FailureDoc, SagaDoc};
+use kraken_messaging_mongo::{MongoIndexSettings, MongoStore};
 use mongodb::bson::{Document, doc};
 use mongodb::{Client, Database};
 use serde::de::DeserializeOwned;
@@ -25,6 +29,8 @@ pub fn t0() -> SystemTime {
 pub struct Store {
     pub client: Client,
     pub db: Database,
+    /// The MongoDB message store over `db`.
+    pub store: Arc<MongoStore>,
     pub clock: ManualClock,
     _mongo: MongoDb,
 }
@@ -34,29 +40,39 @@ impl Store {
         let mongo = containers::mongo().await;
         let client = Client::with_uri_str(&mongo.uri).await.unwrap();
         let db = client.default_database().unwrap();
-        ensure_saga_indexes(
-            &db,
-            Duration::from_secs(30 * 86_400),
-            Duration::from_secs(7 * 86_400),
-            Duration::from_secs(7 * 86_400),
-            Duration::from_secs(30 * 86_400),
-        )
-        .await
-        .unwrap();
+        let clock = ManualClock::new(t0());
+        // The store stamps the outbox with the system clock, as a service's does: the manual
+        // clock is the saga runtime's, relay's and scheduler's.
+        let store = MongoStore::new(client.clone(), db.clone());
+        store
+            .ensure_indexes(&MongoIndexSettings::default())
+            .await
+            .unwrap();
         // Transactions need the collections to exist.
-        for name in ["processed_events", "saga_failures", "outbox"] {
+        for name in [
+            "processed_events",
+            "saga_failures",
+            "outbox",
+            "external_calls",
+        ] {
             let _ = db.create_collection(name).await;
         }
         Store {
             client,
             db,
-            clock: ManualClock::new(t0()),
+            store: Arc::new(store),
+            clock,
             _mongo: mongo,
         }
     }
 
     pub fn ports(&self) -> SagaPorts {
-        SagaPorts::mongo(self.client.clone(), self.db.clone())
+        SagaPorts::of(&*self.store)
+    }
+
+    /// The store as the core takes it.
+    pub fn message_store(&self) -> Arc<dyn MessageStore> {
+        self.store.clone()
     }
 
     pub async fn all<T: DeserializeOwned + Send + Sync + Unpin>(&self, collection: &str) -> Vec<T> {
@@ -76,6 +92,26 @@ impl Store {
             .try_collect()
             .await
             .unwrap()
+    }
+
+    /// The documents of `collection` matching `filter` (read as `D`, the store's document), as
+    /// the core's records.
+    pub async fn records<D, T>(&self, collection: &str, filter: Document) -> Vec<T>
+    where
+        D: DeserializeOwned + Send + Sync + Unpin,
+        T: From<D>,
+    {
+        let found: Vec<D> = self.find(collection, filter).await;
+        found.into_iter().map(T::from).collect()
+    }
+
+    /// Writes `deadline` as the store does, outside any saga.
+    pub async fn insert_deadline(&self, deadline: &DeadlineDocument) {
+        self.db
+            .collection::<DeadlineDoc>("deadlines")
+            .insert_one(DeadlineDoc::from(deadline))
+            .await
+            .unwrap();
     }
 
     pub async fn count(&self, collection: &str, filter: Document) -> u64 {
@@ -109,22 +145,26 @@ impl Store {
     }
 
     pub async fn sagas(&self, type_name: &str) -> Vec<SagaDocument> {
-        self.find("sagas", doc! { "type": type_name }).await
+        let found: Vec<SagaDoc> = self.find("sagas", doc! { "type": type_name }).await;
+        found.into_iter().map(SagaDocument::from).collect()
     }
 
     pub async fn dispatch_of(&self, saga_id: &str) -> Vec<SagaDispatchDocument> {
+        let found: Vec<DispatchDoc> = self.find("saga_dispatch", doc! { "sagaId": saga_id }).await;
         let mut entries: Vec<SagaDispatchDocument> =
-            self.find("saga_dispatch", doc! { "sagaId": saga_id }).await;
+            found.into_iter().map(SagaDispatchDocument::from).collect();
         entries.sort_by_key(|e| e.seq);
         entries
     }
 
     pub async fn deadlines(&self) -> Vec<DeadlineDocument> {
-        self.all("deadlines").await
+        let found: Vec<DeadlineDoc> = self.all("deadlines").await;
+        found.into_iter().map(DeadlineDocument::from).collect()
     }
 
     pub async fn failures(&self) -> Vec<SagaFailureDocument> {
-        self.all("saga_failures").await
+        let found: Vec<FailureDoc> = self.all("saga_failures").await;
+        found.into_iter().map(SagaFailureDocument::from).collect()
     }
 }
 

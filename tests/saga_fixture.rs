@@ -520,11 +520,14 @@ fn ticking_saga(d: SagaDefinition<Ticking>) -> SagaDefinition<Ticking> {
 
 #[test]
 fn publishing_an_event_whose_payload_is_not_a_json_object_is_a_handler_error_naming_the_event() {
-    for (amount, wire) in [(1, "fx.Tick"), (2, "fx.Huge")] {
-        let message = panic_of(|| {
-            SagaTestFixture::new("fx.Ticking", ticking_saga).when_event(&order("o1", amount));
-        });
-        assert!(message.contains(wire), "{message}");
-        assert!(message.contains("outbox"), "{message}");
-    }
+    let message = panic_of(|| {
+        SagaTestFixture::new("fx.Ticking", ticking_saga).when_event(&order("o1", 1));
+    });
+    assert!(message.contains("fx.Tick"), "{message}");
+    assert!(message.contains("outbox"), "{message}");
+    // A JSON object only some stores cannot hold (MongoDB: a number above i64::MAX) is recorded:
+    // the relay gives the entry up when its store refuses it (saga_relay).
+    SagaTestFixture::new("fx.Ticking", ticking_saga)
+        .when_event(&order("o1", 2))
+        .expect_published_events(&[&Huge { n: u64::MAX }]);
 }

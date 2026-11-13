@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use kraken_messaging::hub::StreamOptions;
 use kraken_messaging::{Config, KrakenMessaging, MessagingError, StreamingQuery, message_type};
 use serde::{Deserialize, Serialize};
-use support::containers::{HubContainer, HubOptions, free_port, hub_with, mongo};
+use support::containers::{HubContainer, HubOptions, free_port, hub_with};
 use tokio_stream::StreamExt;
 
 macro_rules! require_docker {
@@ -49,8 +49,8 @@ async fn two_hubs() -> (HubContainer, HubContainer) {
     tokio::join!(start(IDS[0]), start(IDS[1]))
 }
 
-fn config(service: &str, hubs: &str, mongo: &str) -> Config {
-    let mut c = Config::new(service, hubs, "127.0.0.1:1", mongo);
+fn config(service: &str, hubs: &str) -> Config {
+    let mut c = Config::new(service, hubs, "127.0.0.1:1");
     c.outbox_enabled = false;
     c.consumer_enabled = false;
     c.reconnect_backoff_min = Duration::from_millis(100);
@@ -165,15 +165,11 @@ async fn eventually(what: &str, mut check: impl AsyncFnMut() -> bool) {
 #[tokio::test]
 async fn a_thousand_rows_stream_in_order_under_a_window_of_eight_and_a_drop_cancels_the_handler() {
     require_docker!();
-    let ((h1, h2), db) = tokio::join!(two_hubs(), mongo());
+    let (h1, h2) = two_hubs().await;
     let hubs = format!("{},{}", h1.address, h2.address);
     let probe = Arc::new(Probe::default());
-    let exporter = exporter(
-        config("e2e-exporter", &hubs, &db.uri_for("exporter")),
-        Arc::clone(&probe),
-    )
-    .await;
-    let c = caller(config("e2e-collector", &hubs, &db.uri_for("collector"))).await;
+    let exporter = exporter(config("e2e-exporter", &hubs), Arc::clone(&probe)).await;
+    let c = caller(config("e2e-collector", &hubs)).await;
     for app in [&exporter, &c] {
         assert!(app.await_all_hubs(Duration::from_secs(15)).await);
     }

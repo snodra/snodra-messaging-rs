@@ -57,19 +57,21 @@ macro_rules! require_docker {
     };
 }
 
-fn config(service: &str, hub: &str, kafka: &str, mongo: &str) -> Config {
-    let mut c = Config::new(service, hub, kafka, mongo);
+fn config(service: &str, hub: &str, kafka: &str) -> Config {
+    let mut c = Config::new(service, hub, kafka);
     c.outbox_poll_interval = Duration::from_millis(100);
     c.reconnect_backoff_min = Duration::from_millis(100);
     c.reconnect_backoff_max = Duration::from_secs(2);
     c
 }
 
-/// Service B: owns `t.Ping` (replies and publishes `t.Happened`) and the guarded `t.Secret`.
-async fn start_b(cfg: Config) -> KrakenMessaging {
+/// Service B: owns `t.Ping` (replies and publishes `t.Happened`, so it has a store) and the
+/// guarded `t.Secret`.
+async fn start_b(cfg: Config, mongo: &str) -> KrakenMessaging {
     let builder = KrakenMessaging::builder(cfg)
         .await
-        .expect("service b builder");
+        .expect("service b builder")
+        .store(support::mongo_store(mongo).await);
     let events = builder.events();
     builder
         .command::<Ping, _, _>(move |p, _ctx| {
@@ -101,30 +103,24 @@ async fn two_participants_round_trip() {
     let kafka = support::containers::kafka().await;
     let mongo = support::containers::mongo().await;
     let (tx, mut rx) = mpsc::channel::<Happened>(8);
-    let a = KrakenMessaging::builder(config(
-        "svc-a",
-        &hub.address,
-        &kafka.bootstrap,
-        &mongo.uri_for("a"),
-    ))
-    .await
-    .unwrap()
-    .event::<Happened, _, _>(move |e, _ctx| {
-        let tx = tx.clone();
-        async move {
-            tx.send(e).await.unwrap();
-            Ok(())
-        }
-    })
-    .start()
-    .await
-    .expect("service a starts");
-    let b = start_b(config(
-        "svc-b",
-        &hub.address,
-        &kafka.bootstrap,
+    let a = KrakenMessaging::builder(config("svc-a", &hub.address, &kafka.bootstrap))
+        .await
+        .unwrap()
+        .store(support::mongo_store(&mongo.uri_for("a")).await)
+        .event::<Happened, _, _>(move |e, _ctx| {
+            let tx = tx.clone();
+            async move {
+                tx.send(e).await.unwrap();
+                Ok(())
+            }
+        })
+        .start()
+        .await
+        .expect("service a starts");
+    let b = start_b(
+        config("svc-b", &hub.address, &kafka.bootstrap),
         &mongo.uri_for("b"),
-    ))
+    )
     .await;
     assert!(
         a.await_hub(Duration::from_secs(15)).await && b.await_hub(Duration::from_secs(15)).await
@@ -169,8 +165,7 @@ async fn two_participants_round_trip() {
 async fn no_handler_is_reported() {
     require_docker!();
     let hub = support::containers::hub().await;
-    let mongo = support::containers::mongo().await;
-    let mut cfg = config("svc-a", &hub.address, "127.0.0.1:1", &mongo.uri_for("a"));
+    let mut cfg = config("svc-a", &hub.address, "127.0.0.1:1");
     cfg.outbox_enabled = false;
     cfg.consumer_enabled = false;
     let a = KrakenMessaging::builder(cfg)
@@ -205,11 +200,11 @@ async fn permission_denied_with_signed_token() {
         .mount(&jwks)
         .await;
 
-    let mut cfg_b = config("svc-b", &hub.address, &kafka.bootstrap, &mongo.uri_for("b"));
+    let mut cfg_b = config("svc-b", &hub.address, &kafka.bootstrap);
     cfg_b.jwks_url = Some(format!("{}/certs", jwks.uri()));
     cfg_b.issuer = Some(support::ISSUER.to_string());
-    let b = start_b(cfg_b).await;
-    let mut cfg_a = config("svc-a", &hub.address, &kafka.bootstrap, &mongo.uri_for("a"));
+    let b = start_b(cfg_b, &mongo.uri_for("b")).await;
+    let mut cfg_a = config("svc-a", &hub.address, &kafka.bootstrap);
     cfg_a.consumer_enabled = false;
     let a = KrakenMessaging::builder(cfg_a)
         .await
@@ -300,13 +295,7 @@ async fn permission_denied_with_signed_token() {
 #[tokio::test]
 async fn send_before_connected_is_hub_unavailable() {
     require_docker!();
-    let mongo = support::containers::mongo().await;
-    let mut cfg = config(
-        "svc-a",
-        "static://127.0.0.1:1",
-        "127.0.0.1:1",
-        &mongo.uri_for("a"),
-    );
+    let mut cfg = config("svc-a", "static://127.0.0.1:1", "127.0.0.1:1");
     cfg.outbox_enabled = false;
     cfg.consumer_enabled = false;
     let a = KrakenMessaging::builder(cfg)
@@ -330,8 +319,7 @@ async fn reconnects_after_hub_restart() {
     require_docker!();
     let port = support::containers::free_port();
     let hub = support::containers::hub_on(port).await;
-    let mongo = support::containers::mongo().await;
-    let mut cfg_a = config("svc-a", &hub.address, "127.0.0.1:1", &mongo.uri_for("a"));
+    let mut cfg_a = config("svc-a", &hub.address, "127.0.0.1:1");
     cfg_a.outbox_enabled = false;
     cfg_a.consumer_enabled = false;
     let a = KrakenMessaging::builder(cfg_a)
@@ -340,7 +328,7 @@ async fn reconnects_after_hub_restart() {
         .start()
         .await
         .unwrap();
-    let mut cfg_b = config("svc-b", &hub.address, "127.0.0.1:1", &mongo.uri_for("b"));
+    let mut cfg_b = config("svc-b", &hub.address, "127.0.0.1:1");
     cfg_b.outbox_enabled = false;
     cfg_b.consumer_enabled = false;
     let b = KrakenMessaging::builder(cfg_b)
@@ -399,19 +387,19 @@ fn _app_is_shareable() {
 }
 
 #[tokio::test]
-async fn shutdown_is_prompt_and_builder_exposes_database() {
+async fn shutdown_is_prompt() {
     require_docker!();
     let hub = support::containers::hub().await;
-    let mongo = support::containers::mongo().await;
-    let mut cfg = config("svc-a", &hub.address, "127.0.0.1:1", &mongo.uri_for("a"));
+    let mut cfg = config("svc-a", &hub.address, "127.0.0.1:1");
     cfg.outbox_enabled = false;
     cfg.consumer_enabled = false;
-    let builder = KrakenMessaging::builder(cfg).await.unwrap();
-    assert_eq!(builder.database().name(), "a");
-    let _client: mongodb::Client = builder.client();
-    let a = builder.start().await.unwrap();
+    let a = KrakenMessaging::builder(cfg)
+        .await
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
     assert!(a.await_hub(Duration::from_secs(15)).await);
-    assert_eq!(a.database().name(), "a");
     let started = std::time::Instant::now();
     a.shutdown().await;
     assert!(
@@ -435,10 +423,9 @@ impl Command for Stall {
 async fn shutdown_fails_outgoing_requests_in_flight_with_hub_connection_lost() {
     require_docker!();
     let hub = support::containers::hub().await;
-    let mongo = support::containers::mongo().await;
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
-    let mut cfg_b = config("svc-b", &hub.address, "127.0.0.1:1", &mongo.uri_for("b"));
+    let mut cfg_b = config("svc-b", &hub.address, "127.0.0.1:1");
     cfg_b.outbox_enabled = false;
     cfg_b.consumer_enabled = false;
     let (s, r) = (Arc::clone(&started), Arc::clone(&release));
@@ -456,7 +443,7 @@ async fn shutdown_fails_outgoing_requests_in_flight_with_hub_connection_lost() {
         .start()
         .await
         .unwrap();
-    let mut cfg_a = config("svc-a", &hub.address, "127.0.0.1:1", &mongo.uri_for("a"));
+    let mut cfg_a = config("svc-a", &hub.address, "127.0.0.1:1");
     cfg_a.outbox_enabled = false;
     cfg_a.consumer_enabled = false;
     let builder_a = KrakenMessaging::builder(cfg_a).await.unwrap();

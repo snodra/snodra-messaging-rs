@@ -141,8 +141,9 @@ fn bump(order_id: &str, tag: &str) -> Bump {
     }
 }
 
-fn dt(t: std::time::SystemTime) -> mongodb::bson::DateTime {
-    mongodb::bson::DateTime::from_system_time(t)
+/// Epoch milliseconds.
+fn dt(t: std::time::SystemTime) -> i64 {
+    kraken_messaging::saga::epoch_ms(t)
 }
 
 #[tokio::test]
@@ -219,7 +220,7 @@ async fn a_start_event_creates_an_instance_with_its_association_and_state() {
     assert_eq!(state(&doc)["placed"], 1);
     assert!(!doc.ended);
     assert_eq!(doc.version, 0);
-    assert_eq!(doc.created_at, dt(t0()));
+    assert_eq!(doc.created_at_ms, dt(t0()));
     assert_eq!(rt.metrics.started(), ["rt.Order"]);
     assert_eq!(rt.metrics.count("rt.Order", EventOutcome::Handled), 1);
 }
@@ -384,14 +385,12 @@ async fn an_ending_handler_ends_the_instance_and_cancels_its_scheduled_deadlines
 
     let doc = rt.saga("o8").await;
     assert!(doc.ended);
-    assert_eq!(doc.ended_at, Some(dt(t0())));
+    assert_eq!(doc.ended_at_ms, Some(dt(t0())));
     assert_eq!(rt.log_of("o8").await, ["paid"]);
     assert!(
-        rt.store
-            .deadlines()
-            .await
-            .iter()
-            .all(|d| { d.status == DeadlineStatus::Cancelled && d.finished_at == Some(dt(t0())) })
+        rt.store.deadlines().await.iter().all(|d| {
+            d.status == DeadlineStatus::Cancelled && d.finished_at_ms == Some(dt(t0()))
+        })
     );
     assert_eq!(rt.metrics.ended(), ["rt.Order"]);
 }
@@ -448,10 +447,10 @@ async fn commands_and_events_are_recorded_in_saga_dispatch_in_call_order_and_not
     assert_eq!(entries[1].routing_key.as_deref(), Some("k-o10"));
     assert!(entries[2].payload.contains(r#""orderId":"o10-a""#));
     assert!(entries.iter().all(|e| {
-        e.dispatched_at.is_none()
-            && e.failed_at.is_none()
+        e.dispatched_at_ms.is_none()
+            && e.failed_at_ms.is_none()
             && e.attempts == 0
-            && e.created_at == dt(t0())
+            && e.created_at_ms == dt(t0())
     }));
     assert_eq!(
         entries[0].headers.get("correlation-id").map(String::as_str),
@@ -470,7 +469,7 @@ async fn deadlines_are_recorded_with_due_time_payload_and_payload_type() {
     let timeout = deadlines.iter().find(|d| d.name == "timeout").unwrap();
     assert_eq!(timeout.saga_id, saga_id);
     assert_eq!(timeout.saga_type, "rt.Order");
-    assert_eq!(timeout.due_at, dt(t0() + Duration::from_secs(600)));
+    assert_eq!(timeout.due_at_ms, dt(t0() + Duration::from_secs(600)));
     assert_eq!(timeout.payload.as_deref(), Some(r#""p-o11""#));
     assert_eq!(timeout.status, DeadlineStatus::Scheduled);
     assert_eq!(
@@ -481,7 +480,7 @@ async fn deadlines_are_recorded_with_due_time_payload_and_payload_type() {
         Some(true)
     );
     let nudge = deadlines.iter().find(|d| d.name == "nudge").unwrap();
-    assert_eq!(nudge.due_at, dt(t0() + Duration::from_secs(2 * 3600)));
+    assert_eq!(nudge.due_at_ms, dt(t0() + Duration::from_secs(2 * 3600)));
     assert_eq!(nudge.payload.as_deref(), Some(r#"{"orderId":"o11"}"#));
     assert!(nudge.payload_type.as_deref().unwrap().contains("Nudge"));
 }
@@ -600,8 +599,8 @@ async fn a_saga_type_that_fails_on_every_attempt_is_parked_while_another_saga_ty
         "a handler error gets two quick attempts, not the conflict backoff"
     );
     assert!(failure.error.contains("broken on o14"), "{}", failure.error);
-    assert_eq!(failure.first_failed_at, dt(t0()));
-    assert_eq!(failure.last_failed_at, dt(t0()));
+    assert_eq!(failure.first_failed_at_ms, dt(t0()));
+    assert_eq!(failure.last_failed_at_ms, dt(t0()));
     assert!(
         rt.store.marker("saga:rt.Broken:e-14").await && rt.store.marker("saga:rt.Order:e-14").await,
         "parking writes the marker with the failure"
@@ -978,10 +977,13 @@ async fn the_clock_decides_created_at_and_deadline_due_times() {
     rt.deliver(&placed("o40")).await;
 
     let doc = rt.saga("o40").await;
-    assert_eq!(doc.created_at, dt(t0() + Duration::from_secs(3600)));
+    assert_eq!(doc.created_at_ms, dt(t0() + Duration::from_secs(3600)));
     let deadlines = rt.store.deadlines().await;
     let timeout = deadlines.iter().find(|d| d.name == "timeout").unwrap();
-    assert_eq!(timeout.due_at, dt(t0() + Duration::from_secs(3600 + 600)));
+    assert_eq!(
+        timeout.due_at_ms,
+        dt(t0() + Duration::from_secs(3600 + 600))
+    );
 }
 
 #[derive(Default, Serialize, Deserialize)]

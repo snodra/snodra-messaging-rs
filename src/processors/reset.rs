@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use mongodb::bson::{Document, doc};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
@@ -155,16 +154,6 @@ impl Plan {
             .collect();
         all.sort_by(|a, b| (&a.topic, a.partition, a.from).cmp(&(&b.topic, b.partition, b.from)));
         all
-    }
-}
-
-/// The markers of `processor` in `range`: `{processor, topic, partition, offset: [from, until)}`.
-pub fn range_filter(processor: &str, range: &ReplayRange) -> Document {
-    doc! {
-        "processor": processor,
-        "topic": &range.topic,
-        "partition": range.partition,
-        "offset": { "$gte": range.from, "$lt": range.until },
     }
 }
 
@@ -412,14 +401,6 @@ mod tests {
                 range(0, 4, 20),
                 range(1, 0, 7)
             ]
-        );
-    }
-
-    #[test]
-    fn the_range_filter_matches_the_processors_markers_by_position() {
-        assert_eq!(
-            range_filter("audit", &range(3, 5, 9)),
-            doc! { "processor": "audit", "topic": "t", "partition": 3, "offset": { "$gte": 5i64, "$lt": 9i64 } }
         );
     }
 

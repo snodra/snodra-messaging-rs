@@ -137,12 +137,6 @@ impl From<tonic::Status> for MessagingError {
     }
 }
 
-impl From<mongodb::error::Error> for MessagingError {
-    fn from(e: mongodb::error::Error) -> Self {
-        Self::Storage(e.to_string())
-    }
-}
-
 impl From<rdkafka::error::KafkaError> for MessagingError {
     fn from(e: rdkafka::error::KafkaError) -> Self {
         Self::Transport(e.to_string())

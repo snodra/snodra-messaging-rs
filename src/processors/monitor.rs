@@ -1,6 +1,6 @@
 //! What one processor reports in `InstanceStatus.processors` (ADR 0022): kept in memory by the
 //! consumer, its rebalance callbacks and its offset refresher, and read by the hub pool's status
-//! tick under a short lock (never a Kafka or Mongo call).
+//! tick under a short lock (never a Kafka or store call).
 //!
 //! State: STOPPED while its consumer does not run (stopping at shutdown, or out of the group for a
 //! reset, ADR 0023); else PAUSED while its control document says so; else FAILING for 60 s after

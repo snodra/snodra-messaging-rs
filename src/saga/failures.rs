@@ -1,4 +1,4 @@
-//! Admin API over the parked saga events (`saga_failures`, ADR 0021 rulings 3 and 36): an event
+//! Admin API over the parked saga events (the store's saga failures, ADR 0021 rulings 3 and 36): an event
 //! whose saga handler failed all its attempts waits here until the cause is fixed, then is retried
 //! (re-delivered to the saga type that failed, applied once) or discarded.
 //!
@@ -20,16 +20,31 @@ use crate::error::MessagingError;
 
 #[derive(Clone)]
 pub struct SagaFailures {
-    ports: SagaPorts,
-    runtime: Arc<SagaRuntime>,
+    /// `None`: a service without a message store, where every call fails.
+    inner: Option<(SagaPorts, Arc<SagaRuntime>)>,
 }
 
 impl SagaFailures {
     pub fn new(runtime: Arc<SagaRuntime>) -> SagaFailures {
         SagaFailures {
-            ports: runtime.ports().clone(),
-            runtime,
+            inner: Some((runtime.ports().clone(), runtime)),
         }
+    }
+
+    /// The API of a service without a message store: every call fails saying so.
+    pub fn without_store() -> SagaFailures {
+        SagaFailures { inner: None }
+    }
+
+    fn inner(&self) -> Result<(&SagaPorts, &Arc<SagaRuntime>), MessagingError> {
+        self.inner
+            .as_ref()
+            .map(|(ports, runtime)| (ports, runtime))
+            .ok_or_else(|| {
+                MessagingError::InvalidMessage(
+                    "the saga failures need a message store: add .store(...)".into(),
+                )
+            })
     }
 
     /// The parked events of saga type `saga_type` (every type when `None`), the longest waiting
@@ -38,13 +53,9 @@ impl SagaFailures {
         &self,
         saga_type: Option<&str>,
     ) -> Result<Vec<SagaFailureDocument>, MessagingError> {
-        let mut tx = self
-            .ports
-            .tx
-            .plain()
-            .await
-            .map_err(|e| e.into_messaging())?;
-        self.ports
+        let (ports, _) = self.inner()?;
+        let mut tx = ports.tx.plain().await.map_err(|e| e.into_messaging())?;
+        ports
             .failures
             .list(&mut tx, saga_type)
             .await
@@ -55,20 +66,15 @@ impl SagaFailures {
     /// `false` when unknown or failed again. `InvalidMessage` (nothing written) when its saga type
     /// does not run in this service.
     pub async fn retry(&self, id: &str) -> Result<bool, MessagingError> {
-        let mut tx = self
-            .ports
-            .tx
-            .plain()
-            .await
-            .map_err(|e| e.into_messaging())?;
-        let found = self
-            .ports
+        let (ports, _) = self.inner()?;
+        let mut tx = ports.tx.plain().await.map_err(|e| e.into_messaging())?;
+        let found = ports
             .failures
             .find(&mut tx, id)
             .await
             .map_err(|e| e.into_messaging())?;
         match found {
-            Some(failure) => self.runtime.reapply(&failure).await,
+            Some(failure) => self.inner()?.1.reapply(&failure).await,
             None => Ok(false),
         }
     }
@@ -78,12 +84,13 @@ impl SagaFailures {
     /// service and has parked events.
     pub async fn retry_all(&self, saga_type: &str) -> Result<usize, MessagingError> {
         let parked = self.list(Some(saga_type)).await?;
+        let (_, runtime) = self.inner()?;
         if !parked.is_empty() {
-            self.runtime.ensure_runs(saga_type, parked.len())?;
+            runtime.ensure_runs(saga_type, parked.len())?;
         }
         let mut applied = 0;
         for failure in parked {
-            if self.runtime.reapply(&failure).await? {
+            if runtime.reapply(&failure).await? {
                 applied += 1;
             }
         }
@@ -92,13 +99,9 @@ impl SagaFailures {
 
     /// Drops the parked event `id` without applying it; `false` when unknown.
     pub async fn discard(&self, id: &str) -> Result<bool, MessagingError> {
-        let mut tx = self
-            .ports
-            .tx
-            .plain()
-            .await
-            .map_err(|e| e.into_messaging())?;
-        self.ports
+        let (ports, _) = self.inner()?;
+        let mut tx = ports.tx.plain().await.map_err(|e| e.into_messaging())?;
+        ports
             .failures
             .delete(&mut tx, id)
             .await

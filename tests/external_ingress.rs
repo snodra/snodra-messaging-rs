@@ -113,12 +113,12 @@ impl Wh {
             Arc::new(NoopSagaMetrics),
         ));
         let dispatcher = Arc::new(LocalEventDispatcher::new(
-            store.client.clone(),
-            store.db.clone(),
+            Some(store.message_store()),
             Arc::new(registry),
             runtime,
         ));
-        let ingress = ExternalEventIngress::new(dispatcher, store.db.clone(), store.clock.clock());
+        let ingress =
+            ExternalEventIngress::new(dispatcher, Some(store.message_store()), store.clock.clock());
         Wh {
             store,
             handlers,

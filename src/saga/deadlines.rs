@@ -1,9 +1,9 @@
 //! The deadline scheduler: fires the due deadlines of this service's sagas, at least once
 //! (ADR 0021 rulings 15, 37).
 //!
-//! A poll claims due deadlines one at a time with `findOneAndUpdate` (status SCHEDULED,
-//! `dueAt <= now`, not claimed or the claim expired; it sets `claimedBy` and
-//! `claimedUntil = now + lease`) and hands each to [`SagaRuntime::apply_deadline`], which fires it
+//! A poll claims due deadlines one at a time ([`DeadlineStore::claim_due`]: SCHEDULED,
+//! `due_at <= now`, not claimed or the claim expired; it sets `claimed_by` and
+//! `claimed_until = now + lease`) and hands each to [`SagaRuntime::apply_deadline`], which fires it
 //! in a transaction (loads the saga, runs the deadline handler, writes the state, marks it FIRED;
 //! a deadline of an ended or missing saga is CANCELLED instead). Several service instances can run
 //! a scheduler: the lease makes each deadline fire on one of them. When firing fails (or the
@@ -19,17 +19,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::TryStreamExt;
-use mongodb::bson::{DateTime, Document, doc};
-use mongodb::options::ReturnDocument;
-use mongodb::{Collection, Database};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::clock::Clock;
 use super::metrics::SagaMetrics;
+use super::ports::DeadlineStore;
 use super::runtime::SagaRuntime;
-use super::store::{DEADLINES_COLLECTION, DeadlineDocument};
+use super::store::DeadlineDocument;
 use crate::error::MessagingError;
 
 /// Settings of the [`DeadlineScheduler`] (`KRAKEN_DEADLINES_*`): how often it polls and how long a
@@ -71,7 +68,7 @@ impl DeadlineSettings {
 
 /// See the module docs.
 pub struct DeadlineScheduler {
-    db: Database,
+    deadlines: Arc<dyn DeadlineStore>,
     runtime: Arc<SagaRuntime>,
     clock: Clock,
     settings: DeadlineSettings,
@@ -82,7 +79,7 @@ pub struct DeadlineScheduler {
 
 impl DeadlineScheduler {
     pub fn new(
-        db: Database,
+        deadlines: Arc<dyn DeadlineStore>,
         runtime: Arc<SagaRuntime>,
         clock: Clock,
         settings: DeadlineSettings,
@@ -90,7 +87,7 @@ impl DeadlineScheduler {
     ) -> Result<Arc<DeadlineScheduler>, MessagingError> {
         settings.validate()?;
         Ok(Arc::new(DeadlineScheduler {
-            db,
+            deadlines,
             runtime,
             clock,
             settings,
@@ -98,10 +95,6 @@ impl DeadlineScheduler {
             owner: uuid::Uuid::new_v4().to_string(),
             stopping: CancellationToken::new(),
         }))
-    }
-
-    fn deadlines(&self) -> Collection<DeadlineDocument> {
-        self.db.collection(DEADLINES_COLLECTION)
     }
 
     /// One pass: claims and fires the due deadlines; returns how many it claimed. Reports what is
@@ -128,48 +121,15 @@ impl DeadlineScheduler {
     }
 
     async fn claim_next(&self) -> Result<Option<DeadlineDocument>, MessagingError> {
-        let now = self.clock.now_bson();
+        let now = self.clock.now_ms();
         let until =
-            DateTime::from_millis(now.timestamp_millis() + self.settings.lease.as_millis() as i64);
-        Ok(self
-            .deadlines()
-            .find_one_and_update(
-                doc! {
-                    "status": "SCHEDULED",
-                    "dueAt": { "$lte": now },
-                    "$or": [ { "claimedUntil": null }, { "claimedUntil": { "$lt": now } } ],
-                },
-                doc! { "$set": { "claimedBy": &self.owner, "claimedUntil": until } },
-            )
-            .sort(doc! { "dueAt": 1 })
-            .return_document(ReturnDocument::After)
-            .await?)
+            now.saturating_add(i64::try_from(self.settings.lease.as_millis()).unwrap_or(i64::MAX));
+        Ok(self.deadlines.claim_due(&self.owner, now, until).await?)
     }
 
     /// The SCHEDULED deadlines past their due time, per name.
     async fn overdue(&self) -> Result<HashMap<String, u64>, MessagingError> {
-        let docs: Vec<Document> = self
-            .db
-            .collection::<Document>(DEADLINES_COLLECTION)
-            .aggregate(vec![
-                doc! { "$match": { "status": "SCHEDULED", "dueAt": { "$lte": self.clock.now_bson() } } },
-                doc! { "$group": { "_id": "$name", "n": { "$sum": 1 } } },
-            ])
-            .await?
-            .try_collect()
-            .await?;
-        Ok(docs
-            .into_iter()
-            .filter_map(|d| {
-                let name = d.get_str("_id").ok()?.to_string();
-                let n = d
-                    .get_i32("n")
-                    .map(i64::from)
-                    .or_else(|_| d.get_i64("n"))
-                    .ok()?;
-                Some((name, n as u64))
-            })
-            .collect())
+        Ok(self.deadlines.count_overdue(self.clock.now_ms()).await?)
     }
 
     /// Runs the polling loop as a tokio task until `cancel` is cancelled; the pass in progress

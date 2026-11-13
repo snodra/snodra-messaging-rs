@@ -9,12 +9,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use kraken_messaging::kafka::SagaStage;
+use kraken_messaging::saga::epoch_ms;
 use kraken_messaging::saga::store::{DeadlineDocument, DeadlineStatus, DispatchKind, SagaDocument};
 use kraken_messaging::saga::{
     DeadlineScheduler, DeadlineSettings, SagaDefinition, SagaRetry, SagaRuntime, SagaType,
 };
+use kraken_messaging::store::MessageStore;
 use kraken_messaging::{Command, Event, RetryPolicy, message_type};
-use mongodb::bson::{DateTime, doc};
+use kraken_messaging_mongo::documents::DeadlineDoc;
+use mongodb::bson::doc;
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use support::order_saga::RecordingMetrics;
@@ -182,7 +185,7 @@ impl Dl {
 
     fn scheduler(&self) -> Arc<DeadlineScheduler> {
         DeadlineScheduler::new(
-            self.store.db.clone(),
+            self.store.store.sagas().deadlines,
             Arc::clone(&self.runtime),
             self.store.clock.clock(),
             DeadlineSettings {
@@ -230,7 +233,7 @@ impl Dl {
 
     async fn deadlines_of(&self, saga_id: &str) -> Vec<DeadlineDocument> {
         self.store
-            .find("deadlines", doc! { "sagaId": saga_id })
+            .records::<DeadlineDoc, _>("deadlines", doc! { "sagaId": saga_id })
             .await
     }
 }
@@ -242,8 +245,9 @@ fn placed(order_id: &str, seconds: u64) -> Placed {
     }
 }
 
-fn dt(t: std::time::SystemTime) -> DateTime {
-    DateTime::from_system_time(t)
+/// Epoch milliseconds.
+fn dt(t: std::time::SystemTime) -> i64 {
+    epoch_ms(t)
 }
 
 #[tokio::test]
@@ -296,7 +300,7 @@ async fn a_due_deadline_fires_its_handler_once_with_its_payload() {
     );
     let deadline = dl.store.deadlines().await.remove(0);
     assert_eq!(deadline.status, DeadlineStatus::Fired);
-    assert_eq!(deadline.finished_at, Some(dt(dl.store.clock.now())));
+    assert_eq!(deadline.finished_at_ms, Some(dt(dl.store.clock.now())));
     assert_eq!(*dl.metrics.fired.lock().unwrap(), ["charge-timeout"]);
 }
 
@@ -402,28 +406,26 @@ async fn a_deadline_of_an_ended_saga_is_marked_cancelled_when_found_due() {
         name: "charge-timeout".into(),
         payload: Some(r#"{"reason":"late"}"#.into()),
         payload_type: Some("dl.TimeoutPayload".into()),
-        due_at: dt(t0() + Duration::from_secs(10)),
+        due_at_ms: dt(t0() + Duration::from_secs(10)),
         status: DeadlineStatus::Scheduled,
         claimed_by: None,
-        claimed_until: None,
-        finished_at: None,
+        claimed_until_ms: None,
+        finished_at_ms: None,
         correlation_id: None,
     };
-    let collection = dl.store.db.collection::<DeadlineDocument>("deadlines");
-    collection
-        .insert_one(deadline("late", &ended.id))
-        .await
-        .unwrap();
-    collection
-        .insert_one(deadline("orphan", "no-such-saga"))
-        .await
-        .unwrap();
+    dl.store.insert_deadline(&deadline("late", &ended.id)).await;
+    dl.store
+        .insert_deadline(&deadline("orphan", "no-such-saga"))
+        .await;
 
     dl.advance(3600);
     dl.scheduler().poll_once().await.unwrap();
 
     for id in ["late", "orphan"] {
-        let found: Vec<DeadlineDocument> = dl.store.find("deadlines", doc! { "_id": id }).await;
+        let found: Vec<DeadlineDocument> = dl
+            .store
+            .records::<DeadlineDoc, _>("deadlines", doc! { "_id": id })
+            .await;
         assert_eq!(found[0].status, DeadlineStatus::Cancelled, "{id}");
     }
     assert_eq!(dl.fired("o1").await, 0);
@@ -466,7 +468,7 @@ async fn an_expired_lease_makes_a_deadline_fire_again_at_least_once() {
     first.poll_once().await.unwrap();
     let stuck = dl.store.deadlines().await.remove(0);
     assert_eq!(stuck.status, DeadlineStatus::Scheduled);
-    assert!(stuck.claimed_until.is_some());
+    assert!(stuck.claimed_until_ms.is_some());
 
     dl.broken.store(false, Ordering::SeqCst);
     dl.advance(10);
@@ -528,7 +530,7 @@ async fn an_ending_deadline_handler_ends_the_saga_and_cancels_its_other_deadline
 
     let saga = dl.saga("o1").await;
     assert!(saga.ended);
-    assert_eq!(saga.ended_at, Some(dt(dl.store.clock.now())));
+    assert_eq!(saga.ended_at_ms, Some(dt(dl.store.clock.now())));
     let deadlines = dl.deadlines_of(&saga.id).await;
     let by_name = |n: &str| deadlines.iter().find(|d| d.name == n).unwrap().status;
     assert_eq!(by_name("end-now"), DeadlineStatus::Fired);
@@ -563,7 +565,7 @@ async fn a_deadline_handler_that_sends_commands_records_them_for_the_relay() {
         "seq follows the saga's new version"
     );
     assert!(
-        entry.dispatched_at.is_none(),
+        entry.dispatched_at_ms.is_none(),
         "recorded, not sent: the relay sends it"
     );
 }

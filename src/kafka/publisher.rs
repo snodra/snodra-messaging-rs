@@ -1,17 +1,19 @@
-//! Relays pending outbox documents to Kafka in order, marking them sent or failed.
+//! Relays pending outbox entries to Kafka in order, marking them sent or failed.
+//!
+//! Each poll claims a batch from the message store's outbox ([`OutboxStore::claim`]) under a
+//! lease of [`RELAY_LEASE`] held by this publisher, so two instances relaying one outbox never
+//! both send an entry while both live, and a crashed one's entries are relayed after its lease.
+//! Order holds per key for what one instance relays (ADR 0028).
 //!
 //! Metrics (ADR 0026): every publish attempt counts in `kraken.outbox.published{outcome}`; the
 //! gauges `kraken.outbox.pending` and `kraken.outbox.oldest.age` read what the last poll saw (the
-//! batch it fetched, or a count of every pending document when the batch is full), less what it
-//! relayed since: no query of their own.
+//! batch it claimed, or the store's count of every pending entry when the batch is full), less
+//! what it relayed since: no query of their own.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use futures::TryStreamExt;
-use mongodb::Database;
-use mongodb::bson::{DateTime, doc};
 use rdkafka::config::ClientConfig;
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -19,13 +21,19 @@ use rdkafka::util::Timeout;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::outbox::OutboxDocument;
-use super::{OUTBOX_COLLECTION, headers};
+use super::headers;
 use crate::error::MessagingError;
 use crate::metrics::{Metrics, OUTBOX_OLDEST_AGE, OUTBOX_PENDING};
+use crate::store::{OutboxEntry, OutboxStore, now_ms};
+
+/// How long a claimed batch stays this publisher's: long past a batch's sends (it stops at the
+/// first failed send, each bounded by the 40 s delivery budget), renewed by every poll.
+pub const RELAY_LEASE: Duration = Duration::from_secs(120);
 
 pub struct OutboxPublisher {
-    db: Database,
+    outbox: Arc<dyn OutboxStore>,
+    /// This publisher's claims (a random id).
+    owner: String,
     producer: FutureProducer,
     topic: String,
     source: String,
@@ -45,12 +53,10 @@ struct Backlog {
 }
 
 impl Backlog {
-    fn set(&self, pending: u64, oldest: Option<DateTime>) {
+    fn set(&self, pending: u64, oldest_ms: Option<i64>) {
         self.pending.store(pending, Ordering::Relaxed);
-        self.oldest_ms.store(
-            oldest.map_or(i64::MIN, |at| at.timestamp_millis()),
-            Ordering::Relaxed,
-        );
+        self.oldest_ms
+            .store(oldest_ms.unwrap_or(i64::MIN), Ordering::Relaxed);
     }
 
     /// The age of the oldest pending document at `now_ms`, in seconds; 0 when none.
@@ -83,7 +89,7 @@ impl Backlog {
             .with_description("Age of the oldest outbox document not yet published, 0 when none")
             .with_callback(move |o| {
                 if let Some(b) = backlog.upgrade() {
-                    o.observe(b.oldest_age(DateTime::now().timestamp_millis()), &[]);
+                    o.observe(b.oldest_age(now_ms()), &[]);
                 }
             })
             .build();
@@ -91,10 +97,10 @@ impl Backlog {
 }
 
 impl OutboxPublisher {
-    /// The relay of `db`'s outbox to `topic`; its metrics are recorded on `metrics`.
+    /// The relay of `outbox` to `topic`; its metrics are recorded on `metrics`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        db: Database,
+        outbox: Arc<dyn OutboxStore>,
         bootstrap_servers: &str,
         topic: &str,
         source: &str,
@@ -114,7 +120,8 @@ impl OutboxPublisher {
         let backlog = Arc::new(Backlog::default());
         Backlog::observe(Arc::downgrade(&backlog), metrics);
         Ok(Arc::new(OutboxPublisher {
-            db,
+            outbox,
+            owner: uuid::Uuid::new_v4().to_string(),
             producer,
             topic: topic.to_string(),
             source: source.to_string(),
@@ -148,34 +155,30 @@ impl OutboxPublisher {
         })
     }
 
-    /// Sends one batch of pending documents sequentially; returns how many were sent. Stops at the
-    /// first retriable failure so per-key order holds; a document failing `max_attempts` times is
-    /// marked `failedAt` and skipped from then on.
+    /// Claims one batch of pending entries and sends it sequentially; returns how many were
+    /// sent. Stops at the first retriable failure so per-key order holds (the entry stays this
+    /// publisher's and comes first in its next claim); an entry failing `max_attempts` times is
+    /// marked failed and skipped from then on.
     pub async fn relay_once(&self) -> Result<usize, MessagingError> {
-        let coll = self.db.collection::<OutboxDocument>(OUTBOX_COLLECTION);
-        let pending = doc! { "sentAt": null, "failedAt": null };
-        let batch: Vec<OutboxDocument> = coll
-            .find(pending.clone())
-            .sort(doc! { "createdAt": 1, "seq": 1 })
-            .limit(self.batch_size)
-            .await?
-            .try_collect()
+        let batch: Vec<OutboxEntry> = self
+            .outbox
+            .claim(&self.owner, RELAY_LEASE, self.batch_size as usize)
             .await?;
-        // The backlog for the gauges: the batch, or every pending document behind a full one.
+        // The backlog for the gauges: the batch, or every pending entry behind a full one.
         let mut backlog = batch.len() as u64;
         if batch.len() as i64 >= self.batch_size {
-            match coll.count_documents(pending).await {
+            match self.outbox.pending().await {
                 Ok(n) => backlog = n.max(backlog),
                 Err(e) => tracing::debug!("outbox backlog not counted: {e}"),
             }
         }
         self.backlog
-            .set(backlog, batch.first().map(|d| d.created_at));
-        // A document left the backlog (sent, or failed for good): the next of the batch is the
+            .set(backlog, batch.first().map(|d| d.created_at_ms));
+        // An entry left the backlog (sent, or failed for good): the next of the batch is the
         // oldest now; past the batch, the last one stands in until the next poll.
         let left = |backlog: u64, i: usize| {
             let next = batch.get(i + 1).or(batch.get(i).filter(|_| backlog > 0));
-            self.backlog.set(backlog, next.map(|d| d.created_at));
+            self.backlog.set(backlog, next.map(|d| d.created_at_ms));
         };
         let mut sent = 0usize;
         for (i, d) in batch.iter().enumerate() {
@@ -200,11 +203,7 @@ impl OutboxPublisher {
             {
                 Ok(_) => {
                     self.metrics.outbox_published(true);
-                    coll.update_one(
-                        doc! { "_id": &d.id },
-                        doc! { "$set": { "sentAt": DateTime::now() } },
-                    )
-                    .await?;
+                    self.outbox.mark_sent(std::slice::from_ref(&d.id)).await?;
                     sent += 1;
                     backlog = backlog.saturating_sub(1);
                     left(backlog, i);
@@ -213,13 +212,14 @@ impl OutboxPublisher {
                     self.metrics.outbox_published(false);
                     let attempt = d.attempts + 1;
                     if attempt >= self.max_attempts || !is_retriable(&e) {
-                        coll.update_one(doc! { "_id": &d.id }, doc! { "$inc": { "attempts": 1 }, "$set": { "failedAt": DateTime::now() } }).await?;
-                        tracing::error!(id = %d.id, r#type = %d.type_name, attempts = attempt, "outbox document marked failed: {e}");
+                        self.outbox.mark_failed(&d.id, &e.to_string()).await?;
+                        tracing::error!(id = %d.id, r#type = %d.type_name, attempts = attempt, "outbox entry marked failed: {e}");
                         backlog = backlog.saturating_sub(1);
                         left(backlog, i);
                         continue;
                     }
-                    coll.update_one(doc! { "_id": &d.id }, doc! { "$inc": { "attempts": 1 } })
+                    self.outbox
+                        .mark_attempt_failed(&d.id, &e.to_string())
                         .await?;
                     tracing::warn!(id = %d.id, r#type = %d.type_name, attempt, "outbox send failed, will retry: {e}");
                     break;
@@ -229,10 +229,8 @@ impl OutboxPublisher {
         Ok(sent)
     }
 
-    fn record(&self, d: &OutboxDocument) -> Result<Prepared, MessagingError> {
-        let payload = serde_json::to_vec(
-            &mongodb::bson::Bson::Document(d.payload.clone()).into_relaxed_extjson(),
-        )?;
+    fn record(&self, d: &OutboxEntry) -> Result<Prepared, MessagingError> {
+        let payload = d.payload.clone();
         let mut all: Vec<(String, String)> = d
             .headers
             .iter()
@@ -250,7 +248,7 @@ impl OutboxPublisher {
         });
         all.push((headers::TYPE.into(), d.type_name.clone()));
         all.push((headers::ID.into(), d.id.clone()));
-        all.push((headers::TIMESTAMP.into(), rfc3339(d.created_at)));
+        all.push((headers::TIMESTAMP.into(), rfc3339(d.created_at_ms)));
         all.push((headers::SOURCE.into(), self.source.clone()));
         Ok(Prepared {
             key: d.key.clone(),
@@ -284,9 +282,9 @@ struct Prepared {
     headers: Vec<(String, String)>,
 }
 
-/// `createdAt` as Kotlin's `Instant.toString()` would print it (millisecond precision in BSON).
-fn rfc3339(dt: DateTime) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(dt.timestamp_millis())
+/// `createdAt` as Kotlin's `Instant.toString()` would print it (millisecond precision).
+fn rfc3339(at_ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at_ms)
         .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
         .unwrap_or_default()
 }

@@ -13,11 +13,15 @@ use std::time::Duration;
 
 use futures::TryStreamExt;
 use kraken_messaging::config::DeadLetterMode;
-use kraken_messaging::processors::dead_letters::{DeadLetterDocument, DeadLetterReason};
 use kraken_messaging::processors::{DeadLetters, RetryResult};
 use kraken_messaging::proto::{ProcessorState, ProcessorStatus};
 use kraken_messaging::saga::store::SagaDocument;
-use kraken_messaging::{Config, Event, KrakenMessaging, MessagingError, message_type};
+use kraken_messaging::store::{DeadLetter, DeadLetterReason};
+use kraken_messaging::{
+    Config, Event, KrakenMessaging, KrakenMessagingBuilder, MessagingError, message_type,
+};
+use kraken_messaging_mongo::documents::DeadLetterDocument;
+use kraken_messaging_mongo::documents::SagaDoc;
 use mongodb::bson::{Document, doc};
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
@@ -51,8 +55,22 @@ struct Tracker {
     order: Option<String>,
 }
 
-fn config(service: &str, hub: &str, kafka: &str, mongo: &str, topic: &str) -> Config {
-    let mut c = Config::new(service, hub, kafka, mongo);
+/// The service's builder with the MongoDB message store of `mongo`.
+async fn builder(
+    service: &str,
+    hub: &str,
+    kafka: &str,
+    mongo: &str,
+    topic: &str,
+) -> KrakenMessagingBuilder {
+    KrakenMessaging::builder(config(service, hub, kafka, topic))
+        .await
+        .unwrap()
+        .store(support::mongo_store(mongo).await)
+}
+
+fn config(service: &str, hub: &str, kafka: &str, topic: &str) -> Config {
+    let mut c = Config::new(service, hub, kafka);
     c.kafka_topic = topic.to_string();
     c.consumer_max_attempts = 2;
     c.outbox_enabled = false;
@@ -171,15 +189,17 @@ impl Handler {
     }
 }
 
-async fn letters(db: &mongodb::Database) -> Vec<DeadLetterDocument> {
-    db.collection::<DeadLetterDocument>("dead_letters")
+async fn letters(db: &mongodb::Database) -> Vec<DeadLetter> {
+    let found: Vec<DeadLetterDocument> = db
+        .collection::<DeadLetterDocument>("dead_letters")
         .find(doc! {})
         .sort(doc! { "offset": 1 })
         .await
         .unwrap()
         .try_collect()
         .await
-        .unwrap()
+        .unwrap();
+    found.into_iter().map(DeadLetter::from).collect()
 }
 
 async fn markers(db: &mongodb::Database) -> Vec<String> {
@@ -230,14 +250,10 @@ async fn an_invalid_processor_name_fails_the_start_naming_the_handler() {
         ("Orders", "^[a-z0-9][a-z0-9-]{0,47}$"),
         ("default", "'default'"),
     ] {
-        let builder = KrakenMessaging::builder(Config::new(
-            "svc",
-            "static://127.0.0.1:1",
-            "127.0.0.1:1",
-            "mongodb://127.0.0.1:1/db",
-        ))
-        .await
-        .unwrap();
+        let builder =
+            KrakenMessaging::builder(Config::new("svc", "static://127.0.0.1:1", "127.0.0.1:1"))
+                .await
+                .unwrap();
         let e = builder
             .event_in::<Placed, _, _>(name, |_, _| async { Ok(()) })
             .start()
@@ -262,13 +278,13 @@ async fn the_admin_api_knows_the_processors_without_a_running_consumer() {
         "svc-admin",
         "static://127.0.0.1:1",
         "127.0.0.1:1",
-        &mongo.uri_for("admin"),
         "a.events",
     );
     c.consumer_enabled = false;
     let app = KrakenMessaging::builder(c)
         .await
         .unwrap()
+        .store(support::mongo_store(&mongo.uri_for("admin")).await)
         .event::<Placed, _, _>(|_, _| async { Ok(()) })
         .event_in::<Placed, _, _>("audit", |_, _| async { Ok(()) })
         .start()
@@ -291,15 +307,14 @@ async fn named_processors_have_their_own_group_and_markers_and_never_hold_each_o
     let topic = "p.events";
     let (default, audit, mail) = (Handler::default(), Handler::default(), Handler::default());
     audit.fail("o-2");
-    let app = KrakenMessaging::builder(config(
+    let app = builder(
         "svc-p",
         &hub.address(),
         &kafka.bootstrap,
         &mongo.uri_for("named"),
         topic,
-    ))
+    )
     .await
-    .unwrap()
     .event::<Placed, _, _>(default.handle())
     .event_in::<Placed, _, _>("audit", audit.handle())
     .event_in::<Placed, _, _>("mail", mail.handle())
@@ -316,7 +331,7 @@ async fn named_processors_have_their_own_group_and_markers_and_never_hold_each_o
     .start()
     .await
     .unwrap();
-    let db = app.database();
+    let db = support::mongo_db(&mongo.uri_for("named")).await;
     let p = producer(&kafka.bootstrap);
     for (key, order) in [("k1", "o-1"), ("k2", "o-2"), ("k3", "o-3")] {
         produce(&p, topic, Some(key), order).await;
@@ -350,8 +365,8 @@ async fn named_processors_have_their_own_group_and_markers_and_never_hold_each_o
     assert!(!m.contains(&"processor:audit:o-2".to_string()));
     assert!(m.contains(&"processor:audit:o-3".to_string()));
     // Sagas run in default only: one saga per order, the named processors add nothing.
-    let sagas: Vec<SagaDocument> = db
-        .collection::<SagaDocument>("sagas")
+    let sagas: Vec<SagaDoc> = db
+        .collection::<SagaDoc>("sagas")
         .find(doc! {})
         .await
         .unwrap()
@@ -413,17 +428,12 @@ async fn a_failing_key_parks_its_later_records_while_other_keys_flow_until_it_is
     handler.fail("o-bad");
     let meter = support::metrics::TestMeter::new();
     let app = KrakenMessaging::builder_with_meter(
-        config(
-            "svc-s",
-            &hub.address(),
-            &kafka.bootstrap,
-            &mongo.uri_for("seq"),
-            topic,
-        ),
+        config("svc-s", &hub.address(), &kafka.bootstrap, topic),
         meter.meter(),
     )
     .await
     .unwrap()
+    .store(support::mongo_store(&mongo.uri_for("seq")).await)
     .event::<Placed, _, _>(handler.handle())
     .saga::<Tracker>("s.Tracker", |d| {
         d.start_on::<Placed>(
@@ -438,7 +448,7 @@ async fn a_failing_key_parks_its_later_records_while_other_keys_flow_until_it_is
     .start()
     .await
     .unwrap();
-    let db = app.database();
+    let db = support::mongo_db(&mongo.uri_for("seq")).await;
     let admin = app.dead_letters();
     let p = producer(&kafka.bootstrap);
     produce(&p, topic, Some("k1"), "o-bad").await; // 0: HANDLER_FAILED
@@ -489,7 +499,7 @@ async fn a_failing_key_parks_its_later_records_while_other_keys_flow_until_it_is
     assert_eq!(parked[2].error.message, "record without type header");
     assert!(parked[2].event_type.is_none());
     assert_eq!(parked[3].error.message, "payload is not a JSON object");
-    assert_eq!(parked[3].payload.as_deref(), Some("[1]"));
+    assert_eq!(parked[3].payload, b"[1]");
     assert_eq!(
         handler.seen(),
         ["o-bad", "o-bad", "o-other", "o-keyless", "o-k3"],
@@ -497,7 +507,7 @@ async fn a_failing_key_parks_its_later_records_while_other_keys_flow_until_it_is
     );
     // Stage 2 ran for the HANDLER_FAILED and the SEQUENCED record alike.
     let sagas: Vec<String> = db
-        .collection::<SagaDocument>("sagas")
+        .collection::<SagaDoc>("sagas")
         .find(doc! {})
         .await
         .unwrap()
@@ -505,6 +515,7 @@ async fn a_failing_key_parks_its_later_records_while_other_keys_flow_until_it_is
         .await
         .unwrap()
         .into_iter()
+        .map(SagaDocument::from)
         .map(|s| {
             serde_json::from_str::<serde_json::Value>(&s.state).unwrap()["order"]
                 .as_str()
@@ -556,7 +567,15 @@ async fn a_failing_key_parks_its_later_records_while_other_keys_flow_until_it_is
         letters(&db).await.len() == 3
     })
     .await;
-    let remote = DeadLetters::new(db.clone(), DeadLetterMode::Collection, vec![]);
+    let remote = DeadLetters::new(
+        Some(
+            support::mongo_store(&mongo.uri_for("seq"))
+                .await
+                .dead_letters(),
+        ),
+        DeadLetterMode::Collection,
+        vec![],
+    );
     let _ = remote; // no processor runs there: discard straight in the collection instead
     let bad2 = letters(&db)
         .await
@@ -629,19 +648,12 @@ async fn a_letter_is_written_before_its_offset_is_committed_and_parked_once_on_r
     let handler = Handler::default();
     handler.fail("o-1");
     let start = || async {
-        KrakenMessaging::builder(config(
-            "svc-m",
-            &hub.address(),
-            &kafka.bootstrap,
-            &uri,
-            topic,
-        ))
-        .await
-        .unwrap()
-        .event::<Placed, _, _>(handler.handle())
-        .start()
-        .await
-        .unwrap()
+        builder("svc-m", &hub.address(), &kafka.bootstrap, &uri, topic)
+            .await
+            .event::<Placed, _, _>(handler.handle())
+            .start()
+            .await
+            .unwrap()
     };
     let app = start().await;
     let p = producer(&kafka.bootstrap);
@@ -740,19 +752,12 @@ async fn a_letter_that_cannot_be_written_holds_its_record_but_not_the_poll_loop(
         .unwrap();
     let handler = Handler::default();
     handler.fail("o-1");
-    let app = KrakenMessaging::builder(config(
-        "svc-w",
-        &hub.address(),
-        &kafka.bootstrap,
-        &uri,
-        topic,
-    ))
-    .await
-    .unwrap()
-    .event::<Placed, _, _>(handler.handle())
-    .start()
-    .await
-    .unwrap();
+    let app = builder("svc-w", &hub.address(), &kafka.bootstrap, &uri, topic)
+        .await
+        .event::<Placed, _, _>(handler.handle())
+        .start()
+        .await
+        .unwrap();
     let p = producer(&kafka.bootstrap);
     let to = |partition: i32, key: &'static str, order: &'static str| {
         let p = p.clone();
@@ -837,17 +842,12 @@ async fn mode_topic_produces_to_the_dlt_and_mode_log_skips() {
     // topic
     let handler = Handler::default();
     handler.fail("o-1");
-    let mut c = config(
-        "svc-t",
-        &hub.address(),
-        &kafka.bootstrap,
-        &mongo.uri_for("t"),
-        "t.events",
-    );
+    let mut c = config("svc-t", &hub.address(), &kafka.bootstrap, "t.events");
     c.dead_letter_mode = DeadLetterMode::Topic;
     let app = KrakenMessaging::builder(c)
         .await
         .unwrap()
+        .store(support::mongo_store(&mongo.uri_for("t")).await)
         .event::<Placed, _, _>(handler.handle())
         .start()
         .await
@@ -936,7 +936,11 @@ async fn mode_topic_produces_to_the_dlt_and_mode_log_skips() {
         || async { handler.seen().contains(&"o-2".to_string()) },
     )
     .await;
-    assert!(letters(&app.database()).await.is_empty());
+    assert!(
+        letters(&support::mongo_db(&mongo.uri_for("t")).await)
+            .await
+            .is_empty()
+    );
     let e = app.dead_letters().list(None, 100).await.unwrap_err();
     assert!(e.to_string().contains("topic"), "{e}");
     let s = app.processors();
@@ -947,17 +951,12 @@ async fn mode_topic_produces_to_the_dlt_and_mode_log_skips() {
     // log
     let handler = Handler::default();
     handler.fail("o-1");
-    let mut c = config(
-        "svc-l",
-        &hub.address(),
-        &kafka.bootstrap,
-        &mongo.uri_for("l"),
-        "l.events",
-    );
+    let mut c = config("svc-l", &hub.address(), &kafka.bootstrap, "l.events");
     c.dead_letter_mode = DeadLetterMode::Log;
     let app = KrakenMessaging::builder(c)
         .await
         .unwrap()
+        .store(support::mongo_store(&mongo.uri_for("l")).await)
         .event::<Placed, _, _>(handler.handle())
         .start()
         .await
@@ -969,7 +968,11 @@ async fn mode_topic_produces_to_the_dlt_and_mode_log_skips() {
     })
     .await;
     assert_eq!(handler.seen(), ["o-1", "o-1", "o-2"]);
-    assert!(letters(&app.database()).await.is_empty());
+    assert!(
+        letters(&support::mongo_db(&mongo.uri_for("l")).await)
+            .await
+            .is_empty()
+    );
     assert_eq!(status(&app.processors(), "default").dead_letter_mode, "log");
     app.shutdown().await;
 }

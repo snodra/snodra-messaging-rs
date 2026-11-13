@@ -1,5 +1,5 @@
 //! Sagas, deadlines and the integration toolkit (ADR 0021, S2): the Rust form of the Kotlin
-//! `saga`, `deadline` and `external` packages, over the same MongoDB shapes.
+//! `saga`, `deadline` and `external` packages, over the message store's saga ports.
 //!
 //! A saga is registered on the builder with a closure-based definition
 //! ([`KrakenMessagingBuilder::saga`](crate::KrakenMessagingBuilder::saga)); its handlers are
@@ -12,7 +12,6 @@ mod deadlines;
 mod definition;
 mod failed;
 mod failures;
-mod indexes;
 mod metrics;
 mod otel;
 pub mod ports;
@@ -26,11 +25,10 @@ pub mod store;
 #[cfg(feature = "testing")]
 pub mod testing;
 
-pub use clock::{Clock, ManualClock};
+pub use clock::{Clock, ManualClock, epoch_ms};
 pub use context::SagaContext;
 pub use definition::{SagaDefinition, SagaType};
 pub use failed::{FailureReason, SagaCommandFailed};
-pub use indexes::{ensure_external_call_indexes, ensure_saga_indexes};
 pub use metrics::{EventOutcome, ExternalOutcome, NoopSagaMetrics, SagaMetrics};
 pub use otel::OtelSagaMetrics;
 pub use ports::SagaPorts;

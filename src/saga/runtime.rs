@@ -29,7 +29,6 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use futures::future::BoxFuture;
-use mongodb::bson::DateTime;
 
 use super::clock::Clock;
 use super::context::{AssociationChange, SEQ_STRIDE, SagaContext};
@@ -392,7 +391,7 @@ impl SagaRuntime {
         retry_of: Option<&SagaFailureDocument>,
     ) -> Result<Applied, StoreError> {
         let now = self.clock.now();
-        let now_bson = DateTime::from_system_time(now);
+        let now_ms = super::clock::epoch_ms(now);
         match retry_of {
             Some(failure) => {
                 if !self.ports.failures.delete(tx, &failure.id).await? {
@@ -411,7 +410,7 @@ impl SagaRuntime {
                 }
                 self.ports
                     .markers
-                    .insert(tx, &marker, event_type, now_bson)
+                    .insert(tx, &marker, event_type, now_ms)
                     .await?;
             }
         }
@@ -518,7 +517,7 @@ impl SagaRuntime {
             return Ok(Applied::of(Kind::NoMatch));
         }
         for p in &planned {
-            self.write(tx, p, now_bson).await?;
+            self.write(tx, p, now_ms).await?;
         }
         Ok(Applied {
             kind: Kind::Handled,
@@ -619,7 +618,7 @@ impl SagaRuntime {
         claimed: &DeadlineDocument,
     ) -> Result<bool, StoreError> {
         let now = self.clock.now();
-        let now_bson = DateTime::from_system_time(now);
+        let now_ms = super::clock::epoch_ms(now);
         if self
             .ports
             .deadlines
@@ -633,7 +632,7 @@ impl SagaRuntime {
         let Some(doc) = doc.filter(|d| !d.ended) else {
             self.ports
                 .deadlines
-                .cancel(tx, &claimed.saga_id, &claimed.id, now_bson)
+                .cancel(tx, &claimed.saga_id, &claimed.id, now_ms)
                 .await?;
             return Ok(false);
         };
@@ -647,7 +646,7 @@ impl SagaRuntime {
             );
             self.ports
                 .deadlines
-                .cancel(tx, &claimed.saga_id, &claimed.id, now_bson)
+                .cancel(tx, &claimed.saga_id, &claimed.id, now_ms)
                 .await?;
             return Ok(false);
         };
@@ -693,7 +692,7 @@ impl SagaRuntime {
         if !self
             .ports
             .deadlines
-            .mark_fired(tx, &claimed.id, now_bson)
+            .mark_fired(tx, &claimed.id, now_ms)
             .await?
         {
             return Err(StoreError::Conflict(format!(
@@ -701,14 +700,14 @@ impl SagaRuntime {
                 claimed.id
             )));
         }
-        self.write(tx, &planned, now_bson).await?;
+        self.write(tx, &planned, now_ms).await?;
         if planned.doc.ended {
             self.metrics.saga_ended(t.name);
         }
         Ok(true)
     }
 
-    async fn write(&self, tx: &mut Tx, planned: &Planned, now: DateTime) -> Result<(), StoreError> {
+    async fn write(&self, tx: &mut Tx, planned: &Planned, now: i64) -> Result<(), StoreError> {
         let doc = &planned.doc;
         match planned.expected_version {
             None => self.ports.sagas.insert(tx, doc).await?,
@@ -757,7 +756,7 @@ impl SagaRuntime {
         error: &str,
         attempts: u32,
     ) -> Result<(), MessagingError> {
-        let now = self.clock.now_bson();
+        let now = self.clock.now_ms();
         let marker = marker_id(t, &ctx.message_id);
         let failure = SagaFailureDocument {
             id: format!("{}:{}", t.name, ctx.message_id),
@@ -768,8 +767,8 @@ impl SagaRuntime {
             headers: failure_headers(ctx),
             error: error.to_string(),
             attempts: attempts as i32,
-            first_failed_at: now,
-            last_failed_at: now,
+            first_failed_at_ms: now,
+            last_failed_at_ms: now,
         };
         let mut tx = self
             .ports
@@ -819,7 +818,7 @@ impl SagaRuntime {
         error: &str,
         attempts: u32,
     ) -> Result<(), MessagingError> {
-        let now = self.clock.now_bson();
+        let now = self.clock.now_ms();
         let mut tx = self
             .ports
             .tx
@@ -935,7 +934,7 @@ fn plan(
     now: SystemTime,
     start_key: Option<String>,
 ) -> Planned {
-    let now_bson = DateTime::from_system_time(now);
+    let now_ms = super::clock::epoch_ms(now);
     let effects = sctx.take_effects();
     for change in effects.associations {
         match change {
@@ -972,10 +971,10 @@ fn plan(
         associations,
         start_key,
         ended,
-        ended_at: ended.then_some(now_bson),
+        ended_at_ms: ended.then_some(now_ms),
         version,
-        created_at: doc.map_or(now_bson, |d| d.created_at),
-        updated_at: now_bson,
+        created_at_ms: doc.map_or(now_ms, |d| d.created_at_ms),
+        updated_at_ms: now_ms,
     };
     let entries = effects
         .dispatches
@@ -995,16 +994,16 @@ fn plan(
                     ctx.correlation_id.clone(),
                 )]),
                 routing_key: d.routing_key,
-                created_at: now_bson,
-                dispatched_at: None,
+                created_at_ms: now_ms,
+                dispatched_at_ms: None,
                 attempts: 0,
-                next_attempt_at: None,
-                failed_at: None,
+                next_attempt_at_ms: None,
+                failed_at_ms: None,
                 failure_reason: None,
                 failure_message: None,
                 notice_pending: None,
                 notice_attempts: None,
-                notice_next_at: None,
+                notice_next_at_ms: None,
             }
         })
         .collect::<Vec<_>>();
@@ -1025,11 +1024,11 @@ fn plan(
                 name,
                 payload,
                 payload_type,
-                due_at: DateTime::from_system_time(due_at),
+                due_at_ms: super::clock::epoch_ms(due_at),
                 status: DeadlineStatus::Scheduled,
                 claimed_by: None,
-                claimed_until: None,
-                finished_at: None,
+                claimed_until_ms: None,
+                finished_at_ms: None,
                 correlation_id: Some(ctx.correlation_id.clone()),
             })),
             super::context::DeadlineOp::Cancel(id) => PlannedDeadline::Cancel(id),

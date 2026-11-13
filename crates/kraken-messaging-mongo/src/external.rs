@@ -19,7 +19,7 @@ const SUCCEEDED: &str = "SUCCEEDED";
 const FAILED: &str = "FAILED";
 const UNKNOWN: &str = "UNKNOWN";
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum StatusDocument {
     InProgress,
@@ -28,9 +28,10 @@ enum StatusDocument {
     Unknown,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// One `external_calls` document.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ExternalCallDocument {
+pub struct ExternalCallDocument {
     #[serde(rename = "_id")]
     id: String,
     status: StatusDocument,
@@ -82,6 +83,18 @@ impl ExternalCallDocument {
             lease_until_ms: self.lease_until.map(|t| t.timestamp_millis()),
             owner: self.owner,
         }
+    }
+}
+
+impl From<&ExternalCall> for ExternalCallDocument {
+    fn from(call: &ExternalCall) -> Self {
+        ExternalCallDocument::from_call(call)
+    }
+}
+
+impl From<ExternalCallDocument> for ExternalCall {
+    fn from(doc: ExternalCallDocument) -> Self {
+        doc.into_call()
     }
 }
 

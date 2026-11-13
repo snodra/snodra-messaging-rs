@@ -1,4 +1,4 @@
-//! Testing a saga without Kafka or MongoDB (S2-R6, feature `testing`): [`SagaTestFixture`] drives
+//! Testing a saga without Kafka or a database (S2-R6, feature `testing`): [`SagaTestFixture`] drives
 //! one saga definition with events and time over the crate's own [`SagaRuntime`] and the
 //! in-memory ports of [`InMemorySagaStore`]. The Rust form of the Kotlin
 //! `kraken-messaging-test` `SagaTestFixture`.
@@ -19,7 +19,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
-use mongodb::bson::DateTime;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -81,11 +80,11 @@ fn to_json<M: Serialize>(message: &M, type_name: &str) -> Value {
         .unwrap_or_else(|e| panic!("the fixture cannot encode the {type_name} it was given: {e}"))
 }
 
-/// Drives one saga definition with events and time, in memory: no Kafka, no MongoDB, no hub.
+/// Drives one saga definition with events and time, in memory: no Kafka, no database, no hub.
 ///
 /// It runs the crate's own [`SagaRuntime`] (the same association lookup, start keys,
 /// exactly-once markers, version checks and deadline firing) over [`InMemorySagaStore`], so a saga
-/// that behaves here behaves the same on MongoDB. The state is stored as its JSON text as in
+/// that behaves here behaves the same on a real store. The state is stored as its JSON text as in
 /// production: every step decodes it before the handlers run and encodes it after, so state that
 /// `serde_json` cannot carry fails the step instead of passing in memory. A step is atomic: a
 /// handler that fails leaves nothing behind (the in-memory transaction rolls back).
@@ -262,15 +261,15 @@ impl<S: Serialize + DeserializeOwned + Default + Send + 'static> SagaTestFixture
     /// When a deadline handler fails, or more than 10 000 deadlines fall due in one step.
     pub fn when_time_elapses(&mut self, duration: Duration) -> &mut Self {
         let target = self.clock.now() + duration;
-        let target_bson = DateTime::from_system_time(target);
+        let target_ms = super::clock::epoch_ms(target);
         let mut fired = 0usize;
         loop {
             let next = {
                 let data = self.store.data();
                 data.deadlines
                     .iter()
-                    .filter(|d| d.status == DeadlineStatus::Scheduled && d.due_at <= target_bson)
-                    .min_by_key(|d| d.due_at)
+                    .filter(|d| d.status == DeadlineStatus::Scheduled && d.due_at_ms <= target_ms)
+                    .min_by_key(|d| d.due_at_ms)
                     .cloned()
             };
             let Some(next) = next else { break };
@@ -280,7 +279,8 @@ impl<S: Serialize + DeserializeOwned + Default + Send + 'static> SagaTestFixture
                 "{}: more than {MAX_DEADLINES_PER_STEP} deadlines fell due in one step: a deadline keeps rescheduling itself",
                 self.name
             );
-            let due = next.due_at.to_system_time();
+            let due = std::time::UNIX_EPOCH
+                + Duration::from_millis(u64::try_from(next.due_at_ms).unwrap_or(0));
             if due > self.clock.now() {
                 self.clock.set(due);
             }
@@ -351,12 +351,15 @@ impl<S: Serialize + DeserializeOwned + Default + Send + 'static> SagaTestFixture
 
     /// A deadline `name` is scheduled to fire at exactly `at` (to the millisecond, as stored).
     pub fn expect_scheduled_deadline(&mut self, name: &str, at: SystemTime) -> &mut Self {
-        let at = DateTime::from_system_time(at);
+        let at = super::clock::epoch_ms(at);
         let scheduled = self.scheduled();
-        if !scheduled.iter().any(|d| d.name == name && d.due_at == at) {
+        if !scheduled
+            .iter()
+            .any(|d| d.name == name && d.due_at_ms == at)
+        {
             self.fail(format!(
                 "expected a deadline '{name}' at {} but found {}",
-                at.try_to_rfc3339_string().unwrap_or_default(),
+                rfc3339(at),
                 describe_deadlines(&scheduled)
             ));
         }
@@ -501,13 +504,7 @@ fn describe_deadlines(deadlines: &[DeadlineDocument]) -> String {
     }
     let shown: Vec<String> = deadlines
         .iter()
-        .map(|d| {
-            format!(
-                "'{}' at {}",
-                d.name,
-                d.due_at.try_to_rfc3339_string().unwrap_or_default()
-            )
-        })
+        .map(|d| format!("'{}' at {}", d.name, rfc3339(d.due_at_ms)))
         .collect();
     format!("[{}]", shown.join(", "))
 }
@@ -525,7 +522,7 @@ pub struct InMemoryData {
 }
 
 /// The saga persistence ports in memory, and their transaction: [`TxProvider::begin`] takes a
-/// snapshot that [`TxProvider::abort`] restores, as a rolled-back Mongo transaction would (the
+/// snapshot that [`TxProvider::abort`] restores, as a rolled-back store transaction would (the
 /// exactly-once marker included, so a failing event is parked, not skipped). One transaction at a
 /// time: the store is for sequential tests (the fixture), not for concurrent writers.
 #[derive(Default)]
@@ -552,11 +549,11 @@ impl InMemorySagaStore {
         self.data.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn cancel_where(&self, now: DateTime, matches: impl Fn(&DeadlineDocument) -> bool) {
+    fn cancel_where(&self, now: i64, matches: impl Fn(&DeadlineDocument) -> bool) {
         for d in self.data().deadlines.iter_mut() {
             if d.status == DeadlineStatus::Scheduled && matches(d) {
                 d.status = DeadlineStatus::Cancelled;
-                d.finished_at = Some(now);
+                d.finished_at_ms = Some(now);
             }
         }
     }
@@ -666,6 +663,16 @@ impl SagaRepository for InMemorySagaStore {
         };
         ready(Ok(updated))
     }
+
+    fn count_live(
+        &self,
+    ) -> BoxFuture<'_, Result<std::collections::HashMap<String, u64>, StoreError>> {
+        let mut counts = std::collections::HashMap::new();
+        for saga in self.data().sagas.iter().filter(|s| !s.ended) {
+            *counts.entry(saga.type_name.clone()).or_insert(0) += 1;
+        }
+        ready(Ok(counts))
+    }
 }
 
 impl DispatchRecorder for InMemorySagaStore {
@@ -709,7 +716,7 @@ impl DeadlineStore for InMemorySagaStore {
         _tx: &'a mut Tx,
         saga_id: &'a str,
         deadline_id: &'a str,
-        now: DateTime,
+        now: i64,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         self.cancel_where(now, |d| d.saga_id == saga_id && d.id == deadline_id);
         ready(Ok(()))
@@ -720,7 +727,7 @@ impl DeadlineStore for InMemorySagaStore {
         _tx: &'a mut Tx,
         saga_id: &'a str,
         name: &'a str,
-        now: DateTime,
+        now: i64,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         self.cancel_where(now, |d| d.saga_id == saga_id && d.name == name);
         ready(Ok(()))
@@ -730,7 +737,7 @@ impl DeadlineStore for InMemorySagaStore {
         &'a self,
         _tx: &'a mut Tx,
         saga_id: &'a str,
-        now: DateTime,
+        now: i64,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         self.cancel_where(now, |d| d.saga_id == saga_id);
         ready(Ok(()))
@@ -740,7 +747,7 @@ impl DeadlineStore for InMemorySagaStore {
         &'a self,
         _tx: &'a mut Tx,
         id: &'a str,
-        now: DateTime,
+        now: i64,
     ) -> BoxFuture<'a, Result<bool, StoreError>> {
         let mut data = self.data();
         let fired = match data
@@ -750,12 +757,52 @@ impl DeadlineStore for InMemorySagaStore {
         {
             Some(d) => {
                 d.status = DeadlineStatus::Fired;
-                d.finished_at = Some(now);
+                d.finished_at_ms = Some(now);
                 true
             }
             None => false,
         };
         ready(Ok(fired))
+    }
+
+    fn claim_due<'a>(
+        &'a self,
+        owner: &'a str,
+        now: i64,
+        claimed_until_ms: i64,
+    ) -> BoxFuture<'a, Result<Option<DeadlineDocument>, StoreError>> {
+        let mut data = self.data();
+        let claimed = data
+            .deadlines
+            .iter_mut()
+            .filter(|d| {
+                d.status == DeadlineStatus::Scheduled
+                    && d.due_at_ms <= now
+                    && d.claimed_until_ms.is_none_or(|until| until < now)
+            })
+            .min_by_key(|d| d.due_at_ms)
+            .map(|d| {
+                d.claimed_by = Some(owner.to_string());
+                d.claimed_until_ms = Some(claimed_until_ms);
+                d.clone()
+            });
+        ready(Ok(claimed))
+    }
+
+    fn count_overdue(
+        &self,
+        now: i64,
+    ) -> BoxFuture<'_, Result<std::collections::HashMap<String, u64>, StoreError>> {
+        let mut counts = std::collections::HashMap::new();
+        for d in self
+            .data()
+            .deadlines
+            .iter()
+            .filter(|d| d.status == DeadlineStatus::Scheduled && d.due_at_ms <= now)
+        {
+            *counts.entry(d.name.clone()).or_insert(0) += 1;
+        }
+        ready(Ok(counts))
     }
 }
 
@@ -801,14 +848,14 @@ impl FailureStore for InMemorySagaStore {
         id: &'a str,
         error: &'a str,
         attempts: i32,
-        now: DateTime,
+        now: i64,
     ) -> BoxFuture<'a, Result<bool, StoreError>> {
         let mut data = self.data();
         let found = match data.failures.iter_mut().find(|f| f.id == id) {
             Some(f) => {
                 f.attempts += attempts;
                 f.error = error.to_string();
-                f.last_failed_at = now;
+                f.last_failed_at_ms = now;
                 true
             }
             None => false,
@@ -828,7 +875,7 @@ impl FailureStore for InMemorySagaStore {
             .filter(|f| saga_type.is_none_or(|t| f.saga_type == t))
             .cloned()
             .collect();
-        found.sort_by_key(|f| f.last_failed_at);
+        found.sort_by_key(|f| f.last_failed_at_ms);
         ready(Ok(found))
     }
 }
@@ -847,7 +894,7 @@ impl MarkerStore for InMemorySagaStore {
         _tx: &'a mut Tx,
         id: &'a str,
         _type_name: &'a str,
-        _now: DateTime,
+        _now_ms: i64,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         if self.data().markers.insert(id.to_string()) {
             ready(Ok(()))
@@ -855,4 +902,11 @@ impl MarkerStore for InMemorySagaStore {
             ready(Err(StoreError::Conflict(format!("marker {id} exists"))))
         }
     }
+}
+
+/// An epoch-millisecond time as Kotlin's `Instant.toString()` prints it.
+fn rfc3339(at_ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at_ms)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_else(|| at_ms.to_string())
 }

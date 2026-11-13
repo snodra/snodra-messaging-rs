@@ -22,8 +22,10 @@
 
 The Rust counterpart of the Kotlin `kraken-messaging` starter. A service built on it is
 indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
-(`proto/hub.proto`), same `kraken.events` record format, same JSON shapes, same error codes, same
-`outbox` and `processed_events` collections in MongoDB.
+(`proto/hub.proto`), same `kraken.events` record format, same JSON shapes, same error codes. Its state (the outbox,
+the processed events, the dead letters, the processor control, the external calls and the sagas) lives in the service's
+own database through a message store add-on (ADR 0028): `.store(...)` on the builder. The MongoDB store is the crate
+`kraken-messaging-mongo` (`crates/`), the same collections and documents as the Kotlin library's.
 
 | Capability | Where |
 |---|---|
@@ -33,7 +35,8 @@ indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
 | Shared query types and scatter-gather queries | `shared_query`, `Sender::scatter_gather` (see [Scatter-gather](#scatter-gather)) |
 | Streaming queries under the caller's credits | `streaming_query`, `Sender::stream` / `stream_owned` (see [Streaming queries](#streaming-queries)) |
 | Subscription queries: an initial result, then updates pushed by every owner instance | `subscription_query`, `QueryUpdateEmitter`, `Sender::subscribe` (see [Subscription queries](#subscription-queries)) |
-| Publish events through the Mongo outbox, relay to Kafka | `kafka::EventBus`, `kafka::OutboxPublisher` |
+| Publish events through the message store's outbox, relay to Kafka | `kafka::EventBus`, `kafka::OutboxPublisher` |
+| The message store: one interface per collection, an add-on per database, a conformance kit | `store::MessageStore`, `store::conformance` (feature `testing`) |
 | Consume events idempotently (marker + handler in one transaction) | `kafka::EventConsumer` |
 | Named event processors (own consumer group, markers, status), dead letters with an admin API | `event_in`, `app.dead_letters()`, `app.processors()` (see [Event processors](#event-processors), [Dead letters](#dead-letters)) |
 | Processor control from the hub: pause, resume, reset (replay) with reset handlers, dead letters | `event_with` + `EventOptions::disallow_replay`, `reset_handler`, `app.processor_control()` (see [Processor control](#processor-control)) |
@@ -85,7 +88,9 @@ impl Event for TextShouted {}
 
 #[tokio::main]
 async fn main() -> Result<(), MessagingError> {
-    let builder = KrakenMessaging::builder(Config::from_env()?).await?;
+    let store = kraken_messaging_mongo::MongoStore::new(client, db);   // the service's own database
+    let builder = KrakenMessaging::builder(Config::from_env()?).await?
+        .store(std::sync::Arc::new(store));                          // events, sagas, dead letters
     let events = builder.events();                                   // capture what handlers need
     let app = builder
         .command::<Shout, _, _>(move |cmd, ctx| {
@@ -108,9 +113,14 @@ async fn main() -> Result<(), MessagingError> {
 ```
 
 Handlers are async closures `Fn(Message, MessageContext) -> Future<Result<Reply, MessagingError>>`.
-Event handlers receive an `EventContext { message, session }`: `session` is the Mongo session of the
-consumer's transaction (`Arc<Mutex<ClientSession>>`), so writes done through it, including
-`events.publish_in(&event, key, &mut session)`, commit together with the dedupe marker.
+Event handlers receive an `EventContext { message, tx }`: `tx` is the message store's transaction the
+consumer opened (`Arc<Mutex<store::Tx>>`), so writes done in it, including
+`events.publish_in(&event, key, &mut tx)`, commit together with the dedupe marker; the store add-on gives
+the handler its own handle on it (the MongoDB add-on: `MongoTxExt::session`).
+
+A service of commands and queries alone needs no store. An event handler, a saga, an idempotent handler
+or a partner topic without one fails `start()` naming it (`... needs a message store: add .store(...)`),
+and publishing without one fails the same way.
 
 Sending: `app.commands().send_command(&cmd, SendOptions::default()).await?` and
 `app.queries().send_query(&q, SendOptions { routing_key, timeout, ..Default::default() })`. Inside a handler
@@ -123,7 +133,6 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 |---|---|---|
 | `KRAKEN_SERVICE_NAME` | required | hub `service_name`, base of every processor's consumer group (`<service>.<processor>`, `default` included), event `source` |
 | `KRAKEN_INSTANCE_ID` | a fresh UUID per `Config` | `Config.instance_id`: the hub `Register.instance_id`, and the `service.instance.id` the application gives its meter provider (see [Metrics](#metrics)); unique among the service's instances (a pod name, for example) |
-| `KRAKEN_MONGODB_URI` | required | must name a database, e.g. `mongodb://mongodb:27017/service-c?replicaSet=rs0` |
 | `KRAKEN_HUB_ADDRESS` | `static://kraken-hub:7000` | the hub's gRPC target (`static://` optional), a comma-separated list of them, or one `dns:///name:port` re-resolved every 30 s (see [Multiple hubs](#multiple-hubs)); one target is the single-hub setup |
 | `KRAKEN_HUB_STATUS_INTERVAL_MS` | 5000 | how often `InstanceStatus` goes to every hub (at least 1) |
 | `KRAKEN_KAFKA_BOOTSTRAP` | `kafka:19092` | |
@@ -181,9 +190,9 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 - **Outbox**: `publish` inserts; the publisher relays in `createdAt, seq` order, stops the batch on a
   retriable failure, marks `failedAt` after 10 attempts, or at once for non-retriable failures (oversized record, invalid or
   unauthorized topic). Delivery budget per attempt is 30 s, as in the Kotlin producer. `userId` header is `""` when anonymous.
-- **Mongo documents** use the Kotlin field names and BSON types; no `_class` field is written.
-- **Mongo access**: `builder.client()` / `app.client()` and `database()` expose the crate's client; sessions passed to
-  `events.publish_in` must come from it (the driver rejects sessions of another client).
+- **Stored records** keep the Kotlin field names; the MongoDB store writes the Kotlin documents (BSON types, no
+  `_class`). The service keeps its own database handles: the store is built from them, and a transaction passed to
+  `events.publish_in` must be the store's.
 - **Verified identity** checks signature, `exp`, `nbf` and `iss`; `aud` is not validated (Keycloak sets it, Spring's
   decoder ignores it too). A JWKS outage is `UNAUTHENTICATED` for the caller, never an internal error with a URL.
 - **Shutdown** drains in-flight handlers (10 s bound), closes every hub stream, fails this instance's outgoing requests still in flight with `HubConnectionLost`, stops the publisher and the consumer.

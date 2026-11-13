@@ -31,10 +31,10 @@ use axum::routing::{delete, get, post};
 use chrono::Utc;
 use kraken_messaging::MessagingError;
 use kraken_messaging::kafka::EventBus;
-use kraken_messaging::processors::dead_letters::DeadLetterDocument;
 use kraken_messaging::processors::{
     DEFAULT_LIST_LIMIT, DeadLetters, ResetContext, ResetTarget, RetryResult,
 };
+use kraken_messaging::store::DeadLetter;
 use serde::{Deserialize, Serialize};
 
 use crate::messages::ShoutAudit;
@@ -193,8 +193,8 @@ pub struct LetterView {
     pub blocked_by: Option<String>,
 }
 
-impl From<DeadLetterDocument> for LetterView {
-    fn from(letter: DeadLetterDocument) -> LetterView {
+impl From<DeadLetter> for LetterView {
+    fn from(letter: DeadLetter) -> LetterView {
         LetterView {
             id: letter.id,
             processor: letter.processor,
@@ -399,7 +399,7 @@ mod tests {
     use kraken_messaging::MessageType;
     use kraken_messaging::MessagingError;
     use kraken_messaging::processors::RetryResult;
-    use kraken_messaging::processors::dead_letters::DeadLetterDocument;
+    use kraken_messaging::store::{DeadLetter, DeadLetterError, DeadLetterReason};
     use serde_json::json;
 
     use axum::extract::{RawQuery, State};
@@ -498,16 +498,26 @@ mod tests {
 
     #[test]
     fn a_letter_is_shown_the_way_service_b_shows_it() {
-        let letter: DeadLetterDocument = serde_json::from_value(json!({
-            "_id": "audit:kraken.events:0:8", "processor": "audit", "topic": "kraken.events",
-            "partition": 0, "offset": 8, "key": "k1", "eventType": "examples.ShoutAudit",
-            "reason": "SEQUENCED", "error": {"type": "Sequenced", "message": "an earlier letter"},
-            "blockedBy": "audit:kraken.events:0:7", "attempts": 0,
-            "parkedAt": {"$date": "2026-11-04T00:00:00Z"},
-            "lastAttemptAt": {"$date": "2026-11-04T00:00:00Z"},
-            "expireAt": {"$date": "2026-12-04T00:00:00Z"},
-        }))
-        .unwrap();
+        let letter = DeadLetter {
+            id: "audit:kraken.events:0:8".into(),
+            processor: "audit".into(),
+            topic: "kraken.events".into(),
+            partition: 0,
+            offset: 8,
+            key: Some("k1".into()),
+            event_id: None,
+            event_type: Some("examples.ShoutAudit".into()),
+            headers: Default::default(),
+            payload: Vec::new(),
+            reason: DeadLetterReason::Sequenced,
+            error: DeadLetterError::new("Sequenced", "an earlier letter"),
+            blocked_by: Some("audit:kraken.events:0:7".into()),
+            attempts: 0,
+            parked_at_ms: 1_793_750_400_000,
+            last_attempt_at_ms: 1_793_750_400_000,
+            expire_at_ms: 1_796_342_400_000,
+            replay: false,
+        };
         assert_eq!(
             serde_json::to_value(LetterView::from(letter)).unwrap(),
             json!({
@@ -522,16 +532,11 @@ mod tests {
     /// answered before any database work.
     #[tokio::test]
     async fn a_list_limit_below_one_or_not_a_number_is_a_bad_request() {
-        // Never connected to: the answer comes before any database work.
-        let client =
-            mongodb::Client::with_uri_str("mongodb://127.0.0.1:1/x?serverSelectionTimeoutMS=200")
-                .await
-                .unwrap();
-        let db = client.default_database().unwrap();
+        // No store: the answer comes before any store work.
         let http = AuditHttp {
             audit: Audit::default(),
-            events: EventBus::new(db.clone()),
-            dead_letters: DeadLetters::new(db, DeadLetterMode::Collection, vec![]),
+            events: EventBus::new(),
+            dead_letters: DeadLetters::new(None, DeadLetterMode::Collection, vec![]),
         };
         for limit in ["0", "-1", "ten"] {
             let response = list(

@@ -27,6 +27,7 @@ use chrono::Utc;
 use kraken_messaging::external::{ExternalSource, IdempotencyKey};
 use kraken_messaging::processors::EventOptions;
 use kraken_messaging::{Config, KrakenMessaging, MessagingError};
+use kraken_messaging_mongo::{MongoIndexSettings, MongoStore};
 use messages::{
     BannerFailed, BannerPrinted, Counter, GreetingDelivered, IncrementCounter, Inventory,
     OpenSubscriptions, PollBannerJob, PrintBanner, Reverse, Reversed, Rows, Shout, ShoutAudit,
@@ -102,7 +103,21 @@ async fn main() -> Result<(), MessagingError> {
     let (watch_counters, increment_counters) = (counters.clone(), counters);
     let (count_service, count_instance) = (service.clone(), instance.clone());
     let increment_service = service.clone();
-    let builder = KrakenMessaging::builder(config).await?;
+    // The message store: the service's own MongoDB database (a replica set), its indexes with
+    // the retentions of the config.
+    let mongo = mongodb::Client::with_uri_str(&required_env("KRAKEN_MONGODB_URI")?)
+        .await
+        .map_err(|e| MessagingError::Storage(e.to_string()))?;
+    let db = mongo.default_database().ok_or_else(|| {
+        MessagingError::InvalidMessage("KRAKEN_MONGODB_URI must name a database".into())
+    })?;
+    let store = MongoStore::new(mongo, db);
+    store
+        .ensure_indexes(&MongoIndexSettings::from(&config))
+        .await?;
+    let builder = KrakenMessaging::builder(config)
+        .await?
+        .store(Arc::new(store));
     let emitter = builder.emitter();
     let count_emitter = emitter.clone();
     let shout_events = builder.events();
@@ -312,6 +327,14 @@ async fn main() -> Result<(), MessagingError> {
     let _ = server.await;
     app.shutdown().await;
     Ok(())
+}
+
+/// The value of the environment variable `name`; `InvalidMessage` when it is unset or blank.
+fn required_env(name: &str) -> Result<String, MessagingError> {
+    std::env::var(name)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| MessagingError::InvalidMessage(format!("{name} is required")))
 }
 
 async fn shutdown_signal() {

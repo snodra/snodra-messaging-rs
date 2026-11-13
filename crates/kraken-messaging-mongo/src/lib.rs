@@ -6,19 +6,22 @@
 //!
 //! ```ignore
 //! let store = MongoStore::new(client, db);
-//! store.ensure_indexes(&MongoIndexSettings::default()).await?;
+//! store.ensure_indexes(&MongoIndexSettings::from(&config)).await?;
+//! let app = KrakenMessaging::builder(config).await?.store(Arc::new(store)) /* ... */;
 //! ```
 //!
 //! A handler that writes its own documents in the transaction of the event it handles gets the
-//! session with [`MongoTxExt::session`] (`ctx.tx().session()`).
+//! session with [`MongoTxExt::session`] (`ctx.tx.lock().await.session()`).
 //!
 //! Times a store stamps itself (an outbox entry's `sentAt`, `failedAt` and lease) are the
-//! application's clock, never the database's.
+//! application's clock ([`MongoStore::with_clock`]; the system clock by default), never the
+//! database's.
 
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use kraken_messaging::error::MessagingError;
+use kraken_messaging::saga::Clock;
 use kraken_messaging::store::{
     DeadLetterStore, ExternalCallStore, MessageStore, OutboxStore, ProcessedEventStore,
     ProcessorControlStore, SagaStores, StoreError, Tx, TxProvider,
@@ -29,6 +32,7 @@ use mongodb::{Client, ClientSession, Database};
 
 mod control;
 mod dead_letters;
+pub mod documents;
 mod external;
 mod indexes;
 mod outbox;
@@ -55,7 +59,7 @@ impl MongoStore {
     pub fn new(client: Client, db: Database) -> MongoStore {
         MongoStore {
             tx: Arc::new(MongoTx { client }),
-            outbox: Arc::new(outbox::MongoOutboxStore::new(&db)),
+            outbox: Arc::new(outbox::MongoOutboxStore::new(&db, Clock::system())),
             processed: Arc::new(processed::MongoProcessedEventStore::new(&db)),
             dead_letters: Arc::new(dead_letters::MongoDeadLetterStore::new(&db)),
             control: Arc::new(control::MongoProcessorControlStore::new(&db)),
@@ -63,6 +67,13 @@ impl MongoStore {
             sagas: Arc::new(sagas::MongoSagaStore::new(&db)),
             db,
         }
+    }
+
+    /// The store stamping its own times (an outbox entry's `sentAt`, `failedAt` and lease) with
+    /// `clock`, the application's (the one given to the builder).
+    pub fn with_clock(mut self, clock: Clock) -> MongoStore {
+        self.outbox = Arc::new(outbox::MongoOutboxStore::new(&self.db, clock));
+        self
     }
 
     /// Creates the indexes of every collection (idempotent): the outbox relay index, the dead
@@ -105,6 +116,7 @@ impl MessageStore for MongoStore {
         SagaStores {
             sagas: self.sagas.clone(),
             dispatch: self.sagas.clone(),
+            dispatch_queue: self.sagas.clone(),
             deadlines: self.sagas.clone(),
             failures: self.sagas.clone(),
             markers: self.sagas.clone(),
@@ -216,11 +228,6 @@ impl<T> OrStoreError<T> for Result<T, mongodb::error::Error> {
     fn store(self) -> Result<T, StoreError> {
         self.map_err(store_error)
     }
-}
-
-/// The application clock, as a BSON date.
-pub(crate) fn now() -> DateTime {
-    DateTime::now()
 }
 
 /// Epoch milliseconds as a BSON date.

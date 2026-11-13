@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kraken_messaging::proto::{ProcessorState, ProcessorStatus};
-use kraken_messaging::{Config, Event, KrakenMessaging, message_type};
+use kraken_messaging::{Config, Event, KrakenMessaging, KrakenMessagingBuilder, message_type};
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
@@ -33,8 +33,22 @@ struct Ticked {
 message_type!(Ticked, "st.Ticked");
 impl Event for Ticked {}
 
-fn config(service: &str, hub: &str, kafka: &str, mongo: &str, topic: &str) -> Config {
-    let mut c = Config::new(service, hub, kafka, mongo);
+/// The service's builder with the MongoDB message store of `mongo`.
+async fn builder(
+    service: &str,
+    hub: &str,
+    kafka: &str,
+    mongo: &str,
+    topic: &str,
+) -> KrakenMessagingBuilder {
+    KrakenMessaging::builder(config(service, hub, kafka, topic))
+        .await
+        .unwrap()
+        .store(support::mongo_store(mongo).await)
+}
+
+fn config(service: &str, hub: &str, kafka: &str, topic: &str) -> Config {
+    let mut c = Config::new(service, hub, kafka);
     c.kafka_topic = topic.to_string();
     c.outbox_enabled = false;
     c
@@ -97,19 +111,12 @@ async fn the_lag_of_records_produced_while_stopped_shows_while_the_handler_is_bu
     let topic = "st.events";
     let uri = mongo.uri_for("lag");
     // The first run handles three records.
-    let app = KrakenMessaging::builder(config(
-        "svc-st",
-        &hub.address(),
-        &kafka.bootstrap,
-        &uri,
-        topic,
-    ))
-    .await
-    .unwrap()
-    .event::<Ticked, _, _>(|_, _| async { Ok(()) })
-    .start()
-    .await
-    .unwrap();
+    let app = builder("svc-st", &hub.address(), &kafka.bootstrap, &uri, topic)
+        .await
+        .event::<Ticked, _, _>(|_, _| async { Ok(()) })
+        .start()
+        .await
+        .unwrap();
     produce(&kafka.bootstrap, topic, 0, 3).await;
     eventually(
         "three handled and committed",
@@ -142,11 +149,12 @@ async fn the_lag_of_records_produced_while_stopped_shows_while_the_handler_is_bu
     let held = Arc::clone(&gate);
     let meter = support::metrics::TestMeter::new();
     let app = KrakenMessaging::builder_with_meter(
-        config("svc-st", &hub.address(), &kafka.bootstrap, &uri, topic),
+        config("svc-st", &hub.address(), &kafka.bootstrap, topic),
         meter.meter(),
     )
     .await
     .unwrap()
+    .store(support::mongo_store(&uri).await)
     .event::<Ticked, _, _>(move |_, _| {
         let held = Arc::clone(&held);
         async move {
@@ -220,19 +228,12 @@ async fn the_partitions_follow_a_rebalance() {
         .unwrap();
     let uri = mongo.uri_for("rb");
     let start = || async {
-        KrakenMessaging::builder(config(
-            "svc-rb",
-            &hub.address(),
-            &kafka.bootstrap,
-            &uri,
-            topic,
-        ))
-        .await
-        .unwrap()
-        .event::<Ticked, _, _>(|_, _| async { Ok(()) })
-        .start()
-        .await
-        .unwrap()
+        builder("svc-rb", &hub.address(), &kafka.bootstrap, &uri, topic)
+            .await
+            .event::<Ticked, _, _>(|_, _| async { Ok(()) })
+            .start()
+            .await
+            .unwrap()
     };
     let partitions = |app: &KrakenMessaging| -> Vec<i32> {
         default_of(app)

@@ -14,7 +14,7 @@
 //! - `kraken.saga.command.failures{type,reason}`: a `SagaCommandFailed` nobody handled (`type` is
 //!   the failed command's wire type, `reason` the `FailureReason` name, e.g. `NO_HANDLER`);
 //! - the gauges `kraken.sagas.active{type}` and `kraken.saga.dispatch.pending`, which no hook
-//!   moves: [`SagaStats::sample_once`] counts them in the database, and
+//!   moves: [`SagaStats::sample_once`] counts them in the message store, and
 //!   [`SagaStats::start_sampler`] does so every [`SAMPLE_INTERVAL`] (15 s, as Kotlin). A failed
 //!   sample is logged and keeps the last values.
 //!
@@ -26,15 +26,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use futures::TryStreamExt;
-use mongodb::Database;
-use mongodb::bson::{Document, doc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::failed::FailureReason;
 use super::metrics::{EventOutcome, ExternalOutcome, SagaMetrics};
-use super::store::{SAGA_DISPATCH_COLLECTION, SAGAS_COLLECTION};
+use super::ports::{DispatchQueue, SagaRepository};
 use crate::error::MessagingError;
 
 /// How often the sampled gauges are counted (ruling 16: a constant).
@@ -260,31 +257,15 @@ impl SagaStats {
         self.gauge(SAGA_DISPATCH_PENDING, &[])
     }
 
-    /// Counts the live (`ended: false`) instances per saga type and the pending `saga_dispatch`
-    /// entries (neither dispatched nor failed) and sets the two sampled gauges.
-    pub async fn sample_once(&self, db: &Database) -> Result<(), MessagingError> {
-        let mut by_type = HashMap::new();
-        let mut groups = db
-            .collection::<Document>(SAGAS_COLLECTION)
-            .aggregate([
-                doc! { "$match": { "ended": false } },
-                doc! { "$group": { "_id": "$type", "n": { "$sum": 1 } } },
-            ])
-            .await?;
-        while let Some(group) = groups.try_next().await? {
-            if let Ok(t) = group.get_str("_id") {
-                let n = match group.get("n") {
-                    Some(mongodb::bson::Bson::Int32(n)) => *n as u64,
-                    Some(mongodb::bson::Bson::Int64(n)) => *n as u64,
-                    _ => 0,
-                };
-                by_type.insert(t.to_string(), n);
-            }
-        }
-        let pending = db
-            .collection::<Document>(SAGA_DISPATCH_COLLECTION)
-            .count_documents(doc! { "dispatchedAt": null, "failedAt": null })
-            .await?;
+    /// Counts the live (not ended) instances per saga type ([`SagaRepository::count_live`]) and
+    /// the pending dispatch entries ([`DispatchQueue::pending`]) and sets the two sampled gauges.
+    pub async fn sample_once(
+        &self,
+        sagas: &dyn SagaRepository,
+        queue: &dyn DispatchQueue,
+    ) -> Result<(), MessagingError> {
+        let by_type = sagas.count_live().await?;
+        let pending = queue.pending().await?;
         self.set_gauges(SAGAS_ACTIVE, "type", &by_type);
         self.inner()
             .gauges
@@ -295,14 +276,15 @@ impl SagaStats {
     /// Samples every `interval` (the first at once) until `cancel`.
     pub fn start_sampler(
         &self,
-        db: Database,
+        sagas: Arc<dyn SagaRepository>,
+        queue: Arc<dyn DispatchQueue>,
         interval: Duration,
         cancel: CancellationToken,
     ) -> JoinHandle<()> {
         let stats = self.clone();
         tokio::spawn(async move {
             loop {
-                if let Err(e) = stats.sample_once(&db).await {
+                if let Err(e) = stats.sample_once(&*sagas, &*queue).await {
                     tracing::warn!("sampling the saga gauges failed, keeping the last values: {e}");
                 }
                 tokio::select! {

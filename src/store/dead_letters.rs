@@ -1,14 +1,98 @@
 //! The dead letters (ADR 0022, mode `collection`): records that exhausted their attempts, parked
 //! and sequenced per (processor, key). Every operation is a write of its own, outside any
-//! transaction.
+//! transaction, but a retry's [`delete_in`](DeadLetterStore::delete_in).
 
 use std::collections::{BTreeMap, HashSet};
 
 use futures::future::BoxFuture;
 
-pub use crate::processors::dead_letters::{DeadLetterError, DeadLetterReason, letter_id};
+use super::{StoreError, Tx};
+use crate::error::MessagingError;
 
-use super::StoreError;
+/// The most characters of a letter's `error.message` (and of `kraken-dlt-error`).
+pub const MAX_ERROR_MESSAGE_CHARS: usize = 2000;
+
+/// Why a record was parked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DeadLetterReason {
+    /// Stage 1 failed on every attempt.
+    HandlerFailed,
+    /// An earlier letter of the record's key was parked; stage 1 did not run.
+    Sequenced,
+    /// The record cannot be handled (no type header, a value that is not a JSON object); it
+    /// blocks nothing and can only be discarded.
+    Invalid,
+}
+
+impl DeadLetterReason {
+    /// The stored name: `HANDLER_FAILED`, `SEQUENCED`, `INVALID`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeadLetterReason::HandlerFailed => "HANDLER_FAILED",
+            DeadLetterReason::Sequenced => "SEQUENCED",
+            DeadLetterReason::Invalid => "INVALID",
+        }
+    }
+
+    /// The reason of a stored name; `None` for any other text.
+    pub fn parse(name: &str) -> Option<DeadLetterReason> {
+        [
+            DeadLetterReason::HandlerFailed,
+            DeadLetterReason::Sequenced,
+            DeadLetterReason::Invalid,
+        ]
+        .into_iter()
+        .find(|r| r.as_str() == name)
+    }
+}
+
+/// A letter's `error`: `type_name` is the error variant ([`MessagingError::variant_name`]),
+/// Kotlin's exception simple name; `message` at most [`MAX_ERROR_MESSAGE_CHARS`] characters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeadLetterError {
+    pub type_name: String,
+    pub message: String,
+}
+
+impl DeadLetterError {
+    pub fn new(type_name: &str, message: &str) -> DeadLetterError {
+        DeadLetterError {
+            type_name: type_name.to_string(),
+            message: cut_chars(message, MAX_ERROR_MESSAGE_CHARS),
+        }
+    }
+
+    /// A handler's failure.
+    pub fn from_error(e: &MessagingError) -> DeadLetterError {
+        DeadLetterError::new(e.variant_name(), &e.to_string())
+    }
+
+    /// A SEQUENCED letter's error, naming the key's head letter.
+    pub fn sequenced(head_id: &str) -> DeadLetterError {
+        DeadLetterError::new(
+            "Sequenced",
+            &format!("an earlier letter for this key is parked: {head_id}"),
+        )
+    }
+
+    /// An INVALID letter's error.
+    pub fn invalid(message: &str) -> DeadLetterError {
+        DeadLetterError::new("InvalidMessage", message)
+    }
+}
+
+/// `text` cut to at most `max` characters (never inside one).
+pub(crate) fn cut_chars(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((end, _)) => text[..end].to_string(),
+        None => text.to_string(),
+    }
+}
+
+/// A letter's id: `<processor>:<topic>:<partition>:<offset>`.
+pub fn letter_id(processor: &str, topic: &str, partition: i32, offset: i64) -> String {
+    format!("{processor}:{topic}:{partition}:{offset}")
+}
 
 /// One parked record. `id` is `<processor>:<topic>:<partition>:<offset>` ([`letter_id`]), so
 /// parking a redelivered record finds the first letter.
@@ -41,6 +125,17 @@ pub struct DeadLetter {
     pub expire_at_ms: i64,
     /// The record was parked while its processor replayed it (ADR 0023).
     pub replay: bool,
+}
+
+impl DeadLetter {
+    /// The id the record's stage 1 is deduplicated by: its `id` header, else (none or blank)
+    /// `<topic>-<partition>-<offset>` (the consumer's fallback).
+    pub fn dedupe_id(&self) -> String {
+        self.event_id
+            .clone()
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| format!("{}-{}-{}", self.topic, self.partition, self.offset))
+    }
 }
 
 /// What [`DeadLetterStore::summaries`] reads of a letter.
@@ -111,6 +206,14 @@ pub trait DeadLetterStore: Send + Sync {
 
     /// Deletes the letter; false when there was none.
     fn delete<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<bool, StoreError>>;
+
+    /// Deletes the letter in `tx`: a retry's, which commits with the record's marker and its
+    /// handlers' effects or not at all. False when there was none.
+    fn delete_in<'a>(
+        &'a self,
+        tx: &'a mut Tx,
+        id: &'a str,
+    ) -> BoxFuture<'a, Result<bool, StoreError>>;
 
     /// A retry failed again: `attempts + 1`, `error`, `last_attempt_at_ms = now_ms`, reason
     /// HANDLER_FAILED, no `blocked_by` any more. False when the letter is gone.

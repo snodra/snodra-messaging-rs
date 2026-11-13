@@ -324,18 +324,13 @@ mod tests {
     #[tokio::test]
     async fn a_poll_whose_publish_fails_is_retryable_so_the_saga_keeps_polling() {
         let (printer, _) = done_printer().await;
-        // An outbox that cannot be reached: the publish fails after the printer said DONE.
-        let db =
-            mongodb::Client::with_uri_str("mongodb://127.0.0.1:1/x?serverSelectionTimeoutMS=200")
-                .await
-                .unwrap()
-                .database("x");
+        // No outbox: the publish fails after the printer said DONE.
         let cmd = PollBannerJob {
             job_id: "banner-x".into(),
             attempt: 1,
         };
 
-        let polled = poll(&printer, &EventBus::new(db), &cmd).await;
+        let polled = poll(&printer, &EventBus::new(), &cmd).await;
 
         assert!(
             matches!(polled, Err(MessagingError::RetryableExternal(_))),

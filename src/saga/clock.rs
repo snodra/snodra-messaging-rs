@@ -3,9 +3,7 @@
 //! test fixture) move a [`ManualClock`].
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
-
-use mongodb::bson::DateTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A source of the current time, cheap to clone and share.
 #[derive(Clone)]
@@ -26,9 +24,17 @@ impl Clock {
         (self.0)()
     }
 
-    /// `now()` as a BSON datetime (millisecond precision, as stored).
-    pub fn now_bson(&self) -> DateTime {
-        DateTime::from_system_time(self.now())
+    /// `now()` as epoch milliseconds (the precision the stores keep).
+    pub fn now_ms(&self) -> i64 {
+        epoch_ms(self.now())
+    }
+}
+
+/// `at` as epoch milliseconds (before 1970: negative).
+pub fn epoch_ms(at: SystemTime) -> i64 {
+    match at.duration_since(UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
+        Err(e) => -i64::try_from(e.duration().as_millis()).unwrap_or(i64::MAX),
     }
 }
 

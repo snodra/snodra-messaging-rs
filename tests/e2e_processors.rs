@@ -41,12 +41,7 @@ async fn the_hub_shows_the_processors_their_letters_and_their_lag() {
     let kafka = support::containers::kafka().await;
     let mongo = support::containers::mongo().await;
     let topic = "e2e.events";
-    let mut config = Config::new(
-        "svc-e2e-proc",
-        &hub.address,
-        &kafka.bootstrap,
-        &mongo.uri_for("e2e"),
-    );
+    let mut config = Config::new("svc-e2e-proc", &hub.address, &kafka.bootstrap);
     config.kafka_topic = topic.to_string();
     config.outbox_enabled = false;
     config.consumer_max_attempts = 1;
@@ -56,6 +51,7 @@ async fn the_hub_shows_the_processors_their_letters_and_their_lag() {
     let app = KrakenMessaging::builder(config)
         .await
         .unwrap()
+        .store(support::mongo_store(&mongo.uri_for("e2e")).await)
         .event::<Ordered, _, _>(|_, _| async { Ok(()) })
         .event_in::<Ordered, _, _>("orders", move |e, _| {
             let fail = Arc::clone(&fail);
