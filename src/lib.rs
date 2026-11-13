@@ -17,6 +17,7 @@ pub mod proto;
 pub mod retry;
 pub mod saga;
 pub mod security;
+pub mod store;
 pub mod types;
 
 pub use app::{KrakenMessaging, KrakenMessagingBuilder};

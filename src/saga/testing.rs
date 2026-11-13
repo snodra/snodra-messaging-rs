@@ -30,7 +30,6 @@ use super::failed::{FailureReason, SagaCommandFailed};
 use super::metrics::NoopSagaMetrics;
 use super::ports::{
     DeadlineStore, DispatchRecorder, FailureStore, MarkerStore, SagaPorts, SagaRepository,
-    StoreError, Tx, TxProvider,
 };
 use super::retry::SagaRetry;
 use super::runtime::SagaRuntime;
@@ -41,6 +40,7 @@ use super::store::{
 use crate::context::MessageContext;
 use crate::kafka::SagaStage;
 use crate::retry::RetryPolicy;
+use crate::store::{StoreError, Tx, TxProvider};
 use crate::types::{Command, Event, MessageType};
 
 /// An event as the fixture takes it: any [`Event`], behind `&dyn` so one slice holds several

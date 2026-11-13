@@ -36,7 +36,7 @@ use super::context::{AssociationChange, SEQ_STRIDE, SagaContext};
 use super::definition::{ErasedHandler, SagaType};
 use super::failed::SagaCommandFailed;
 use super::metrics::{EventOutcome, SagaMetrics};
-use super::ports::{SagaPorts, StoreError, Tx};
+use super::ports::SagaPorts;
 use super::retry::SagaRetry;
 use super::store::{
     Association, DeadlineDocument, DeadlineStatus, SagaDispatchDocument, SagaDocument,
@@ -46,6 +46,7 @@ use crate::codec;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
 use crate::kafka::SagaStage;
+use crate::store::{StoreError, Tx};
 use crate::types::MessageType;
 
 /// The header of a `saga_dispatch` entry that carries the correlation id of the message that

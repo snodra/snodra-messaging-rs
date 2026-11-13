@@ -1,7 +1,8 @@
 //! The persistence the saga runtime needs, as small ports: the MongoDB implementations below are
 //! the default, and the test fixture (Task 14) supplies in-memory ones. Every method takes the
 //! [`Tx`] of the attempt it runs in, so the runtime decides what commits together; an in-memory
-//! implementation ignores it ([`Tx::none`]).
+//! implementation ignores it ([`Tx::none`]). [`Tx`], [`TxProvider`] and [`StoreError`] are the
+//! message store's ([`crate::store`]), which provides these ports too.
 //!
 //! A port reports a [`StoreError`]: a *conflict* (a duplicate key, a Mongo write conflict, a
 //! transient transaction error: the kind a retry resolves) apart from any other failure.
@@ -20,56 +21,10 @@ use super::store::{
 };
 use crate::error::MessagingError;
 use crate::kafka::PROCESSED_EVENTS_COLLECTION;
+use crate::store::{StoreError, Tx, TxProvider};
 
 const WRITE_CONFLICT: i32 = 112;
 const DUPLICATE_KEY: i32 = 11000;
-
-/// What a port or a transaction fails with.
-#[derive(Debug)]
-pub enum StoreError {
-    /// A version check, a start-key or marker duplicate, a write conflict or a transient
-    /// transaction error: another writer got there first, a retry of the whole attempt resolves it.
-    Conflict(String),
-    /// Anything else (a handler's error, a store outage).
-    Failed(MessagingError),
-}
-
-impl StoreError {
-    /// The failure as the crate's error (a conflict becomes a storage error).
-    pub fn into_messaging(self) -> MessagingError {
-        match self {
-            StoreError::Conflict(message) => MessagingError::Storage(message),
-            StoreError::Failed(e) => e,
-        }
-    }
-
-    pub fn is_conflict(&self) -> bool {
-        matches!(self, StoreError::Conflict(_))
-    }
-}
-
-impl std::fmt::Display for StoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StoreError::Conflict(message) => write!(f, "conflict: {message}"),
-            StoreError::Failed(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for StoreError {}
-
-impl From<MessagingError> for StoreError {
-    fn from(e: MessagingError) -> Self {
-        StoreError::Failed(e)
-    }
-}
-
-impl From<serde_json::Error> for StoreError {
-    fn from(e: serde_json::Error) -> Self {
-        StoreError::Failed(e.into())
-    }
-}
 
 /// The server error codes a driver error carries (command, write and bulk write errors).
 fn error_codes(e: &mongodb::error::Error) -> Vec<i32> {
@@ -106,44 +61,22 @@ impl From<mongodb::error::Error> for StoreError {
     }
 }
 
-/// The transaction an attempt runs in: a Mongo session (inside a transaction, or a plain one for
-/// the admin reads) or nothing at all for in-memory ports.
-pub struct Tx {
-    session: Option<ClientSession>,
-}
-
+/// Transitional (O0-3 removes it with the MongoDB code of the core; the MongoDB add-on's
+/// `MongoTxExt` replaces it): the [`Tx`] of a Mongo session, as the saga code builds and reads it.
 impl Tx {
-    /// No session: for in-memory ports, which ignore it.
-    pub fn none() -> Tx {
-        Tx { session: None }
-    }
-
     pub fn from_session(session: ClientSession) -> Tx {
-        Tx {
-            session: Some(session),
-        }
+        Tx::new(session)
     }
 
     /// The session of this transaction; an error for [`Tx::none`] (a Mongo port was given an
     /// in-memory transaction).
     pub fn session(&mut self) -> Result<&mut ClientSession, StoreError> {
-        self.session.as_mut().ok_or_else(|| {
+        self.get_mut::<ClientSession>().ok_or_else(|| {
             StoreError::Failed(MessagingError::Storage(
                 "a MongoDB saga port needs a transaction with a session".into(),
             ))
         })
     }
-}
-
-/// Starts, commits and aborts the [`Tx`] of an attempt (Spring's `TransactionOperations`).
-pub trait TxProvider: Send + Sync {
-    /// A transaction.
-    fn begin(&self) -> BoxFuture<'_, Result<Tx, StoreError>>;
-    /// No transaction: what reads and writes outside an attempt (the admin API) run in.
-    fn plain(&self) -> BoxFuture<'_, Result<Tx, StoreError>>;
-    fn commit<'a>(&'a self, tx: &'a mut Tx) -> BoxFuture<'a, Result<(), StoreError>>;
-    /// Abandons the transaction; never fails (there is nothing left to do about it).
-    fn abort<'a>(&'a self, tx: &'a mut Tx) -> BoxFuture<'a, ()>;
 }
 
 /// The `sagas` collection.
@@ -389,7 +322,7 @@ impl TxProvider for MongoSagaStore {
 
     fn abort<'a>(&'a self, tx: &'a mut Tx) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            if let Some(session) = tx.session.as_mut() {
+            if let Some(session) = tx.get_mut::<ClientSession>() {
                 let _ = session.abort_transaction().await;
             }
         })

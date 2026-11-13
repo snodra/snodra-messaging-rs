@@ -33,7 +33,7 @@ pub use failed::{FailureReason, SagaCommandFailed};
 pub use indexes::{ensure_external_call_indexes, ensure_saga_indexes};
 pub use metrics::{EventOutcome, ExternalOutcome, NoopSagaMetrics, SagaMetrics};
 pub use otel::OtelSagaMetrics;
-pub use ports::{SagaPorts, StoreError, Tx};
+pub use ports::SagaPorts;
 pub use raw::{
     LocalFirstSender, LocalRawCommandSender, RETRYABLE_MARKER, RawCommandSender, RawOutcome,
     UNKNOWN_OUTCOME_MARKER, classify_failure,
