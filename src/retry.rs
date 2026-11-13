@@ -8,7 +8,7 @@
 //!
 //! [`is_retryable`] is the one place that decides which failures may be retried. It is shared by
 //! [`crate::hub::Sender`] and, later, the saga relay, so both apply the same transient /
-//! non-transient split (mirrors Axon's `RetryScheduler`):
+//! non-transient split (the same rule for commands and queries):
 //!
 //! | Failure | Command | Query |
 //! |---|---|---|

@@ -1505,7 +1505,13 @@ async fn a_late_renewal_never_takes_the_lock_again() {
         .unwrap();
     let (code, message) = refused(hub.control("audit", prepare("op-2", 30_000), ASK).await);
     assert_eq!(code, ControlRefusal::NotPrepared, "{message}");
-    assert!(message.contains("lock lost"), "{message}");
+    // Whichever notices the lost lock first answers (ADR 0023 ruling 19): the renewal ("lock
+    // lost"), or the control poll, which forgets op-2 so this prepare is a late one ("already
+    // finished"). Either way the lock is not taken (below).
+    assert!(
+        message.contains("lock lost") || message.contains("op-2 already finished"),
+        "{message}"
+    );
     assert_eq!(lock().await, Some(Bson::Null));
     let (code, _) = refused(hub.control("audit", prepare("op-2", 30_000), ASK).await);
     assert_eq!(

@@ -522,7 +522,7 @@ impl KrakenMessagingBuilder {
         self
     }
 
-    /// An event handler in the named processor `processor` (ADR 0022, Axon's processing group):
+    /// An event handler in the named processor `processor` (ADR 0022):
     /// its own Kafka consumer in group `<service>.<processor>`, its own markers
     /// (`processor:<processor>:<eventId>`), position, dead letters and failure domain, so a slow
     /// or failing handler there never holds the other processors. Stage 1 only: sagas run in

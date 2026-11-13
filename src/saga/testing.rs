@@ -1,7 +1,7 @@
 //! Testing a saga without Kafka or MongoDB (S2-R6, feature `testing`): [`SagaTestFixture`] drives
 //! one saga definition with events and time over the crate's own [`SagaRuntime`] and the
 //! in-memory ports of [`InMemorySagaStore`]. The Rust form of the Kotlin
-//! `kraken-messaging-test` `SagaTestFixture`, in the style of Axon's.
+//! `kraken-messaging-test` `SagaTestFixture`.
 //!
 //! ```ignore
 //! SagaTestFixture::new("examples.Payment", payment_saga) // the closure given to builder.saga(..)

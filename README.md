@@ -841,7 +841,7 @@ The behaviour is ADR 0021's rulings 1 to 46; where Rust differs, the S2 ruling s
 ## Event processors
 
 Each **event processor** is its own Kafka consumer on the events topic, with its own consumer
-group, position, markers, dead letters and failure domain (ADR 0022; Axon's processing groups, the
+group, position, markers, dead letters and failure domain (ADR 0022; the
 Kotlin starter's `@ProcessingGroup`). A slow or failing handler in one processor never holds
 another.
 
