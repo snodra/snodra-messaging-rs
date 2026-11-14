@@ -77,7 +77,7 @@ async fn event_handler_without_store_fails_at_build() {
     .await;
     assert_eq!(
         message,
-        "the event handler for sr.Happened needs a message store: add .store(...)"
+        "the event handler for sr.Happened needs a message store: add .store(...) (store::memory::MemoryStore runs the in-memory one, not durable: tests and local runs)"
     );
     let message = refused(
         builder("127.0.0.1:1")
@@ -87,7 +87,7 @@ async fn event_handler_without_store_fails_at_build() {
     .await;
     assert_eq!(
         message,
-        "the event handler for sr.Happened in processor 'projections' needs a message store: add .store(...)"
+        "the event handler for sr.Happened in processor 'projections' needs a message store: add .store(...) (store::memory::MemoryStore runs the in-memory one, not durable: tests and local runs)"
     );
 }
 
@@ -106,7 +106,7 @@ async fn saga_without_store_fails_at_build() {
     .await;
     assert_eq!(
         message,
-        "saga 'tally' needs a message store: add .store(...)"
+        "saga 'tally' needs a message store: add .store(...) (store::memory::MemoryStore runs the in-memory one, not durable: tests and local runs)"
     );
 }
 
@@ -180,7 +180,7 @@ async fn commands_and_queries_need_no_store() {
         .unwrap_err();
     assert_eq!(
         e.to_string(),
-        "publishing an event needs a message store: add .store(...)"
+        "publishing an event needs a message store: add .store(...) (store::memory::MemoryStore runs the in-memory one, not durable: tests and local runs)"
     );
     app.shutdown().await;
     hub.stop();
@@ -270,7 +270,7 @@ async fn event_handler_without_event_store_fails_at_build() {
     .await;
     assert_eq!(
         message,
-        "the event handler for sr.Happened needs an event store: add .event_store(...)"
+        "the event handler for sr.Happened needs an event store: add .event_store(...) (event_store::memory::MemoryEventStore runs the in-memory one, not durable: tests and local runs)"
     );
     let message = refused(
         builder_without_event_store("127.0.0.1:1")
@@ -280,7 +280,7 @@ async fn event_handler_without_event_store_fails_at_build() {
     .await;
     assert_eq!(
         message,
-        "the event handler for sr.Happened in processor 'projections' needs an event store: add .event_store(...)"
+        "the event handler for sr.Happened in processor 'projections' needs an event store: add .event_store(...) (event_store::memory::MemoryEventStore runs the in-memory one, not durable: tests and local runs)"
     );
 }
 
@@ -303,7 +303,7 @@ async fn saga_without_event_store_fails_at_build() {
     .await;
     assert_eq!(
         message,
-        "saga 'tally' needs an event store: add .event_store(...)"
+        "saga 'tally' needs an event store: add .event_store(...) (event_store::memory::MemoryEventStore runs the in-memory one, not durable: tests and local runs)"
     );
 }
 
@@ -325,7 +325,7 @@ async fn publishing_without_event_store_fails() {
         .unwrap_err();
     assert_eq!(
         e.to_string(),
-        "publishing an event needs an event store: add .event_store(...)"
+        "publishing an event needs an event store: add .event_store(...) (event_store::memory::MemoryEventStore runs the in-memory one, not durable: tests and local runs)"
     );
     app.shutdown().await;
     hub.stop();
@@ -352,5 +352,52 @@ async fn dead_letter_mode_event_store_needs_the_capability() {
     assert!(
         message.contains("event-store") && message.contains("native-dead-letter"),
         "{message}"
+    );
+}
+
+/// The in-memory stores warn at startup that they are not durable; another store does not.
+#[tokio::test]
+async fn the_in_memory_stores_warn_that_they_are_not_durable() {
+    use kraken_messaging::event_store::memory::MemoryEventStore;
+    use kraken_messaging::store::memory::MemoryStore;
+    let logs = support::logs::Captured::default();
+    let _guard = logs.install();
+    let warned = |text: &str| {
+        logs.lines()
+            .iter()
+            .any(|l| l.contains("WARN") && l.contains(text))
+    };
+    let app = builder("127.0.0.1:1")
+        .await
+        .store(std::sync::Arc::new(MemoryStore::new()))
+        .event_store(std::sync::Arc::new(support::event_store::Log::full()))
+        .event::<Happened, _, _>(|_, _| async { Ok(()) })
+        .start()
+        .await
+        .unwrap();
+    app.shutdown().await;
+    assert!(
+        warned("in-memory message store: not durable"),
+        "{}",
+        logs.text()
+    );
+    assert!(
+        !warned("in-memory event store"),
+        "another event store: no warning\n{}",
+        logs.text()
+    );
+    let app = builder("127.0.0.1:1")
+        .await
+        .store(std::sync::Arc::new(MemoryStore::new()))
+        .event_store(std::sync::Arc::new(MemoryEventStore::default()))
+        .event::<Happened, _, _>(|_, _| async { Ok(()) })
+        .start()
+        .await
+        .unwrap();
+    app.shutdown().await;
+    assert!(
+        warned("in-memory event store: not durable"),
+        "{}",
+        logs.text()
     );
 }

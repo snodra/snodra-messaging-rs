@@ -44,6 +44,7 @@ own database through a message store add-on (ADR 0028): `.store(...)` on the bui
 | Sagas and deadlines on the Kotlin starter's collections, the relay, parked events | `KrakenMessagingBuilder::saga`, `saga::SagaContext`, `app.saga_failures()` (see [Sagas](#sagas)) |
 | Idempotent adapters, partner Kafka topics, webhooks; saga statistics | `idempotent_command`, `external_source`, `app.ingress()`, `external::webhook::verify`, `app.saga_stats()` |
 | A saga test fixture (feature `testing`) | `saga::testing::SagaTestFixture` |
+| In-memory event store and message store: tests, local runs and demos with no infrastructure | `event_store::memory::MemoryEventStore`, `store::memory::MemoryStore`, `testing::InMemoryStores` (feature `testing`; see [In-memory stores](#in-memory-stores)) |
 | Metrics through the OpenTelemetry API (outbox, consumed events, processors, hub client, sagas); the application installs the provider | `metrics`, `KrakenMessaging::builder_with_meter`, `saga::OtelSagaMetrics` (see [Metrics](#metrics)) |
 | One builder wiring all of it from `KRAKEN_*` variables | `KrakenMessaging`, `Config` |
 
@@ -60,6 +61,7 @@ own database through a message store add-on (ADR 0028): `.store(...)` on the bui
 - [Event processors](#event-processors)
 - [Dead letters](#dead-letters)
 - [Processor control](#processor-control)
+- [In-memory stores](#in-memory-stores)
 - [Security](#security)
 - [Metrics](#metrics)
 - [Build and test](#build-and-test)
@@ -1113,6 +1115,71 @@ KrakenMessaging::builder(config).await?
   replaying as soon as its last replayed record is acknowledged.
 - `reset_handler` for a processor without event handlers here fails `start()`.
 
+## In-memory stores
+
+The core ships an event store and a message store that live in the process's memory, for tests,
+local runs and single-process demos: no broker, no database, no container. A service asks for them
+by code, as for any store; they are never a fallback for a missing one.
+
+```rust
+use kraken_messaging::event_store::memory::MemoryEventStore;
+use kraken_messaging::store::memory::MemoryStore;
+
+let app = KrakenMessaging::builder(config).await?
+    .event_store(Arc::new(MemoryEventStore::default()))
+    .store(Arc::new(MemoryStore::new()))
+    /* handlers */
+    .start()
+    .await?;
+```
+
+- **Not durable.** Everything is lost when the process ends, and both stores keep everything they
+  are given until then (bounding it is the caller's concern). `start()` warns at WARN:
+  `in-memory message store: not durable` and `in-memory event store: not durable`.
+- **One process.** Every clone of a store is the same store: hand clones to the instances of a
+  test to make them compete for a processor's segments, or relay one outbox.
+- **The event store** (`event_store::memory`) keeps one log per source split into a fixed number of
+  segments `0` to `n-1` (`MemoryEventStoreConfig::segments`, 4 by default, 1 to 1024); a key goes
+  to segment `FNV-1a 64(key) mod n` (the Kotlin library's too), so a key's events keep their order;
+  events without a key go round the segments from `0`. It declares `replay`, `browse` and `lag` (its browser serves the
+  `kraken.events.*` queries), not `native-dead-letter`: dead letters stay in the message store
+  (mode `collection`). A segment moves to another instance only once the one holding it let it go.
+  Its events are stamped with `Clock::tokio()` unless configured otherwise.
+- **The message store** (`store::memory`) has real transactions: what a handler writes in its
+  transaction is seen by others only at the commit, and nothing of it stays after a rollback. A
+  record written by one live transaction is a conflict at once for another, and a commit fails
+  when a record it wrote changed meanwhile (`StoreError::Conflict`, retried as a database's write
+  conflict); a transaction that ended counts as none. Claims and leases are atomic and run on the
+  application's clock (until the builder hands it over, `Clock::tokio()`, which follows paused
+  time in tests). Every committed outbox append wakes the relay (`OutboxStore::on_append`), so
+  events go out at once. Nothing is ever deleted but dead letters at their `expire_at_ms`.
+- Both pass the conformance kits of every add-on (`event_store::conformance`,
+  `store::conformance`), with no container.
+
+### Zero-infrastructure tests
+
+With the feature `testing`, `testing::InMemoryStores` builds a service's messaging on both stores,
+publishes events to it as another service would, and reads back what it published and its dead
+letters:
+
+```rust
+let stores = InMemoryStores::new();
+let app = stores
+    .install(KrakenMessaging::builder(stores.config("orders")).await?)
+    .event::<OrderPlaced, _, _>(place_order)
+    .start()
+    .await?;
+let event_id = stores.publish(&OrderPlaced { order: "o-1".into() }, Some("o-1")).await?;
+let confirmed: Vec<OrderConfirmed> = stores.wait_published(1, Duration::from_secs(10)).await?;
+assert!(stores.processed(&event_id)); // the event's processed marker is committed
+let letters = stores.dead_letters().await?;
+```
+
+Events, processors, dead letters, sagas and idempotent handlers need no hub; commands and queries
+do, and `stores.config(..)` points at none. `MemoryEventStore::events(source)` and
+`MemoryStore::contents()` show what each store holds. `examples/service-c` tests its `audit`
+processor this way (`src/audit.rs`).
+
 ## Security
 
 Access control and TLS for the hub connection (roadmap P5a, hub ADR 0018). Everything here is opt-in
@@ -1462,8 +1529,9 @@ cargo build
 cargo test                            # unit tests + integration tests (Docker required for the latter)
 ```
 
-Integration tests start Kafka (`apache/kafka`), MongoDB (replica set) and `kraken-hub:dev` with
-testcontainers. The hub image is built from the sibling repo: `docker build -t kraken-hub:dev .` in
+Most tests run on the in-memory stores (see [In-memory stores](#in-memory-stores)) and need no
+container. The integration tests that pin the add-ons' own behaviour, and the end-to-end tests,
+start Kafka (`apache/kafka`), MongoDB (replica set) and `kraken-hub:dev` with testcontainers. The hub image is built from the sibling repo: `docker build -t kraken-hub:dev .` in
 `../kraken-hub` (override with `KRAKEN_HUB_IMAGE`); every end-to-end test runs that one image (the
 hub and this library ship together). `tests/e2e_protocol.rs` covers the handshake, timeouts,
 reconnect, flow control and status reports against it; `tests/e2e_multi_hub.rs`,

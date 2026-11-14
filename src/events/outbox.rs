@@ -13,11 +13,9 @@ use crate::time::now_ms;
 use crate::types::Event;
 
 /// What publishing without a store fails with.
-pub(crate) const PUBLISH_NEEDS_STORE: &str =
-    "publishing an event needs a message store: add .store(...)";
+pub(crate) const PUBLISH_NEEDS_STORE: &str = "publishing an event needs a message store: add .store(...) (store::memory::MemoryStore runs the in-memory one, not durable: tests and local runs)";
 /// What publishing without an event store fails with.
-pub(crate) const PUBLISH_NEEDS_EVENT_STORE: &str =
-    "publishing an event needs an event store: add .event_store(...)";
+pub(crate) const PUBLISH_NEEDS_EVENT_STORE: &str = "publishing an event needs an event store: add .event_store(...) (event_store::memory::MemoryEventStore runs the in-memory one, not durable: tests and local runs)";
 
 /// Builds the outbox entry for `event`: headers from the handler context when there is one.
 pub fn new_outbox_entry<E: Event>(

@@ -25,14 +25,13 @@ use std::time::Duration;
 
 use chrono::Utc;
 use kraken_messaging::external::IdempotencyKey;
-use kraken_messaging::processors::EventOptions;
 use kraken_messaging::{Config, KrakenMessaging, MessagingError};
 use kraken_messaging_kafka::{ExternalSource, KafkaConfig, KafkaEventStore, KafkaExternalSource};
 use kraken_messaging_mongo::MongoStore;
 use messages::{
     BannerFailed, BannerPrinted, Counter, GreetingDelivered, IncrementCounter, Inventory,
-    OpenSubscriptions, PollBannerJob, PrintBanner, Reverse, Reversed, Rows, Shout, ShoutAudit,
-    Shouted, SubscriptionCount, TextReversed, TextShouted, WatchCounter,
+    OpenSubscriptions, PollBannerJob, PrintBanner, Reverse, Reversed, Rows, Shout, Shouted,
+    SubscriptionCount, TextReversed, TextShouted, WatchCounter,
 };
 
 /// The banner saga's settings, from the environment (compose.local.yaml sets them in-network):
@@ -89,8 +88,6 @@ async fn main() -> Result<(), MessagingError> {
     let _metrics = telemetry::init_metrics(&config, otlp_endpoint.as_deref())?;
     let banners = BannerSettings::from_env()?;
     let audit = audit::Audit::default();
-    let (audit_handler, audit_notifier, audit_resets) =
-        (audit.clone(), audit.clone(), audit.clone());
     let outcomes = banner::BannerOutcomes::default();
     let (printed_outcomes, failed_outcomes) = (outcomes.clone(), outcomes.clone());
     let print_printer = printer::Printer::new(&banners.printer_url, banners.reply.clone())?;
@@ -131,7 +128,8 @@ async fn main() -> Result<(), MessagingError> {
     let shout_events = builder.events();
     let reverse_events = builder.events();
     let poll_events = builder.events();
-    let app = builder
+    // The named processor `audit`: its own consumer, group and dead letters.
+    let app = audit::register(builder, &audit)
         .command::<Shout, _, _>(move |cmd, ctx| {
             let events = shout_events.clone();
             async move {
@@ -225,25 +223,6 @@ async fn main() -> Result<(), MessagingError> {
         .event::<GreetingDelivered, _, _>(|e, _ctx| async move {
             tracing::info!("C: received GreetingDelivered id={} name={}", e.id, e.name);
             Ok(())
-        })
-        // The named processor `audit`: its own consumer, group and dead letters.
-        .event_in::<ShoutAudit, _, _>(audit::PROCESSOR, move |e, _ctx| {
-            let handled = audit_handler.handle(e);
-            async move { handled }
-        })
-        // P6b: a second handler there that a replay never runs again, and the reset handler.
-        .event_with::<ShoutAudit, _, _>(
-            EventOptions::new()
-                .processor(audit::PROCESSOR)
-                .disallow_replay(),
-            move |e, _ctx| {
-                audit_notifier.notify(e);
-                async { Ok(()) }
-            },
-        )
-        .reset_handler(audit::PROCESSOR, move |ctx| {
-            audit_resets.reset(&ctx);
-            async { Ok(()) }
         })
         // The banner saga and its edge.
         .saga(banner::SAGA, banner::banner_saga)

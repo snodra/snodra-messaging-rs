@@ -20,6 +20,8 @@ pub mod retry;
 pub mod saga;
 pub mod security;
 pub mod store;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod time;
 pub mod types;
 

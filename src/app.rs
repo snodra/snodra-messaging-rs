@@ -808,6 +808,20 @@ impl KrakenMessagingBuilder {
         } else {
             Vec::new()
         };
+        // The in-memory stores lose everything when the process ends: say so (ADR 0028), named
+        // by their reserved name, whatever the profile.
+        if store
+            .as_ref()
+            .is_some_and(|s| s.name() == crate::store::memory::NAME)
+        {
+            tracing::warn!("in-memory message store: not durable");
+        }
+        if event_store
+            .as_ref()
+            .is_some_and(|e| e.name() == crate::event_store::memory::NAME)
+        {
+            tracing::warn!("in-memory event store: not durable");
+        }
         // The store stamps its own times with the application's clock, and gets its schema.
         if let Some(store) = &store {
             store.use_clock(clock.clone());
@@ -1088,6 +1102,12 @@ impl KrakenMessagingBuilder {
     }
 }
 
+/// What the missing-store messages add: the in-memory store and what it is for.
+const MEMORY_STORE_HINT: &str =
+    "store::memory::MemoryStore runs the in-memory one, not durable: tests and local runs";
+/// What the missing-event-store messages add.
+const MEMORY_EVENT_STORE_HINT: &str = "event_store::memory::MemoryEventStore runs the in-memory one, not durable: tests and local runs";
+
 /// Without a store: the first registration that needs one, as the error naming it (ADR 0028:
 /// commands, queries and subscription queries need none).
 fn needs_store(
@@ -1098,7 +1118,7 @@ fn needs_store(
 ) -> Result<(), MessagingError> {
     let needs = |what: String| {
         Err(MessagingError::InvalidMessage(format!(
-            "{what} needs a message store: add .store(...)"
+            "{what} needs a message store: add .store(...) ({MEMORY_STORE_HINT})"
         )))
     };
     if let Some(t) = registry.event_types().first() {
@@ -1133,7 +1153,7 @@ fn needs_event_store(
 ) -> Result<(), MessagingError> {
     let needs = |what: String| {
         Err(MessagingError::InvalidMessage(format!(
-            "{what} needs an event store: add .event_store(...)"
+            "{what} needs an event store: add .event_store(...) ({MEMORY_EVENT_STORE_HINT})"
         )))
     };
     if let Some(t) = registry.event_types().first() {

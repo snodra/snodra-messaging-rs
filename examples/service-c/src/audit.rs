@@ -30,11 +30,13 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use chrono::Utc;
-use kraken_messaging::MessagingError;
 use kraken_messaging::event_store::ResetTarget;
 use kraken_messaging::events::EventBus;
-use kraken_messaging::processors::{DEFAULT_LIST_LIMIT, DeadLetters, ResetContext, RetryResult};
+use kraken_messaging::processors::{
+    DEFAULT_LIST_LIMIT, DeadLetters, EventOptions, ResetContext, RetryResult,
+};
 use kraken_messaging::store::DeadLetter;
+use kraken_messaging::{KrakenMessagingBuilder, MessagingError};
 use serde::{Deserialize, Serialize};
 
 use crate::messages::ShoutAudit;
@@ -102,6 +104,28 @@ impl From<&ResetContext> for ResetView {
                 .collect(),
         }
     }
+}
+
+/// The `audit` processor's registrations on `builder`: its handler, a second handler there that a
+/// replay never runs again (P6b), and its reset handler, all reporting to `audit`.
+pub fn register(builder: KrakenMessagingBuilder, audit: &Audit) -> KrakenMessagingBuilder {
+    let (handler, notifier, resets) = (audit.clone(), audit.clone(), audit.clone());
+    builder
+        .event_in::<ShoutAudit, _, _>(PROCESSOR, move |e, _ctx| {
+            let handled = handler.handle(e);
+            async move { handled }
+        })
+        .event_with::<ShoutAudit, _, _>(
+            EventOptions::new().processor(PROCESSOR).disallow_replay(),
+            move |e, _ctx| {
+                notifier.notify(e);
+                async { Ok(()) }
+            },
+        )
+        .reset_handler(PROCESSOR, move |ctx| {
+            resets.reset(&ctx);
+            async { Ok(()) }
+        })
 }
 
 impl Audit {
@@ -596,5 +620,108 @@ mod tests {
         assert_eq!(param(&query, "on"), None, "an empty value is no value");
         assert_eq!(param(&query, "other"), None);
         assert_eq!(param(&None, "processor"), None);
+    }
+}
+
+/// The `audit` processor in the zero-infrastructure mode (`kraken_messaging::testing`): on the
+/// in-memory event store and message store, no Kafka, MongoDB or hub. What the sandbox shows with
+/// containers (`examples/smoke.sh`), as a unit test.
+#[cfg(test)]
+mod zero_infrastructure {
+    use std::time::Duration;
+
+    use chrono::Utc;
+    use kraken_messaging::KrakenMessaging;
+    use kraken_messaging::processors::RetryResult;
+    use kraken_messaging::store::DeadLetterReason;
+    use kraken_messaging::testing::InMemoryStores;
+
+    use super::{Audit, PROCESSOR, register};
+    use crate::messages::ShoutAudit;
+
+    const WITHIN: Duration = Duration::from_secs(10);
+
+    fn note(key: &str, text: &str) -> ShoutAudit {
+        ShoutAudit {
+            key: key.into(),
+            text: text.into(),
+            at: Utc::now(),
+        }
+    }
+
+    async fn handled(audit: &Audit, count: usize) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + WITHIN;
+        loop {
+            let texts: Vec<String> = audit.handled().into_iter().map(|n| n.text).collect();
+            if texts.len() >= count || tokio::time::Instant::now() >= deadline {
+                return texts;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A note the service publishes (as `POST /audit/notes` does) reaches the event store and its
+    /// `audit` processor; a poison note while failing is parked as a dead letter, holds back the
+    /// later note of its key while another key flows, and both are handled once it is retried.
+    #[tokio::test]
+    async fn the_audit_processor_runs_without_infrastructure() {
+        let stores = InMemoryStores::new();
+        let mut config = stores.config("service-c");
+        config.consumer_max_attempts = 2;
+        let audit = Audit::default();
+        let builder = stores.install(KrakenMessaging::builder(config).await.unwrap());
+        let events = builder.events();
+        let app = register(builder, &audit).start().await.unwrap();
+
+        events
+            .publish(&note("k1", "hello"), Some("k1"))
+            .await
+            .unwrap();
+        let published = stores
+            .wait_published::<ShoutAudit>(1, WITHIN)
+            .await
+            .unwrap();
+        assert_eq!(published[0].text, "hello", "the service published it");
+        assert_eq!(handled(&audit, 1).await, ["hello"]);
+
+        audit.set_failing(true);
+        stores
+            .publish(&note("k2", "poison-1"), Some("k2"))
+            .await
+            .unwrap();
+        let letters = stores.wait_dead_letters(1, WITHIN).await.unwrap();
+        assert_eq!(letters[0].processor, PROCESSOR);
+        assert_eq!(letters[0].key.as_deref(), Some("k2"));
+        assert_eq!(letters[0].reason, DeadLetterReason::HandlerFailed);
+        stores
+            .publish(&note("k2", "after"), Some("k2"))
+            .await
+            .unwrap();
+        stores
+            .publish(&note("k3", "other"), Some("k3"))
+            .await
+            .unwrap();
+        assert_eq!(handled(&audit, 2).await, ["hello", "other"]);
+        let letters = stores.wait_dead_letters(2, WITHIN).await.unwrap();
+        assert_eq!(
+            letters[1].reason,
+            DeadLetterReason::Sequenced,
+            "parked behind the poison note"
+        );
+
+        audit.set_failing(false);
+        let dead_letters = app.dead_letters();
+        for letter in letters {
+            assert_eq!(
+                dead_letters.retry(&letter.id).await.unwrap(),
+                RetryResult::Retried
+            );
+        }
+        assert_eq!(
+            handled(&audit, 4).await,
+            ["hello", "other", "poison-1", "after"]
+        );
+        assert!(stores.dead_letters().await.unwrap().is_empty());
+        app.shutdown().await;
     }
 }

@@ -21,7 +21,16 @@ impl Write for Captured {
 
 impl Captured {
     /// Captures everything at DEBUG and above (no ANSI) until the guard is dropped.
+    ///
+    /// First makes a global subscriber that enables nothing but keeps every callsite worth
+    /// asking: a callsite first reached on a test thread without a subscriber would otherwise be
+    /// cached as of no interest, and a capture on another thread would miss it (tests run in
+    /// parallel). Threads without a capture do no work for it.
     pub fn install(&self) -> tracing::subscriber::DefaultGuard {
+        static GLOBAL: std::sync::Once = std::sync::Once::new();
+        GLOBAL.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(AskEveryTime);
+        });
         let sink = self.clone();
         tracing::subscriber::set_default(
             tracing_subscriber::fmt()
@@ -39,4 +48,35 @@ impl Captured {
     pub fn lines(&self) -> Vec<String> {
         self.text().lines().map(str::to_string).collect()
     }
+}
+
+/// A subscriber that records nothing and answers "ask me each time" for every callsite, so the
+/// thread-local captures decide.
+struct AskEveryTime;
+
+impl tracing::Subscriber for AskEveryTime {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
 }
