@@ -17,6 +17,15 @@ impl Clock {
         Clock(Arc::new(SystemTime::now))
     }
 
+    /// The wall clock as it read when this clock was made, moved on by tokio's clock since: the
+    /// wall clock in a running service, and a clock that follows paused time in a test
+    /// (`#[tokio::test(start_paused = true)]`, `tokio::time::advance`). The in-memory stores'
+    /// default.
+    pub fn tokio() -> Clock {
+        let (wall, start) = (SystemTime::now(), tokio::time::Instant::now());
+        Clock(Arc::new(move || wall + start.elapsed()))
+    }
+
     /// A clock reading `now()`.
     pub fn new(now: impl Fn() -> SystemTime + Send + Sync + 'static) -> Clock {
         Clock(Arc::new(now))
@@ -70,5 +79,29 @@ impl ManualClock {
     pub fn clock(&self) -> Clock {
         let shared = Arc::clone(&self.0);
         Clock::new(move || *shared.lock().expect("clock lock"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tokio clock reads the wall clock and moves with tokio's time, paused time included.
+    #[tokio::test(start_paused = true)]
+    async fn the_tokio_clock_follows_paused_time() {
+        let before = SystemTime::now();
+        let clock = Clock::tokio();
+        let start = clock.now();
+        assert!(
+            start >= before - Duration::from_secs(1)
+                && start <= SystemTime::now() + Duration::from_secs(1),
+            "starts at the wall clock"
+        );
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        let moved = clock.now().duration_since(start).expect("forward");
+        assert!(
+            moved >= Duration::from_secs(3600) && moved < Duration::from_secs(3601),
+            "moved with paused time: {moved:?}"
+        );
     }
 }

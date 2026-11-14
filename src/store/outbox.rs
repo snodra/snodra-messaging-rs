@@ -2,6 +2,7 @@
 //! store by whichever instance claims them.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -85,6 +86,14 @@ pub trait OutboxStore: Send + Sync {
     /// How many entries are pending (neither sent nor failed), held or not: the outbox backlog
     /// gauge.
     fn pending(&self) -> BoxFuture<'_, Result<u64, StoreError>>;
+
+    /// Registers `wake`, called each time an append commits (on its own, or with its
+    /// transaction), so the relay publishes at once instead of at its next poll. A store that
+    /// cannot tell ignores it (the default): the relay then polls
+    /// (`Config::outbox_poll_interval`). `wake` must return at once.
+    fn on_append(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        let _ = wake;
+    }
 
     /// `created_at_ms` of the oldest pending entry (neither sent nor failed, held or not); `None`
     /// when none is pending: the outbox age gauge.

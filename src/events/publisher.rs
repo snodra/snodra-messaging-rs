@@ -170,8 +170,16 @@ impl OutboxPublisher {
         }))
     }
 
-    /// Polls until cancelled; a full batch is followed immediately by the next poll.
+    /// Polls until cancelled; a full batch is followed immediately by the next poll, and so is
+    /// an append the store reports ([`OutboxStore::on_append`]).
     pub fn start(self: Arc<Self>, cancel: CancellationToken) -> JoinHandle<()> {
+        let appended = Arc::new(tokio::sync::Notify::new());
+        let waker = Arc::downgrade(&appended);
+        self.outbox.on_append(Arc::new(move || {
+            if let Some(appended) = waker.upgrade() {
+                appended.notify_one();
+            }
+        }));
         tokio::spawn(async move {
             loop {
                 let sent = match self.relay_once().await {
@@ -187,6 +195,7 @@ impl OutboxPublisher {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     _ = tokio::time::sleep(self.poll_interval) => {}
+                    _ = appended.notified() => {}
                 }
             }
         })

@@ -17,10 +17,8 @@ pub use consumer::{
     classify_with,
 };
 pub use dispatch::{LocalEventDispatcher, NoSagas, SagaStage};
-pub(crate) use outbox::check_payload;
-#[cfg(feature = "testing")]
-pub(crate) use outbox::check_payload_text;
 pub use outbox::{EventBus, new_outbox_entry};
+pub(crate) use outbox::{check_payload, check_payload_text};
 pub use publisher::{OUTBOX_SEND_TIMEOUT, OutboxPublisher, OutboxPublisherSettings};
 pub(crate) use resubscribe::{Ended, Resubscribing, keep_subscribed};
 pub use resubscribe::{RESUBSCRIBE_MAX, RESUBSCRIBE_MIN};

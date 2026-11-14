@@ -19,6 +19,7 @@ use crate::saga::Clock;
 pub mod control;
 pub mod dead_letters;
 pub mod external;
+pub mod memory;
 pub mod outbox;
 pub mod processed;
 mod tx;

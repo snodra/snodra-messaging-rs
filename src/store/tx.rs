@@ -26,6 +26,11 @@ impl Tx {
         Tx { inner: None }
     }
 
+    /// Whether it is [`Tx::none`]: it holds nothing.
+    pub fn is_none(&self) -> bool {
+        self.inner.is_none()
+    }
+
     /// What [`Tx::new`] put in, when it is a `T`; `None` for [`Tx::none`] or another type.
     pub fn get_mut<T: Any>(&mut self) -> Option<&mut T> {
         self.inner.as_mut().and_then(|inner| inner.downcast_mut())
@@ -55,5 +60,6 @@ mod tests {
         assert_eq!(tx.get_mut::<String>().map(|s| s.as_str()), Some("session!"));
         assert!(tx.get_mut::<u32>().is_none(), "another type");
         assert!(Tx::none().get_mut::<String>().is_none(), "nothing");
+        assert!(Tx::none().is_none() && !tx.is_none());
     }
 }
