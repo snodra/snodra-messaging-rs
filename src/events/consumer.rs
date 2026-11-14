@@ -8,7 +8,8 @@
 //! flowing.
 //!
 //! A subscription whose `next` fails is broken: it is closed and the processor subscribes again
-//! after a backoff ([`keep_subscribed`](super::resubscribe)), showing the error on its status. What the subscription recovered from by itself ([`Subscription::take_error`]) shows
+//! after a backoff ([`keep_subscribed`](super::keep_subscribed)), showing the error on its
+//! status. What the subscription recovered from by itself ([`Subscription::take_error`]) shows
 //! there too.
 //!
 //! Processor control (ADR 0023) reaches it through its [`ConsumerControl`]: paused, it pauses its

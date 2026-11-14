@@ -25,6 +25,15 @@ use serde::{Deserialize, Serialize};
 use support::event_store::Log;
 use tokio_util::sync::CancellationToken;
 
+macro_rules! require_docker {
+    () => {
+        if !support::docker_available() {
+            eprintln!("docker not available, skipping");
+            return;
+        }
+    };
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Noted {
     note: String,
@@ -160,10 +169,7 @@ fn request(action: Action) -> ControlRequest {
 /// store offers.
 #[tokio::test]
 async fn control_action_without_capability_is_unsupported() {
-    if !support::docker_available() {
-        eprintln!("docker not available, skipping");
-        return;
-    }
+    require_docker!();
     let mongo = support::containers::mongo().await;
     let uri = mongo.uri_for("unsupported");
     let mut config = Config::new("core", "static://127.0.0.1:1");
