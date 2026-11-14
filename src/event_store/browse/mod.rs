@@ -141,11 +141,11 @@ mod tail;
 pub use filters::{EventFilter, Filters, MAX_FILTER, TimeArg, TypeFilter, parse_time};
 pub use queries::{
     BrowseError, BrowseSettings, DEFAULT_HEARTBEAT, DEFAULT_LIMIT, EndReason, GET, GetRequest,
-    Heartbeat, LAG, LagRequest, LagView, MAX_HEARTBEAT, MAX_PAYLOAD_SETTING, MAX_RESULTS_SETTING,
-    MAX_TAIL_BUFFER_SETTING, MAX_TAIL_DURATION_SETTING, MAX_TIMEOUT_SETTING, MIN_HEARTBEAT,
-    MIN_TAIL_DURATION_SETTING, SEARCH, SOURCES, SearchPage, SearchRequest, SegmentBounds,
-    SegmentLag, SourceView, SourcesRequest, SourcesView, StoppedBy, SubscriptionLag, TAIL, TailEnd,
-    TailEvent, TailRequest, TailStart, heartbeat_period, quoted,
+    Heartbeat, LAG, LagRequest, LagView, MAX_CALLS_SETTING, MAX_HEARTBEAT, MAX_PAYLOAD_SETTING,
+    MAX_RESULTS_SETTING, MAX_TAIL_BUFFER_SETTING, MAX_TAIL_DURATION_SETTING, MAX_TIMEOUT_SETTING,
+    MIN_HEARTBEAT, MIN_TAIL_DURATION_SETTING, SEARCH, SOURCES, SearchPage, SearchRequest,
+    SegmentBounds, SegmentLag, SourceView, SourcesRequest, SourcesView, StoppedBy, SubscriptionLag,
+    TAIL, TailEnd, TailEvent, TailRequest, TailStart, heartbeat_period, quoted,
 };
 pub use records::{
     EventRecord, EventSummary, HeaderView, MAX_HEADER_NAME, MAX_HEADER_VALUE, MAX_HEADERS, MAX_KEY,

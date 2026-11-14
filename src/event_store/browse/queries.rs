@@ -40,6 +40,8 @@ pub const MIN_TAIL_DURATION_SETTING: Duration = Duration::from_secs(1);
 pub const MAX_TAIL_DURATION_SETTING: Duration = Duration::from_secs(24 * 3600);
 /// The most events a browser may be set to buffer for a tail's reader.
 pub const MAX_TAIL_BUFFER_SETTING: usize = 65_536;
+/// The most searches (and the most tails) a browser may be set to run at once.
+pub const MAX_CALLS_SETTING: usize = 1024;
 /// The most payload bytes a browser may be set to carry in a record.
 pub const MAX_PAYLOAD_SETTING: usize = 16 * 1024 * 1024;
 
@@ -116,7 +118,8 @@ impl From<BrowseError> for MessagingError {
 pub struct BrowseSettings {
     /// The only sources the browser reads; the first is the default of a call that names none.
     pub sources: Vec<String>,
-    /// Records a search page reads at most (50 000).
+    /// Records a search page reads at most (50 000), but at least one record per segment that is
+    /// not done.
     pub max_scanned: u64,
     /// Results a search page returns at most (100).
     pub max_results: usize,
@@ -158,8 +161,9 @@ impl BrowseSettings {
     /// maximum: `max_results` at most [`MAX_RESULTS_SETTING`] (1000), `timeout` at most
     /// [`MAX_TIMEOUT_SETTING`] (5 min), `tail_duration` from [`MIN_TAIL_DURATION_SETTING`]
     /// (1 s) to [`MAX_TAIL_DURATION_SETTING`] (24 h), `tail_buffer` at most
-    /// [`MAX_TAIL_BUFFER_SETTING`] (65 536), `max_payload` at most [`MAX_PAYLOAD_SETTING`]
-    /// (16 MiB). Within these, no deadline a browser computes from them can overflow.
+    /// [`MAX_TAIL_BUFFER_SETTING`] (65 536), `max_searches` and `max_tails` at most
+    /// [`MAX_CALLS_SETTING`] (1024), `max_payload` at most [`MAX_PAYLOAD_SETTING`] (16 MiB).
+    /// Within these, no deadline a browser computes from them can overflow.
     pub fn validate(&self) -> Result<(), String> {
         if self.sources.is_empty() || self.sources.iter().any(|s| s.trim().is_empty()) {
             return Err("the browser needs at least one source, none of them empty".into());
@@ -198,6 +202,16 @@ impl BrowseSettings {
                 "tail_buffer",
                 self.tail_buffer > MAX_TAIL_BUFFER_SETTING,
                 MAX_TAIL_BUFFER_SETTING.to_string(),
+            ),
+            (
+                "max_searches",
+                self.max_searches > MAX_CALLS_SETTING,
+                MAX_CALLS_SETTING.to_string(),
+            ),
+            (
+                "max_tails",
+                self.max_tails > MAX_CALLS_SETTING,
+                MAX_CALLS_SETTING.to_string(),
             ),
             (
                 "max_payload",
@@ -715,6 +729,14 @@ mod tests {
                 ..BrowseSettings::default()
             },
             BrowseSettings {
+                max_searches: 1025,
+                ..BrowseSettings::default()
+            },
+            BrowseSettings {
+                max_tails: usize::MAX,
+                ..BrowseSettings::default()
+            },
+            BrowseSettings {
                 max_payload: 16 * 1024 * 1024 + 1,
                 ..BrowseSettings::default()
             },
@@ -726,6 +748,8 @@ mod tests {
             timeout: Duration::from_secs(300),
             tail_duration: Duration::from_secs(24 * 3600),
             tail_buffer: 65_536,
+            max_searches: 1024,
+            max_tails: 1024,
             max_payload: 16 * 1024 * 1024,
             ..BrowseSettings::default()
         };

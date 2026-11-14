@@ -138,6 +138,7 @@ pub struct Page {
 #[derive(Debug, Clone, Copy)]
 pub struct Budget {
     pub limit: usize,
+    /// Records read at most, but at least one per segment that is not done.
     pub max_scanned: u64,
     pub deadline: Instant,
 }
@@ -320,7 +321,7 @@ pub struct SearchPlan {
     pub limit: usize,
     /// The page it continues.
     pub cursor: Option<Cursor>,
-    /// Records read at most.
+    /// Records read at most, but at least one record per segment that is not done ([`merge`]).
     pub max_scanned: u64,
     /// The time the page may take.
     pub timeout: Duration,

@@ -533,14 +533,23 @@ impl LogBrowser {
         let Some(segments) = state.sources.get(&plan.source) else {
             return Ok(plan.missing());
         };
+        // The double's times rise within a segment: `from` and `to` bound each range.
         let ranges: Vec<Range> = (0..SEGMENTS)
             .map(|s| {
+                let records = &segments[s];
+                let lower = plan
+                    .filters
+                    .from
+                    .map_or(0, |from| records.partition_point(|r| r.timestamp_ms < from))
+                    as i64;
+                let upper = plan.filters.to.map_or(records.len(), |to| {
+                    records.partition_point(|r| r.timestamp_ms <= to)
+                }) as i64;
                 let name = s.to_string();
-                let upper = plan.upper(&name, 0, segments[s].len() as i64);
                 Range {
+                    upper: plan.upper(&name, lower, upper),
                     segment: name,
-                    lower: 0,
-                    upper,
+                    lower,
                 }
             })
             .collect();

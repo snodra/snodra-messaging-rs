@@ -1000,7 +1000,9 @@ pub async fn search_finds_by_type_key_and_correlation(kit: &EventStoreKit<'_>) {
 
 /// `browse`: a search page stops at its `limit` and continues from its cursor (the pages
 /// together are every match, newest first, none twice), and stops at its scan budget having
-/// read no more; a cursor only continues its own search, and bounds it cannot honour are refused.
+/// read no more (but at least one record per segment that is not done); pages under that budget,
+/// from the check's start time, still find every match; a cursor only continues its own search,
+/// and bounds it cannot honour are refused. Holds whatever the source held before.
 pub async fn search_stops_at_bounds(kit: &EventStoreKit<'_>) {
     let events = kit.instance();
     let browser = browser_of(&*events);
@@ -1008,6 +1010,8 @@ pub async fn search_stops_at_bounds(kit: &EventStoreKit<'_>) {
     let sent: Vec<OutgoingEvent> = (0..5)
         .map(|_| typed(kit.source, &fresh("key"), &ty, &fresh("correlation")))
         .collect();
+    // Every event of this check is stamped at or after this (module docs: the clocks agree).
+    let since = now_ms();
     publish_spaced(&*events, &sent).await;
     let newest_first: Vec<&OutgoingEvent> = sent.iter().rev().collect();
     let by_type = EventFilter {
@@ -1103,18 +1107,23 @@ pub async fn search_stops_at_bounds(kit: &EventStoreKit<'_>) {
     assert_eq!(first.stopped_by, Some(StoppedBy::ScanBudget), "{first:?}");
     assert!(!first.exhausted && first.cursor.is_some(), "{first:?}");
 
-    // Progress: pages of that budget, each continuing the last, find the five, newest first,
-    // none twice.
+    // Progress: pages of that budget from the check's start (whatever the source held before),
+    // each continuing the last, find the five, newest first, none twice.
+    let recent = EventFilter {
+        from: Some(TimeArg::Millis(since)),
+        ..by_type.clone()
+    };
     let mut pages = 0;
     let mut cursor = None;
     let mut got: Vec<String> = Vec::new();
+    let deadline = Instant::now() + WAIT;
     while got.len() < ids.len() {
         pages += 1;
         assert!(
-            pages <= 100,
-            "the five within 100 pages of {segments} records, got {got:?}"
+            Instant::now() < deadline,
+            "the five within {WAIT:?} of pages of {segments} records ({pages} pages), got {got:?}"
         );
-        let page = search(&*browser, budget(by_type.clone(), cursor.clone())).await;
+        let page = search(&*browser, budget(recent.clone(), cursor.clone())).await;
         assert!(
             page.scanned <= segments,
             "at most {segments} records read: {page:?}"

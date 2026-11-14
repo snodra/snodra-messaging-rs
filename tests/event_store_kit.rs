@@ -12,9 +12,9 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use kraken_messaging::Config;
 use kraken_messaging::event_store::conformance::{
-    EventStoreKit, lag_counts_unacked, run_event_store_conformance,
+    EventStoreKit, lag_counts_unacked, run_event_store_conformance, search_stops_at_bounds,
 };
-use kraken_messaging::event_store::{Capability, EventStore, ReplayRange};
+use kraken_messaging::event_store::{Capability, EventStore, OutgoingEvent, ReplayRange};
 use kraken_messaging::saga::Clock;
 use kraken_messaging::store::{
     DeadLetterStore, ExternalCallStore, MessageStore, OutboxStore, ProcessedEventStore,
@@ -69,6 +69,37 @@ async fn the_lag_check_passes_alone_on_an_empty_source() {
         store: &markers,
     };
     lag_counts_unacked(&kit).await;
+}
+
+/// The scan-budget check on a source that already holds a few hundred older events (a reused
+/// source): its paging may not depend on what the source held before it started.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_scan_budget_check_passes_on_a_pre_filled_source() {
+    let source = "conformance.prefilled";
+    let events = Log::new(Capability::ALL.to_vec()).browsing(&[source]);
+    for i in 0..400 {
+        let old = OutgoingEvent {
+            source: source.to_string(),
+            id: format!("old-{i}"),
+            type_name: "conformance.Old".to_string(),
+            key: Some(format!("key-{i}")),
+            headers: std::collections::HashMap::from([
+                ("type".to_string(), "conformance.Old".to_string()),
+                ("id".to_string(), format!("old-{i}")),
+            ]),
+            payload: b"{}".to_vec(),
+        };
+        events.publish(&old).await.expect("publish");
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let make = move || Arc::new(events.clone()) as Arc<dyn EventStore>;
+    let markers = Markers::default();
+    let kit = EventStoreKit {
+        source,
+        make_events: &make,
+        store: &markers,
+    };
+    search_stops_at_bounds(&kit).await;
 }
 
 async fn run_kit(events: Log) {
