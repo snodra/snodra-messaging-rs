@@ -578,7 +578,32 @@ async fn graceful_shutdown_hands_queued_requests_to_another_instance_at_once() {
         .await
         .expect("A took the first request");
     let queued = [call(key.clone()), call(key.clone())];
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Both are queued at the hub for A (its one permit is taken) before A shuts down.
+    let a_instance = a.instance_id().to_string();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let topology: serde_json::Value = reqwest::get(format!("{}/api/v1/topology", hub.http))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let queued_for_a = topology["services"]
+            .as_array()
+            .and_then(|all| all.iter().find(|s| s["serviceName"] == "svc-d"))
+            .and_then(|s| s["instances"].as_array())
+            .and_then(|all| all.iter().find(|i| i["instanceId"] == a_instance.as_str()))
+            .and_then(|i| i["queued"].as_u64())
+            .unwrap_or(0);
+        if queued_for_a >= 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never two requests queued for A: {topology}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     let shutdown = tokio::spawn(a.shutdown());
     let handed_over = std::time::Instant::now();

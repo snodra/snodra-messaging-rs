@@ -518,6 +518,9 @@ pub struct HubConnection {
     live: Mutex<Option<Live>>,
     connected: AtomicBool,
     handshake: watch::Sender<Option<RegisterAck>>,
+    /// The later `Register`s (after the handshake) of the current stream: (stream, written,
+    /// acknowledged). The hub acks them in order, so the n-th written is acked once n acks came.
+    later_registers: watch::Sender<(StreamId, u64, u64)>,
     last_rejection: Mutex<Option<String>>,
     /// The token resolved for the stream being opened (the last one read from `token_file`); what
     /// every `Register` of the stream carries.
@@ -638,6 +641,7 @@ impl HubConnection {
     ) -> Result<Arc<HubConnection>, MessagingError> {
         settings.check()?;
         let (handshake, _) = watch::channel(None);
+        let (later_registers, _) = watch::channel((0, 0, 0));
         let mut settings = settings;
         if settings
             .tls
@@ -660,6 +664,7 @@ impl HubConnection {
             live: Mutex::new(None),
             connected: AtomicBool::new(false),
             handshake,
+            later_registers,
             last_rejection: Mutex::new(None),
             token: Mutex::new(None),
             jwt: Mutex::new(None),
@@ -919,19 +924,35 @@ impl HubConnection {
     /// the current handshaken stream. With no types the hub stops routing to this instance there
     /// and hands its queue to other instances, while replies to requests it already forwarded
     /// still go through. `HubUnavailable` when there is no handshaken stream.
-    pub(crate) async fn reregister(&self) -> Result<(), MessagingError> {
+    pub(crate) async fn reregister(&self) -> Result<(StreamId, u64), MessagingError> {
         // One at a time: the message built last (with the types set last) is written last.
         let _order = self.reregistering.lock().await;
-        let (tx, initial) = {
+        let (tx, initial, stream) = {
             let live = self.live.lock().unwrap();
             let live = live
                 .as_ref()
                 .ok_or_else(|| MessagingError::HubUnavailable("not connected to the hub".into()))?;
-            (live.tx.clone(), live.grants.initial())
+            (live.tx.clone(), live.grants.initial(), live.stream)
         };
         tx.send(self.register(initial))
             .await
-            .map_err(|_| MessagingError::HubUnavailable("hub stream closed".into()))
+            .map_err(|_| MessagingError::HubUnavailable("hub stream closed".into()))?;
+        Ok((stream, self.count_later_register(stream)))
+    }
+
+    /// Counts one more `Register` written on `stream` after its handshake: its number.
+    fn count_later_register(&self, stream: StreamId) -> u64 {
+        let mut n = 0;
+        self.later_registers.send_modify(|(s, written, acked)| {
+            if *s != stream {
+                *s = stream;
+                *written = 0;
+                *acked = 0;
+            }
+            *written += 1;
+            n = *written;
+        });
+        n
     }
 
     /// Writes a `Register` with no types to the current handshaken stream, without changing the
@@ -948,9 +969,14 @@ impl HubConnection {
                 .ok_or_else(|| MessagingError::HubUnavailable("not connected to the hub".into()))?;
             (live.tx.clone(), live.grants.initial())
         };
+        let stream = self.live.lock().unwrap().as_ref().map(|l| l.stream);
         tx.send(self.register_with(RegisteredTypes::default(), initial))
             .await
-            .map_err(|_| MessagingError::HubUnavailable("hub stream closed".into()))
+            .map_err(|_| MessagingError::HubUnavailable("hub stream closed".into()))?;
+        if let Some(stream) = stream {
+            self.count_later_register(stream);
+        }
+        Ok(())
     }
 
     /// The first step of a graceful shutdown (kraken-messaging's `HubLifecycle.stop`): registers
@@ -961,18 +987,24 @@ impl HubConnection {
     /// is no handshaken stream or the ack did not come in time.
     pub(crate) async fn deregister_for_shutdown(&self, within: Duration) -> bool {
         self.set_registered_types(RegisteredTypes::default());
-        let mut acks = self.handshake.subscribe();
-        acks.borrow_and_update();
-        if self.reregister().await.is_err() {
-            return false;
-        }
+        let mut acks = self.later_registers.subscribe();
+        // The write too is bounded: a stalled stream must not hold the shutdown.
         tokio::time::timeout(within, async {
-            while acks.changed().await.is_ok() {
-                if acks.borrow_and_update().is_some() {
-                    return true;
+            let Ok((stream, ours)) = self.reregister().await else {
+                return false;
+            };
+            // Only the ack of this very Register counts (the n-th later ack of the stream).
+            loop {
+                {
+                    let (s, _, acked) = *acks.borrow_and_update();
+                    if s == stream && acked >= ours {
+                        return true;
+                    }
+                }
+                if acks.changed().await.is_err() {
+                    return false;
                 }
             }
-            false
         })
         .await
         .unwrap_or(false)
@@ -1728,6 +1760,16 @@ impl HubConnection {
         if first {
             self.changed();
         }
+        self.later_registers.send_modify(|(s, written, acked)| {
+            if *s != stream {
+                // The handshake of a new stream: nothing later written or acked on it yet.
+                *s = stream;
+                *written = 0;
+                *acked = 0;
+            } else if *acked < *written {
+                *acked += 1;
+            }
+        });
     }
 
     /// Asks the pool (if any) whether this stream may go live; a refusal stops the connection.

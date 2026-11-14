@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use kraken_messaging::hub::{ScatterOptions, SendOptions};
 use kraken_messaging::{Config, KrakenMessaging, MessagingError, Query, message_type};
 use serde::{Deserialize, Serialize};
-use support::containers::{HubContainer, HubOptions, free_port, hub_with};
+use support::containers::{HubContainer, HubOptions, hub_with};
 use tokio_stream::StreamExt;
 
 macro_rules! require_docker {
@@ -40,8 +40,7 @@ impl Query for Find {
 const IDS: [&str; 2] = ["e2e-p4a-1", "e2e-p4a-2"];
 
 async fn two_hubs() -> (HubContainer, HubContainer) {
-    let start =
-        |id: &'static str| hub_with(HubOptions::new().port(free_port()).env("KRAKEN_HUB_ID", id));
+    let start = |id: &'static str| hub_with(HubOptions::new().env("KRAKEN_HUB_ID", id));
     tokio::join!(start(IDS[0]), start(IDS[1]))
 }
 

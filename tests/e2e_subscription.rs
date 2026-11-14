@@ -20,7 +20,7 @@ use futures::stream::BoxStream;
 use kraken_messaging::hub::SubscriptionOptions;
 use kraken_messaging::{Config, KrakenMessaging, MessagingError, SubscriptionQuery, message_type};
 use serde::{Deserialize, Serialize};
-use support::containers::{HubContainer, HubOptions, free_port, hub_with};
+use support::containers::{HubContainer, HubOptions, hub_with};
 
 macro_rules! require_docker {
     () => {
@@ -65,8 +65,7 @@ impl SubscriptionQuery for SharedPrices {
 const IDS: [&str; 2] = ["e2e-p4c-1", "e2e-p4c-2"];
 
 async fn two_hubs() -> (HubContainer, HubContainer) {
-    let start =
-        |id: &'static str| hub_with(HubOptions::new().port(free_port()).env("KRAKEN_HUB_ID", id));
+    let start = |id: &'static str| hub_with(HubOptions::new().env("KRAKEN_HUB_ID", id));
     tokio::join!(start(IDS[0]), start(IDS[1]))
 }
 
