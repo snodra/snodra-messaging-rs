@@ -10,8 +10,8 @@ use crate::codec;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
 use crate::event_store::headers;
-use crate::kafka::LocalEventDispatcher;
-use crate::kafka::dispatch::Outcome;
+use crate::events::LocalEventDispatcher;
+use crate::events::dispatch::Outcome;
 use crate::saga::Clock;
 use crate::store::{MessageStore, ProcessedMarker};
 use crate::types::Event;
@@ -126,9 +126,9 @@ impl ExternalEventIngress {
             type_name: E::TYPE.to_string(),
             processed_at_ms: self.clock.now_ms(),
             processor: None,
-            topic: None,
-            partition: None,
-            offset: None,
+            source: None,
+            segment: None,
+            position: None,
         };
         // A marker of its own, outside any transaction.
         let mut tx = store.tx().plain().await?;

@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use kraken_messaging::events::{EventBus, LocalEventDispatcher, SagaStage};
 use kraken_messaging::external::{ExternalCallSettings, ExternalCalls, IdempotencyKey};
 use kraken_messaging::hub::{HandlerRegistry, SendOptions};
-use kraken_messaging::kafka::{EventBus, LocalEventDispatcher, SagaStage};
 use kraken_messaging::saga::stats::{
     DEADLINES_DUE, EXTERNAL_CALLS, SAGA_COMMAND_FAILURES, SAGA_DISPATCH_PENDING, SAGA_EVENTS,
     SAGAS_ACTIVE, SAGAS_STARTED, SagaStats,

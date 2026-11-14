@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use kraken_messaging::event_store::headers;
+use kraken_messaging::events::{RecordDisposition, classify, new_outbox_entry};
 use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::kafka::{RecordDisposition, classify, new_outbox_entry};
 use kraken_messaging::{Event, Identity, MessageContext, message_type};
 use serde::{Deserialize, Serialize};
 
@@ -119,8 +119,8 @@ fn classify_skips_missing_type() {
         &hdrs(&[(headers::ID, "x")]),
         b"{}",
         "kraken.events",
-        0,
-        1,
+        "0",
+        "1",
         &registry_with_happened(),
     );
     assert!(matches!(d, RecordDisposition::Skip(reason) if reason.contains("type")));
@@ -134,8 +134,8 @@ fn classify_skips_a_blank_type() {
             &hdrs(&[(headers::TYPE, blank), (headers::ID, "x")]),
             b"{}",
             "kraken.events",
-            0,
-            1,
+            "0",
+            "1",
             &registry_with_happened(),
         );
         assert!(
@@ -151,8 +151,8 @@ fn classify_skips_unhandled_type() {
         &hdrs(&[(headers::TYPE, "t.Other"), (headers::ID, "x")]),
         b"{}",
         "kraken.events",
-        0,
-        1,
+        "0",
+        "1",
         &registry_with_happened(),
     );
     assert!(matches!(d, RecordDisposition::Skip(_)));
@@ -164,21 +164,21 @@ fn classify_skips_non_object_payload() {
         &hdrs(&[(headers::TYPE, "t.Happened"), (headers::ID, "x")]),
         b"[1,2]",
         "kraken.events",
-        0,
-        1,
+        "0",
+        "1",
         &registry_with_happened(),
     );
     assert!(matches!(d, RecordDisposition::Skip(reason) if reason.contains("object")));
 }
 
 #[test]
-fn classify_uses_topic_partition_offset_when_id_missing() {
+fn classify_uses_source_segment_position_when_id_missing() {
     let d = classify(
         &hdrs(&[(headers::TYPE, "t.Happened")]),
         b"{}",
         "kraken.events",
-        3,
-        17,
+        "3",
+        "17",
         &registry_with_happened(),
     );
     assert!(
@@ -189,14 +189,14 @@ fn classify_uses_topic_partition_offset_when_id_missing() {
 /// A blank `id` header is no id: the fallback, as in Kotlin (and as the letter's absent `eventId`
 /// makes the retry use).
 #[test]
-fn classify_uses_topic_partition_offset_when_id_blank() {
+fn classify_uses_source_segment_position_when_id_blank() {
     for blank in ["", "   "] {
         let d = classify(
             &hdrs(&[(headers::TYPE, "t.Happened"), (headers::ID, blank)]),
             b"{}",
             "kraken.events",
-            3,
-            17,
+            "3",
+            "17",
             &registry_with_happened(),
         );
         assert!(
@@ -212,8 +212,8 @@ fn classify_handles_known_type() {
         &hdrs(&[(headers::TYPE, "t.Happened"), (headers::ID, "e-9")]),
         br#"{"id":"e-9"}"#,
         "kraken.events",
-        0,
-        1,
+        "0",
+        "1",
         &registry_with_happened(),
     );
     assert!(

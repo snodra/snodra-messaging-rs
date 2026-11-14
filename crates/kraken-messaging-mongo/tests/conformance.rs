@@ -85,3 +85,92 @@ async fn the_outbox_stamps_its_times_with_the_application_clock() {
     );
     assert_eq!(read("failed").await.get_datetime("failedAt"), Ok(&now));
 }
+
+/// Markers without a position (a local dispatch's, a saga's, an ingress's) still deduplicate and
+/// no reset deletes them; a marker written before the event store became an add-on (`partition`
+/// an Int32, `offset` an Int64, no string fields) keeps its position: it deduplicates and a replay
+/// over its offset deletes it, as before, with no migration. A marker of a non-decimal position is
+/// stored as text and deleted by a range of the same kind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn markers_without_position_behave_as_before() {
+    use kraken_messaging::event_store::ReplayRange;
+    use kraken_messaging::store::ProcessedMarker;
+
+    let (_container, client) = mongo().await;
+    let db = client.database(&format!("t{}", uuid::Uuid::new_v4().simple()));
+    let store = MongoStore::new(client, db.clone());
+    store
+        .ensure_indexes(&MongoIndexSettings::default())
+        .await
+        .expect("indexes");
+    let markers = db.collection::<Document>("processed_events");
+    let at = DateTime::now();
+    markers
+        .insert_many([
+            // Written before E0 by either library, for the record at offset 4 of partition 1.
+            doc! { "_id": "processor:default:old-4", "type": "t.E", "processedAt": at,
+            "processor": "default", "topic": "kraken.events", "partition": 1_i32,
+            "offset": 4_i64 },
+            // Without a position: a saga's marker, from before as from now on.
+            doc! { "_id": "saga:t.Order:e-1", "type": "t.E", "processedAt": at },
+        ])
+        .await
+        .expect("insert");
+    let processed = store.processed_events();
+    let txs = store.tx();
+    let record = |id: &str, segment: Option<&str>, position: Option<&str>| ProcessedMarker {
+        id: id.to_string(),
+        type_name: "t.E".into(),
+        processed_at_ms: 0,
+        processor: segment.map(|_| "default".to_string()),
+        source: segment.map(|_| "kraken.events".to_string()),
+        segment: segment.map(str::to_string),
+        position: position.map(str::to_string),
+    };
+    for (marker, fresh) in [
+        (
+            record("processor:default:old-4", Some("1"), Some("4")),
+            false,
+        ),
+        (record("saga:t.Order:e-1", None, None), false),
+        (record("ingress:partner:k-1", None, None), true),
+        (
+            record("processor:default:odd", Some("p-a"), Some("x5")),
+            true,
+        ),
+    ] {
+        let mut tx = txs.begin().await.expect("begin");
+        let recorded = processed.record(&mut tx, &marker).await.expect("record");
+        if recorded {
+            txs.commit(&mut tx).await.expect("commit");
+        } else {
+            txs.abort(&mut tx).await;
+        }
+        assert_eq!(recorded, fresh, "{}", marker.id);
+    }
+    let range = |segment: &str, from: &str, until: &str| ReplayRange {
+        source: "kraken.events".into(),
+        segment: segment.into(),
+        from: from.into(),
+        until: until.into(),
+    };
+    assert_eq!(
+        processed
+            .delete_markers(
+                "default",
+                &[range("1", "0", "10"), range("p-a", "x0", "x9")]
+            )
+            .await
+            .expect("delete"),
+        2,
+        "the marker from before E0 and the textual one"
+    );
+    for (id, kept) in [
+        ("processor:default:old-4", false),
+        ("processor:default:odd", false),
+        ("saga:t.Order:e-1", true),
+        ("ingress:partner:k-1", true),
+    ] {
+        assert_eq!(processed.exists(id).await.expect("exists"), kept, "{id}");
+    }
+}

@@ -172,7 +172,7 @@ async fn an_empty_token_is_no_token() {
 #[test]
 fn debug_output_never_shows_the_token() {
     let token = random_token();
-    let mut config = Config::new("svc", "static://hub:7000", "kafka:19092");
+    let mut config = Config::new("svc", "static://hub:7000");
     config.hub_token = Some(SecretString::new(token.clone()));
     let settings = settings("static://hub:7000".into(), Some(&token));
     for printed in [

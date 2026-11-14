@@ -8,13 +8,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use kraken_messaging::events::dispatch::{LocalEventDispatcher, NoSagas};
+use kraken_messaging::events::{EventBus, SagaStage};
 use kraken_messaging::external::{
     ExternalCallSettings, ExternalCalls, ExternalCallsHandle, IdempotencyKey,
 };
 use kraken_messaging::hub::{Dispatcher, HandlerRegistry};
 use kraken_messaging::identity::IdentityResolver;
-use kraken_messaging::kafka::dispatch::{LocalEventDispatcher, NoSagas};
-use kraken_messaging::kafka::{EventBus, SagaStage};
 use kraken_messaging::proto::{ErrorCode, Reply, Request, RequestKind, reply};
 use kraken_messaging::saga::store::{DispatchKind, SagaDispatchDocument};
 use kraken_messaging::saga::{

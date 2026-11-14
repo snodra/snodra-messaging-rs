@@ -1,19 +1,22 @@
 //! One event processor under control (ADR 0023): its consumer, started and stopped by what its
 //! `processor_control` document says, and the leased reset.
 //!
-//! The runner reads the document before the consumer first polls and then every
-//! [`CONTROL_POLL`]: a pause pauses the assigned partitions (the consumer stays in the group), the
-//! replay ranges reach the consumer and the status, a range is removed once this instance is past
-//! its end, a held lease that passed without renewal is cleared (and the consumer starts again),
-//! and an unexpired lock this instance was not prepared for keeps the consumer out of the group.
+//! The runner reads the document before the consumer first reads and then every
+//! [`CONTROL_POLL`]: a pause pauses the subscription (it keeps its segments), the replay ranges
+//! reach the consumer and the status, a range is removed once this instance is past its end, a
+//! held lease that passed without renewal is cleared (and the consumer starts again), and an
+//! unexpired lock this instance was not prepared for keeps the consumer out of its subscription.
 //! A [`ControlRequest`](crate::proto::ControlRequest) is the fast path to the same state.
 //!
-//! Leaving the group is stopping the consumer task and dropping its consumer (librdkafka's close,
-//! on a blocking thread: the commits in flight are written, the group is left); starting again
-//! creates a new consumer, which reads the group's committed offsets.
+//! Leaving the subscription is stopping the consumer task, which closes its subscription (the
+//! acknowledgements are flushed, its segments go to the other instances); starting again
+//! subscribes again, from the subscription's committed positions. A reset needs the event store's
+//! capability `replay`: without it, `reset_prepare` and `reset_execute` are refused `UNSUPPORTED`
+//! before anything changes.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, Weak};
+use std::cmp::Ordering as Order;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
@@ -23,12 +26,12 @@ use tokio_util::sync::CancellationToken;
 
 use super::ProcessorMonitor;
 use super::monitor::cut_bytes;
-use super::reset::{GroupAdmin, Plan, ResetContext, ResetFailure, ResetHandler};
+use super::reset::{ResetContext, ResetHandler, merged, replaying};
 use crate::error::MessagingError;
-use crate::event_store::{ReplayRange, ResetTarget};
-use crate::kafka::{
-    ConsumerControl, EventConsumer, LocalEventDispatcher, ProcessorSettings, kafka_range,
+use crate::event_store::{
+    Capability, EventStoreError, ReplayRange, ResetTarget, SubscriptionAdmin,
 };
+use crate::events::{ConsumerControl, EventConsumer, LocalEventDispatcher, ProcessorSettings};
 use crate::proto::{self, ControlRefusal};
 use crate::store::{Locked, ProcessedEventStore, ProcessorControlStore};
 use crate::time::{after, now_ms as now, rfc3339};
@@ -44,9 +47,6 @@ pub const LEASE_KEEP_MAX: Duration = Duration::from_secs(120);
 /// lock lost) is remembered, twice its lease when that is longer: a prepare of it is then a late
 /// renewal and never takes the lock again. Never longer than a day.
 pub const FINISHED_KEPT: Duration = Duration::from_secs(60);
-/// How long a stopped consumer may still be referenced (an offset read in flight) before it is
-/// left to close when the last reference goes.
-const CLOSE_WAIT: Duration = Duration::from_secs(10);
 
 /// Why a control action was refused. Nothing changed unless the message says what did (an
 /// execute refused after its reset handlers ran).
@@ -69,19 +69,31 @@ impl Refusal {
     }
 }
 
-impl From<ResetFailure> for Refusal {
-    fn from(f: ResetFailure) -> Refusal {
-        match f {
-            ResetFailure::Invalid(m) => Refusal::new(ControlRefusal::Invalid, m),
-            ResetFailure::GroupNotEmpty(m) => Refusal::new(ControlRefusal::GroupNotEmpty, m),
-            ResetFailure::Failed(m) => Refusal::new(ControlRefusal::Failed, m),
+impl From<EventStoreError> for Refusal {
+    fn from(e: EventStoreError) -> Refusal {
+        match e {
+            EventStoreError::Invalid(m) => Refusal::new(ControlRefusal::Invalid, m),
+            EventStoreError::SubscribersActive(m) => {
+                Refusal::new(ControlRefusal::SubscribersActive, m)
+            }
+            EventStoreError::Unsupported(capability) => unsupported(capability),
+            e @ (EventStoreError::Rejected(_) | EventStoreError::Failed(_)) => {
+                Refusal::new(ControlRefusal::Failed, e.to_string())
+            }
         }
     }
 }
 
+/// The refusal of an action the event store's capabilities do not cover.
+fn unsupported(capability: Capability) -> Refusal {
+    Refusal::new(
+        ControlRefusal::Unsupported,
+        format!("the event store lacks the capability {capability}"),
+    )
+}
+
 /// The consumer running now.
 struct Run {
-    consumer: Weak<EventConsumer>,
     stop: CancellationToken,
     task: JoinHandle<()>,
 }
@@ -135,24 +147,25 @@ impl ProcessorRunner {
     pub fn new(
         settings: ProcessorSettings,
         dispatcher: Arc<LocalEventDispatcher>,
-        control: Arc<dyn ProcessorControlStore>,
+        store: Arc<dyn ProcessorControlStore>,
         markers: Arc<dyn ProcessedEventStore>,
         reset_handlers: Vec<ResetHandler>,
         cancel: CancellationToken,
     ) -> Arc<ProcessorRunner> {
         let monitor = Arc::new(ProcessorMonitor::new(
             &settings.name,
-            &settings.group_id,
-            &settings.topic,
+            &settings.subscription,
+            &settings.events,
             settings.dead_letter_mode,
             dispatcher.event_types(),
         ));
+        let control = Arc::new(ConsumerControl::new(Arc::clone(&settings.events)));
         Arc::new(ProcessorRunner {
             settings,
             dispatcher,
             monitor,
-            control: Arc::new(ConsumerControl::default()),
-            store: control,
+            control,
+            store,
             markers,
             reset_handlers,
             run: tokio::sync::Mutex::new(None),
@@ -284,7 +297,7 @@ impl ProcessorRunner {
         match lock {
             Some(operation) => {
                 if self.stop_consumer().await {
-                    tracing::info!(processor = %name, operation = %operation, "a reset holds the processor's lock: its consumer left the group until the reset ends");
+                    tracing::info!(processor = %name, operation = %operation, "a reset holds the processor's lock: its consumer left its subscription until the reset ends");
                 }
             }
             None => {
@@ -299,15 +312,6 @@ impl ProcessorRunner {
         let changed = self.control.paused() != paused;
         self.control.set_paused(paused);
         self.monitor.set_paused(paused);
-        if let Some(consumer) = self
-            .run
-            .lock()
-            .await
-            .as_ref()
-            .and_then(|r| r.consumer.upgrade())
-        {
-            consumer.apply_pause();
-        }
         if changed {
             tracing::info!(processor = %self.name(), paused, "processor {}", if paused { "paused" } else { "resumed" });
         }
@@ -316,41 +320,39 @@ impl ProcessorRunner {
     fn apply_replay(&self, ranges: &[ReplayRange]) {
         let mine: Vec<ReplayRange> = ranges
             .iter()
-            .filter(|r| r.source == self.settings.topic)
+            .filter(|r| r.source == self.settings.subscription.source)
             .cloned()
             .collect();
-        let mut until: BTreeMap<i32, i64> = BTreeMap::new();
-        for (partition, _, end) in mine
-            .iter()
-            .filter_map(|r| kafka_range(r, &self.settings.topic))
-        {
-            let at = until.entry(partition).or_insert(end);
-            *at = (*at).max(end);
+        let events = &self.settings.events;
+        let mut until: HashMap<String, String> = HashMap::new();
+        for r in &mine {
+            match until.get(&r.segment) {
+                Some(at) if events.compare(at, &r.until) != Order::Less => {}
+                _ => {
+                    until.insert(r.segment.clone(), r.until.clone());
+                }
+            }
         }
         self.control.set_replay(mine);
         self.monitor.set_replay(until);
     }
 
-    /// Removes each open range of an assigned partition this instance is past the end of.
+    /// Removes each open range of an assigned segment this instance is past the end of.
     async fn remove_passed_ranges(&self, ranges: &[ReplayRange]) {
-        for r in ranges {
-            let Some((partition, from, until)) = kafka_range(r, &self.settings.topic) else {
-                continue;
-            };
-            if !self
-                .monitor
-                .progress(partition)
-                .is_some_and(|at| at >= until)
-            {
+        for r in ranges
+            .iter()
+            .filter(|r| r.source == self.settings.subscription.source)
+        {
+            if !self.monitor.passed_on(&r.segment, &r.until) {
                 continue;
             }
             match self.store.remove_range(self.name(), r, now()).await {
                 Ok(true) => {
-                    tracing::info!(processor = %self.name(), partition, from, until, "replay range done")
+                    tracing::info!(processor = %self.name(), segment = %r.segment, from = %r.from, until = %r.until, "replay range done")
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    tracing::warn!(processor = %self.name(), partition, "cannot remove the replay range: {e}")
+                    tracing::warn!(processor = %self.name(), segment = %r.segment, "cannot remove the replay range: {e}")
                 }
             }
         }
@@ -385,16 +387,11 @@ impl ProcessorRunner {
             }
         };
         let stop = self.cancel.child_token();
-        let weak = Arc::downgrade(&consumer);
-        let task = tokio::spawn(run_consumer(consumer, stop.clone()));
-        *run = Some(Run {
-            consumer: weak,
-            stop,
-            task,
-        });
+        let task = consumer.start(stop.clone());
+        *run = Some(Run { stop, task });
     }
 
-    /// Stops the consumer and waits until it left the group; false when none ran.
+    /// Stops the consumer and waits until it left its subscription; false when none ran.
     async fn stop_consumer(&self) -> bool {
         let run = self.run.lock().await.take();
         let stopped = match run {
@@ -464,9 +461,9 @@ impl ProcessorRunner {
         }
     }
 
-    /// `reset_prepare`: takes the lock (or renews it) and leaves the group; an operation that
-    /// already ended here is a late renewal, refused without taking the lock. The caller holds
-    /// `serial`.
+    /// `reset_prepare`: takes the lock (or renews it) and leaves the subscription; an operation
+    /// that already ended here is a late renewal, refused without taking the lock; `UNSUPPORTED`
+    /// without the capability `replay`. The caller holds `serial`.
     pub(crate) async fn prepare(
         &self,
         operation: &str,
@@ -478,6 +475,9 @@ impl ProcessorRunner {
                 ControlRefusal::Invalid,
                 super::control::BAD_PREPARE,
             ));
+        }
+        if !self.settings.events.supports(Capability::Replay) {
+            return Err(unsupported(Capability::Replay));
         }
         if self.has_ended(operation) {
             return Err(Refusal::new(
@@ -509,8 +509,8 @@ impl ProcessorRunner {
                 self.monitor.set_operation(Some(operation));
                 self.stop_consumer().await;
                 Ok(format!(
-                    "left the consumer group {}",
-                    self.settings.group_id
+                    "left the subscription {}",
+                    self.settings.subscription.name
                 ))
             }
         }
@@ -544,17 +544,21 @@ impl ProcessorRunner {
     }
 
     /// `reset_execute` on the instance chosen to run it (it holds the operation): resolves the
-    /// target, checks the group is empty, runs the reset handlers, deletes the markers of the
-    /// ranges, writes the ranges and commits the offsets, keeping its own lease all along. Right
-    /// after the reset handlers and again before the offsets are committed the lease must still
-    /// be extended (and the execute within [`LEASE_KEEP_MAX`]): otherwise another instance may
-    /// consume or reset already, and it stops (`FAILED`, "lease lost"). A refusal after the reset
-    /// handlers ran says what changed. The caller holds `serial`.
+    /// target, checks nobody reads the subscription, runs the reset handlers, deletes the markers
+    /// of the ranges, writes the ranges and moves the committed positions, keeping its own lease
+    /// all along. Right after the reset handlers and again before the positions move the lease
+    /// must still be extended (and the execute within [`LEASE_KEEP_MAX`]): otherwise another
+    /// instance may consume or reset already, and it stops (`FAILED`, "lease lost"). A refusal
+    /// after the reset handlers ran says what changed; `UNSUPPORTED` without the capability
+    /// `replay`. The caller holds `serial`.
     pub(crate) async fn execute(
         &self,
         operation: &str,
         target: ResetTarget,
     ) -> Result<proto::ResetOutcome, Refusal> {
+        if !self.settings.events.supports(Capability::Replay) {
+            return Err(unsupported(Capability::Replay));
+        }
         let Some(held) = self.held().filter(|h| h.id == operation) else {
             return Err(self.not_prepared(operation, self.held().as_ref()));
         };
@@ -621,25 +625,23 @@ impl ProcessorRunner {
     ) -> Result<proto::ResetOutcome, Refusal> {
         let operation = held.id.as_str();
         let name = self.name().to_string();
-        let topic = self.settings.topic.clone();
-        let admin = {
-            let (bootstrap, group, topic) = (
-                self.settings.bootstrap_servers.clone(),
-                self.settings.group_id.clone(),
-                topic.clone(),
-            );
-            blocking(move || GroupAdmin::new(&bootstrap, &group, &topic).map(Arc::new)).await?
-        };
-        let (plan, members) = {
-            let (admin, target) = (Arc::clone(&admin), target.clone());
-            blocking(move || Ok((admin.plan(&target)?, admin.members()?))).await?
+        let subscription = &self.settings.subscription;
+        let admin: Box<dyn SubscriptionAdmin> = self.settings.events.admin(subscription)?;
+        let (admin, plan, members) = {
+            let target = target.clone();
+            blocking(move || {
+                let plan = admin.plan(&target)?;
+                let members = admin.members()?;
+                Ok((admin, plan, members))
+            })
+            .await?
         };
         if !members.is_empty() {
             return Err(Refusal::new(
-                ControlRefusal::GroupNotEmpty,
+                ControlRefusal::SubscribersActive,
                 format!(
-                    "consumer group {} still has members: {}",
-                    self.settings.group_id,
+                    "subscription {} still has subscribers: {}",
+                    subscription.name,
                     members.join(", ")
                 ),
             ));
@@ -650,7 +652,9 @@ impl ProcessorRunner {
             .await
             .map_err(|e| Refusal::failed(&e))?
             .replay;
-        let ranges = plan.ranges(&topic, &target, &open);
+        let events = Arc::clone(&self.settings.events);
+        let compare = |a: &str, b: &str| events.compare(a, b);
+        let ranges = replaying(&plan, &target, &open, &compare);
         let mut done = Changed::default();
         if !ranges.is_empty() {
             let ctx = ResetContext {
@@ -692,17 +696,12 @@ impl ProcessorRunner {
                     .map_err(|e| Refusal::failed(&e))?;
             }
             self.store
-                .set_replay(&name, &Plan::merged(&open, &ranges), now())
+                .set_replay(&name, &merged(&open, &ranges, &compare), now())
                 .await
                 .map_err(|e| Refusal::failed(&e))?;
             done.ranges_written = !ranges.is_empty();
             self.keep_lease(held, started).await?;
-            let offsets: Vec<(i32, i64)> = plan
-                .partitions
-                .iter()
-                .map(|(&p, &(to, _))| (p, to))
-                .collect();
-            blocking(move || admin.commit(&offsets)).await
+            blocking(move || admin.apply(&plan)).await
         }
         .await;
         if let Err(refusal) = finished {
@@ -717,11 +716,10 @@ impl ProcessorRunner {
         Ok(proto::ResetOutcome {
             ranges: ranges
                 .iter()
-                .filter_map(|r| kafka_range(r, &topic))
-                .map(|(partition, from, until)| proto::ReplayRange {
-                    partition,
-                    from,
-                    until,
+                .map(|r| proto::ReplayRange {
+                    segment: r.segment.clone(),
+                    from: r.from.clone(),
+                    until: r.until.clone(),
                 })
                 .collect(),
             markers_deleted,
@@ -751,7 +749,8 @@ impl ProcessorRunner {
     }
 }
 
-/// The most bytes of a reset handler's or Kafka's error in a refusal that also says what changed.
+/// The most bytes of a reset handler's or the event store's error in a refusal that also says
+/// what changed.
 const MAX_CAUSE_BYTES: usize = 300;
 
 /// What an execute changed before it stopped.
@@ -779,7 +778,7 @@ impl Changed {
         };
         Refusal {
             message: format!(
-                "{}; reset handlers ran ({}), {markers}{ranges}, offsets not moved: retry the reset",
+                "{}; reset handlers ran ({}), {markers}{ranges}, positions not moved: retry the reset",
                 cut_bytes(&refusal.message, MAX_CAUSE_BYTES),
                 self.reset_handlers
             ),
@@ -788,44 +787,15 @@ impl Changed {
     }
 }
 
-/// A consumer's run: until `stop`, then its close.
-async fn run_consumer(consumer: Arc<EventConsumer>, stop: CancellationToken) {
-    let _ = Arc::clone(&consumer).start(stop).await;
-    close(consumer).await;
-}
-
-/// Drops the last reference to `consumer` on a blocking thread (librdkafka's close blocks until
-/// the group is left), once the offset reads still in flight let go of it.
-async fn close(mut consumer: Arc<EventConsumer>) {
-    let deadline = tokio::time::Instant::now() + CLOSE_WAIT;
-    loop {
-        match Arc::try_unwrap(consumer) {
-            Ok(last) => {
-                let _ = tokio::task::spawn_blocking(move || drop(last)).await;
-                return;
-            }
-            Err(shared) if tokio::time::Instant::now() < deadline => {
-                consumer = shared;
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            Err(shared) => {
-                tracing::warn!("a stopped consumer is still referenced; it closes when released");
-                let _ = tokio::task::spawn_blocking(move || drop(shared)).await;
-                return;
-            }
-        }
-    }
-}
-
-/// `work` on a blocking thread (librdkafka's calls block).
+/// `work` on a blocking thread (the admin's calls block).
 async fn blocking<T: Send + 'static>(
-    work: impl FnOnce() -> Result<T, ResetFailure> + Send + 'static,
+    work: impl FnOnce() -> Result<T, EventStoreError> + Send + 'static,
 ) -> Result<T, Refusal> {
     match tokio::task::spawn_blocking(work).await {
         Ok(result) => result.map_err(Refusal::from),
         Err(e) => Err(Refusal::new(
             ControlRefusal::Failed,
-            format!("kafka call failed: {e}"),
+            format!("event store call failed: {e}"),
         )),
     }
 }

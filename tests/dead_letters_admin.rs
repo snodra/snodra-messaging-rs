@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use kraken_messaging::config::DeadLetterMode;
+use kraken_messaging::events::{LocalEventDispatcher, NoSagas, SagaStage};
 use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::kafka::{LocalEventDispatcher, NoSagas, SagaStage};
 use kraken_messaging::processors::dead_letters::{DeadLetterRecord, park};
 use kraken_messaging::processors::{DeadLetters, RetryAllResult, RetryResult};
 use kraken_messaging::store::{DeadLetter, DeadLetterError, DeadLetterReason, MessageStore};
@@ -239,11 +239,11 @@ impl<'a> Letter<'a> {
     }
 
     fn document(&self) -> DeadLetter {
-        let mut headers = vec![("type".to_string(), self.type_name.as_bytes().to_vec())];
+        let mut headers = HashMap::from([("type".to_string(), self.type_name.to_string())]);
         if let Some(id) = self.event_id {
-            headers.push(("id".to_string(), id.as_bytes().to_vec()));
+            headers.insert("id".to_string(), id.to_string());
         }
-        headers.push(("correlationId".to_string(), b"corr-1".to_vec()));
+        headers.insert("correlationId".to_string(), "corr-1".to_string());
         let error = match self.reason {
             DeadLetterReason::HandlerFailed => DeadLetterError::new("Storage", "boom"),
             DeadLetterReason::Sequenced => DeadLetterError::sequenced("head"),
@@ -252,10 +252,10 @@ impl<'a> Letter<'a> {
         park(
             DeadLetterRecord {
                 processor: self.processor.to_string(),
-                topic: "kraken.events".to_string(),
-                partition: 1,
-                offset: self.offset,
-                key: self.key.map(|k| k.as_bytes().to_vec()),
+                source: "kraken.events".to_string(),
+                segment: "1".to_string(),
+                position: self.offset.to_string(),
+                key: self.key.map(str::to_string),
                 headers,
                 payload: serde_json::to_vec(&Placed {
                     order: self.order.to_string(),
@@ -284,7 +284,7 @@ fn names(letters: &[DeadLetter]) -> Vec<&str> {
 async fn outside_mode_collection_every_call_is_an_error_naming_the_mode() {
     // No store is reached.
     let store = support::mongo_store_unreached().await;
-    for mode in [DeadLetterMode::Topic, DeadLetterMode::Log] {
+    for mode in [DeadLetterMode::EventStore, DeadLetterMode::Log] {
         let admin = DeadLetters::new(Some(store.dead_letters()), mode, vec![]);
         let errors = [
             admin.list(None, 100).await.unwrap_err(),

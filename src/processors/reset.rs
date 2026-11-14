@@ -1,33 +1,17 @@
-//! The reset of a processor (ADR 0023): its target, the replay ranges it makes, the reset
-//! handlers' context, the markers it deletes and the Kafka calls of the executing instance.
-//!
-//! rdkafka has no admin call to alter a group's offsets: the executor commits them with a
-//! consumer of the group that never subscribes (an assign-mode consumer, generation -1), which
-//! the broker refuses while the group has members (`UNKNOWN_MEMBER_ID`, `ILLEGAL_GENERATION` or
-//! `REBALANCE_IN_PROGRESS`: [`ResetFailure::GroupNotEmpty`]). The group is checked empty before
-//! with `fetch_group_list`; the watermarks, `offsets_for_times`, the committed offsets and the
-//! topic's partitions come from the same consumer. Every call blocks: run them on a blocking
-//! thread.
+//! The reset of a processor (ADR 0023): its target, the replay ranges it makes and the reset
+//! handlers' context. The event store moves the positions
+//! ([`SubscriptionAdmin`](crate::event_store::SubscriptionAdmin), capability `replay`); positions
+//! are ordered by its [`compare`](crate::event_store::EventStore::compare) only.
 
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures::future::BoxFuture;
-use rdkafka::config::ClientConfig;
-use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
-use rdkafka::error::{KafkaError, RDKafkaErrorCode};
-use rdkafka::{Offset, TopicPartitionList};
 
 use crate::error::MessagingError;
-use crate::event_store::{ReplayRange, ResetTarget};
-use crate::kafka::{kafka_range, replay_range};
+use crate::event_store::{ReplayRange, ResetTarget, segment_order};
 use crate::proto;
 
-/// How long one Kafka call of a reset may take.
-const KAFKA_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// On Kafka a segment is a partition and a position an offset, both in decimal.
 impl ResetTarget {
     /// The request's target; `None` when it names none.
     pub fn from_proto(target: Option<&proto::ResetTarget>) -> Option<ResetTarget> {
@@ -36,10 +20,10 @@ impl ResetTarget {
             To::Earliest(_) => ResetTarget::Earliest,
             To::Latest(_) => ResetTarget::Latest,
             To::TimestampMs(ms) => ResetTarget::Timestamp(*ms),
-            To::Offsets(o) => ResetTarget::Positions(
-                o.offsets
+            To::Positions(p) => ResetTarget::Positions(
+                p.positions
                     .iter()
-                    .map(|p| (p.partition.to_string(), p.offset.to_string()))
+                    .map(|p| (p.segment.clone(), p.position.clone()))
                     .collect(),
             ),
         })
@@ -69,8 +53,8 @@ pub struct ResetContext {
     pub processor: String,
     pub operation_id: String,
     pub target: ResetTarget,
-    /// Per partition (segment) of the processor's topic (source), sorted by partition; never
-    /// empty (a reset that replays nothing runs no reset handler).
+    /// Per segment of the processor's source, in segment order; never empty (a reset that
+    /// replays nothing runs no reset handler).
     pub ranges: Vec<ReplayRange>,
 }
 
@@ -78,329 +62,129 @@ pub struct ResetContext {
 pub(crate) type ResetHandler =
     Arc<dyn Fn(ResetContext) -> BoxFuture<'static, Result<(), MessagingError>> + Send + Sync>;
 
-/// Why a reset's Kafka work refused or failed; nothing changed.
-#[derive(Debug, PartialEq, Eq)]
-pub enum ResetFailure {
-    /// A bad target: an unknown partition, a negative offset or one past the high watermark.
-    Invalid(String),
-    /// The group has members (their client ids), or the broker refused the commit for them.
-    GroupNotEmpty(String),
-    /// A Kafka error.
-    Failed(String),
-}
+/// The order of two positions of one segment (the event store's).
+pub type Compare<'a> = &'a dyn Fn(&str, &str) -> Ordering;
 
-/// What step 1 and 2 of an execute found: the target offset of each partition it moves, the
-/// committed offset before (-1 none) of each.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Plan {
-    /// Partition → (target, committed before).
-    pub partitions: BTreeMap<i32, (i64, i64)>,
-}
-
-impl Plan {
-    /// The replay ranges of this reset over `open` (the ranges still open): `[target, before)`
-    /// where `target < before`, never for `latest` and never for a partition without a committed
-    /// offset; a partition that still has an open range gets `[target, max(before, open until))`
-    /// (that range's records past `before` were not replayed yet and their markers are gone).
-    /// Sorted by partition.
-    pub fn ranges(
-        &self,
-        topic: &str,
-        target: &ResetTarget,
-        open: &[ReplayRange],
-    ) -> Vec<ReplayRange> {
-        if *target == ResetTarget::Latest {
-            return Vec::new();
-        }
-        self.partitions
-            .iter()
-            .filter(|(_, (to, before))| *before >= 0 && to < before)
-            .map(|(&partition, &(from, before))| {
-                let until = open
-                    .iter()
-                    .filter_map(|r| kafka_range(r, topic))
-                    .filter(|&(p, _, _)| p == partition)
-                    .map(|(_, _, until)| until)
-                    .fold(before, i64::max);
-                replay_range(topic, partition, from, until)
-            })
-            .collect()
+/// The replay ranges of a reset whose plan is `moves` (one per segment it moves:
+/// [`SubscriptionAdmin::plan`](crate::event_store::SubscriptionAdmin::plan)) over `open` (the
+/// ranges still open): only the moves that replay, `[from, until)` with `until` set and `from`
+/// before it, never for `latest`; a segment that still has an open range gets
+/// `[from, max(until, open until))` (that range's records past `until` were not replayed yet and
+/// their markers are gone). In segment order.
+pub fn replaying(
+    moves: &[ReplayRange],
+    target: &ResetTarget,
+    open: &[ReplayRange],
+    compare: Compare<'_>,
+) -> Vec<ReplayRange> {
+    if *target == ResetTarget::Latest {
+        return Vec::new();
     }
-
-    /// The replay ranges after the reset: `open` without the ranges of the partitions that got a
-    /// new one, then the new ones (sorted by topic and partition).
-    pub fn merged(open: &[ReplayRange], new: &[ReplayRange]) -> Vec<ReplayRange> {
-        let mut all: Vec<ReplayRange> = open
-            .iter()
-            .filter(|r| {
-                !new.iter()
-                    .any(|n| n.source == r.source && n.segment == r.segment)
-            })
-            .cloned()
-            .chain(new.iter().cloned())
-            .collect();
-        // Partitions and offsets by value.
-        let order = |r: &ReplayRange| {
-            (
-                r.source.clone(),
-                r.segment.parse::<i64>().ok(),
-                r.from.parse::<i64>().ok(),
-            )
-        };
-        all.sort_by_key(order);
-        all
-    }
-}
-
-/// The Kafka side of a reset: a consumer of the processor's group that never subscribes.
-pub struct GroupAdmin {
-    consumer: BaseConsumer,
-    group: String,
-    topic: String,
-}
-
-impl GroupAdmin {
-    pub fn new(bootstrap: &str, group: &str, topic: &str) -> Result<GroupAdmin, ResetFailure> {
-        let consumer: BaseConsumer = ClientConfig::new()
-            .set("bootstrap.servers", bootstrap)
-            .set("group.id", group)
-            .set("enable.auto.commit", "false")
-            .create()
-            .map_err(|e| ResetFailure::Failed(format!("kafka: {e}")))?;
-        Ok(GroupAdmin {
-            consumer,
-            group: group.to_string(),
-            topic: topic.to_string(),
+    let mut ranges: Vec<ReplayRange> = moves
+        .iter()
+        .filter(|m| !m.until.is_empty() && compare(&m.from, &m.until) == Ordering::Less)
+        .map(|m| {
+            let until = open
+                .iter()
+                .filter(|r| r.source == m.source && r.segment == m.segment)
+                .map(|r| r.until.as_str())
+                .fold(m.until.as_str(), |a, b| {
+                    if compare(a, b) == Ordering::Less {
+                        b
+                    } else {
+                        a
+                    }
+                });
+            ReplayRange {
+                until: until.to_string(),
+                ..m.clone()
+            }
         })
-    }
-
-    /// Steps 1 and 2 of an execute: the target offset of every partition it moves and the
-    /// group's committed offset there.
-    pub fn plan(&self, target: &ResetTarget) -> Result<Plan, ResetFailure> {
-        let partitions = self.partitions()?;
-        let mut targets: BTreeMap<i32, i64> = BTreeMap::new();
-        match target {
-            ResetTarget::Earliest | ResetTarget::Latest => {
-                for &p in &partitions {
-                    let (low, high) = self.watermarks(p)?;
-                    targets.insert(
-                        p,
-                        if *target == ResetTarget::Earliest {
-                            low
-                        } else {
-                            high
-                        },
-                    );
-                }
-            }
-            ResetTarget::Timestamp(ms) => {
-                let mut tpl = TopicPartitionList::new();
-                for &p in &partitions {
-                    tpl.add_partition_offset(&self.topic, p, Offset::Offset(*ms))
-                        .map_err(kafka)?;
-                }
-                let found = self
-                    .consumer
-                    .offsets_for_times(tpl, KAFKA_TIMEOUT)
-                    .map_err(kafka)?;
-                for &p in &partitions {
-                    let offset = match found.find_partition(&self.topic, p).map(|e| e.offset()) {
-                        Some(Offset::Offset(o)) if o >= 0 => o,
-                        // No record that late: the end.
-                        _ => self.watermarks(p)?.1,
-                    };
-                    targets.insert(p, offset);
-                }
-            }
-            ResetTarget::Positions(given) => {
-                if given.is_empty() {
-                    return Err(ResetFailure::Invalid("no partition offsets given".into()));
-                }
-                for (segment, position) in given {
-                    let Ok(p) = segment.parse::<i32>() else {
-                        return Err(ResetFailure::Invalid(format!(
-                            "topic {} has no partition {segment}",
-                            self.topic
-                        )));
-                    };
-                    let Ok(offset) = position.parse::<i64>() else {
-                        return Err(ResetFailure::Invalid(format!(
-                            "position {position} of partition {p} is not an offset"
-                        )));
-                    };
-                    if !partitions.contains(&p) {
-                        return Err(ResetFailure::Invalid(format!(
-                            "topic {} has no partition {p}",
-                            self.topic
-                        )));
-                    }
-                    if offset < 0 {
-                        return Err(ResetFailure::Invalid(format!(
-                            "offset {offset} of partition {p} is negative"
-                        )));
-                    }
-                    let high = self.watermarks(p)?.1;
-                    if offset > high {
-                        return Err(ResetFailure::Invalid(format!(
-                            "offset {offset} of partition {p} is past its end ({high})"
-                        )));
-                    }
-                    if targets.insert(p, offset).is_some() {
-                        return Err(ResetFailure::Invalid(format!(
-                            "partition {p} is given twice"
-                        )));
-                    }
-                }
-            }
-        }
-        let committed = self.committed(&targets.keys().copied().collect::<Vec<_>>())?;
-        Ok(Plan {
-            partitions: targets
-                .into_iter()
-                .map(|(p, to)| (p, (to, committed.get(&p).copied().unwrap_or(-1))))
-                .collect(),
-        })
-    }
-
-    /// Step 3: the client ids of the group's members; empty when the group is empty.
-    pub fn members(&self) -> Result<Vec<String>, ResetFailure> {
-        let groups = self
-            .consumer
-            .fetch_group_list(Some(&self.group), KAFKA_TIMEOUT)
-            .map_err(kafka)?;
-        Ok(groups
-            .groups()
-            .iter()
-            .filter(|g| g.name() == self.group)
-            .flat_map(|g| g.members().iter().map(|m| m.client_id().to_string()))
-            .collect())
-    }
-
-    /// The last step: commits `offsets` (partition, offset) for the group.
-    pub fn commit(&self, offsets: &[(i32, i64)]) -> Result<(), ResetFailure> {
-        let mut tpl = TopicPartitionList::new();
-        for &(p, o) in offsets {
-            tpl.add_partition_offset(&self.topic, p, Offset::Offset(o))
-                .map_err(kafka)?;
-        }
-        match self.consumer.commit(&tpl, CommitMode::Sync) {
-            Ok(()) => Ok(()),
-            Err(KafkaError::ConsumerCommit(
-                code @ (RDKafkaErrorCode::UnknownMemberId
-                | RDKafkaErrorCode::IllegalGeneration
-                | RDKafkaErrorCode::RebalanceInProgress),
-            )) => Err(ResetFailure::GroupNotEmpty(format!(
-                "Kafka refused the offsets of group {}: {code} (the group has members)",
-                self.group
-            ))),
-            Err(e) => Err(kafka(e)),
-        }
-    }
-
-    fn partitions(&self) -> Result<Vec<i32>, ResetFailure> {
-        let metadata = self
-            .consumer
-            .fetch_metadata(Some(&self.topic), KAFKA_TIMEOUT)
-            .map_err(kafka)?;
-        let topic = metadata
-            .topics()
-            .iter()
-            .find(|t| t.name() == self.topic)
-            .filter(|t| t.error().is_none())
-            .ok_or_else(|| ResetFailure::Failed(format!("topic {} not found", self.topic)))?;
-        let mut all: Vec<i32> = topic.partitions().iter().map(|p| p.id()).collect();
-        all.sort();
-        Ok(all)
-    }
-
-    fn watermarks(&self, partition: i32) -> Result<(i64, i64), ResetFailure> {
-        self.consumer
-            .fetch_watermarks(&self.topic, partition, KAFKA_TIMEOUT)
-            .map_err(kafka)
-    }
-
-    fn committed(&self, partitions: &[i32]) -> Result<HashMap<i32, i64>, ResetFailure> {
-        let mut tpl = TopicPartitionList::new();
-        for &p in partitions {
-            tpl.add_partition(&self.topic, p);
-        }
-        let committed = self
-            .consumer
-            .committed_offsets(tpl, KAFKA_TIMEOUT)
-            .map_err(kafka)?;
-        Ok(partitions
-            .iter()
-            .map(|&p| {
-                let offset = match committed.find_partition(&self.topic, p).map(|e| e.offset()) {
-                    Some(Offset::Offset(o)) => o,
-                    _ => -1,
-                };
-                (p, offset)
-            })
-            .collect())
-    }
+        .collect();
+    ranges.sort_by(|a, b| segment_order(&a.segment, &b.segment));
+    ranges
 }
 
-fn kafka(e: KafkaError) -> ResetFailure {
-    ResetFailure::Failed(format!("kafka: {e}"))
+/// The replay ranges after the reset: `open` without the ranges of the segments that got a new
+/// one, then the new ones; sorted by source, segment (in segment order) and `from`.
+pub fn merged(open: &[ReplayRange], new: &[ReplayRange], compare: Compare<'_>) -> Vec<ReplayRange> {
+    let mut all: Vec<ReplayRange> = open
+        .iter()
+        .filter(|r| {
+            !new.iter()
+                .any(|n| n.source == r.source && n.segment == r.segment)
+        })
+        .cloned()
+        .chain(new.iter().cloned())
+        .collect();
+    all.sort_by(|a, b| {
+        a.source
+            .cmp(&b.source)
+            .then_with(|| segment_order(&a.segment, &b.segment))
+            .then_with(|| compare(&a.from, &b.from))
+    });
+    all
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn range(partition: i32, from: i64, until: i64) -> ReplayRange {
-        replay_range("t", partition, from, until)
+    fn decimal(a: &str, b: &str) -> Ordering {
+        a.parse::<i64>().unwrap().cmp(&b.parse::<i64>().unwrap())
     }
 
-    fn plan(all: &[(i32, i64, i64)]) -> Plan {
-        Plan {
-            partitions: all
-                .iter()
-                .map(|&(p, to, before)| (p, (to, before)))
-                .collect(),
+    fn range(segment: i32, from: i64, until: &str) -> ReplayRange {
+        ReplayRange {
+            source: "t".into(),
+            segment: segment.to_string(),
+            from: from.to_string(),
+            until: until.to_string(),
         }
     }
 
     #[test]
-    fn a_range_is_target_to_before_when_the_target_is_lower() {
-        let p = plan(&[(0, 0, 10), (1, 5, 5), (2, 8, 3), (3, 0, -1)]);
+    fn a_range_is_a_move_whose_target_is_before_the_committed_position() {
+        let moves = [
+            range(10, 0, "10"),
+            range(1, 5, "5"),
+            range(2, 8, "3"),
+            range(3, 0, ""),
+            range(0, 9, "10"),
+        ];
         assert_eq!(
-            p.ranges("t", &ResetTarget::Earliest, &[]),
-            [range(0, 0, 10)],
-            "not at or past before, and not without a commit"
+            replaying(&moves, &ResetTarget::Earliest, &[], &decimal),
+            [range(0, 9, "10"), range(10, 0, "10")],
+            "not at or past the committed position, not without one; by position, not text; in segment order"
         );
         assert!(
-            plan(&[(0, 0, 10)])
-                .ranges("t", &ResetTarget::Latest, &[])
-                .is_empty(),
+            replaying(&[range(0, 0, "10")], &ResetTarget::Latest, &[], &decimal).is_empty(),
             "latest never makes a range"
         );
     }
 
     #[test]
-    fn an_open_range_of_the_partition_extends_the_new_one_and_others_stay() {
+    fn an_open_range_of_the_segment_extends_the_new_one_and_others_stay() {
         let open = [
-            range(0, 2, 20),
-            range(1, 0, 7),
+            range(0, 2, "20"),
+            range(1, 0, "7"),
             ReplayRange {
                 source: "other".into(),
-                ..range(0, 0, 99)
+                ..range(0, 0, "99")
             },
         ];
-        let p = plan(&[(0, 4, 12), (1, 9, 9)]);
-        let new = p.ranges("t", &ResetTarget::Timestamp(1), &open);
-        assert_eq!(new, [range(0, 4, 20)]);
-        let merged = Plan::merged(&open, &new);
+        let moves = [range(0, 4, "12"), range(1, 9, "9")];
+        let new = replaying(&moves, &ResetTarget::Timestamp(1), &open, &decimal);
+        assert_eq!(new, [range(0, 4, "20")]);
         assert_eq!(
-            merged,
+            merged(&open, &new, &decimal),
             [
                 ReplayRange {
                     source: "other".into(),
-                    ..range(0, 0, 99)
+                    ..range(0, 0, "99")
                 },
-                range(0, 4, 20),
-                range(1, 0, 7)
+                range(0, 4, "20"),
+                range(1, 0, "7")
             ]
         );
     }
@@ -417,14 +201,14 @@ mod tests {
             ResetTarget::from_proto(Some(&t(To::TimestampMs(7)))),
             Some(ResetTarget::Timestamp(7))
         );
-        let offsets = To::Offsets(proto::PartitionOffsets {
-            offsets: vec![proto::PartitionOffset {
-                partition: 1,
-                offset: 4,
+        let positions = To::Positions(proto::SegmentPositions {
+            positions: vec![proto::SegmentPosition {
+                segment: "1".into(),
+                position: "4".into(),
             }],
         });
         assert_eq!(
-            ResetTarget::from_proto(Some(&t(offsets))).map(|t| t.describe()),
+            ResetTarget::from_proto(Some(&t(positions))).map(|t| t.describe()),
             Some("positions 1@4".to_string())
         );
         assert_eq!(ResetTarget::from_proto(None), None);

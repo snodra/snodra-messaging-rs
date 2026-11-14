@@ -69,7 +69,7 @@ mod tests {
 
     #[test]
     fn the_resource_names_the_service_and_the_instance_the_hub_sees() {
-        let mut config = Config::new("service-c", "hub:7000", "kafka:19092");
+        let mut config = Config::new("service-c", "hub:7000");
         config.instance_id = "pod-7".into();
         let resource = resource(&config);
         let get = |key: &'static str| {
@@ -84,14 +84,14 @@ mod tests {
 
     #[tokio::test]
     async fn without_an_endpoint_no_provider_is_installed() {
-        let config = Config::new("service-c", "hub:7000", "kafka:19092");
+        let config = Config::new("service-c", "hub:7000");
         let guard = init_metrics(&config, None).unwrap();
         assert!(guard.0.is_none());
     }
 
     #[tokio::test]
     async fn with_an_endpoint_the_provider_is_built_without_connecting() {
-        let config = Config::new("service-c", "hub:7000", "kafka:19092");
+        let config = Config::new("service-c", "hub:7000");
         let guard = init_metrics(&config, Some("http://127.0.0.1:1")).unwrap();
         assert!(guard.0.is_some());
     }

@@ -1,6 +1,7 @@
 //! service-c's named event processor (P6a, ADR 0022) and the example-only admin edge around it.
 //!
-//! The `audit` processor is its own Kafka consumer, group `service-c.audit`, markers
+//! The `audit` processor is its own subscription of the event store, `service-c.audit` (on Kafka
+//! its consumer group), markers
 //! `processor:audit:<eventId>`, its own dead letters. [`Audit::failing`] is example-only: while it
 //! is on, every note whose text starts with `poison` fails (the others are handled), so the sandbox
 //! can show a record parked as a dead letter, the later records of its key parked behind it while
@@ -31,7 +32,7 @@ use axum::routing::{delete, get, post};
 use chrono::Utc;
 use kraken_messaging::MessagingError;
 use kraken_messaging::event_store::ResetTarget;
-use kraken_messaging::kafka::EventBus;
+use kraken_messaging::events::EventBus;
 use kraken_messaging::processors::{DEFAULT_LIST_LIMIT, DeadLetters, ResetContext, RetryResult};
 use kraken_messaging::store::DeadLetter;
 use serde::{Deserialize, Serialize};
@@ -405,7 +406,7 @@ mod tests {
     use axum::extract::{RawQuery, State};
     use axum::http::StatusCode;
     use kraken_messaging::config::DeadLetterMode;
-    use kraken_messaging::kafka::EventBus;
+    use kraken_messaging::events::EventBus;
     use kraken_messaging::processors::DeadLetters;
 
     use super::{Audit, AuditHttp, LetterView, RetryView, list, param};
@@ -501,9 +502,9 @@ mod tests {
         let letter = DeadLetter {
             id: "audit:kraken.events:0:8".into(),
             processor: "audit".into(),
-            topic: "kraken.events".into(),
-            partition: 0,
-            offset: 8,
+            source: "kraken.events".into(),
+            segment: "0".into(),
+            position: "8".into(),
             key: Some("k1".into()),
             event_id: None,
             event_type: Some("examples.ShoutAudit".into()),

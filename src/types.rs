@@ -40,7 +40,7 @@ pub trait SubscriptionQuery:
     type Update: Serialize + DeserializeOwned + Send + 'static;
 }
 
-/// A fact that happened; published to Kafka topic `kraken.events`.
+/// A fact that happened; published to the event store (source `kraken.events` by default).
 pub trait Event: MessageType + Serialize + DeserializeOwned + Send + Sync + 'static {}
 
 /// Declares the wire type name of a message struct.

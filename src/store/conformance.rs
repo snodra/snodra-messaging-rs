@@ -715,10 +715,11 @@ pub async fn dead_letters_sequence_per_key(store: &dyn MessageStore) {
     let sequenced = DeadLetter {
         blocked_by: Some(head.id.clone()),
         error: DeadLetterError::sequenced(&head.id),
+        // Position 10: after the head's 5 by value, before it as text.
         ..letter(
             &processor,
             0,
-            7,
+            10,
             Some("k"),
             DeadLetterReason::Sequenced,
             t0 + 1,
@@ -774,24 +775,30 @@ pub async fn dead_letters_sequence_per_key(store: &dyn MessageStore) {
         Some(head.id.clone())
     );
     assert_eq!(
-        letters.earlier(&processor, "k", 7).await.expect("earlier"),
+        letters
+            .earlier(&processor, "k", "7")
+            .await
+            .expect("earlier"),
         Some(head.id.clone())
     );
     assert_eq!(
-        letters.earlier(&processor, "k", 5).await.expect("earlier"),
+        letters
+            .earlier(&processor, "k", "5")
+            .await
+            .expect("earlier"),
         None,
         "an INVALID letter blocks nothing"
     );
     assert_eq!(
         letters
-            .parked_keys(&processor, TOPIC, &[0, 1])
+            .parked_keys(&processor, TOPIC, &["0".to_string(), "1".to_string()])
             .await
             .expect("parked_keys"),
         HashSet::from(["k".to_string(), "k2".to_string()])
     );
     assert_eq!(
         letters
-            .parked_keys(&processor, TOPIC, &[1])
+            .parked_keys(&processor, TOPIC, &["1".to_string()])
             .await
             .expect("parked_keys"),
         HashSet::from(["k2".to_string()])
@@ -838,15 +845,14 @@ pub async fn dead_letters_sequence_per_key(store: &dyn MessageStore) {
         2
     );
     assert_eq!(letters.count(Some(&processor)).await.expect("count"), 5);
-    let mut summaries = letters.summaries(&processor).await.expect("summaries");
-    summaries.sort_by_key(|s| s.offset);
+    let summaries = letters.summaries(&processor).await.expect("summaries");
     assert_eq!(
         summaries
             .iter()
             .map(|s| (
                 s.id.clone(),
                 s.key.clone(),
-                s.offset,
+                s.position.parse::<i64>().expect("decimal"),
                 s.reason,
                 s.parked_at_ms
             ))
@@ -874,20 +880,21 @@ pub async fn dead_letters_sequence_per_key(store: &dyn MessageStore) {
                 t0 + 3
             ),
             (
-                sequenced.id.clone(),
-                Some("k".into()),
-                7,
-                DeadLetterReason::Sequenced,
-                t0 + 1
-            ),
-            (
                 no_key.id.clone(),
                 None,
                 9,
                 DeadLetterReason::HandlerFailed,
                 t0 + 4
             ),
-        ]
+            (
+                sequenced.id.clone(),
+                Some("k".into()),
+                10,
+                DeadLetterReason::Sequenced,
+                t0 + 1
+            ),
+        ],
+        "by position (decimal ones by value), then id"
     );
 
     assert!(letters.delete(&head.id).await.expect("delete"));
@@ -2706,9 +2713,9 @@ fn marker(processed_at_ms: i64) -> ProcessedMarker {
         type_name: "conformance.Happened".into(),
         processed_at_ms,
         processor: None,
-        topic: None,
-        partition: None,
-        offset: None,
+        source: None,
+        segment: None,
+        position: None,
     }
 }
 
@@ -2719,9 +2726,9 @@ fn stage_one(processor: &str, topic: &str, partition: i32, offset: i64) -> Proce
         type_name: "conformance.Happened".into(),
         processed_at_ms: now_ms(),
         processor: Some(processor.to_string()),
-        topic: Some(topic.to_string()),
-        partition: Some(partition),
-        offset: Some(offset),
+        source: Some(topic.to_string()),
+        segment: Some(partition.to_string()),
+        position: Some(offset.to_string()),
     }
 }
 
@@ -2734,11 +2741,16 @@ fn letter(
     parked_at_ms: i64,
 ) -> DeadLetter {
     DeadLetter {
-        id: letter_id(processor, TOPIC, partition, offset),
+        id: letter_id(
+            processor,
+            TOPIC,
+            &partition.to_string(),
+            &offset.to_string(),
+        ),
         processor: processor.to_string(),
-        topic: TOPIC.to_string(),
-        partition,
-        offset,
+        source: TOPIC.to_string(),
+        segment: partition.to_string(),
+        position: offset.to_string(),
         key: key.map(str::to_string),
         event_id: Some(uuid::Uuid::new_v4().to_string()),
         event_type: Some("conformance.Happened".into()),

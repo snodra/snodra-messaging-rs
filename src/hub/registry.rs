@@ -53,7 +53,7 @@ pub(crate) struct SubscriptionHandler {
 /// `ctx.tx.lock().await.session()` with `MongoTxExt`), and [`EventBus::publish_in`] appends to the
 /// outbox in it.
 ///
-/// [`EventBus::publish_in`]: crate::kafka::EventBus::publish_in
+/// [`EventBus::publish_in`]: crate::events::EventBus::publish_in
 #[derive(Clone)]
 pub struct EventContext {
     pub message: MessageContext,

@@ -1,7 +1,7 @@
 //! The local event dispatcher: runs one event inside this service, first through its ordinary
-//! `event` handlers (stage 1), then through the saga stage (stage 2). Shared by the Kafka
-//! [`EventConsumer`](super::EventConsumer) and, in the later S2 tasks, the partner-topic
-//! consumers, the webhook ingress and the relay's `SagaCommandFailed` notices (ADR 0021 ruling 2).
+//! `event` handlers (stage 1), then through the saga stage (stage 2). Shared by the processors'
+//! [`EventConsumer`](super::EventConsumer), the external sources, the webhook ingress and the
+//! relay's `SagaCommandFailed` notices (ADR 0021 ruling 2).
 //!
 //! Stage 1 is the consumer's own behaviour: the idempotency marker (the message store's processed
 //! events, id `processor:<processor>:<dedupe_id>`) is recorded and the handlers run inside one
@@ -119,18 +119,18 @@ pub struct Stages {
     pub stage_one_took: Option<Duration>,
 }
 
-/// Where the record of a stage-1 marker sits (ADR 0023): the Kafka consumer's markers (and a dead
+/// Where the record of a stage-1 marker sits (ADR 0023): the processors' markers (and a dead
 /// letter's retry, which is that record's stage 1) carry it, so a replay deletes exactly the
 /// markers of its range. Markers of local dispatch, sagas, ingress and failure notices have none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarkerPosition {
     pub processor: String,
-    pub topic: String,
-    pub partition: i32,
-    pub offset: i64,
+    pub source: String,
+    pub segment: String,
+    pub position: String,
 }
 
-/// How the Kafka consumer dispatches one record ([`LocalEventDispatcher::dispatch_record`]).
+/// How a processor dispatches one record ([`LocalEventDispatcher::dispatch_record`]).
 #[derive(Clone, Copy, Debug)]
 pub struct RecordDispatch<'a> {
     /// Written into stage 1's marker.
@@ -176,8 +176,8 @@ impl LocalEventDispatcher {
     }
 
     /// The named processors' dispatchers (ADR 0022): [`dispatch`](Self::dispatch), the path of
-    /// the partner topics, the webhook ingress and the relay's notices, runs each one's stage 1
-    /// too (its own transaction and marker family), the sagas still once. The Kafka consumer's
+    /// the external sources, the webhook ingress and the relay's notices, runs each one's stage 1
+    /// too (its own transaction and marker family), the sagas still once. The processor's consumer's
     /// [`dispatch_stages`](Self::dispatch_stages) stays with this dispatcher's own handlers.
     pub fn with_fan_out(mut self, named: Vec<Arc<LocalEventDispatcher>>) -> LocalEventDispatcher {
         self.fan_out = named;
@@ -317,7 +317,7 @@ impl LocalEventDispatcher {
 
     /// [`dispatch`](Self::dispatch) with each stage's result apart: stage 1 (the ordinary
     /// handlers, when `run_stage_one` and one wants the type), then stage 2 (the sagas, when one is
-    /// interested), which runs whatever stage 1 did (ruling 26). The Kafka consumer parks a record
+    /// interested), which runs whatever stage 1 did (ruling 26). The processor's consumer parks a record
     /// only for stage 1's failure, and runs a SEQUENCED record through stage 2 alone (ADR 0022).
     pub async fn dispatch_stages(
         &self,
@@ -340,7 +340,7 @@ impl LocalEventDispatcher {
         .await
     }
 
-    /// [`dispatch_stages`](Self::dispatch_stages) for a Kafka record: stage 1's marker carries
+    /// [`dispatch_stages`](Self::dispatch_stages) for a processor's record: stage 1's marker carries
     /// the record's position, and a record of a replay range runs stage 1 without the handlers
     /// that disallow replay and skips stage 2 (ADR 0023).
     pub async fn dispatch_record(
@@ -415,9 +415,9 @@ impl LocalEventDispatcher {
             type_name: type_name.to_string(),
             processed_at_ms: now_ms(),
             processor: record.position.map(|p| p.processor.clone()),
-            topic: record.position.map(|p| p.topic.clone()),
-            partition: record.position.map(|p| p.partition),
-            offset: record.position.map(|p| p.offset),
+            source: record.position.map(|p| p.source.clone()),
+            segment: record.position.map(|p| p.segment.clone()),
+            position: record.position.map(|p| p.position.clone()),
         };
         match store.processed_events().record(&mut tx, &marker).await {
             Ok(true) => {}

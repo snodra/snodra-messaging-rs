@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use kraken_messaging::kafka::SagaStage;
+use kraken_messaging::events::SagaStage;
 use kraken_messaging::saga::store::{DeadlineDocument, DeadlineStatus, DispatchKind, SagaDocument};
 use kraken_messaging::saga::{
     DeadlineScheduler, DeadlineSettings, SagaDefinition, SagaRetry, SagaRuntime, SagaType,

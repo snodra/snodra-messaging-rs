@@ -26,7 +26,7 @@ fn order_id(e: &OrderPlaced) -> Option<String> {
 /// A builder that has not touched the network (the clients connect lazily), with a MongoDB store
 /// that is never reached.
 async fn builder() -> KrakenMessagingBuilder {
-    let config = Config::new("svc", "static://127.0.0.1:1", "127.0.0.1:1");
+    let config = Config::new("svc", "static://127.0.0.1:1");
     let client = mongodb::Client::with_uri_str("mongodb://127.0.0.1:1/db")
         .await
         .unwrap();

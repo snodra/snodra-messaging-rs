@@ -47,7 +47,7 @@ impl Store {
         let store = MongoStore::new(client.clone(), db.clone());
         // What `start()` does: the indexes, which create the collections transactions write to.
         store
-            .init_schema(&Config::new("saga-tests", "127.0.0.1:1", "127.0.0.1:1"))
+            .init_schema(&Config::new("saga-tests", "127.0.0.1:1"))
             .await
             .unwrap();
         Store {

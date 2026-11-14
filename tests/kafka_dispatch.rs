@@ -13,12 +13,14 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use kraken_messaging::config::DeadLetterMode;
-use kraken_messaging::event_store::headers;
-use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::kafka::dispatch::{
+use kraken_messaging::event_store::{SubscriptionSpec, headers};
+use kraken_messaging::events::dispatch::{
     LocalEventDispatcher, NoSagas, Outcome, SagaStage, StageOneDone,
 };
-use kraken_messaging::kafka::{EventConsumer, ProcessorSettings, RecordDisposition, classify_with};
+use kraken_messaging::events::{
+    EventConsumer, ProcessorSettings, RecordDisposition, classify_with,
+};
+use kraken_messaging::hub::HandlerRegistry;
 use kraken_messaging::{Event, MessageContext, MessagingError, message_type};
 use mongodb::Database;
 use mongodb::bson::doc;
@@ -430,11 +432,12 @@ fn a_record_only_a_saga_wants_is_handled_not_skipped() {
     .into();
     let none = HandlerRegistry::new();
     assert_eq!(
-        classify_with(&hdrs, b"{}", "kraken.events", 0, 7, |_| false),
+        classify_with(&hdrs, b"{}", "kraken.events", "0", "7", |_| false),
         RecordDisposition::Skip("no handler for this type")
     );
     assert_eq!(
-        classify_with(&hdrs, b"{}", "kraken.events", 0, 7, |t| t == "t.Happened"),
+        classify_with(&hdrs, b"{}", "kraken.events", "0", "7", |t| t
+            == "t.Happened"),
         RecordDisposition::Handle {
             type_name: "t.Happened".into(),
             id: "e-1".into()
@@ -442,7 +445,7 @@ fn a_record_only_a_saga_wants_is_handled_not_skipped() {
     );
     // `classify` is `classify_with` over the registry's handlers.
     assert_eq!(
-        kraken_messaging::kafka::classify(&hdrs, b"{}", "kraken.events", 0, 7, &none),
+        kraken_messaging::events::classify(&hdrs, b"{}", "kraken.events", "0", "7", &none),
         RecordDisposition::Skip("no handler for this type")
     );
 }
@@ -456,9 +459,11 @@ async fn the_consumer_hands_a_record_only_a_saga_wants_to_the_saga_stage() {
     let consumer = EventConsumer::processor(
         ProcessorSettings {
             name: "default".into(),
-            bootstrap_servers: kafka.bootstrap.clone(),
-            group_id: "svc-saga.default".into(),
-            topic: "kraken.events".into(),
+            subscription: SubscriptionSpec {
+                name: "svc-saga.default".into(),
+                source: "kraken.events".into(),
+            },
+            events: support::kafka_events(&kafka.bootstrap),
             max_attempts: 3,
             backoff: Duration::from_millis(50),
             dead_letter_mode: DeadLetterMode::Log,

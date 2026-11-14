@@ -2,7 +2,8 @@
 //!
 //! ```ignore
 //! let builder = KrakenMessaging::builder(Config::from_env()?).await?
-//!     .store(Arc::new(store));                        // a message store add-on (events, sagas)
+//!     .store(Arc::new(store))                         // a message store add-on (events, sagas)
+//!     .event_store(Arc::new(events));                 // an event-store add-on (events, sagas)
 //! let events = builder.events();                      // clone into handlers that publish
 //! let app = builder
 //!     .command::<Shout, _, _>(move |cmd, ctx| { let events = events.clone(); async move { ... } })
@@ -20,7 +21,6 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rdkafka::message::BorrowedMessage;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
@@ -32,25 +32,26 @@ use crate::config::Config;
 use crate::config::DeadLetterMode;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
-use crate::external::kafka::{SourceRegistration, validate_source};
+use crate::event_store::{Capability, EventStore, SubscriptionSpec};
+use crate::events::{
+    EventBus, LocalEventDispatcher, NoSagas, OutboxPublisher, OutboxPublisherSettings,
+    ProcessorSettings, SagaStage,
+};
+use crate::external::sources::{SourceRegistration, validate_source};
 use crate::external::{
-    ExternalCalls, ExternalCallsHandle, ExternalEventIngress, ExternalKafkaSources, ExternalSource,
-    IdempotencyKey, TranslatedEvent,
+    ExternalCalls, ExternalCallsHandle, ExternalEventIngress, ExternalRecord,
+    ExternalSourceProvider, ExternalSources, IdempotencyKey, TranslatedEvent,
 };
 use crate::hub::{
     Dispatcher, EventContext, HandlerRegistry, HubPool, HubSettings, Inbound, QueryUpdateEmitter,
     Sender, SenderSettings, TokenProvider,
 };
 use crate::identity::{Guard, IdentityResolver, JwksVerifier};
-use crate::kafka::{
-    EventBus, LocalEventDispatcher, NoSagas, OutboxPublisher, OutboxPublisherSettings,
-    ProcessorSettings, SagaStage,
-};
 use crate::metrics::Metrics;
 use crate::processors::reset::ResetHandler;
 use crate::processors::{
     DEFAULT_PROCESSOR, DeadLetters, EventOptions, ProcessorControl, ProcessorMonitor,
-    ProcessorRunner, ResetContext, group_id, marker_prefix, validate_processor_name,
+    ProcessorRunner, ResetContext, marker_prefix, subscription_name, validate_processor_name,
 };
 use crate::proto::ProcessorStatus;
 use crate::saga::{
@@ -71,6 +72,8 @@ pub struct KrakenMessagingBuilder {
     registry: HandlerRegistry,
     /// The message store (ADR 0028); none for a service with commands and queries only.
     store: Option<Arc<dyn MessageStore>>,
+    /// The event store (ADR 0027); none for a service that neither publishes nor handles events.
+    event_store: Option<Arc<dyn EventStore>>,
     events: EventBus,
     hubs: Arc<HubPool>,
     inbound: mpsc::Receiver<Inbound>,
@@ -80,7 +83,7 @@ pub struct KrakenMessagingBuilder {
     sagas: Vec<Result<SagaType, MessagingError>>,
     /// What the idempotent handlers record their calls in, bound by `start()`.
     external_calls: ExternalCallsHandle,
-    /// The partner topics, consumed from `start()`.
+    /// The partner sources, read from `start()`.
     sources: Vec<SourceRegistration>,
     /// What the runtime, relay, scheduler and idempotent handlers report to.
     stats: SagaStats,
@@ -166,6 +169,7 @@ impl KrakenMessaging {
         Ok(KrakenMessagingBuilder {
             registry: HandlerRegistry::new(),
             store: None,
+            event_store: None,
             events,
             hubs,
             inbound,
@@ -185,7 +189,7 @@ impl KrakenMessaging {
     }
 
     /// The dead-letter admin API (ADR 0022): list, get, count, retry, retry_all and discard the
-    /// letters in `dead_letters` of the processors this instance runs. In modes `topic` and `log`
+    /// letters in `dead_letters` of the processors this instance runs. In modes `event-store` and `log`
     /// every call is an error naming the mode. See [`DeadLetters`].
     pub fn dead_letters(&self) -> DeadLetters {
         self.dead_letters.clone()
@@ -444,7 +448,7 @@ impl KrakenMessagingBuilder {
         self
     }
 
-    /// An event handler in the unnamed processor `default` (with the sagas): the consumer group
+    /// An event handler in the unnamed processor `default` (with the sagas): the subscription
     /// `<service>.default` and the markers `processor:default:<eventId>`.
     pub fn event<E, F, Fut>(self, handler: F) -> Self
     where
@@ -492,7 +496,7 @@ impl KrakenMessagingBuilder {
 
     /// A reset handler of processor `processor` (`default`, or a name given to `event_in`; ADR
     /// 0023, Kotlin's `@ResetHandler`): runs once per reset that replays a range, on the instance
-    /// executing it, before the markers and the offsets change, with the target and the ranges.
+    /// executing it, before the markers and the positions change, with the target and the ranges.
     /// The handlers of a processor run in registration order; an error (or a panic) refuses the
     /// reset (`RESET_HANDLER_FAILED`) with nothing changed. A processor without event handlers
     /// here fails [`start`](Self::start).
@@ -511,7 +515,7 @@ impl KrakenMessagingBuilder {
     }
 
     /// An event handler in the named processor `processor` (ADR 0022):
-    /// its own Kafka consumer in group `<service>.<processor>`, its own markers
+    /// its own subscription `<service>.<processor>` of the event store, its own markers
     /// (`processor:<processor>:<eventId>`), position, dead letters and failure domain, so a slow
     /// or failing handler there never holds the other processors. Stage 1 only: sagas run in
     /// `default`. The name matches `^[a-z0-9][a-z0-9-]{0,47}$` and is not `default`; otherwise
@@ -660,35 +664,38 @@ impl KrakenMessagingBuilder {
         self
     }
 
-    /// A partner's Kafka topic whose records become local kraken events (ADR 0021 ruling 20,
-    /// spec "Inbound 1"): `translator` turns each record into an event (`Ok(None)` ignores it, an
-    /// error retries it up to `KRAKEN_CONSUMER_MAX_ATTEMPTS` times and then skips it, an
-    /// `InvalidMessage` skips it at once: map a record that cannot be read to it), which is
-    /// dispatched locally to this service's event handlers and sagas, never published to
-    /// `kraken.events`. The dedupe id is `<name>:<partition>:<offset>`, or `<name>:<dedupeKey>`
-    /// when the translation carries one. A `properties` entry for a key the library fixes, an
-    /// empty topic or two sources of one name fail [`start`](Self::start). See
-    /// [`crate::external::kafka`].
+    /// A partner source whose records become local kraken events (ADR 0021 ruling 20, spec
+    /// "Inbound 1"), read through an event-store add-on's `provider` (the Kafka add-on's
+    /// `KafkaExternalSource` for a partner's topic), whatever the service's own event store is:
+    /// `translator` turns each record into an event (`Ok(None)` ignores it, an error retries it up
+    /// to `KRAKEN_CONSUMER_MAX_ATTEMPTS` times and then skips it, an `InvalidMessage` skips it at
+    /// once: map a record that cannot be read to it), which is dispatched locally to this
+    /// service's event handlers and sagas, never published to its events. The dedupe id is
+    /// `<name>:<segment>:<position>`, or `<name>:<dedupeKey>` when the translation carries one.
+    /// An empty or reserved name, or two sources of one name, fail [`start`](Self::start). See
+    /// [`crate::external::sources`].
     ///
     /// ```ignore
-    /// builder.external_source("printer-banner", ExternalSource::new("partner.printer.banner"), |record| {
+    /// let partner = KafkaExternalSource::new("printer-banner", ExternalSource::new("partner.printer.banner"), "svc", "kafka:19092")?;
+    /// builder.external_source("printer-banner", partner, |record: &ExternalRecord| {
     ///     // A record that is not a reply never will be: InvalidMessage skips it at once (a bare
     ///     // `?` would make it Serialization, retried up to the attempt limit first).
-    ///     let reply: PrinterReply = serde_json::from_slice(record.payload().unwrap_or_default())
+    ///     let reply: PrinterReply = serde_json::from_slice(&record.payload)
     ///         .map_err(|e| MessagingError::InvalidMessage(format!("not a printer reply: {e}")))?;
     ///     Ok(Some(TranslatedEvent::new(&BannerPrinted { job_id: reply.job_id }, Some(reply.event_id))?))
     /// })
     /// ```
-    pub fn external_source<T>(mut self, name: &str, source: ExternalSource, translator: T) -> Self
+    pub fn external_source<P, T>(mut self, name: &str, provider: P, translator: T) -> Self
     where
-        T: Fn(&BorrowedMessage<'_>) -> Result<Option<TranslatedEvent>, MessagingError>
+        P: ExternalSourceProvider + 'static,
+        T: Fn(&ExternalRecord) -> Result<Option<TranslatedEvent>, MessagingError>
             + Send
             + Sync
             + 'static,
     {
         self.sources.push(SourceRegistration {
             name: name.to_string(),
-            source,
+            provider: Arc::new(provider),
             translator: Arc::new(translator),
         });
         self
@@ -740,14 +747,25 @@ impl KrakenMessagingBuilder {
         self
     }
 
+    /// The event store (ADR 0027): where the service's events go (the outbox relay publishes
+    /// them there) and where its event processors read them, through an event-store add-on (e.g.
+    /// `kraken-messaging-kafka`'s `KafkaEventStore`). An event handler and a saga need one
+    /// ([`start`](Self::start) fails naming what needs it), and so does publishing an event;
+    /// commands and queries do not.
+    pub fn event_store(mut self, events: Arc<dyn EventStore>) -> Self {
+        self.event_store = Some(events);
+        self
+    }
+
     /// Prepares the message store's schema (unless `Config::store_init_schema` is false), registers
-    /// with the hub (in the background), starts the outbox publisher and the consumer. Does not
-    /// wait for the hub: see [`KrakenMessaging::await_hub`].
+    /// with the hub (in the background), starts the outbox publisher and the event processors.
+    /// Does not wait for the hub: see [`KrakenMessaging::await_hub`].
     pub async fn start(self) -> Result<KrakenMessaging, MessagingError> {
         let KrakenMessagingBuilder {
             config,
             registry,
             store,
+            event_store,
             events,
             hubs,
             mut inbound,
@@ -769,10 +787,28 @@ impl KrakenMessagingBuilder {
         }
         let saga_types = validate_registrations(sagas)?;
         for source in &sources {
-            validate_source(&source.name, &source.source)?;
+            validate_source(&source.name)?;
         }
         if store.is_none() {
             needs_store(&registry, &named_registries, &saga_types, &sources)?;
+        }
+        match &event_store {
+            None => {
+                needs_event_store(&registry, &named_registries, &saga_types)?;
+                // Nothing would relay the outbox: publishing fails, naming the missing add-on.
+                events.without_event_store();
+            }
+            Some(events)
+                if config.dead_letter_mode == DeadLetterMode::EventStore
+                    && !events.supports(Capability::NativeDeadLetter) =>
+            {
+                return Err(MessagingError::InvalidMessage(format!(
+                    "dead-letter mode event-store needs an event store with the capability {}: {} lacks it",
+                    Capability::NativeDeadLetter,
+                    events.name()
+                )));
+            }
+            Some(_) => {}
         }
         if !config.sagas_enabled && !saga_types.is_empty() {
             tracing::warn!(sagas = ?saga_types.iter().map(SagaType::name).collect::<Vec<_>>(), "sagas are registered but KRAKEN_SAGAS_ENABLED=false: they do not run");
@@ -833,8 +869,8 @@ impl KrakenMessagingBuilder {
                 (name, Arc::new(dispatcher))
             })
             .collect();
-        // One local dispatch for every entry point: the Kafka consumer of `default`, the partner
-        // topics, the webhook ingress and the relay's failure notices (the ordinary handlers, then
+        // One local dispatch for every entry point: the processor `default`, the partner
+        // sources, the webhook ingress and the relay's failure notices (the ordinary handlers, then
         // the sagas). Outside the consumer it also runs every named processor's handlers.
         let local = Arc::new(
             LocalEventDispatcher::new(store.clone(), Arc::clone(&registry), stage)
@@ -882,8 +918,11 @@ impl KrakenMessagingBuilder {
         );
         // Each processor's consumer runs under its control document (ADR 0023).
         let mut runners = Vec::new();
-        // A processor exists only with event handlers or sagas, which have a store.
-        if let Some(store) = store.as_ref().filter(|_| config.consumer_enabled) {
+        // A processor exists only with event handlers or sagas, which have both stores.
+        if let (Some(store), Some(events)) = (
+            store.as_ref().filter(|_| config.consumer_enabled),
+            event_store.as_ref(),
+        ) {
             for (name, dispatcher) in planned {
                 let handlers = reset_handlers
                     .iter()
@@ -892,10 +931,12 @@ impl KrakenMessagingBuilder {
                     .collect();
                 let runner = ProcessorRunner::new(
                     ProcessorSettings {
-                        group_id: group_id(&config.service_name, &name),
+                        subscription: SubscriptionSpec {
+                            name: subscription_name(&config.service_name, &name),
+                            source: config.events_source.clone(),
+                        },
                         name,
-                        bootstrap_servers: config.kafka_bootstrap.clone(),
-                        topic: config.kafka_topic.clone(),
+                        events: Arc::clone(events),
                         max_attempts: config.consumer_max_attempts,
                         backoff: Duration::from_secs(1),
                         dead_letter_mode: config.dead_letter_mode,
@@ -971,9 +1012,13 @@ impl KrakenMessagingBuilder {
             }
         }));
 
-        if let Some(store) = store.as_ref().filter(|_| config.outbox_enabled) {
+        if let (Some(store), Some(events)) = (
+            store.as_ref().filter(|_| config.outbox_enabled),
+            event_store.as_ref(),
+        ) {
             let publisher = OutboxPublisher::new(
                 store.outbox(),
+                Arc::clone(events),
                 OutboxPublisherSettings::from(&config),
                 clock.clone(),
                 &metrics,
@@ -1020,17 +1065,15 @@ impl KrakenMessagingBuilder {
             ));
         }
         if !sources.is_empty() {
-            let sources = ExternalKafkaSources::new(
+            let sources = ExternalSources::new(
                 sources,
                 Arc::clone(&local),
-                &config.service_name,
-                &config.kafka_bootstrap,
                 config.consumer_max_attempts,
                 Duration::from_secs(1),
             )?;
             tasks.push(sources.start(cancel.clone()));
         }
-        tracing::info!(service = %config.service_name, instance = %hubs.instance_id(), hubs = ?hubs.targets(), commands = ?registry.command_types(), queries = ?registry.exclusive_query_types(), shared_queries = ?registry.shared_query_types(), streaming_queries = ?registry.streaming_query_types(), subscription_queries = ?registry.subscription_query_types(), events = ?registry.event_types(), sagas = ?runtime.as_ref().map(|r| r.saga_types()).unwrap_or_default(), idempotent = ?registry.idempotent_handlers(), processors = ?monitors.iter().map(|m| m.name().to_string()).collect::<Vec<_>>(), dead_letter_mode = config.dead_letter_mode.as_str(), store = store.as_ref().map_or("none", |s| s.name()), "kraken messaging started");
+        tracing::info!(service = %config.service_name, instance = %hubs.instance_id(), hubs = ?hubs.targets(), commands = ?registry.command_types(), queries = ?registry.exclusive_query_types(), shared_queries = ?registry.shared_query_types(), streaming_queries = ?registry.streaming_query_types(), subscription_queries = ?registry.subscription_query_types(), events = ?registry.event_types(), sagas = ?runtime.as_ref().map(|r| r.saga_types()).unwrap_or_default(), idempotent = ?registry.idempotent_handlers(), processors = ?monitors.iter().map(|m| m.name().to_string()).collect::<Vec<_>>(), dead_letter_mode = config.dead_letter_mode.as_str(), store = store.as_ref().map_or("none", |s| s.name()), event_store = event_store.as_ref().map_or("none", |e| e.name()), "kraken messaging started");
         Ok(KrakenMessaging {
             hubs,
             sender,
@@ -1091,6 +1134,35 @@ fn needs_store(
     Ok(())
 }
 
+/// Without an event store: the first registration that needs one, as the error naming it (ADR
+/// 0027: commands, queries and subscription queries need none).
+fn needs_event_store(
+    registry: &HandlerRegistry,
+    named: &std::collections::BTreeMap<String, HandlerRegistry>,
+    sagas: &[SagaType],
+) -> Result<(), MessagingError> {
+    let needs = |what: String| {
+        Err(MessagingError::InvalidMessage(format!(
+            "{what} needs an event store: add .event_store(...)"
+        )))
+    };
+    if let Some(t) = registry.event_types().first() {
+        return needs(format!("the event handler for {t}"));
+    }
+    if let Some((processor, t)) = named
+        .iter()
+        .find_map(|(p, r)| r.event_types().first().map(|t| (p.clone(), t.clone())))
+    {
+        return needs(format!(
+            "the event handler for {t} in processor '{processor}'"
+        ));
+    }
+    if let Some(saga) = sagas.first() {
+        return needs(format!("saga '{}'", saga.name()));
+    }
+    Ok(())
+}
+
 /// The hub connection settings a [`Config`] describes, access control included.
 ///
 /// With `hub_oauth2` this is where the one token provider of the process is made; it is shared by
@@ -1126,7 +1198,7 @@ mod hub_settings_tests {
 
     #[test]
     fn the_config_reaches_the_hub_settings() {
-        let mut config = Config::new("svc", "static://hub:7000", "kafka:19092");
+        let mut config = Config::new("svc", "static://hub:7000");
         assert!(hub_settings(&config).unwrap().token.is_none());
         assert!(hub_settings(&config).unwrap().tls.is_none());
         assert!(hub_settings(&config).unwrap().token_provider.is_none());
@@ -1150,7 +1222,7 @@ mod hub_settings_tests {
 
     #[test]
     fn oauth2_in_the_config_becomes_one_token_provider_for_the_settings() {
-        let mut config = Config::new("svc", "a:7000,b:7000", "kafka:19092");
+        let mut config = Config::new("svc", "a:7000,b:7000");
         config.hub_oauth2 = Some(crate::security::HubOAuth2 {
             token_uri: "http://keycloak:8080/token".into(),
             client_id: "svc".into(),

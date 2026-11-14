@@ -1,17 +1,18 @@
 //! kraken messaging client for Rust: the counterpart of the Kotlin `kraken-messaging` starter.
 //!
-//! Wire- and storage-compatible with it: same hub protocol (`proto/hub.proto`), same Kafka record
-//! format on `kraken.events`, same `outbox` and `processed_events` collections. See README.md.
+//! Wire- and storage-compatible with it: same hub protocol (`proto/hub.proto`), same events on the
+//! event store (an add-on, ADR 0027: `kraken-messaging-kafka`), same documents in the message store
+//! (an add-on, ADR 0028: `kraken-messaging-mongo`). See README.md.
 pub mod app;
 pub mod codec;
 pub mod config;
 pub mod context;
 pub mod error;
 pub mod event_store;
+pub mod events;
 pub mod external;
 pub mod hub;
 pub mod identity;
-pub mod kafka;
 pub mod metrics;
 pub mod processors;
 pub mod proto;

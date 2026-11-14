@@ -40,6 +40,7 @@ pub mod documents;
 mod external;
 mod indexes;
 mod outbox;
+mod positions;
 mod processed;
 mod sagas;
 

@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use kraken_messaging::context::CURRENT;
+use kraken_messaging::events::EventBus;
+use kraken_messaging::events::dispatch::{LocalEventDispatcher, NoSagas, SagaStage};
 use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::kafka::EventBus;
-use kraken_messaging::kafka::dispatch::{LocalEventDispatcher, NoSagas, SagaStage};
 use kraken_messaging::saga::store::{DispatchKind, SagaDispatchDocument, SagaDocument};
 use kraken_messaging::saga::{
     FailureReason, LocalRawCommandSender, NoopSagaMetrics, RETRYABLE_MARKER, RawCommandSender,
@@ -442,7 +442,7 @@ impl Rl {
     }
 
     async fn deliver<E: Event>(&self, event: &E, id: &str) {
-        use kraken_messaging::kafka::SagaStage;
+        use kraken_messaging::events::SagaStage;
         self.runtime
             .process(
                 E::TYPE,

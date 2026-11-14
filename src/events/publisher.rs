@@ -1,4 +1,5 @@
-//! Relays pending outbox entries to Kafka in order, marking them sent or failed.
+//! Relays pending outbox entries to the event store in order
+//! ([`EventStore::publish`]), marking them sent or failed.
 //!
 //! Each poll claims a batch from the message store's outbox ([`OutboxStore::claim`]) under a
 //! lease ([`OutboxPublisherSettings::lease`], `KRAKEN_OUTBOX_LEASE_MS`) held by this publisher, so
@@ -6,7 +7,9 @@
 //! one's entries are relayed after its lease. A batch stops before its lease could run out under
 //! a send ([`OUTBOX_SEND_TIMEOUT`] before its end, by the injected clock); the next poll claims
 //! again, which renews the lease of what this publisher still holds. Order holds per key for what
-//! one instance relays (ADR 0028).
+//! one instance relays (ADR 0028). A publish the event store rejects for good
+//! ([`EventStoreError::Rejected`], or `Invalid`) marks the entry failed at once; any other failure
+//! is tried again, up to the attempts.
 //!
 //! Metrics (ADR 0026): every publish attempt counts in `kraken.outbox.published{outcome}`; the
 //! gauges `kraken.outbox.pending` and `kraken.outbox.oldest.age` read what the last poll saw (the
@@ -19,34 +22,29 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use rdkafka::config::ClientConfig;
-use rdkafka::error::KafkaError;
-use rdkafka::message::{Header, OwnedHeaders};
-use rdkafka::producer::{FutureProducer, FutureRecord};
-use rdkafka::util::Timeout;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::error::MessagingError;
-use crate::event_store::headers;
+use crate::event_store::{EventStore, EventStoreError, OutgoingEvent, headers};
 use crate::metrics::{Metrics, OUTBOX_OLDEST_AGE, OUTBOX_PENDING};
 use crate::saga::Clock;
 use crate::store::{OutboxEntry, OutboxStore};
 use crate::time::{after, now_ms, rfc3339};
 
-/// The most one send to Kafka takes: the producer's delivery budget (as Kotlin's `max.block.ms`
-/// 10 s + `delivery.timeout.ms` 30 s). The outbox lease must be longer.
+/// The most one publish takes (as Kotlin's `max.block.ms` 10 s + `delivery.timeout.ms` 30 s): one
+/// still unanswered then counts as failed. The outbox lease must be longer.
 pub const OUTBOX_SEND_TIMEOUT: Duration = Duration::from_secs(40);
 
-/// What an [`OutboxPublisher`] relays, where to and how (`Config`'s `outbox_*` and Kafka
+/// What an [`OutboxPublisher`] relays, where to and how (`Config`'s `outbox_*` and events
 /// settings, [`From<&Config>`]).
 #[derive(Clone, Debug)]
 pub struct OutboxPublisherSettings {
-    pub bootstrap_servers: String,
-    pub topic: String,
-    /// The `source` header: the service name.
+    /// The event store's source the events go to.
     pub source: String,
+    /// The `source` header: the service name.
+    pub service_name: String,
     pub poll_interval: Duration,
     pub batch_size: usize,
     /// Sends of one entry in all before it is given up.
@@ -58,9 +56,8 @@ pub struct OutboxPublisherSettings {
 impl From<&Config> for OutboxPublisherSettings {
     fn from(config: &Config) -> Self {
         OutboxPublisherSettings {
-            bootstrap_servers: config.kafka_bootstrap.clone(),
-            topic: config.kafka_topic.clone(),
-            source: config.service_name.clone(),
+            source: config.events_source.clone(),
+            service_name: config.service_name.clone(),
             poll_interval: config.outbox_poll_interval,
             batch_size: config.outbox_batch_size,
             max_attempts: config.outbox_max_attempts,
@@ -73,9 +70,9 @@ pub struct OutboxPublisher {
     outbox: Arc<dyn OutboxStore>,
     /// This publisher's claims (a random id).
     owner: String,
-    producer: FutureProducer,
-    topic: String,
+    events: Arc<dyn EventStore>,
     source: String,
+    service_name: String,
     poll_interval: Duration,
     batch_size: i64,
     max_attempts: i32,
@@ -139,10 +136,11 @@ impl Backlog {
 }
 
 impl OutboxPublisher {
-    /// The relay of `outbox` as `settings` say, its batches timed by `clock`; its metrics are
-    /// recorded on `metrics`. `InvalidMessage` for a lease not longer than a send.
+    /// The relay of `outbox` to `events` as `settings` say, its batches timed by `clock`; its
+    /// metrics are recorded on `metrics`. `InvalidMessage` for a lease not longer than a send.
     pub fn new(
         outbox: Arc<dyn OutboxStore>,
+        events: Arc<dyn EventStore>,
         settings: OutboxPublisherSettings,
         clock: Clock,
         metrics: &Metrics,
@@ -154,22 +152,14 @@ impl OutboxPublisher {
                 OUTBOX_SEND_TIMEOUT.as_secs()
             )));
         }
-        let producer: FutureProducer = ClientConfig::new()
-            .set("bootstrap.servers", &settings.bootstrap_servers)
-            // Same budget as the Kotlin producer (max.block.ms 10 s + delivery.timeout.ms 30 s): a broker
-            // restart must not exhaust the 10 attempts.
-            .set("message.timeout.ms", "30000")
-            .set("request.timeout.ms", "20000")
-            .set("enable.idempotence", "true")
-            .create()?;
         let backlog = Arc::new(Backlog::default());
         Backlog::observe(Arc::downgrade(&backlog), metrics);
         Ok(Arc::new(OutboxPublisher {
             outbox,
             owner: uuid::Uuid::new_v4().to_string(),
-            producer,
-            topic: settings.topic,
+            events,
             source: settings.source,
+            service_name: settings.service_name,
             poll_interval: settings.poll_interval,
             batch_size: settings.batch_size as i64,
             max_attempts: settings.max_attempts as i32,
@@ -213,10 +203,8 @@ impl OutboxPublisher {
             .outbox
             .claim(&self.owner, self.lease, self.batch_size as usize)
             .await?;
-        self.relay_batch(batch, claimed_at_ms, |prepared| {
-            Box::pin(self.send(prepared))
-        })
-        .await
+        self.relay_batch(batch, claimed_at_ms, |event| Box::pin(self.send(event)))
+            .await
     }
 
     /// Sends `batch`, claimed at `claimed_at_ms`, through `send`, in order; see
@@ -228,7 +216,7 @@ impl OutboxPublisher {
         mut send: F,
     ) -> Result<usize, MessagingError>
     where
-        F: FnMut(Prepared) -> BoxFuture<'s, Result<(), KafkaError>>,
+        F: FnMut(OutgoingEvent) -> BoxFuture<'s, Result<(), EventStoreError>>,
     {
         // The backlog for the gauges: the batch, or every pending entry behind a full one (and the
         // oldest of them, which another instance may hold).
@@ -264,7 +252,7 @@ impl OutboxPublisher {
                 );
                 break;
             }
-            match send(self.record(d)?).await {
+            match send(self.event(d)).await {
                 Ok(()) => {
                     self.metrics.outbox_published(true);
                     self.outbox.mark_sent(std::slice::from_ref(&d.id)).await?;
@@ -293,79 +281,43 @@ impl OutboxPublisher {
         Ok(sent)
     }
 
-    /// One record to Kafka, within [`OUTBOX_SEND_TIMEOUT`].
-    async fn send(&self, prepared: Prepared) -> Result<(), KafkaError> {
-        let mut owned = OwnedHeaders::new();
-        for (k, v) in &prepared.headers {
-            owned = owned.insert(Header {
-                key: k,
-                value: Some(v),
-            });
+    /// One event to the event store; no answer within [`OUTBOX_SEND_TIMEOUT`] is a failure.
+    async fn send(&self, event: OutgoingEvent) -> Result<(), EventStoreError> {
+        match tokio::time::timeout(OUTBOX_SEND_TIMEOUT, self.events.publish(&event)).await {
+            Ok(sent) => sent,
+            Err(_) => Err(EventStoreError::Failed(format!(
+                "no answer within {} s",
+                OUTBOX_SEND_TIMEOUT.as_secs()
+            ))),
         }
-        let mut record = FutureRecord::to(&self.topic)
-            .payload(&prepared.payload)
-            .headers(owned);
-        if let Some(k) = &prepared.key {
-            record = record.key(k);
-        }
-        self.producer
-            .send(record, Timeout::After(OUTBOX_SEND_TIMEOUT))
-            .await
-            .map(|_| ())
-            .map_err(|(e, _)| e)
     }
 
-    fn record(&self, d: &OutboxEntry) -> Result<Prepared, MessagingError> {
-        let payload = d.payload.clone();
-        let mut all: Vec<(String, String)> = d
-            .headers
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        all.sort();
-        all.retain(|(k, _)| {
-            ![
-                headers::TYPE,
-                headers::ID,
-                headers::TIMESTAMP,
-                headers::SOURCE,
-            ]
-            .contains(&k.as_str())
-        });
-        all.push((headers::TYPE.into(), d.type_name.clone()));
-        all.push((headers::ID.into(), d.id.clone()));
-        all.push((headers::TIMESTAMP.into(), rfc3339(d.created_at_ms)));
-        all.push((headers::SOURCE.into(), self.source.clone()));
-        Ok(Prepared {
+    /// The event of `d`: its headers, with `type`, `id`, `timestamp` and `source` (the service)
+    /// set from the entry.
+    fn event(&self, d: &OutboxEntry) -> OutgoingEvent {
+        let mut all = d.headers.clone();
+        all.insert(headers::TYPE.into(), d.type_name.clone());
+        all.insert(headers::ID.into(), d.id.clone());
+        all.insert(headers::TIMESTAMP.into(), rfc3339(d.created_at_ms));
+        all.insert(headers::SOURCE.into(), self.service_name.clone());
+        OutgoingEvent {
+            source: self.source.clone(),
+            id: d.id.clone(),
+            type_name: d.type_name.clone(),
             key: d.key.clone(),
-            payload,
             headers: all,
-        })
+            payload: d.payload.clone(),
+        }
     }
 }
 
-/// Delivery failures no retry can fix (Kotlin's NON_RETRIABLE set): oversized or invalid records,
-/// unknown or unauthorized topics.
-fn is_retriable(e: &rdkafka::error::KafkaError) -> bool {
-    use rdkafka::types::RDKafkaErrorCode as Code;
+/// Whether another publish of the event may succeed: not after the event store rejected it for
+/// good (too large, not authorized, a destination it cannot have) or found it invalid.
+fn is_retriable(e: &EventStoreError) -> bool {
     !matches!(
-        e.rdkafka_error_code(),
-        Some(
-            Code::MessageSizeTooLarge
-                | Code::InvalidMessage
-                | Code::InvalidMessageSize
-                | Code::InvalidTopic
-                | Code::TopicAuthorizationFailed
-                | Code::ClusterAuthorizationFailed
-                | Code::InvalidRecord
-        )
+        e,
+        EventStoreError::Rejected(_) | EventStoreError::Invalid(_)
     )
-}
-
-struct Prepared {
-    key: Option<String>,
-    payload: Vec<u8>,
-    headers: Vec<(String, String)>,
 }
 
 #[cfg(test)]
@@ -377,10 +329,12 @@ mod tests {
     use crate::saga::ManualClock;
     use crate::store::{StoreError, Tx};
 
-    /// An outbox that records which entries were marked sent.
+    /// An outbox that records which entries were marked sent, failed for good, or failed once.
     #[derive(Default)]
     struct Recorded {
         sent: Mutex<Vec<String>>,
+        failed: Mutex<Vec<String>>,
+        attempt_failed: Mutex<Vec<String>>,
     }
 
     fn done<'a, T: Send + 'a>(value: T) -> BoxFuture<'a, Result<T, StoreError>> {
@@ -412,16 +366,18 @@ mod tests {
         }
         fn mark_attempt_failed<'a>(
             &'a self,
-            _: &'a str,
+            id: &'a str,
             _: &'a str,
         ) -> BoxFuture<'a, Result<(), StoreError>> {
+            self.attempt_failed.lock().unwrap().push(id.to_string());
             done(())
         }
         fn mark_failed<'a>(
             &'a self,
-            _: &'a str,
+            id: &'a str,
             _: &'a str,
         ) -> BoxFuture<'a, Result<(), StoreError>> {
+            self.failed.lock().unwrap().push(id.to_string());
             done(())
         }
         fn purge(&self, _: i64) -> BoxFuture<'_, Result<u64, StoreError>> {
@@ -448,22 +404,116 @@ mod tests {
         }
     }
 
+    /// An event store the relay never reaches in these tests: `relay_batch` gets its sends.
+    struct Unreached;
+
+    impl EventStore for Unreached {
+        fn name(&self) -> &'static str {
+            "unreached"
+        }
+        fn capabilities(&self) -> &[crate::event_store::Capability] {
+            &[]
+        }
+        fn publish<'a>(
+            &'a self,
+            _: &'a OutgoingEvent,
+        ) -> BoxFuture<'a, Result<(), EventStoreError>> {
+            unreachable!("the tests send through relay_batch")
+        }
+        fn subscribe(
+            &self,
+            _: crate::event_store::SubscriptionSpec,
+        ) -> BoxFuture<'_, Result<Box<dyn crate::event_store::Subscription>, EventStoreError>>
+        {
+            unreachable!()
+        }
+        fn admin(
+            &self,
+            _: &crate::event_store::SubscriptionSpec,
+        ) -> Result<Box<dyn crate::event_store::SubscriptionAdmin>, EventStoreError> {
+            unreachable!()
+        }
+        fn compare(&self, a: &str, b: &str) -> std::cmp::Ordering {
+            a.cmp(b)
+        }
+    }
+
+    fn settings(lease: Duration) -> OutboxPublisherSettings {
+        OutboxPublisherSettings {
+            source: "kraken.events".into(),
+            service_name: "svc".into(),
+            poll_interval: Duration::from_millis(100),
+            batch_size: 10,
+            max_attempts: 10,
+            lease,
+        }
+    }
+
     fn publisher(outbox: Arc<Recorded>, clock: &ManualClock) -> Arc<OutboxPublisher> {
         OutboxPublisher::new(
             outbox,
-            OutboxPublisherSettings {
-                bootstrap_servers: "127.0.0.1:1".into(),
-                topic: "kraken.events".into(),
-                source: "svc".into(),
-                poll_interval: Duration::from_millis(100),
-                batch_size: 10,
-                max_attempts: 10,
-                lease: Duration::from_secs(120),
-            },
+            Arc::new(Unreached),
+            settings(Duration::from_secs(120)),
             clock.clock(),
             &Metrics::global(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_rejected_event_is_given_up_at_once_a_failed_one_tried_again() {
+        let clock = ManualClock::new(UNIX_EPOCH + Duration::from_secs(1_793_700_000));
+        let outbox = Arc::new(Recorded::default());
+        let relay = publisher(Arc::clone(&outbox), &clock);
+        let batch: Vec<OutboxEntry> = (0..4).map(entry).collect();
+        let sent = relay
+            .relay_batch(batch, clock.clock().now_ms(), |event| {
+                Box::pin(async move {
+                    match event.id.as_str() {
+                        "e-0" => Ok(()),
+                        "e-1" => Err(EventStoreError::Rejected("too large".into())),
+                        "e-2" => Err(EventStoreError::Failed("broker down".into())),
+                        _ => Ok(()),
+                    }
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(sent, 1);
+        assert_eq!(*outbox.sent.lock().unwrap(), ["e-0"]);
+        assert_eq!(
+            *outbox.failed.lock().unwrap(),
+            ["e-1"],
+            "rejected: failed at once"
+        );
+        assert_eq!(
+            *outbox.attempt_failed.lock().unwrap(),
+            ["e-2"],
+            "failed: tried again, and the batch stops there (order per key)"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_event_carries_the_entry_and_the_service_as_its_source_header() {
+        let clock = ManualClock::new(UNIX_EPOCH);
+        let relay = publisher(Arc::new(Recorded::default()), &clock);
+        let mut e = entry(1);
+        e.key = Some("k".into());
+        e.headers.insert("correlationId".into(), "c-1".into());
+        e.headers.insert("type".into(), "stale".into());
+        let event = relay.event(&e);
+        assert_eq!(event.source, "kraken.events");
+        assert_eq!(
+            (event.id.as_str(), event.type_name.as_str()),
+            ("e-1", "t.Happened")
+        );
+        assert_eq!(event.key.as_deref(), Some("k"));
+        assert_eq!(event.headers["type"], "t.Happened");
+        assert_eq!(event.headers["id"], "e-1");
+        assert_eq!(event.headers["source"], "svc");
+        assert_eq!(event.headers["correlationId"], "c-1");
+        assert_eq!(event.headers["timestamp"], "1970-01-01T00:00:00.000Z");
+        assert_eq!(event.payload, b"{}");
     }
 
     #[tokio::test]
@@ -501,15 +551,8 @@ mod tests {
         let clock = ManualClock::new(UNIX_EPOCH);
         let e = OutboxPublisher::new(
             Arc::new(Recorded::default()),
-            OutboxPublisherSettings {
-                bootstrap_servers: "127.0.0.1:1".into(),
-                topic: "kraken.events".into(),
-                source: "svc".into(),
-                poll_interval: Duration::from_millis(100),
-                batch_size: 10,
-                max_attempts: 10,
-                lease: OUTBOX_SEND_TIMEOUT,
-            },
+            Arc::new(Unreached),
+            settings(OUTBOX_SEND_TIMEOUT),
             clock.clock(),
             &Metrics::global(),
         )

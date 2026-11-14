@@ -89,20 +89,23 @@ pub(crate) fn cut_chars(text: &str, max: usize) -> String {
     }
 }
 
-/// A letter's id: `<processor>:<topic>:<partition>:<offset>`.
-pub fn letter_id(processor: &str, topic: &str, partition: i32, offset: i64) -> String {
-    format!("{processor}:{topic}:{partition}:{offset}")
+/// A letter's id: `<processor>:<source>:<segment>:<position>` (on Kafka
+/// `<processor>:<topic>:<partition>:<offset>`, as always).
+pub fn letter_id(processor: &str, source: &str, segment: &str, position: &str) -> String {
+    format!("{processor}:{source}:{segment}:{position}")
 }
 
-/// One parked record. `id` is `<processor>:<topic>:<partition>:<offset>` ([`letter_id`]), so
-/// parking a redelivered record finds the first letter.
+/// One parked record. `id` is `<processor>:<source>:<segment>:<position>` ([`letter_id`]), so
+/// parking a redelivered record finds the first letter. `segment` and `position` are the event
+/// store's opaque strings (decimal numbers for the first-wave stores).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeadLetter {
     pub id: String,
     pub processor: String,
-    pub topic: String,
-    pub partition: i32,
-    pub offset: i64,
+    /// The source the record was read from.
+    pub source: String,
+    pub segment: String,
+    pub position: String,
     /// The record's key as lossy UTF-8; `None` when it had none.
     pub key: Option<String>,
     /// The `id` header; `None` when the record had none or a blank one.
@@ -129,12 +132,12 @@ pub struct DeadLetter {
 
 impl DeadLetter {
     /// The id the record's stage 1 is deduplicated by: its `id` header, else (none or blank)
-    /// `<topic>-<partition>-<offset>` (the consumer's fallback).
+    /// `<source>-<segment>-<position>` (the consumer's fallback).
     pub fn dedupe_id(&self) -> String {
         self.event_id
             .clone()
             .filter(|id| !id.trim().is_empty())
-            .unwrap_or_else(|| format!("{}-{}-{}", self.topic, self.partition, self.offset))
+            .unwrap_or_else(|| format!("{}-{}-{}", self.source, self.segment, self.position))
     }
 }
 
@@ -143,7 +146,7 @@ impl DeadLetter {
 pub struct DeadLetterSummary {
     pub id: String,
     pub key: Option<String>,
-    pub offset: i64,
+    pub position: String,
     pub reason: DeadLetterReason,
     pub parked_at_ms: i64,
 }
@@ -159,30 +162,32 @@ pub trait DeadLetterStore: Send + Sync {
     /// Inserts `letter`; [`Parked::Already`] when a letter of that id exists (a redelivery).
     fn park<'a>(&'a self, letter: &'a DeadLetter) -> BoxFuture<'a, Result<Parked, StoreError>>;
 
-    /// The id of the head letter of (`processor`, `key`): the lowest offset among its letters
-    /// that are not INVALID (then the lowest id).
+    /// The id of the head letter of (`processor`, `key`): the earliest position among its
+    /// letters that are not INVALID (then the lowest id). The letters of one key come from one
+    /// segment; positions are ordered as the store orders them, decimal ones (every first-wave
+    /// event store's) by value.
     fn head<'a>(
         &'a self,
         processor: &'a str,
         key: &'a str,
     ) -> BoxFuture<'a, Result<Option<String>, StoreError>>;
 
-    /// The id of a letter of (`processor`, `key`) with an offset below `offset`, not INVALID (the
-    /// lowest): what blocks a retry.
+    /// The id of a letter of (`processor`, `key`) at a position before `position`, not INVALID
+    /// (the earliest): what blocks a retry.
     fn earlier<'a>(
         &'a self,
         processor: &'a str,
         key: &'a str,
-        offset: i64,
+        position: &'a str,
     ) -> BoxFuture<'a, Result<Option<String>, StoreError>>;
 
-    /// The keys with a letter (not INVALID) of `processor` on the given partitions of `topic`;
-    /// none for no partitions.
+    /// The keys with a letter (not INVALID) of `processor` on the given segments of `source`;
+    /// none for no segments.
     fn parked_keys<'a>(
         &'a self,
         processor: &'a str,
-        topic: &'a str,
-        partitions: &'a [i32],
+        source: &'a str,
+        segments: &'a [String],
     ) -> BoxFuture<'a, Result<HashSet<String>, StoreError>>;
 
     fn get<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Option<DeadLetter>, StoreError>>;
@@ -195,7 +200,8 @@ pub trait DeadLetterStore: Send + Sync {
         limit: Option<usize>,
     ) -> BoxFuture<'a, Result<Vec<DeadLetter>, StoreError>>;
 
-    /// Every letter of `processor`, without its record (in no particular order).
+    /// Every letter of `processor`, without its record, by position as [`head`](Self::head)
+    /// orders them, then id.
     fn summaries<'a>(
         &'a self,
         processor: &'a str,

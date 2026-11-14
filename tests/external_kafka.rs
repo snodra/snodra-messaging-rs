@@ -1,6 +1,7 @@
-//! Partner Kafka topics become local kraken events (S2 Task 10, ADR 0021 rulings 20, 40): the Rust
-//! form of the Kotlin `ExternalKafkaSourcesTest`, against a real Kafka and MongoDB. One broker
-//! serves every scenario (each on a topic and source of its own).
+//! Partner Kafka topics become local kraken events (S2 Task 10, ADR 0021 rulings 20, 40; ADR 0027):
+//! the core's external sources over the Kafka add-on's `KafkaExternalSource`, the Rust form of the
+//! Kotlin `ExternalKafkaSourcesTest`, against a real Kafka and MongoDB. One broker serves every
+//! scenario (each on a topic and source of its own).
 
 mod support;
 
@@ -9,15 +10,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kraken_messaging::external::kafka::{
-    ExternalKafkaSources, ExternalSource, SourceRegistration, TranslatedEvent, Translator,
-};
+use kraken_messaging::events::LocalEventDispatcher;
+use kraken_messaging::external::sources::{SourceRegistration, validate_source};
+use kraken_messaging::external::{ExternalSources, TranslatedEvent, Translator};
 use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::kafka::LocalEventDispatcher;
 use kraken_messaging::saga::{NoopSagaMetrics, SagaDefinition, SagaRetry, SagaRuntime, SagaType};
 use kraken_messaging::{Event, MessageContext, MessagingError, RetryPolicy, message_type};
+use kraken_messaging_kafka::{ExternalSource, KafkaExternalSource};
 use mongodb::bson::doc;
-use rdkafka::Message;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
@@ -76,7 +76,7 @@ struct Handlers {
 fn translator(calls: Arc<AtomicUsize>) -> Translator {
     Arc::new(move |record| {
         calls.fetch_add(1, Ordering::SeqCst);
-        let tree: serde_json::Value = serde_json::from_slice(record.payload().unwrap()).unwrap();
+        let tree: serde_json::Value = serde_json::from_slice(&record.payload).unwrap();
         let status = tree["status"].as_str().unwrap().to_string();
         match status.as_str() {
             "ignore" => return Ok(None),
@@ -171,16 +171,16 @@ impl Ek {
         source: ExternalSource,
         calls: &Arc<AtomicUsize>,
         max_attempts: u32,
-    ) -> Arc<ExternalKafkaSources> {
-        ExternalKafkaSources::new(
+    ) -> Arc<ExternalSources> {
+        ExternalSources::new(
             vec![SourceRegistration {
                 name: name.into(),
-                source,
+                provider: Arc::new(
+                    KafkaExternalSource::new(name, source, "service-b", &self.bootstrap).unwrap(),
+                ),
                 translator: translator(Arc::clone(calls)),
             }],
             Arc::clone(&self.dispatcher),
-            "service-b",
-            &self.bootstrap,
             max_attempts,
             Duration::from_millis(50),
         )
@@ -249,7 +249,7 @@ fn a_properties_entry_for_a_key_the_library_fixes_fails_the_startup_naming_the_s
             properties: HashMap::from([(key.to_string(), "x".to_string())]),
             ..ExternalSource::new("partner.printer")
         };
-        let e = kraken_messaging::external::kafka::validate_source("printer", &source)
+        let e = KafkaExternalSource::new("printer", source, "svc", "k:1")
             .unwrap_err()
             .to_string();
         assert!(e.contains("printer") && e.contains(key), "{key}: {e}");
@@ -262,9 +262,9 @@ fn a_properties_entry_for_a_key_the_library_fixes_fails_the_startup_naming_the_s
         ]),
         ..ExternalSource::new("partner.printer")
     };
-    kraken_messaging::external::kafka::validate_source("printer", &source).unwrap();
+    KafkaExternalSource::new("printer", source, "svc", "k:1").unwrap();
     assert!(
-        kraken_messaging::external::kafka::validate_source("printer", &ExternalSource::default())
+        KafkaExternalSource::new("printer", ExternalSource::default(), "svc", "k:1")
             .unwrap_err()
             .to_string()
             .contains("topic")
@@ -276,12 +276,7 @@ fn a_properties_entry_for_a_key_the_library_fixes_fails_the_startup_naming_the_s
 #[test]
 fn a_reserved_source_name_fails_the_startup_naming_it() {
     for name in ["processor", "saga", "ingress", "failed"] {
-        let e = kraken_messaging::external::kafka::validate_source(
-            name,
-            &ExternalSource::new("partner.printer"),
-        )
-        .unwrap_err()
-        .to_string();
+        let e = validate_source(name).unwrap_err().to_string();
         assert!(
             e.contains(&format!("'{name}'")) && e.contains("reserved"),
             "{name}: {e}"
@@ -309,7 +304,7 @@ async fn partner_records_become_local_events_deduplicated_never_published_and_re
     let calls = Arc::new(AtomicUsize::new(0));
     let sources = ek.sources("printer", ExternalSource::new(&topic), &calls, 3);
     assert_eq!(
-        sources.group_id_for("printer"),
+        sources.subscription_of("printer"),
         Some("service-b.external.printer")
     );
     let cancel = CancellationToken::new();
@@ -416,7 +411,7 @@ async fn partner_records_become_local_events_deduplicated_never_published_and_re
         &calls,
         3,
     );
-    assert_eq!(sources.group_id_for("billing"), Some("my-group"));
+    assert_eq!(sources.subscription_of("billing"), Some("my-group"));
     let cancel = CancellationToken::new();
     let running = sources.start(cancel.clone());
     ek.send(&topic, r#"{"jobId":"j7","status":"done"}"#, &[])
@@ -435,19 +430,25 @@ fn two_sources_of_one_name_fail_the_startup() {
         let dispatcher = Arc::new(LocalEventDispatcher::new(
             None,
             Arc::new(HandlerRegistry::new()),
-            Arc::new(kraken_messaging::kafka::NoSagas),
+            Arc::new(kraken_messaging::events::NoSagas),
         ));
         let calls = Arc::new(AtomicUsize::new(0));
         let registration = || SourceRegistration {
             name: "printer".into(),
-            source: ExternalSource::new("partner.printer"),
+            provider: Arc::new(
+                KafkaExternalSource::new(
+                    "printer",
+                    ExternalSource::new("partner.printer"),
+                    "svc",
+                    "127.0.0.1:1",
+                )
+                .unwrap(),
+            ),
             translator: translator(Arc::clone(&calls)),
         };
-        let e = ExternalKafkaSources::new(
+        let e = ExternalSources::new(
             vec![registration(), registration()],
             dispatcher,
-            "svc",
-            "127.0.0.1:1",
             3,
             Duration::from_millis(1),
         )

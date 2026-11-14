@@ -1,43 +1,42 @@
-//! Consumes `kraken.events` for one event processor's group (ADR 0022): one record at a time;
-//! the dedupe marker is recorded first, then the handlers run, all in one transaction of the
-//! message store; the offset is committed after. A record whose handlers fail on every attempt, a malformed one and,
-//! in mode `collection`, one whose key has a parked letter go to the processor's dead letters
-//! before the offset is committed. When the dead letters cannot take it (the store or the DLT
-//! unreachable), the record is not committed: its partition is sought back to it and the consumer
-//! polls again, so the record comes back after a second while the poll loop keeps the group
-//! membership (and the other partitions flow).
+//! Reads one event processor's subscription of the event store (ADR 0022, ADR 0027): one record
+//! at a time; the dedupe marker is recorded first, then the handlers run, all in one transaction
+//! of the message store; the record is acknowledged after. A record whose handlers fail on every
+//! attempt, a malformed one and, in mode `collection`, one whose key has a parked letter go to the
+//! processor's dead letters before it is acknowledged. When the dead letters cannot take it (the
+//! store or the event store unreachable), the record is not acknowledged: the subscription hands
+//! it out again ([`Subscription::redeliver`]) after a second, and keeps its other segments
+//! flowing.
 //!
-//! Processor control (ADR 0023) reaches it through its [`ConsumerControl`]: paused, it pauses
-//! its assigned partitions (and every partition assigned later) and keeps polling, so it stays in
-//! the group; a record of a replay range is handled without the handlers that disallow replay
-//! and without the sagas.
+//! A subscription whose `next` fails is broken: it is closed and the processor subscribes again
+//! after a backoff ([`RESUBSCRIBE_MIN`] doubling to [`RESUBSCRIBE_MAX`]), showing the error on its
+//! status. What the subscription recovered from by itself ([`Subscription::take_error`]) shows
+//! there too.
+//!
+//! Processor control (ADR 0023) reaches it through its [`ConsumerControl`]: paused, it pauses its
+//! subscription (which keeps its segments, and pauses every segment assigned later); a record of a
+//! replay range is handled without the handlers that disallow replay and without the sagas.
 
+use std::cmp::Ordering as Order;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use opentelemetry::Value;
-use rdkafka::config::ClientConfig;
-use rdkafka::consumer::{
-    BaseConsumer, CommitMode, Consumer, ConsumerContext, Rebalance, StreamConsumer,
-};
-use rdkafka::error::{KafkaError, RDKafkaErrorCode};
-use rdkafka::message::{BorrowedMessage, Header, Headers, OwnedHeaders};
-use rdkafka::producer::{FutureProducer, FutureRecord};
-use rdkafka::util::Timeout;
-use rdkafka::{ClientContext, Message, Offset, TopicPartitionList};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::dispatch::{LocalEventDispatcher, MarkerPosition, RecordDispatch, StageOneDone};
+use super::publisher::OUTBOX_SEND_TIMEOUT;
 use crate::codec;
 use crate::config::DeadLetterMode;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
-use crate::event_store::ReplayRange;
-use crate::event_store::headers;
-use crate::hub::HandlerRegistry;
+use crate::event_store::{
+    Capability, Delivery, EventStore, EventStoreError, OutgoingEvent, ReplayRange, Subscription,
+    SubscriptionEvent, SubscriptionSpec, dead_letter_source, headers,
+};
 use crate::metrics::{Consumed, Metrics, OTHER, TypeLabels};
 use crate::processors::ProcessorMonitor;
 use crate::processors::dead_letters::{DeadLetterRecord, park};
@@ -50,7 +49,7 @@ use crate::time::now_ms;
 /// What to do with a record, decided before any database work.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RecordDisposition {
-    /// Commit the offset and move on; the reason is logged (never the payload).
+    /// Acknowledge it and move on; the reason is logged (never the payload).
     Skip(&'static str),
     Handle {
         type_name: String,
@@ -60,16 +59,16 @@ pub enum RecordDisposition {
 
 /// Mirrors `EventConsumer.kt`: no `type` header (or a blank one), a type nobody handles, or a
 /// non-object payload are skipped; a missing or blank `id` header falls back to
-/// `<topic>-<partition>-<offset>`.
+/// `<source>-<segment>-<position>`.
 pub fn classify(
     hdrs: &HashMap<String, String>,
     payload: &[u8],
-    topic: &str,
-    partition: i32,
-    offset: i64,
-    registry: &HandlerRegistry,
+    source: &str,
+    segment: &str,
+    position: &str,
+    registry: &crate::hub::HandlerRegistry,
 ) -> RecordDisposition {
-    classify_with(hdrs, payload, topic, partition, offset, |t| {
+    classify_with(hdrs, payload, source, segment, position, |t| {
         registry.has_event_handler(t)
     })
 }
@@ -79,9 +78,9 @@ pub fn classify(
 pub fn classify_with(
     hdrs: &HashMap<String, String>,
     payload: &[u8],
-    topic: &str,
-    partition: i32,
-    offset: i64,
+    source: &str,
+    segment: &str,
+    position: &str,
     interested: impl Fn(&str) -> bool,
 ) -> RecordDisposition {
     let Some(type_name) = hdrs.get(headers::TYPE).filter(|t| !t.trim().is_empty()) else {
@@ -97,37 +96,36 @@ pub fn classify_with(
         .get(headers::ID)
         .filter(|i| !i.trim().is_empty())
         .cloned()
-        .unwrap_or_else(|| format!("{topic}-{partition}-{offset}"));
+        .unwrap_or_else(|| format!("{source}-{segment}-{position}"));
     RecordDisposition::Handle {
         type_name: type_name.clone(),
         id,
     }
 }
 
-/// How long the offset refresher waits between two reads of the committed offsets and the high
-/// watermarks (ADR 0022: at most every 5 s).
-pub const OFFSETS_REFRESH: Duration = Duration::from_secs(5);
-/// How long one committed-offsets or watermark request may take.
-const OFFSETS_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often the processor's dead letters are counted (ADR 0022: every 30 s).
 pub const DEAD_LETTERS_SAMPLE: Duration = Duration::from_secs(30);
-/// Between a record the dead letters could not take (a park, a DLT produce or a sequencing read
-/// failed) and its redelivery.
+/// How often the subscription's segment statuses are copied into the processor's status (they
+/// also are after every acknowledgement).
+const STATUS_REFRESH: Duration = Duration::from_secs(1);
+/// Between a record the dead letters could not take (a park, a dead-letter publish or a
+/// sequencing read failed) and its redelivery.
 const PARK_RETRY: Duration = Duration::from_secs(1);
+/// The first wait before subscribing again after a subscription failed; it doubles up to
+/// [`RESUBSCRIBE_MAX`] while the next ones fail before delivering anything.
+pub const RESUBSCRIBE_MIN: Duration = Duration::from_secs(1);
+pub const RESUBSCRIBE_MAX: Duration = Duration::from_secs(30);
 
-/// Between a record that arrived while the processor is paused (fetched before the pause) and the
-/// next poll.
-const PAUSED_POLL: Duration = Duration::from_millis(100);
-
-/// What a processor's consumer is (ADR 0022): its name, group, dead-letter mode and the database
-/// its letters go to.
+/// What a processor's consumer is (ADR 0022): its name, its subscription on the event store,
+/// its dead-letter mode and where its letters go.
 #[derive(Clone)]
 pub struct ProcessorSettings {
     /// `default` or the name given to `event_in`.
     pub name: String,
-    pub bootstrap_servers: String,
-    pub group_id: String,
-    pub topic: String,
+    /// `<service>.<processor>` on the events source.
+    pub subscription: SubscriptionSpec,
+    /// The event store the processor reads (and its dead letters go to in mode `event-store`).
+    pub events: Arc<dyn EventStore>,
     /// Handler invocations per record in all (`KRAKEN_CONSUMER_MAX_ATTEMPTS`), at least 1.
     pub max_attempts: u32,
     /// Between two invocations.
@@ -143,102 +141,59 @@ pub struct ProcessorSettings {
 
 /// What processor control (ADR 0023) tells a processor's consumer, shared by its every run: the
 /// pause and the open replay ranges.
-#[derive(Debug, Default)]
 pub struct ConsumerControl {
     paused: AtomicBool,
     replay: Mutex<Vec<ReplayRange>>,
+    /// Woken when the pause changes.
+    changed: Notify,
+    /// The event store's order of positions.
+    events: Arc<dyn EventStore>,
 }
 
 impl ConsumerControl {
+    /// Not paused, nothing replaying; positions ordered by `events`.
+    pub fn new(events: Arc<dyn EventStore>) -> ConsumerControl {
+        ConsumerControl {
+            paused: AtomicBool::new(false),
+            replay: Mutex::new(Vec::new()),
+            changed: Notify::new(),
+            events,
+        }
+    }
+
     pub fn paused(&self) -> bool {
         self.paused.load(Ordering::SeqCst)
     }
 
     pub(crate) fn set_paused(&self, paused: bool) {
-        self.paused.store(paused, Ordering::SeqCst);
+        if self.paused.swap(paused, Ordering::SeqCst) != paused {
+            self.changed.notify_one();
+        }
     }
 
     pub(crate) fn set_replay(&self, ranges: Vec<ReplayRange>) {
         *self.replay.lock().unwrap() = ranges;
     }
 
-    /// Whether the record at `offset` of `partition` of `topic` is in an open replay range.
-    pub fn replays(&self, topic: &str, partition: i32, offset: i64) -> bool {
+    /// Whether the record at `position` of `segment` of `source` is in an open replay range
+    /// (`from <= position < until`, by the event store's order).
+    pub fn replays(&self, source: &str, segment: &str, position: &str) -> bool {
         self.replay.lock().unwrap().iter().any(|r| {
-            super::kafka_range(r, topic)
-                .is_some_and(|(p, from, until)| p == partition && from <= offset && offset < until)
+            r.source == source
+                && r.segment == segment
+                && self.events.compare(&r.from, position) != Order::Greater
+                && self.events.compare(position, &r.until) == Order::Less
         })
-    }
-}
-
-/// The consumer's librdkafka callbacks: the assignment and errors go to the processor's monitor
-/// (never blocking: they run inside the consumer's poll); a partition assigned while the processor
-/// is paused is paused at once.
-pub struct ProcessorContext {
-    monitor: Arc<ProcessorMonitor>,
-    control: Arc<ConsumerControl>,
-}
-
-impl ClientContext for ProcessorContext {
-    fn error(&self, error: KafkaError, reason: &str) {
-        // An idle connection the broker closed is reconnected by librdkafka, and a subscribed topic
-        // that does not exist yet is auto-created by its first record: neither is a failure (the
-        // latter leaves the processor STARTING, without an assignment).
-        if matches!(
-            error,
-            KafkaError::Global(
-                RDKafkaErrorCode::BrokerTransportFailure
-                    | RDKafkaErrorCode::UnknownTopicOrPartition
-                    | RDKafkaErrorCode::UnknownTopic
-            )
-        ) {
-            tracing::debug!(processor = %self.monitor.name(), "kafka: {error}: {reason}");
-            return;
-        }
-        tracing::warn!(processor = %self.monitor.name(), "kafka error: {error}: {reason}");
-        self.monitor.error(&format!("kafka: {error}: {reason}"));
-    }
-}
-
-impl ConsumerContext for ProcessorContext {
-    fn post_rebalance(&self, consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
-        let partitions = |tpl: &TopicPartitionList| {
-            tpl.elements()
-                .iter()
-                .map(|e| e.partition())
-                .collect::<Vec<_>>()
-        };
-        match rebalance {
-            Rebalance::Assign(tpl) => {
-                let assigned = partitions(tpl);
-                tracing::info!(processor = %self.monitor.name(), partitions = ?assigned, "partitions assigned");
-                if self.control.paused()
-                    && !assigned.is_empty()
-                    && let Err(e) = consumer.pause(tpl)
-                {
-                    tracing::warn!(processor = %self.monitor.name(), "cannot pause the assigned partitions: {e}");
-                }
-                self.monitor.assigned(&assigned);
-            }
-            Rebalance::Revoke(tpl) => {
-                let revoked = partitions(tpl);
-                tracing::info!(processor = %self.monitor.name(), partitions = ?revoked, "partitions revoked");
-                self.monitor.revoked(&revoked);
-            }
-            Rebalance::Error(e) => {
-                tracing::warn!(processor = %self.monitor.name(), "rebalance error: {e}");
-                self.monitor.error(&format!("rebalance: {e}"));
-            }
-        }
     }
 }
 
 /// Where a record goes that the processor cannot handle.
 enum Sink {
     Log,
-    Topic {
-        producer: FutureProducer,
-        topic: String,
+    /// The event store's dead-letter source (`<source>.dlt`).
+    EventStore {
+        events: Arc<dyn EventStore>,
+        source: String,
     },
     Collection {
         store: Arc<dyn DeadLetterStore>,
@@ -246,8 +201,8 @@ enum Sink {
     },
 }
 
-/// The keys this processor has a letter for on its partitions (sequencing, ADR 0022), loaded
-/// for the assignment of `generation`.
+/// The keys this processor has a letter for on its segments (sequencing, ADR 0022), loaded for
+/// the assignment of `generation`.
 #[derive(Default)]
 struct ParkedKeys {
     generation: Option<u64>,
@@ -264,9 +219,9 @@ struct PendingLetter {
 }
 
 pub struct EventConsumer {
-    consumer: StreamConsumer<ProcessorContext>,
+    events: Arc<dyn EventStore>,
+    subscription: SubscriptionSpec,
     dispatcher: Arc<LocalEventDispatcher>,
-    topic: String,
     name: String,
     max_attempts: u32,
     backoff: Duration,
@@ -274,11 +229,8 @@ pub struct EventConsumer {
     monitor: Arc<ProcessorMonitor>,
     control: Arc<ConsumerControl>,
     parked: Mutex<ParkedKeys>,
-    /// Per (partition, offset): what the dead letters still have to take.
-    pending: Mutex<HashMap<(i32, i64), PendingLetter>>,
-    /// Per partition: the generation and offset it was sought back to, until that record is
-    /// delivered again.
-    rewound: Mutex<HashMap<i32, (u64, i64)>>,
+    /// Per (segment, position): what the dead letters still have to take.
+    pending: Mutex<HashMap<(String, String), PendingLetter>>,
     metrics: Metrics,
     /// The `processor` label.
     processor_label: Value,
@@ -290,63 +242,73 @@ pub struct EventConsumer {
 enum Done {
     /// Acknowledge; `processed`: its dispatch completed without a stage-1 failure.
     Ack { processed: bool },
-    /// The dead letters could not take it (or the sequencing reads failed): leave the offset
-    /// uncommitted and deliver the record again after [`PARK_RETRY`].
+    /// The dead letters could not take it (or the sequencing reads failed): leave it
+    /// unacknowledged and deliver it again after [`PARK_RETRY`].
     Again,
-    /// Shutting down: leave the offset uncommitted for the next run.
+    /// Shutting down: leave it unacknowledged for the next run.
     Stop,
 }
 
+/// What one turn of a subscription's loop got.
+enum Step {
+    Cancelled,
+    PauseChanged,
+    Refresh,
+    Next(Result<SubscriptionEvent, EventStoreError>),
+}
+
+/// How a subscription ended.
+enum Ended {
+    /// The processor stops (its cancel, or a shutdown in the middle of a record).
+    Stopped,
+    /// The subscription failed: subscribe again. `delivered`: it handed out anything first.
+    Failed {
+        error: EventStoreError,
+        delivered: bool,
+    },
+}
+
 impl EventConsumer {
-    /// The consumer of one event processor (ADR 0022): its group, its dispatcher (whose marker
-    /// prefix and handlers are the processor's) and its dead letters.
+    /// The consumer of one event processor (ADR 0022): its subscription, its dispatcher (whose
+    /// marker prefix and handlers are the processor's) and its dead letters.
     pub fn processor(
         settings: ProcessorSettings,
         dispatcher: Arc<LocalEventDispatcher>,
     ) -> Result<Arc<EventConsumer>, MessagingError> {
         let monitor = Arc::new(ProcessorMonitor::new(
             &settings.name,
-            &settings.group_id,
-            &settings.topic,
+            &settings.subscription,
+            &settings.events,
             settings.dead_letter_mode,
             dispatcher.event_types(),
         ));
-        Self::controlled(
-            settings,
-            dispatcher,
-            monitor,
-            Arc::new(ConsumerControl::default()),
-        )
+        let control = Arc::new(ConsumerControl::new(Arc::clone(&settings.events)));
+        Self::controlled(settings, dispatcher, monitor, control)
     }
 
     /// One run of a controlled processor's consumer (ADR 0023): its monitor and its control
-    /// outlive the run, which ends (and leaves the group) when the consumer is dropped.
+    /// outlive the run, which ends (and leaves the subscription) when its task ends.
     pub fn controlled(
         settings: ProcessorSettings,
         dispatcher: Arc<LocalEventDispatcher>,
         monitor: Arc<ProcessorMonitor>,
         control: Arc<ConsumerControl>,
     ) -> Result<Arc<EventConsumer>, MessagingError> {
-        let consumer: StreamConsumer<ProcessorContext> = ClientConfig::new()
-            .set("bootstrap.servers", &settings.bootstrap_servers)
-            .set("group.id", &settings.group_id)
-            .set("enable.auto.commit", "false")
-            .set("auto.offset.reset", "earliest")
-            .set("allow.auto.create.topics", "true")
-            .create_with_context(ProcessorContext {
-                monitor: Arc::clone(&monitor),
-                control: Arc::clone(&control),
-            })?;
         let sink = match settings.dead_letter_mode {
             DeadLetterMode::Log => Sink::Log,
-            DeadLetterMode::Topic => Sink::Topic {
-                producer: ClientConfig::new()
-                    .set("bootstrap.servers", &settings.bootstrap_servers)
-                    .set("enable.idempotence", "true")
-                    .set("message.timeout.ms", "30000")
-                    .create()?,
-                topic: format!("{}.dlt", settings.topic),
-            },
+            DeadLetterMode::EventStore => {
+                if !settings.events.supports(Capability::NativeDeadLetter) {
+                    return Err(MessagingError::InvalidMessage(format!(
+                        "dead-letter mode event-store needs an event store with the capability {}: {} lacks it",
+                        Capability::NativeDeadLetter,
+                        settings.events.name()
+                    )));
+                }
+                Sink::EventStore {
+                    events: Arc::clone(&settings.events),
+                    source: dead_letter_source(&settings.subscription.source),
+                }
+            }
             DeadLetterMode::Collection => Sink::Collection {
                 store: settings.dead_letters.clone().ok_or_else(|| {
                     MessagingError::InvalidMessage(
@@ -358,12 +320,12 @@ impl EventConsumer {
         };
         let types = TypeLabels::new(dispatcher.event_types());
         Ok(Arc::new(EventConsumer {
-            consumer,
+            events: settings.events,
+            subscription: settings.subscription,
             processor_label: Value::from(Arc::<str>::from(settings.name.as_str())),
             types,
             metrics: settings.metrics,
             dispatcher,
-            topic: settings.topic,
             name: settings.name,
             max_attempts: settings.max_attempts.max(1),
             backoff: settings.backoff,
@@ -372,7 +334,6 @@ impl EventConsumer {
             control,
             parked: Mutex::new(ParkedKeys::default()),
             pending: Mutex::new(HashMap::new()),
-            rewound: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -381,37 +342,11 @@ impl EventConsumer {
         Arc::clone(&self.monitor)
     }
 
-    /// Pauses (or resumes) every partition assigned now; a partition assigned later is paused
-    /// by the rebalance callback while [`ConsumerControl`] says paused.
-    pub fn apply_pause(&self) {
-        let paused = self.control.paused();
-        let assignment = match self.consumer.assignment() {
-            Ok(tpl) => tpl,
-            Err(e) => {
-                tracing::warn!(processor = %self.name, "cannot read the assignment: {e}");
-                return;
-            }
-        };
-        if assignment.count() == 0 {
-            return;
-        }
-        let applied = if paused {
-            self.consumer.pause(&assignment)
-        } else {
-            self.consumer.resume(&assignment)
-        };
-        if let Err(e) = applied {
-            tracing::warn!(processor = %self.name, paused, "cannot pause or resume the assigned partitions: {e}");
-        }
-    }
-
-    /// Consumes until `cancel`; also refreshes the committed offsets and high watermarks (on a
-    /// blocking thread, every [`OFFSETS_REFRESH`]) and, in mode `collection`, counts the
-    /// processor's letters (every [`DEAD_LETTERS_SAMPLE`] and after a park).
+    /// Consumes until `cancel` (then leaves the subscription); in mode `collection` also counts
+    /// the processor's letters (every [`DEAD_LETTERS_SAMPLE`] and after a park).
     pub fn start(self: Arc<Self>, cancel: CancellationToken) -> JoinHandle<()> {
         tokio::spawn(async move {
             let helpers = cancel.child_token();
-            let refresher = tokio::spawn(Arc::clone(&self).refresh_offsets(helpers.clone()));
             let sampler = match &self.sink {
                 Sink::Collection { store, .. } => Some(tokio::spawn(
                     Arc::clone(&self).sample_dead_letters(store.clone(), helpers.clone()),
@@ -421,130 +356,161 @@ impl EventConsumer {
             self.consume(&cancel).await;
             self.monitor.stopped();
             helpers.cancel();
-            let _ = refresher.await;
             if let Some(sampler) = sampler {
                 let _ = sampler.await;
             }
         })
     }
 
+    /// Subscribes, reads until `cancel` or a failure, and subscribes again after a failure.
     async fn consume(&self, cancel: &CancellationToken) {
-        if let Err(e) = self.consumer.subscribe(&[self.topic.as_str()]) {
-            tracing::error!(processor = %self.name, "cannot subscribe to {}: {e}", self.topic);
-            self.monitor
-                .error(&format!("cannot subscribe to {}: {e}", self.topic));
-            return;
-        }
+        let mut backoff = RESUBSCRIBE_MIN;
         loop {
-            tokio::select! {
+            let subscribed = tokio::select! {
                 _ = cancel.cancelled() => break,
-                received = self.consumer.recv() => match received {
-                    // The events topic does not exist yet (auto-created by its first record): the
-                    // processor stays STARTING (no assignment), it is not failing.
-                    Err(KafkaError::MessageConsumption(
-                        RDKafkaErrorCode::UnknownTopicOrPartition | RDKafkaErrorCode::UnknownTopic,
-                    )) => {
-                        tracing::debug!(processor = %self.name, "topic {} not available yet", self.topic);
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(processor = %self.name, "kafka receive error: {e}");
-                        self.monitor.error(&format!("kafka receive: {e}"));
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-                    Ok(msg) => {
-                        if self.overtakes(&msg) {
-                            continue;
-                        }
-                        // Fetched before the pause: not handled, and its partition sought back to
-                        // it, so the resume starts there.
-                        if self.control.paused() {
-                            self.rewind(msg.partition(), msg.offset());
-                            tokio::select! {
-                                _ = tokio::time::sleep(PAUSED_POLL) => {}
-                                _ = cancel.cancelled() => break,
+                subscribed = self.events.subscribe(self.subscription.clone()) => subscribed,
+            };
+            let failure = match subscribed {
+                Err(e) => e,
+                Ok(mut subscription) => {
+                    let ended = self.read(&mut *subscription, cancel).await;
+                    subscription.close().await;
+                    // Its segments are gone with it: STARTING until the next one's assignment.
+                    let assigned = self.monitor.assigned_segments();
+                    self.monitor.revoked(&assigned);
+                    match ended {
+                        Ended::Stopped => break,
+                        Ended::Failed { error, delivered } => {
+                            if delivered {
+                                backoff = RESUBSCRIBE_MIN;
                             }
-                            continue;
+                            error
                         }
-                        let processed = match self.handle_record(&msg, cancel).await {
-                            Done::Ack { processed } => processed,
-                            // Not committed: back to the poll after a second, which delivers the
-                            // record again (never holding the poll loop for longer).
-                            Done::Again => {
-                                self.rewind(msg.partition(), msg.offset());
-                                tokio::select! {
-                                    _ = tokio::time::sleep(PARK_RETRY) => {}
-                                    _ = cancel.cancelled() => break,
-                                }
-                                continue;
-                            }
-                            Done::Stop => break, // leave the offset uncommitted for the next run
-                        };
-                        if let Err(e) = self.consumer.commit_message(&msg, CommitMode::Async) {
-                            tracing::warn!(processor = %self.name, "offset commit failed: {e}");
-                        }
-                        self.monitor.acknowledged(msg.partition(), msg.offset(), processed);
                     }
                 }
+            };
+            tracing::warn!(processor = %self.name, subscription = %self.subscription.name, "the subscription failed, subscribing again in {backoff:?}: {failure}");
+            self.monitor.error(&format!("subscription: {failure}"));
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(backoff) => {}
             }
+            backoff = (backoff * 2).min(RESUBSCRIBE_MAX);
         }
         self.monitor.stopped();
     }
 
-    /// Seeks `partition` back to `offset`, the record that could not be acknowledged: the next
-    /// polls deliver it again (the partition's later records wait behind it).
-    fn rewind(&self, partition: i32, offset: i64) {
-        self.rewound
-            .lock()
-            .unwrap()
-            .insert(partition, (self.monitor.generation(), offset));
-        // Asynchronous: librdkafka drops the partition's records fetched before the seek at once.
-        if let Err(e) = self.consumer.seek(
-            &self.topic,
-            partition,
-            Offset::Offset(offset),
-            Duration::ZERO,
-        ) {
-            tracing::warn!(processor = %self.name, partition, offset, "cannot seek back to an unacknowledged record: {e}");
+    /// Reads `subscription` until `cancel` or its failure.
+    async fn read(&self, subscription: &mut dyn Subscription, cancel: &CancellationToken) -> Ended {
+        let mut paused = false;
+        self.apply_pause(subscription, &mut paused);
+        let mut delivered = false;
+        let mut refresh = tokio::time::interval(STATUS_REFRESH);
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let step = tokio::select! {
+                _ = cancel.cancelled() => Step::Cancelled,
+                _ = self.control.changed.notified() => Step::PauseChanged,
+                _ = refresh.tick() => Step::Refresh,
+                next = subscription.next() => Step::Next(next),
+            };
+            match step {
+                Step::Cancelled => return Ended::Stopped,
+                Step::PauseChanged => self.apply_pause(subscription, &mut paused),
+                Step::Refresh => self.refresh(subscription),
+                Step::Next(Err(error)) => {
+                    if let Some(e) = subscription.take_error() {
+                        self.monitor.error(&e);
+                    }
+                    return Ended::Failed { error, delivered };
+                }
+                Step::Next(Ok(SubscriptionEvent::Assigned(segments))) => {
+                    delivered = true;
+                    tracing::info!(processor = %self.name, segments = ?segments, "segments assigned");
+                    self.monitor.assigned(&segments);
+                    self.monitor.segments(subscription.segments());
+                }
+                Step::Next(Ok(SubscriptionEvent::Revoked(segments))) => {
+                    delivered = true;
+                    tracing::info!(processor = %self.name, segments = ?segments, "segments revoked");
+                    self.monitor.revoked(&segments);
+                }
+                Step::Next(Ok(SubscriptionEvent::Delivery(record))) => {
+                    delivered = true;
+                    // Paused since the last turn: not handled, handed out again on the resume.
+                    self.apply_pause(subscription, &mut paused);
+                    if paused {
+                        redeliver(subscription, &record, &self.name);
+                        continue;
+                    }
+                    // While a handler runs (it may take long), the status still follows the
+                    // subscription and a pause still reaches it.
+                    let handled = self.handle_record(&record, cancel);
+                    tokio::pin!(handled);
+                    let done = loop {
+                        tokio::select! {
+                            done = &mut handled => break done,
+                            _ = refresh.tick() => self.refresh(subscription),
+                            _ = self.control.changed.notified() => {
+                                self.apply_pause(subscription, &mut paused);
+                            }
+                        }
+                    };
+                    match done {
+                        Done::Ack { processed } => {
+                            if let Err(e) = subscription.ack(&record.segment, &record.position) {
+                                tracing::warn!(processor = %self.name, segment = %record.segment, position = %record.position, "acknowledgement failed: {e}");
+                            }
+                            self.monitor.acknowledged(processed);
+                            self.monitor.segments(subscription.segments());
+                        }
+                        // Not acknowledged: handed out again after a second (never holding
+                        // the subscription's other segments for longer).
+                        Done::Again => {
+                            redeliver(subscription, &record, &self.name);
+                            tokio::select! {
+                                _ = tokio::time::sleep(PARK_RETRY) => {}
+                                _ = cancel.cancelled() => return Ended::Stopped,
+                            }
+                        }
+                        Done::Stop => return Ended::Stopped,
+                    }
+                }
+            }
+            if let Some(e) = subscription.take_error() {
+                self.monitor.error(&e);
+            }
         }
     }
 
-    /// True for a record that comes after the one its partition was sought back to (a seek that
-    /// did not take effect): it is not handled, and the partition is sought back again. A
-    /// rebalance since forgets the rewind (the group's committed offset decides then).
-    fn overtakes(&self, msg: &BorrowedMessage<'_>) -> bool {
-        let rewound = self.rewound.lock().unwrap().get(&msg.partition()).copied();
-        match rewound {
-            Some((generation, offset))
-                if generation == self.monitor.generation() && msg.offset() > offset =>
-            {
-                self.rewind(msg.partition(), offset);
-                true
-            }
-            Some(_) => {
-                self.rewound.lock().unwrap().remove(&msg.partition());
-                false
-            }
-            None => false,
+    /// Copies what `subscription` reports of its segments, and the trouble it recovered from,
+    /// into the status.
+    fn refresh(&self, subscription: &mut dyn Subscription) {
+        self.monitor.segments(subscription.segments());
+        if let Some(e) = subscription.take_error() {
+            self.monitor.error(&e);
         }
     }
 
-    async fn handle_record(&self, msg: &BorrowedMessage<'_>, cancel: &CancellationToken) -> Done {
+    /// Pauses or resumes `subscription` when the control's pause differs from `paused`.
+    fn apply_pause(&self, subscription: &mut dyn Subscription, paused: &mut bool) {
+        let wanted = self.control.paused();
+        if wanted == *paused {
+            return;
+        }
+        if wanted {
+            subscription.pause();
+        } else {
+            subscription.resume();
+        }
+        *paused = wanted;
+    }
+
+    async fn handle_record(&self, record: &Delivery, cancel: &CancellationToken) -> Done {
         if !self.load_parked_keys().await {
             return Done::Again;
         }
-        let raw_headers: Vec<(String, Vec<u8>)> = msg
-            .headers()
-            .map(|h| {
-                h.iter()
-                    .map(|x| (x.key.to_string(), x.value.unwrap_or(&[]).to_vec()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let hdrs: HashMap<String, String> = raw_headers
-            .iter()
-            .map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).to_string()))
-            .collect();
+        let hdrs = &record.headers;
         let type_label = match hdrs.get(headers::TYPE) {
             Some(t) => self.types.label(t),
             None => Value::from(OTHER),
@@ -554,27 +520,22 @@ impl EventConsumer {
             .pending
             .lock()
             .unwrap()
-            .remove(&(msg.partition(), msg.offset()))
+            .remove(&(record.segment.clone(), record.position.clone()))
             .filter(|p| p.generation == generation);
         if let Some(pending) = pending {
             // Its attempts are done: only the letter is missing.
             return self
-                .letter_after_attempts(
-                    msg,
-                    &raw_headers,
-                    &type_label,
-                    pending.error,
-                    pending.attempts,
-                )
+                .letter_after_attempts(record, &type_label, pending.error, pending.attempts)
                 .await;
         }
-        let payload = msg.payload().unwrap_or(&[]);
+        let source = &self.subscription.source;
+        let payload = record.payload.as_slice();
         let (type_name, id) = match classify_with(
-            &hdrs,
+            hdrs,
             payload,
-            msg.topic(),
-            msg.partition(),
-            msg.offset(),
+            source,
+            &record.segment,
+            &record.position,
             |t| self.dispatcher.interested_here(t),
         ) {
             RecordDisposition::Skip(NO_HANDLER) => {
@@ -583,11 +544,10 @@ impl EventConsumer {
             }
             // Malformed: a letter that blocks nothing (ADR 0022 INVALID).
             RecordDisposition::Skip(reason) => {
-                tracing::warn!(processor = %self.name, topic = msg.topic(), partition = msg.partition(), offset = msg.offset(), "invalid record: {reason}");
+                tracing::warn!(processor = %self.name, source = %source, segment = %record.segment, position = %record.position, "invalid record: {reason}");
                 let taken = self
                     .dead_letter(
-                        msg,
-                        &raw_headers,
+                        record,
                         DeadLetterReason::Invalid,
                         DeadLetterError::invalid(reason),
                         None,
@@ -605,18 +565,20 @@ impl EventConsumer {
             RecordDisposition::Handle { type_name, id } => (type_name, id),
         };
         if !hdrs.get(headers::ID).is_some_and(|i| *i == id) {
-            tracing::warn!(processor = %self.name, r#type = %type_name, id = %id, "record has no id header, using topic-partition-offset for idempotency");
+            tracing::warn!(processor = %self.name, r#type = %type_name, id = %id, "record has no id header, using source-segment-position for idempotency");
         }
-        let ctx = message_context(&type_name, &id, &hdrs);
+        let ctx = message_context(&type_name, &id, hdrs);
         let stage_one = self.dispatcher.has_stage_one(&type_name);
-        if stage_one && let Some(key) = msg.key().map(|k| String::from_utf8_lossy(k).into_owned()) {
-            match self.head_of(&key).await {
+        let replay = self
+            .control
+            .replays(source, &record.segment, &record.position);
+        if stage_one && let Some(key) = &record.key {
+            match self.head_of(key).await {
                 None => return Done::Again,
                 Some(Some(head)) => {
                     let taken = self
                         .dead_letter(
-                            msg,
-                            &raw_headers,
+                            record,
                             DeadLetterReason::Sequenced,
                             DeadLetterError::sequenced(&head),
                             Some(head),
@@ -628,10 +590,7 @@ impl EventConsumer {
                     };
                     self.consumed(&type_label, outcome);
                     // A replay never reaches the sagas (ADR 0023).
-                    if self
-                        .control
-                        .replays(msg.topic(), msg.partition(), msg.offset())
-                    {
+                    if replay {
                         return Done::Ack { processed: false };
                     }
                     // Stage 2 still sees it (ADR 0021 ruling 26).
@@ -642,10 +601,12 @@ impl EventConsumer {
                 Some(None) => {}
             }
         }
-        let position = self.position(msg);
-        let replay = self
-            .control
-            .replays(msg.topic(), msg.partition(), msg.offset());
+        let position = MarkerPosition {
+            processor: self.name.clone(),
+            source: source.clone(),
+            segment: record.segment.clone(),
+            position: record.position.clone(),
+        };
         for attempt in 1..=self.max_attempts {
             let stages = self
                 .dispatcher
@@ -693,15 +654,14 @@ impl EventConsumer {
             if !in_stage_one {
                 // Stage 1 is done; the saga stage could not even park its failure (ADR 0021): logged
                 // and skipped, no letter (a retry would find the marker and do nothing).
-                tracing::error!(processor = %self.name, r#type = %type_name, id = %id, topic = msg.topic(), partition = msg.partition(), offset = msg.offset(), attempts = attempt, "saga stage failed, record skipped: {failure}");
+                tracing::error!(processor = %self.name, r#type = %type_name, id = %id, source = %source, segment = %record.segment, position = %record.position, attempts = attempt, "saga stage failed, record skipped: {failure}");
                 self.consumed(&type_label, Consumed::Failed);
                 return Done::Ack { processed: false };
             }
-            tracing::error!(processor = %self.name, r#type = %type_name, id = %id, topic = msg.topic(), partition = msg.partition(), offset = msg.offset(), attempts = attempt, "event handler failed on every attempt: {failure}");
+            tracing::error!(processor = %self.name, r#type = %type_name, id = %id, source = %source, segment = %record.segment, position = %record.position, attempts = attempt, "event handler failed on every attempt: {failure}");
             return self
                 .letter_after_attempts(
-                    msg,
-                    &raw_headers,
+                    record,
                     &type_label,
                     DeadLetterError::from_error(&failure),
                     attempt,
@@ -717,31 +677,19 @@ impl EventConsumer {
             .event_consumed(self.processor_label.clone(), type_label.clone(), outcome);
     }
 
-    /// What this processor's stage-1 marker of `msg` records (ADR 0023).
-    fn position(&self, msg: &BorrowedMessage<'_>) -> MarkerPosition {
-        MarkerPosition {
-            processor: self.name.clone(),
-            topic: msg.topic().to_string(),
-            partition: msg.partition(),
-            offset: msg.offset(),
-        }
-    }
-
     /// The HANDLER_FAILED letter of a record whose attempts are done. When the dead letters cannot
     /// take it, the failure is remembered for the record's redelivery (which then comes straight
-    /// here) as long as the partition stays assigned.
+    /// here) as long as the segment stays assigned.
     async fn letter_after_attempts(
         &self,
-        msg: &BorrowedMessage<'_>,
-        raw_headers: &[(String, Vec<u8>)],
+        record: &Delivery,
         type_label: &Value,
         error: DeadLetterError,
         attempts: u32,
     ) -> Done {
         if let Some(outcome) = self
             .dead_letter(
-                msg,
-                raw_headers,
+                record,
                 DeadLetterReason::HandlerFailed,
                 error.clone(),
                 None,
@@ -756,7 +704,7 @@ impl EventConsumer {
         let mut pending = self.pending.lock().unwrap();
         pending.retain(|_, p| p.generation == generation);
         pending.insert(
-            (msg.partition(), msg.offset()),
+            (record.segment.clone(), record.position.clone()),
             PendingLetter {
                 generation,
                 error,
@@ -826,8 +774,8 @@ impl EventConsumer {
     }
 
     /// After an assignment (mode `collection`): the keys of the processor's letters on the
-    /// assigned partitions. False when they cannot be read (the record is delivered again, and
-    /// the load tried again).
+    /// assigned segments. False when they cannot be read (the record is delivered again, and the
+    /// load tried again).
     async fn load_parked_keys(&self) -> bool {
         let Sink::Collection { store, .. } = &self.sink else {
             return true;
@@ -836,9 +784,9 @@ impl EventConsumer {
         if self.parked.lock().unwrap().generation == Some(generation) {
             return true;
         }
-        let partitions = self.monitor.assigned_partitions();
+        let segments = self.monitor.assigned_segments();
         match store
-            .parked_keys(&self.name, &self.topic, &partitions)
+            .parked_keys(&self.name, &self.subscription.source, &segments)
             .await
         {
             Ok(keys) => {
@@ -857,68 +805,47 @@ impl EventConsumer {
     }
 
     /// Hands the record to the sink: logged (mode `log`, the record [`Consumed::Failed`]),
-    /// produced to `<topic>.dlt` (mode `topic`, SEQUENCED never happens there) or parked in
-    /// `dead_letters` (mode `collection`), the record [`Consumed::Parked`] (or
-    /// [`Consumed::Duplicate`]: its letter was there already). `None` when the sink could not take
-    /// it: the record is then not acknowledged and comes again.
+    /// published to the event store's dead-letter source (mode `event-store`, SEQUENCED never
+    /// happens there) or parked in `dead_letters` (mode `collection`), the record
+    /// [`Consumed::Parked`] (or [`Consumed::Duplicate`]: its letter was there already). `None`
+    /// when the sink could not take it: the record is then not acknowledged and comes again.
     async fn dead_letter(
         &self,
-        msg: &BorrowedMessage<'_>,
-        raw_headers: &[(String, Vec<u8>)],
+        record: &Delivery,
         reason: DeadLetterReason,
         error: DeadLetterError,
         blocked_by: Option<String>,
         attempts: u32,
     ) -> Option<Consumed> {
+        let source = &self.subscription.source;
         match &self.sink {
             Sink::Log => {
-                tracing::error!(processor = %self.name, topic = msg.topic(), partition = msg.partition(), offset = msg.offset(), reason = reason.as_str(), "record skipped: {}", error.message);
+                tracing::error!(processor = %self.name, source = %source, segment = %record.segment, position = %record.position, reason = reason.as_str(), "record skipped: {}", error.message);
                 Some(Consumed::Failed)
             }
-            Sink::Topic { producer, topic } => {
-                let mut headers = OwnedHeaders::new();
-                for (k, v) in raw_headers
-                    .iter()
-                    .filter(|(k, _)| !DLT_HEADERS.contains(&k.as_str()))
+            Sink::EventStore {
+                events,
+                source: dlt,
+            } => {
+                let letter = dead_letter_event(&self.name, source, dlt, record, reason, &error);
+                let published = match tokio::time::timeout(
+                    OUTBOX_SEND_TIMEOUT,
+                    events.publish(&letter),
+                )
+                .await
                 {
-                    headers = headers.insert(Header {
-                        key: k,
-                        value: Some(v.as_slice()),
-                    });
-                }
-                let (partition, offset) = (msg.partition().to_string(), msg.offset().to_string());
-                let dlt_error = cut_chars(
-                    &format!("{}: {}", error.type_name, error.message),
-                    MAX_ERROR_MESSAGE_CHARS,
-                );
-                for (k, v) in DLT_HEADERS.into_iter().zip([
-                    self.name.as_str(),
-                    reason.as_str(),
-                    dlt_error.as_str(),
-                    msg.topic(),
-                    partition.as_str(),
-                    offset.as_str(),
-                ]) {
-                    headers = headers.insert(Header {
-                        key: k,
-                        value: Some(v),
-                    });
-                }
-                let mut record: FutureRecord<'_, [u8], [u8]> = FutureRecord::to(topic)
-                    .payload(msg.payload().unwrap_or(&[]))
-                    .headers(headers);
-                if let Some(key) = msg.key() {
-                    record = record.key(key);
-                }
-                match producer
-                    .send(record, Timeout::After(Duration::from_secs(30)))
-                    .await
-                {
-                    Ok(_) => Some(Consumed::Parked),
-                    Err((e, _)) => {
-                        tracing::warn!(processor = %self.name, dlt = %topic, "cannot produce to the dead-letter topic, the record comes again: {e}");
+                    Ok(published) => published,
+                    Err(_) => Err(EventStoreError::Failed(format!(
+                        "no answer within {} s",
+                        OUTBOX_SEND_TIMEOUT.as_secs()
+                    ))),
+                };
+                match published {
+                    Ok(()) => Some(Consumed::Parked),
+                    Err(e) => {
+                        tracing::warn!(processor = %self.name, dlt = %dlt, "cannot publish to the dead-letter source, the record comes again: {e}");
                         self.monitor
-                            .error(&format!("dead-letter topic {topic}: {e}"));
+                            .error(&format!("dead-letter source {dlt}: {e}"));
                         None
                     }
                 }
@@ -927,18 +854,18 @@ impl EventConsumer {
                 // Parked in a replay: its retry must be one too (ADR 0023).
                 let replay = self
                     .control
-                    .replays(msg.topic(), msg.partition(), msg.offset());
+                    .replays(source, &record.segment, &record.position);
                 let letter = crate::store::DeadLetter {
                     replay,
                     ..park(
                         DeadLetterRecord {
                             processor: self.name.clone(),
-                            topic: msg.topic().to_string(),
-                            partition: msg.partition(),
-                            offset: msg.offset(),
-                            key: msg.key().map(<[u8]>::to_vec),
-                            headers: raw_headers.to_vec(),
-                            payload: msg.payload().unwrap_or(&[]).to_vec(),
+                            source: source.clone(),
+                            segment: record.segment.clone(),
+                            position: record.position.clone(),
+                            key: record.key.clone(),
+                            headers: record.headers.clone(),
+                            payload: record.payload.clone(),
                         },
                         reason,
                         error,
@@ -966,69 +893,13 @@ impl EventConsumer {
                         Some(outcome)
                     }
                     Err(e) => {
-                        tracing::warn!(processor = %self.name, letter = %letter.id, "cannot park the record, it comes again (its offset stays uncommitted): {e}");
+                        tracing::warn!(processor = %self.name, letter = %letter.id, "cannot park the record, it comes again (unacknowledged): {e}");
                         self.monitor
                             .error(&format!("cannot park {}: {e}", letter.id));
                         None
                     }
                 }
             }
-        }
-    }
-
-    /// Every [`OFFSETS_REFRESH`]: the group's committed offsets and the high watermarks of the
-    /// assigned partitions, read on a blocking thread (librdkafka's calls block; the consumer task
-    /// and the hub stream never wait for them).
-    async fn refresh_offsets(self: Arc<Self>, cancel: CancellationToken) {
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => return,
-                _ = tokio::time::sleep(OFFSETS_REFRESH) => {}
-            }
-            let partitions = self.monitor.assigned_partitions();
-            if partitions.is_empty() {
-                continue;
-            }
-            let me = Arc::clone(&self);
-            let read = tokio::task::spawn_blocking(move || me.read_offsets(&partitions));
-            tokio::select! {
-                _ = cancel.cancelled() => return,
-                _ = read => {}
-            }
-        }
-    }
-
-    fn read_offsets(&self, partitions: &[i32]) {
-        let mut tpl = TopicPartitionList::new();
-        for &p in partitions {
-            tpl.add_partition(&self.topic, p);
-        }
-        let committed = match self.consumer.committed_offsets(tpl, OFFSETS_TIMEOUT) {
-            Ok(list) => list,
-            Err(e) => {
-                tracing::debug!(processor = %self.name, "committed offsets not read: {e}");
-                TopicPartitionList::new()
-            }
-        };
-        for &p in partitions {
-            let offset = committed
-                .find_partition(&self.topic, p)
-                .and_then(|e| match e.offset() {
-                    Offset::Offset(o) => Some(o),
-                    _ => None,
-                })
-                .unwrap_or(-1);
-            let high = match self
-                .consumer
-                .fetch_watermarks(&self.topic, p, OFFSETS_TIMEOUT)
-            {
-                Ok((_, high)) => high,
-                Err(e) => {
-                    tracing::debug!(processor = %self.name, partition = p, "watermarks not read: {e}");
-                    -1
-                }
-            };
-            self.monitor.offsets(p, offset, high);
         }
     }
 
@@ -1052,10 +923,19 @@ impl EventConsumer {
     }
 }
 
+/// Hands `record` out again (its segment's later records wait behind it).
+fn redeliver(subscription: &mut dyn Subscription, record: &Delivery, processor: &str) {
+    if let Err(e) = subscription.redeliver(&record.segment, &record.position) {
+        tracing::warn!(processor = %processor, segment = %record.segment, position = %record.position, "cannot hand an unacknowledged record out again: {e}");
+    }
+}
+
 /// The reason [`classify_with`] gives for a type nobody handles: skipped, not a letter.
 const NO_HANDLER: &str = "no handler for this type";
-/// The headers mode `topic` adds; a record's own header of one of these names is replaced.
-const DLT_HEADERS: [&str; 6] = [
+/// The headers mode `event-store` adds (names unchanged since they named Kafka's topic,
+/// partition and offset: the source, segment and position); a record's own header of one of
+/// these names is replaced.
+pub const DLT_HEADERS: [&str; 6] = [
     "kraken-dlt-processor",
     "kraken-dlt-reason",
     "kraken-dlt-error",
@@ -1063,6 +943,47 @@ const DLT_HEADERS: [&str; 6] = [
     "kraken-dlt-original-partition",
     "kraken-dlt-original-offset",
 ];
+
+/// The event mode `event-store` publishes to `dlt` for `record` of `source`: its key, payload
+/// and headers, plus the [`DLT_HEADERS`].
+fn dead_letter_event(
+    processor: &str,
+    source: &str,
+    dlt: &str,
+    record: &Delivery,
+    reason: DeadLetterReason,
+    error: &DeadLetterError,
+) -> OutgoingEvent {
+    let mut all: HashMap<String, String> = record
+        .headers
+        .iter()
+        .filter(|(k, _)| !DLT_HEADERS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let dlt_error = cut_chars(
+        &format!("{}: {}", error.type_name, error.message),
+        MAX_ERROR_MESSAGE_CHARS,
+    );
+    for (k, v) in DLT_HEADERS.into_iter().zip([
+        processor,
+        reason.as_str(),
+        dlt_error.as_str(),
+        source,
+        record.segment.as_str(),
+        record.position.as_str(),
+    ]) {
+        all.insert(k.to_string(), v.to_string());
+    }
+    let header = |name: &str| record.headers.get(name).cloned().unwrap_or_default();
+    OutgoingEvent {
+        source: dlt.to_string(),
+        id: header(headers::ID),
+        type_name: header(headers::TYPE),
+        key: record.key.clone(),
+        headers: all,
+        payload: record.payload.clone(),
+    }
+}
 
 /// What the handlers of a record see: its id and type, the correlation id header (else the id) and
 /// every header.
@@ -1082,5 +1003,73 @@ pub(crate) fn message_context(
         identity: None,
         authorization: None,
         headers: hdrs.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn delivery() -> Delivery {
+        Delivery {
+            segment: "3".into(),
+            position: "41".into(),
+            key: Some("k".into()),
+            headers: HashMap::from([
+                ("type".to_string(), "t.Happened".to_string()),
+                ("id".to_string(), "e-1".to_string()),
+                ("kraken-dlt-reason".to_string(), "stale".to_string()),
+            ]),
+            payload: b"{}".to_vec(),
+            timestamp_ms: 0,
+        }
+    }
+
+    #[test]
+    fn a_dead_letter_event_keeps_the_record_and_names_where_it_came_from() {
+        let e = dead_letter_event(
+            "orders",
+            "kraken.events",
+            "kraken.events.dlt",
+            &delivery(),
+            DeadLetterReason::HandlerFailed,
+            &DeadLetterError::new("Storage", "down"),
+        );
+        assert_eq!(e.source, "kraken.events.dlt");
+        assert_eq!((e.id.as_str(), e.type_name.as_str()), ("e-1", "t.Happened"));
+        assert_eq!(e.key.as_deref(), Some("k"));
+        assert_eq!(e.payload, b"{}");
+        let h = |name: &str| e.headers[name].as_str();
+        assert_eq!(h("type"), "t.Happened");
+        assert_eq!(h("kraken-dlt-processor"), "orders");
+        assert_eq!(
+            h("kraken-dlt-reason"),
+            "HANDLER_FAILED",
+            "the record's own is replaced"
+        );
+        assert_eq!(h("kraken-dlt-error"), "Storage: down");
+        assert_eq!(h("kraken-dlt-original-topic"), "kraken.events");
+        assert_eq!(h("kraken-dlt-original-partition"), "3");
+        assert_eq!(h("kraken-dlt-original-offset"), "41");
+    }
+
+    #[test]
+    fn replay_ranges_compare_positions_by_the_event_stores_order() {
+        let control = ConsumerControl::new(crate::processors::monitor::tests::decimal());
+        control.set_replay(vec![ReplayRange {
+            source: "s".into(),
+            segment: "1".into(),
+            from: "9".into(),
+            until: "11".into(),
+        }]);
+        assert!(!control.replays("s", "1", "8"));
+        assert!(control.replays("s", "1", "9"));
+        assert!(
+            control.replays("s", "1", "10"),
+            "10 is after 9, though not as text"
+        );
+        assert!(!control.replays("s", "1", "11"));
+        assert!(!control.replays("s", "2", "10"));
+        assert!(!control.replays("t", "1", "10"));
     }
 }

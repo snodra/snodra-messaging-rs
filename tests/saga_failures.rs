@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use kraken_messaging::kafka::SagaStage;
+use kraken_messaging::events::SagaStage;
 use kraken_messaging::saga::ports::SagaPorts;
 use kraken_messaging::saga::store::SagaFailureDocument;
 use kraken_messaging::saga::{NoopSagaMetrics, SagaFailures, SagaRetry, SagaRuntime, SagaType};

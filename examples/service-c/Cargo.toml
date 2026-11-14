@@ -11,6 +11,8 @@ publish = false
 kraken-messaging-rs = { path = "../.." }
 # The message store (ADR 0028): its own MongoDB database, through the MongoDB add-on.
 kraken-messaging-mongo = { path = "../../crates/kraken-messaging-mongo" }
+# The event store (ADR 0027): Kafka, through the Kafka add-on (also the printer's partner topic).
+kraken-messaging-kafka = { path = "../../crates/kraken-messaging-kafka" }
 mongodb = "3.9.1"
 tokio = { version = "1.54.1", features = ["full"] }
 futures = "0.3"

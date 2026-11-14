@@ -1,81 +1,85 @@
-//! Partner Kafka topics as local kraken events (ADR 0021 rulings 20, 40, 44a; spec "Inbound 1"):
-//! the Rust form of the Kotlin `ExternalKafkaSources`.
+//! Partner sources as local kraken events (ADR 0021 rulings 20, 40, 44a; ADR 0027; spec "Inbound
+//! 1"): the Rust form of the Kotlin external sources.
 //!
 //! Each source registered with
-//! [`KrakenMessagingBuilder::external_source`](crate::KrakenMessagingBuilder::external_source) gets
-//! a consumer of its own (one task: a partner topic is read in order). Every record goes through
-//! the source's translator, and the event it returns is dispatched **locally** through the
-//! [`LocalEventDispatcher`] (the ordinary event handlers, then the sagas of this service); it is
-//! never republished to `kraken.events`. The dedupe id is `<name>:<partition>:<offset>`, or
+//! [`KrakenMessagingBuilder::external_source`](crate::KrakenMessagingBuilder::external_source)
+//! comes from an [`ExternalSourceProvider`] (an event-store add-on's, for example the Kafka
+//! add-on's `KafkaExternalSource` for a partner's topic), whatever the service's own event store
+//! is, and gets a task of its own (one subscription: a partner source is read in order). Every
+//! record ([`ExternalRecord`]) goes through the source's translator, and the event it returns is
+//! dispatched **locally** through the [`LocalEventDispatcher`] (the ordinary event handlers, then
+//! the sagas of this service); it is never republished to the service's events. The dedupe id is
+//! `<name>:<segment>:<position>` (on Kafka `<name>:<partition>:<offset>`, as always), or
 //! `<name>:<dedupeKey>` when the translator gives one; it keys the dispatcher's markers, so a
-//! record seen twice is applied once. (A partner that deletes and recreates its topic within the
-//! markers' retention makes the default id skip the new records: such a partner needs a dedupe
-//! key, ruling 44a.) The handlers' `MessageContext` has that id as `message_id` and in the `id`
-//! header, the source's name in `source`, the event's type in `type` and the record's own headers;
-//! the correlation id is the record's `correlationId` header, else the dedupe id.
+//! record seen twice is applied once. (A partner that recreates its source within the markers'
+//! retention makes the default id skip the new records: such a partner needs a dedupe key, ruling
+//! 44a.) The handlers' `MessageContext` has that id as `message_id` and in the `id` header, the
+//! source's name in `source`, the event's type in `type` and the record's own headers; the
+//! correlation id is the record's `correlationId` header, else the dedupe id.
 //!
-//! Delivery is the main consumer's: the offset is committed after the dispatch returned (at least
+//! Delivery is the processors': the record is acknowledged after the dispatch returned (at least
 //! once); a translator error (or panic) or a handler failure retries the record up to
 //! `max_attempts` invocations in all with a fixed wait, then logs it (never its payload) and skips
 //! it. An `InvalidMessage` from the translator skips the record at once. `Ok(None)` from the
-//! translator is committed and applies nothing (no marker). A source's group is its `group_id`,
-//! by default `<service-name>.external.<name>`; its consumer properties are the source's
-//! `properties` on top of `auto.offset.reset=earliest`, with the servers, the group and
-//! auto-commit fixed by the library: a `properties` entry for a fixed key fails the startup
-//! (ruling 40).
+//! translator is acknowledged and applies nothing (no marker). A subscription whose `next` fails
+//! is closed and subscribed again after a backoff.
 
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// rdkafka's record type and the traits a translator reads it with (`record.payload()`,
-/// `record.key()`, `record.headers()`), re-exported so a service needs no rdkafka dependency of
-/// its own (and cannot end up with a second, incompatible rdkafka version).
-pub use rdkafka::Message;
-use rdkafka::config::ClientConfig;
-use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
-pub use rdkafka::message::{BorrowedMessage, Headers};
+use futures::future::BoxFuture;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::codec;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
-use crate::event_store::headers;
-use crate::kafka::LocalEventDispatcher;
+use crate::event_store::{Delivery, EventStoreError, Subscription, SubscriptionEvent, headers};
+use crate::events::{LocalEventDispatcher, RESUBSCRIBE_MAX, RESUBSCRIBE_MIN};
 use crate::types::Event;
 
-/// The consumer properties the library sets itself; a source's `properties` cannot hold them
-/// (Kotlin's list: Rust has no deserializers to configure, the keys are refused all the same).
-pub const FIXED_KEYS: [&str; 5] = [
-    "bootstrap.servers",
-    "group.id",
-    "key.deserializer",
-    "value.deserializer",
-    "enable.auto.commit",
-];
-
-/// A partner's Kafka topic (Kotlin's `kraken.messaging.external.kafka.sources.<name>`):
-/// `bootstrap_servers` defaults to the service's own Kafka, `group_id` to
-/// `<service-name>.external.<name>`; `properties` are extra consumer properties (librdkafka
-/// names), never one of [`FIXED_KEYS`].
-#[derive(Clone, Debug, Default)]
-pub struct ExternalSource {
-    pub bootstrap_servers: Option<String>,
-    pub topic: String,
-    pub group_id: Option<String>,
-    pub properties: HashMap<String, String>,
+/// One record of a partner source, as a translator reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalRecord {
+    /// The partner's source it was read from (a topic on Kafka).
+    pub source: String,
+    pub key: Option<String>,
+    /// Its headers as text.
+    pub headers: HashMap<String, String>,
+    /// Its payload as published.
+    pub payload: Vec<u8>,
+    /// Where it sits in the source: the event store's opaque segment and position.
+    pub segment: String,
+    pub position: String,
 }
 
-impl ExternalSource {
-    /// A source reading `topic` on the service's own Kafka.
-    pub fn new(topic: &str) -> ExternalSource {
-        ExternalSource {
-            topic: topic.to_string(),
-            ..ExternalSource::default()
+impl ExternalRecord {
+    fn of(source: &str, delivery: Delivery) -> ExternalRecord {
+        ExternalRecord {
+            source: source.to_string(),
+            key: delivery.key,
+            headers: delivery.headers,
+            payload: delivery.payload,
+            segment: delivery.segment,
+            position: delivery.position,
         }
     }
+}
+
+/// A partner source an event-store add-on reads (the Kafka add-on's `KafkaExternalSource`, for
+/// example): a subscription of its own over the partner's source.
+pub trait ExternalSourceProvider: Send + Sync {
+    /// The partner's source it reads ([`ExternalRecord::source`]).
+    fn source(&self) -> &str;
+
+    /// The name of the subscription it reads in (a consumer group on Kafka), for the logs.
+    fn subscription(&self) -> &str;
+
+    /// Joins the subscription as one more instance; see the [`Subscription`] contract (a failure
+    /// of `next` ends it, and the core subscribes again).
+    fn subscribe(&self) -> BoxFuture<'_, Result<Box<dyn Subscription>, EventStoreError>>;
 }
 
 /// What a partner record became: a kraken event (its wire type and JSON) and, optionally, the key
@@ -113,134 +117,74 @@ impl TranslatedEvent {
 }
 
 /// Turns a partner record into a kraken event: `Ok(None)` ignores the record, an error retries it
-/// (as the main consumer does) and then skips it. Kotlin's `ExternalRecordTranslator` bean.
-pub type Translator = Arc<
-    dyn Fn(&BorrowedMessage<'_>) -> Result<Option<TranslatedEvent>, MessagingError> + Send + Sync,
->;
+/// (as the processors do) and then skips it. Kotlin's `ExternalRecordTranslator` bean.
+pub type Translator =
+    Arc<dyn Fn(&ExternalRecord) -> Result<Option<TranslatedEvent>, MessagingError> + Send + Sync>;
 
-/// A source as registered: its name, its settings and its translator.
+/// A source as registered: its name, where it is read from and its translator.
 pub struct SourceRegistration {
     pub name: String,
-    pub source: ExternalSource,
+    pub provider: Arc<dyn ExternalSourceProvider>,
     pub translator: Translator,
 }
 
-/// Rejects a source the library cannot run as configured: an empty name or topic, or a
-/// `properties` entry for one of the [`FIXED_KEYS`] (ruling 40), naming the source and the key.
-pub fn validate_source(name: &str, source: &ExternalSource) -> Result<(), MessagingError> {
-    let invalid = |what: String| Err(MessagingError::InvalidMessage(what));
+/// Rejects a source name the library cannot run: an empty one or a reserved one.
+pub fn validate_source(name: &str) -> Result<(), MessagingError> {
     if name.trim().is_empty() {
-        return invalid("an external source needs a name".into());
+        return Err(MessagingError::InvalidMessage(
+            "an external source needs a name".into(),
+        ));
     }
     if super::is_reserved_source_name(name) {
-        return invalid(format!(
+        return Err(MessagingError::InvalidMessage(format!(
             "external source '{name}': the name is reserved (the library's marker families: {})",
             super::RESERVED_SOURCE_NAMES.join(", ")
-        ));
-    }
-    if source.topic.trim().is_empty() {
-        return invalid(format!("external source '{name}' needs a topic"));
-    }
-    if let Some(key) = FIXED_KEYS
-        .iter()
-        .find(|k| source.properties.contains_key(**k))
-    {
-        return invalid(format!(
-            "external source '{name}': properties[{key}] cannot be set: the library fixes it (use the source's own bootstrap_servers and group_id; deserializers and auto-commit are not configurable). Fixed keys: {}",
-            FIXED_KEYS.join(", ")
-        ));
+        )));
     }
     Ok(())
 }
 
-struct SourceConsumer {
-    name: String,
-    topic: String,
-    group_id: String,
-    consumer: StreamConsumer,
-    translator: Translator,
-}
-
-/// The consumers of the registered partner topics; see the module docs.
-pub struct ExternalKafkaSources {
-    sources: Vec<SourceConsumer>,
+/// The registered partner sources' readers; see the module docs.
+pub struct ExternalSources {
+    sources: Vec<SourceRegistration>,
     dispatcher: Arc<LocalEventDispatcher>,
     max_attempts: u32,
     backoff: Duration,
 }
 
-impl ExternalKafkaSources {
-    /// Checks every source ([`validate_source`], no two of one name) and creates its consumer
-    /// (nothing connects before [`start`](Self::start)). `max_attempts` invocations per record in
-    /// all (`KRAKEN_CONSUMER_MAX_ATTEMPTS`), `backoff` between them.
+impl ExternalSources {
+    /// Checks every source ([`validate_source`], no two of one name); nothing connects before
+    /// [`start`](Self::start). `max_attempts` invocations per record in all
+    /// (`KRAKEN_CONSUMER_MAX_ATTEMPTS`), `backoff` between them.
     pub fn new(
         sources: Vec<SourceRegistration>,
         dispatcher: Arc<LocalEventDispatcher>,
-        service_name: &str,
-        default_bootstrap_servers: &str,
         max_attempts: u32,
         backoff: Duration,
-    ) -> Result<Arc<ExternalKafkaSources>, MessagingError> {
-        let mut consumers: Vec<SourceConsumer> = Vec::new();
-        for SourceRegistration {
-            name,
-            source,
-            translator,
-        } in sources
-        {
-            validate_source(&name, &source)?;
-            if consumers.iter().any(|c| c.name == name) {
+    ) -> Result<Arc<ExternalSources>, MessagingError> {
+        for (i, source) in sources.iter().enumerate() {
+            validate_source(&source.name)?;
+            if sources[..i].iter().any(|s| s.name == source.name) {
                 return Err(MessagingError::InvalidMessage(format!(
-                    "external source '{name}' is registered twice"
+                    "external source '{}' is registered twice",
+                    source.name
                 )));
             }
-            let group_id = source
-                .group_id
-                .clone()
-                .filter(|g| !g.trim().is_empty())
-                .unwrap_or_else(|| format!("{service_name}.external.{name}"));
-            let mut config = ClientConfig::new();
-            config.set("auto.offset.reset", "earliest");
-            for (k, v) in &source.properties {
-                config.set(k, v);
-            }
-            config
-                .set(
-                    "bootstrap.servers",
-                    source
-                        .bootstrap_servers
-                        .as_deref()
-                        .unwrap_or(default_bootstrap_servers),
-                )
-                .set("group.id", &group_id)
-                .set("enable.auto.commit", "false");
-            let consumer: StreamConsumer = config.create().map_err(|e| {
-                MessagingError::InvalidMessage(format!(
-                    "external source '{name}': cannot create its consumer: {e}"
-                ))
-            })?;
-            consumers.push(SourceConsumer {
-                name,
-                topic: source.topic,
-                group_id,
-                consumer,
-                translator,
-            });
         }
-        Ok(Arc::new(ExternalKafkaSources {
-            sources: consumers,
+        Ok(Arc::new(ExternalSources {
+            sources,
             dispatcher,
             max_attempts: max_attempts.max(1),
             backoff,
         }))
     }
 
-    /// The consumer group of the source `name`.
-    pub fn group_id_for(&self, name: &str) -> Option<&str> {
+    /// The subscription the source `name` reads in.
+    pub fn subscription_of(&self, name: &str) -> Option<&str> {
         self.sources
             .iter()
             .find(|s| s.name == name)
-            .map(|s| s.group_id.as_str())
+            .map(|s| s.provider.subscription())
     }
 
     /// The names of the sources.
@@ -248,7 +192,7 @@ impl ExternalKafkaSources {
         self.sources.iter().map(|s| s.name.clone()).collect()
     }
 
-    /// Runs one consumer task per source until `cancel`; the handle completes when all stopped.
+    /// Runs one task per source until `cancel`; the handle completes when all stopped.
     pub fn start(self: &Arc<Self>, cancel: CancellationToken) -> JoinHandle<()> {
         let tasks: Vec<JoinHandle<()>> = (0..self.sources.len())
             .map(|i| {
@@ -257,7 +201,7 @@ impl ExternalKafkaSources {
                 tokio::spawn(async move { this.run(i, cancel).await })
             })
             .collect();
-        tracing::info!(sources = ?self.sources.iter().map(|s| format!("{} -> {}", s.name, s.topic)).collect::<Vec<_>>(), "external Kafka sources started");
+        tracing::info!(sources = ?self.sources.iter().map(|s| format!("{} -> {}", s.name, s.provider.source())).collect::<Vec<_>>(), "external sources started");
         tokio::spawn(async move {
             for t in tasks {
                 let _ = t.await;
@@ -265,29 +209,74 @@ impl ExternalKafkaSources {
         })
     }
 
+    /// Subscribes, reads until `cancel`, and subscribes again after a failure.
     async fn run(&self, index: usize, cancel: CancellationToken) {
         let source = &self.sources[index];
-        if let Err(e) = source.consumer.subscribe(&[source.topic.as_str()]) {
-            tracing::error!(source = %source.name, "cannot subscribe to {}: {e}", source.topic);
-            return;
-        }
+        let mut backoff = RESUBSCRIBE_MIN;
         loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                received = source.consumer.recv() => match received {
-                    Err(e) => {
-                        tracing::warn!(source = %source.name, "kafka receive error: {e}");
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-                    Ok(msg) => {
-                        if !self.handle_record(source, &msg, &cancel).await {
-                            break; // shutting down mid-retry: the record is redelivered after a restart
-                        }
-                        if let Err(e) = source.consumer.commit_message(&msg, CommitMode::Async) {
-                            tracing::warn!(source = %source.name, "offset commit failed: {e}");
+            let subscribed = tokio::select! {
+                _ = cancel.cancelled() => return,
+                subscribed = source.provider.subscribe() => subscribed,
+            };
+            let failure = match subscribed {
+                Err(e) => e,
+                Ok(mut subscription) => {
+                    let ended = self.read(source, &mut *subscription, &cancel).await;
+                    subscription.close().await;
+                    match ended {
+                        None => return,
+                        Some((error, delivered)) => {
+                            if delivered {
+                                backoff = RESUBSCRIBE_MIN;
+                            }
+                            error
                         }
                     }
                 }
+            };
+            tracing::warn!(source = %source.name, subscription = %source.provider.subscription(), "the external source's subscription failed, subscribing again in {backoff:?}: {failure}");
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(RESUBSCRIBE_MAX);
+        }
+    }
+
+    /// Reads `subscription` until `cancel` (`None`) or its failure (the error, and whether it
+    /// handed out anything first).
+    async fn read(
+        &self,
+        source: &SourceRegistration,
+        subscription: &mut dyn Subscription,
+        cancel: &CancellationToken,
+    ) -> Option<(EventStoreError, bool)> {
+        let mut delivered = false;
+        loop {
+            let next = tokio::select! {
+                _ = cancel.cancelled() => return None,
+                next = subscription.next() => next,
+            };
+            if let Some(e) = subscription.take_error() {
+                tracing::warn!(source = %source.name, "external source: {e}");
+            }
+            let delivery = match next {
+                Err(e) => return Some((e, delivered)),
+                Ok(SubscriptionEvent::Delivery(d)) => d,
+                Ok(change) => {
+                    delivered = true;
+                    tracing::debug!(source = %source.name, "external source: {change:?}");
+                    continue;
+                }
+            };
+            delivered = true;
+            let record = ExternalRecord::of(source.provider.source(), delivery);
+            if !self.handle_record(source, &record, cancel).await {
+                // Shutting down mid-retry: the record is delivered again after a restart.
+                return None;
+            }
+            if let Err(e) = subscription.ack(&record.segment, &record.position) {
+                tracing::warn!(source = %source.name, segment = %record.segment, position = %record.position, "acknowledgement failed: {e}");
             }
         }
     }
@@ -295,23 +284,23 @@ impl ExternalKafkaSources {
     /// Returns false when cancelled while retrying.
     async fn handle_record(
         &self,
-        source: &SourceConsumer,
-        msg: &BorrowedMessage<'_>,
+        source: &SourceRegistration,
+        record: &ExternalRecord,
         cancel: &CancellationToken,
     ) -> bool {
         for attempt in 1..=self.max_attempts {
-            match self.translate_and_dispatch(source, msg).await {
+            match self.translate_and_dispatch(source, record).await {
                 Ok(()) => return true,
                 Err(e) => {
                     let skip = matches!(e, MessagingError::InvalidMessage(_));
                     if attempt < self.max_attempts && !skip {
-                        tracing::warn!(source = %source.name, topic = msg.topic(), partition = msg.partition(), offset = msg.offset(), attempt, "external record failed, retrying: {e}");
+                        tracing::warn!(source = %source.name, from = %record.source, segment = %record.segment, position = %record.position, attempt, "external record failed, retrying: {e}");
                         tokio::select! {
                             _ = tokio::time::sleep(self.backoff) => {}
                             _ = cancel.cancelled() => return false,
                         }
                     } else {
-                        tracing::error!(source = %source.name, topic = msg.topic(), partition = msg.partition(), offset = msg.offset(), attempts = attempt, "giving up on a record of an external source: {e}");
+                        tracing::error!(source = %source.name, from = %record.source, segment = %record.segment, position = %record.position, attempts = attempt, "giving up on a record of an external source: {e}");
                         return true;
                     }
                 }
@@ -322,10 +311,10 @@ impl ExternalKafkaSources {
 
     async fn translate_and_dispatch(
         &self,
-        source: &SourceConsumer,
-        msg: &BorrowedMessage<'_>,
+        source: &SourceRegistration,
+        record: &ExternalRecord,
     ) -> Result<(), MessagingError> {
-        let translated = catch_unwind(AssertUnwindSafe(|| (source.translator)(msg)))
+        let translated = catch_unwind(AssertUnwindSafe(|| (source.translator)(record)))
             .unwrap_or_else(|_| {
                 Err(MessagingError::Transport(format!(
                     "the translator of external source '{}' panicked",
@@ -333,7 +322,7 @@ impl ExternalKafkaSources {
                 )))
             })?;
         let Some(translated) = translated else {
-            tracing::debug!(source = %source.name, topic = msg.topic(), partition = msg.partition(), offset = msg.offset(), "the translator ignored the record");
+            tracing::debug!(source = %source.name, segment = %record.segment, position = %record.position, "the translator ignored the record");
             return Ok(());
         };
         let dedupe_id = format!(
@@ -344,9 +333,9 @@ impl ExternalKafkaSources {
                 .as_deref()
                 .filter(|k| !k.trim().is_empty())
                 .map(str::to_string)
-                .unwrap_or_else(|| format!("{}:{}", msg.partition(), msg.offset()))
+                .unwrap_or_else(|| format!("{}:{}", record.segment, record.position))
         );
-        let mut hdrs = record_headers(msg);
+        let mut hdrs = record.headers.clone();
         let correlation_id = hdrs
             .get(headers::CORRELATION_ID)
             .filter(|c| !c.is_empty())
@@ -368,20 +357,4 @@ impl ExternalKafkaSources {
             .await
             .map(|_| ())
     }
-}
-
-/// The record's headers as text.
-pub(crate) fn record_headers(msg: &BorrowedMessage<'_>) -> HashMap<String, String> {
-    msg.headers()
-        .map(|h| {
-            h.iter()
-                .map(|x| {
-                    (
-                        x.key.to_string(),
-                        String::from_utf8_lossy(x.value.unwrap_or(&[])).to_string(),
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use kraken_messaging::kafka::SagaStage;
+use kraken_messaging::events::SagaStage;
 use kraken_messaging::saga::store::{Association, DeadlineStatus, DispatchKind};
 use kraken_messaging::saga::{
     EventOutcome, FailureReason, SagaCommandFailed, SagaDefinition, SagaRetry, SagaRuntime,

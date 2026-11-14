@@ -9,16 +9,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kraken_messaging::external::{ExternalSource, IdempotencyKey, IngressResult, TranslatedEvent};
+use kraken_messaging::external::{ExternalRecord, IdempotencyKey, IngressResult, TranslatedEvent};
 use kraken_messaging::saga::store::SagaDocument;
 use kraken_messaging::saga::{EventOutcome, ExternalOutcome};
 use kraken_messaging::store::{ExternalCall, ExternalCallStatus};
 use kraken_messaging::{
     Command, Config, Event, KrakenMessaging, MessageContext, MessagingError, message_type,
 };
+use kraken_messaging_kafka::{ExternalSource, KafkaExternalSource};
 use kraken_messaging_mongo::documents::{ExternalCallDocument, SagaDoc};
 use mongodb::bson::{Document, doc};
-use rdkafka::Message;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde::{Deserialize, Serialize};
@@ -80,8 +80,8 @@ struct Banner {
 
 const PARTNER_TOPIC: &str = "partner.printer.banner";
 
-fn config(hub: &str, kafka: &str) -> Config {
-    let mut c = Config::new("svc-banner", hub, kafka);
+fn config(hub: &str) -> Config {
+    let mut c = Config::new("svc-banner", hub);
     c.outbox_poll_interval = Duration::from_millis(100);
     c.reconnect_backoff_min = Duration::from_millis(100);
     c.reconnect_backoff_max = Duration::from_secs(2);
@@ -130,13 +130,11 @@ async fn an_event_starts_a_saga_whose_command_reaches_the_idempotent_adapter_and
 
     let meter = support::metrics::TestMeter::new();
     let uri = mongo.uri_for("banner");
-    let builder = KrakenMessaging::builder_with_meter(
-        config(&hub.address(), &kafka.bootstrap),
-        meter.meter(),
-    )
-    .await
-    .unwrap()
-    .store(support::mongo_store(&uri).await);
+    let builder = KrakenMessaging::builder_with_meter(config(&hub.address()), meter.meter())
+        .await
+        .unwrap()
+        .store(support::mongo_store(&uri).await)
+        .event_store(support::kafka_events(&kafka.bootstrap));
     let recorded = Arc::clone(&calls);
     let app = builder
         // No ordinary event handler: the consumer runs for the saga alone.
@@ -185,16 +183,21 @@ async fn an_event_starts_a_saga_whose_command_reaches_the_idempotent_adapter_and
         // The partner's replies on its own topic end a saga too.
         .external_source(
             "printer-banner",
-            ExternalSource {
-                properties: HashMap::from([(
-                    "topic.metadata.refresh.interval.ms".to_string(),
-                    "500".to_string(),
-                )]),
-                ..ExternalSource::new(PARTNER_TOPIC)
-            },
-            |record| {
-                let reply: serde_json::Value =
-                    serde_json::from_slice(record.payload().unwrap_or_default())?;
+            KafkaExternalSource::new(
+                "printer-banner",
+                ExternalSource {
+                    properties: HashMap::from([(
+                        "topic.metadata.refresh.interval.ms".to_string(),
+                        "500".to_string(),
+                    )]),
+                    ..ExternalSource::new(PARTNER_TOPIC)
+                },
+                "svc-banner",
+                &kafka.bootstrap,
+            )
+            .unwrap(),
+            |record: &ExternalRecord| {
+                let reply: serde_json::Value = serde_json::from_slice(&record.payload)?;
                 let event = BannerPrinted {
                     job_id: reply["jobId"].as_str().unwrap_or_default().to_string(),
                 };
@@ -428,7 +431,7 @@ async fn a_service_without_sagas_adapters_or_sources_builds_none_of_it() {
     let hub = FakeHub::start().await;
     let mongo = support::containers::mongo().await;
     // Commands only: no store, no saga state, and the saga admin API says it has no store.
-    let app = KrakenMessaging::builder(config(&hub.address(), "127.0.0.1:1"))
+    let app = KrakenMessaging::builder(config(&hub.address()))
         .await
         .unwrap()
         .command::<PrintBanner, _, _>(|_, _| async { Ok(()) })
@@ -442,7 +445,7 @@ async fn a_service_without_sagas_adapters_or_sources_builds_none_of_it() {
 
     // Disabled sagas are not built, even when registered: with the schema setup turned off, the
     // library writes nothing in the store.
-    let mut disabled = config(&hub.address(), "127.0.0.1:1");
+    let mut disabled = config(&hub.address());
     disabled.sagas_enabled = false;
     disabled.store_init_schema = false;
     let uri = mongo.uri_for("disabled");
@@ -450,6 +453,7 @@ async fn a_service_without_sagas_adapters_or_sources_builds_none_of_it() {
         .await
         .unwrap()
         .store(support::mongo_store_bare(&uri).await)
+        .event_store(support::memory_events())
         .saga::<Banner>("app.Banner", |d| {
             d.start_on::<Shouted>("jobId", |e| Some(e.job_id.clone()), |_, _, _| Ok(()))
         })
@@ -486,7 +490,7 @@ async fn a_service_without_sagas_adapters_or_sources_builds_none_of_it() {
 
     // An idempotent handler starts with its store and builds nothing of the sagas.
     let uri = mongo.uri_for("adapter");
-    let mut unprepared = config(&hub.address(), "127.0.0.1:1");
+    let mut unprepared = config(&hub.address());
     unprepared.store_init_schema = false;
     let app = KrakenMessaging::builder(unprepared)
         .await

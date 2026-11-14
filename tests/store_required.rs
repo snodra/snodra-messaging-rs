@@ -1,6 +1,7 @@
 //! The message store is required by what keeps state (ADR 0028): an event handler, a saga, an
-//! idempotent handler and publishing an event need one; a service with commands and queries only
-//! runs without.
+//! idempotent handler and publishing an event need one; and the event store by what reads or
+//! writes events (ADR 0027): an event handler, a saga and publishing an event. A service with
+//! commands and queries only runs without either.
 
 mod support;
 
@@ -54,7 +55,7 @@ struct Tally {
 
 /// A builder that has not touched the network, with no store.
 async fn builder(hub: &str) -> KrakenMessagingBuilder {
-    let mut config = Config::new("store-required", hub, "127.0.0.1:1");
+    let mut config = Config::new("store-required", hub);
     config.outbox_enabled = false;
     KrakenMessaging::builder(config).await.unwrap()
 }
@@ -192,7 +193,7 @@ async fn start_prepares_the_store_schema_unless_turned_off() {
     require_docker!();
     let mongo = support::containers::mongo().await;
     let start = |uri: String, init: bool| async move {
-        let mut config = Config::new("store-required", "127.0.0.1:1", "127.0.0.1:1");
+        let mut config = Config::new("store-required", "127.0.0.1:1");
         config.outbox_enabled = false;
         config.store_init_schema = init;
         KrakenMessaging::builder(config)
@@ -246,4 +247,110 @@ async fn start_prepares_the_store_schema_unless_turned_off() {
         .unwrap();
     assert!(names.is_empty(), "{names:?}");
     app.shutdown().await;
+}
+
+/// A builder with a MongoDB store that is never reached and no event store.
+async fn builder_without_event_store(hub: &str) -> KrakenMessagingBuilder {
+    let mut config = Config::new("event-store-required", hub);
+    config.outbox_enabled = false;
+    config.store_init_schema = false;
+    KrakenMessaging::builder(config)
+        .await
+        .unwrap()
+        .store(support::mongo_store_unreached().await)
+}
+
+#[tokio::test]
+async fn event_handler_without_event_store_fails_at_build() {
+    let message = refused(
+        builder_without_event_store("127.0.0.1:1")
+            .await
+            .event::<Happened, _, _>(|_, _| async { Ok(()) }),
+    )
+    .await;
+    assert_eq!(
+        message,
+        "the event handler for sr.Happened needs an event store: add .event_store(...)"
+    );
+    let message = refused(
+        builder_without_event_store("127.0.0.1:1")
+            .await
+            .event_in::<Happened, _, _>("projections", |_, _| async { Ok(()) }),
+    )
+    .await;
+    assert_eq!(
+        message,
+        "the event handler for sr.Happened in processor 'projections' needs an event store: add .event_store(...)"
+    );
+}
+
+#[tokio::test]
+async fn saga_without_event_store_fails_at_build() {
+    let message = refused(
+        builder_without_event_store("127.0.0.1:1")
+            .await
+            .saga::<Tally>("tally", |d| {
+                d.start_on::<Happened>(
+                    "n",
+                    |e| Some(e.n.to_string()),
+                    |s, _, _| {
+                        s.n += 1;
+                        Ok(())
+                    },
+                )
+            }),
+    )
+    .await;
+    assert_eq!(
+        message,
+        "saga 'tally' needs an event store: add .event_store(...)"
+    );
+}
+
+/// A service with a store but no event store starts (its commands need neither), and publishing
+/// an event fails naming the missing event store: nothing would relay its outbox.
+#[tokio::test]
+async fn publishing_without_event_store_fails() {
+    let hub = FakeHub::start().await;
+    let app = builder_without_event_store(&hub.address())
+        .await
+        .command::<Shout, _, _>(|c, _| async move { Ok(c.text) })
+        .start()
+        .await
+        .expect("commands need no event store");
+    let e = app
+        .events()
+        .publish(&Happened { n: 1 }, None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "publishing an event needs an event store: add .event_store(...)"
+    );
+    app.shutdown().await;
+    hub.stop();
+}
+
+/// Mode `event-store` needs an event store with a native dead letter.
+#[tokio::test]
+async fn dead_letter_mode_event_store_needs_the_capability() {
+    let mut config = Config::new("event-store-required", "127.0.0.1:1");
+    config.store_init_schema = false;
+    config.dead_letter_mode = kraken_messaging::config::DeadLetterMode::EventStore;
+    let events = std::sync::Arc::new(support::event_store::Log::new(vec![
+        kraken_messaging::event_store::Capability::Replay,
+    ]));
+    let message = refused(
+        KrakenMessaging::builder(config)
+            .await
+            .unwrap()
+            .store(support::mongo_store_unreached().await)
+            .event_store(events)
+            .event::<Happened, _, _>(|_, _| async { Ok(()) }),
+    )
+    .await;
+    assert!(
+        message.contains("event-store") && message.contains("native-dead-letter"),
+        "{message}"
+    );
 }

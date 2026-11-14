@@ -137,8 +137,11 @@ fn the_fixtures_of_each_reason_deserialise() {
     let failed = read("handler_failed");
     assert_eq!(failed.id, "orders:kraken.events:1:42");
     assert_eq!(failed.processor, "orders");
-    assert_eq!(failed.topic, "kraken.events");
-    assert_eq!((failed.partition, failed.offset), (1, 42));
+    assert_eq!(failed.source, "kraken.events");
+    assert_eq!(
+        (failed.segment.as_str(), failed.position.as_str()),
+        ("1", "42")
+    );
     assert_eq!(failed.key.as_deref(), Some("order-7"));
     assert_eq!(failed.event_id.as_deref(), Some("evt-7"));
     assert_eq!(failed.event_type.as_deref(), Some("examples.OrderPlaced"));
@@ -235,13 +238,14 @@ fn record_at(
 ) -> DeadLetterRecord {
     DeadLetterRecord {
         processor: processor.into(),
-        topic: "kraken.events".into(),
-        partition,
-        offset,
-        key: key.map(<[u8]>::to_vec),
+        source: "kraken.events".into(),
+        segment: partition.to_string(),
+        position: offset.to_string(),
+        key: key.map(|k| String::from_utf8_lossy(k).into_owned()),
+        // As a delivery carries them: text, lossy UTF-8.
         headers: headers
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_vec()))
+            .map(|(k, v)| (k.to_string(), String::from_utf8_lossy(v).into_owned()))
             .collect(),
         payload: payload.to_vec(),
     }

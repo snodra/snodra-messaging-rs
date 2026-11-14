@@ -135,8 +135,7 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 | `KRAKEN_INSTANCE_ID` | a fresh UUID per `Config` | `Config.instance_id`: the hub `Register.instance_id`, and the `service.instance.id` the application gives its meter provider (see [Metrics](#metrics)); unique among the service's instances (a pod name, for example) |
 | `KRAKEN_HUB_ADDRESS` | `static://kraken-hub:7000` | the hub's gRPC target (`static://` optional), a comma-separated list of them, or one `dns:///name:port` re-resolved every 30 s (see [Multiple hubs](#multiple-hubs)); one target is the single-hub setup |
 | `KRAKEN_HUB_STATUS_INTERVAL_MS` | 5000 | how often `InstanceStatus` goes to every hub (at least 1) |
-| `KRAKEN_KAFKA_BOOTSTRAP` | `kafka:19092` | |
-| `KRAKEN_KAFKA_TOPIC` | `kraken.events` | |
+| `KRAKEN_EVENTS_SOURCE` | `kraken.events` | the event store's source the service publishes to and its processors read (the Kafka add-on's topic; its servers: `KRAKEN_KAFKA_BOOTSTRAP`, `KafkaConfig::from_env`) |
 | `KRAKEN_JWKS_URL`, `KRAKEN_ISSUER` | unset | set both to verify forwarded tokens (RS256, `exp`, `iss`); unset = read signed tokens unverified, warned once |
 | `KRAKEN_HUB_REQUEST_TIMEOUT_MS` | unset | default request timeout, sent as `timeout_ms` (`SendOptions.timeout` wins per call). Unset: the hub gets `timeout_ms = 0` and applies its per-type override or its default (5 s). `0` counts as unset (here and for `SendOptions.timeout`) |
 | `KRAKEN_RECONNECT_BACKOFF_MIN_MS` / `_MAX_MS` | 500 / 5000 | exponential, each wait ±20 % jitter and never above the max (at the max: 80-100 % of it); back to the min once a connect reached the handshake; the min and the max must each be at least 1 ms and the max not below the min (a startup error otherwise) |
@@ -160,8 +159,8 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 | `KRAKEN_HUB_TLS_SERVER_NAME` | the host of the address (for `dns:///name:port`, `name`) | the name the hub's certificate must carry, also sent as SNI (`HubTls.server_name`); needs `KRAKEN_HUB_TLS=true` |
 | `KRAKEN_HUB_TLS_CLIENT_CERT`, `KRAKEN_HUB_TLS_CLIENT_KEY` | none | the client certificate chain (leaf first) and its PKCS#8 PEM private key for mutual TLS (`HubTls.client_cert_file`, `HubTls.client_key_file`); both or neither; **they turn TLS on** like `KRAKEN_HUB_TLS=true` (`KRAKEN_HUB_TLS=false` next to them is an error); exclude `KRAKEN_HUB_TOKEN*` and `KRAKEN_HUB_OAUTH2_*` (one credential kind per service; a startup error naming both); the files are checked at startup. See [Authenticating with a client certificate](#authenticating-with-a-client-certificate-mtls) |
 | `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS` | true, 5 | one consumer per [event processor](#event-processors) with handlers (`default` also for sagas alone); the attempts and the 1 s backoff are shared by every processor |
-| `KRAKEN_KAFKA_DEAD_LETTER_MODE` | `collection` | where a record a processor cannot handle goes (see [Dead letters](#dead-letters)): `collection` (`dead_letters`, sequenced per key, admin API), `topic` (`<topic>.dlt`) or `log` (logged and skipped); case-insensitive, anything else is a startup error |
-| `KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS` | 2592000000 (30 d) | how long a letter is kept (`expireAt` = `parkedAt` + this; a TTL index removes it then, which unblocks its key); at least 1000 (a startup error otherwise, also when set in code) |
+| `KRAKEN_EVENTS_DEAD_LETTER_MODE` | `collection` | where a record a processor cannot handle goes (see [Dead letters](#dead-letters)): `collection` (`dead_letters`, sequenced per key, admin API), `event-store` (the event store's `<source>.dlt`; needs the capability `native-dead-letter`) or `log` (logged and skipped); case-insensitive, anything else is a startup error |
+| `KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS` | 2592000000 (30 d) | how long a letter is kept (`expireAt` = `parkedAt` + this; a TTL index removes it then, which unblocks its key); at least 1000 (a startup error otherwise, also when set in code) |
 | `KRAKEN_OUTBOX_ENABLED`, `KRAKEN_OUTBOX_POLL_INTERVAL_MS`, `KRAKEN_OUTBOX_BATCH_SIZE`, `KRAKEN_OUTBOX_MAX_ATTEMPTS` | true, 200, 100, 10 | |
 | `KRAKEN_OUTBOX_LEASE_MS` | 120000 | how long a batch the relay claims stays its own; longer than a send (40 s), else a startup error. A batch stops before its lease could run out under a send; the next claim renews what the relay still holds |
 | `KRAKEN_STORE_INIT_SCHEMA` | true | `start()` prepares the message store's schema (the MongoDB store: its indexes, with the retentions below); `false` when it is managed elsewhere |
@@ -663,8 +662,8 @@ in one transaction, and the relay sends them after the commit, in order, with th
 
 ```rust
 use kraken_messaging::SagaDefinition;
-use kraken_messaging::external::{ExternalSource, IdempotencyKey, TranslatedEvent};
-use kraken_messaging::external::kafka::Message; // record.payload(): rdkafka's trait, re-exported
+use kraken_messaging::external::{ExternalRecord, IdempotencyKey, TranslatedEvent};
+use kraken_messaging_kafka::{ExternalSource, KafkaExternalSource}; // the partner's topic, read by the Kafka add-on
 use serde::de::IgnoredAny;
 
 #[derive(Default, Serialize, Deserialize)]   // stored as its serde_json text; must round-trip from Default
@@ -690,7 +689,11 @@ fn banner_saga(d: SagaDefinition<Banner>) -> SagaDefinition<Banner> {
     })
 }
 
+let kafka = KafkaConfig::from_env();
+let partner = KafkaExternalSource::new("printer-banner", ExternalSource::new("printer.banner.events"), "service-c", &kafka.bootstrap_servers)?;
 let app = KrakenMessaging::builder(Config::from_env()?).await?
+    .store(Arc::new(store))
+    .event_store(Arc::new(KafkaEventStore::new(kafka)?))
     .saga("examples.Banner", banner_saga)
     // The adapter: a command handler made idempotent over external_calls (one call per key).
     .idempotent_command::<PrintBanner, _, _>(IdempotencyKey::default(), false, move |c, ctx| {
@@ -698,9 +701,9 @@ let app = KrakenMessaging::builder(Config::from_env()?).await?
         async move { printer.submit(&c, &ctx.headers["idempotency-key"]).await }
     })
     // A partner's Kafka topic: records become local events (never republished to kraken.events).
-    .external_source("printer-banner", ExternalSource::new("printer.banner.events"), |record| {
+    .external_source("printer-banner", partner, |record: &ExternalRecord| {
         // Malformed never heals: InvalidMessage skips the record at once (a bare `?` is Serialization, retried first).
-        let n: Notification = serde_json::from_slice(record.payload().unwrap_or_default())
+        let n: Notification = serde_json::from_slice(&record.payload)
             .map_err(|e| MessagingError::InvalidMessage(format!("not a printer notification: {e}")))?;
         Ok(Some(TranslatedEvent::new(&BannerPrinted { job_id: n.job_id }, Some(n.delivery_id))?))
     })
@@ -920,7 +923,7 @@ list locally.
 
 ## Dead letters
 
-A record a processor cannot handle is kept, not lost (ADR 0022). `KRAKEN_KAFKA_DEAD_LETTER_MODE`
+A record a processor cannot handle is kept, not lost (ADR 0022). `KRAKEN_EVENTS_DEAD_LETTER_MODE`
 chooses where it goes:
 
 | Mode | What happens | Sequenced per key | Admin API |
@@ -951,7 +954,7 @@ partition stays assigned). Sequencing keeps an in-memory set of the parked keys 
 partitions this instance holds (loaded on every assignment, added to on every park); a record
 whose key is in the set is confirmed against the collection first, and a miss (another instance
 retried or discarded the letters) removes the key and handles the record normally. **A letter that
-expires** (`KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS`, 30 d; TTL index on `expireAt`) **unblocks its
+expires** (`KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS`, 30 d; TTL index on `expireAt`) **unblocks its
 key**.
 
 ### The admin API

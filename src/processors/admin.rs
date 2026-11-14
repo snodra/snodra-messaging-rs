@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use crate::config::DeadLetterMode;
 use crate::error::MessagingError;
-use crate::kafka::dispatch::{FinishInTransaction, MarkerPosition, RecordDispatch, StageOneThen};
-use crate::kafka::{LocalEventDispatcher, message_context};
+use crate::events::dispatch::{FinishInTransaction, MarkerPosition, RecordDispatch, StageOneThen};
+use crate::events::{LocalEventDispatcher, message_context};
 use crate::store::{
     DeadLetter, DeadLetterError, DeadLetterReason, DeadLetterStore, DeadLetterSummary,
 };
@@ -61,7 +61,7 @@ struct Inner {
 
 impl DeadLetters {
     /// The API over the letters in `store` (none: a service without a message store) for the processors this instance runs (name and its
-    /// dispatcher, whose stage 1 a retry runs). In modes `topic` and `log` every call fails.
+    /// dispatcher, whose stage 1 a retry runs). In modes `event-store` and `log` every call fails.
     pub fn new(
         store: Option<Arc<dyn DeadLetterStore>>,
         mode: DeadLetterMode,
@@ -148,7 +148,7 @@ impl DeadLetters {
         if let Some(key) = &letter.key
             && let Some(head) = self
                 .store()?
-                .earlier(&letter.processor, key, letter.offset)
+                .earlier(&letter.processor, key, &letter.position)
                 .await?
         {
             return Ok(RetryResult::Blocked(head));
@@ -182,9 +182,9 @@ impl DeadLetters {
         // The retry is the record's stage 1: its marker carries the record's position (ADR 0023).
         let position = MarkerPosition {
             processor: letter.processor.clone(),
-            topic: letter.topic.clone(),
-            partition: letter.partition,
-            offset: letter.offset,
+            source: letter.source.clone(),
+            segment: letter.segment.clone(),
+            position: letter.position.clone(),
         };
         match dispatcher
             .stage_one_then(
@@ -235,7 +235,7 @@ impl DeadLetters {
         Ok(RetryResult::Failed(message))
     }
 
-    /// Retries every letter of `processor`: per key in offset order (the keys in the order of their
+    /// Retries every letter of `processor`: per key in position order (the keys in the order of their
     /// head letters' `parkedAt`, then `_id`), a key stopping at its first failure (its later
     /// letters count as blocked); then the keyless letters in `parkedAt` order; INVALID letters
     /// skipped. The run is ordered from the letters' summaries (no record is loaded); each letter
@@ -256,14 +256,9 @@ impl DeadLetters {
                 None => keyless.push(letter),
             }
         }
-        // Keys in the order of their head letter (lowest offset) by (`parkedAt`, `_id`).
-        let mut keyed: Vec<Vec<DeadLetterSummary>> = keyed
-            .into_values()
-            .map(|mut letters| {
-                letters.sort_by(|a, b| (a.offset, &a.id).cmp(&(b.offset, &b.id)));
-                letters
-            })
-            .collect();
+        // Each key's letters in the store's order (position, then id); the keys in the order of
+        // their head letter by (`parkedAt`, `_id`).
+        let mut keyed: Vec<Vec<DeadLetterSummary>> = keyed.into_values().collect();
         keyed.sort_by(|a, b| (a[0].parked_at_ms, &a[0].id).cmp(&(b[0].parked_at_ms, &b[0].id)));
         keyless.sort_by(|a, b| (a.parked_at_ms, &a.id).cmp(&(b.parked_at_ms, &b.id)));
         for letters in keyed {
@@ -330,7 +325,7 @@ impl DeadLetters {
         match self.inner.mode {
             DeadLetterMode::Collection => Ok(()),
             mode => Err(MessagingError::InvalidMessage(format!(
-                "dead letters are not kept in mode {} (KRAKEN_KAFKA_DEAD_LETTER_MODE): there is no dead-letter admin API",
+                "dead letters are not kept in mode {} (KRAKEN_EVENTS_DEAD_LETTER_MODE): there is no dead-letter admin API",
                 mode.as_str()
             ))),
         }

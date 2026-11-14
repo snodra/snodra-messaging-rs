@@ -1,8 +1,10 @@
 //! The `dead_letters` collection (ADR 0022, mode `collection`): the document, field for field the
-//! contract both libraries write. A letter's `_id` is `<processor>:<topic>:<partition>:<offset>`,
-//! so parking the same record twice finds the first letter (a duplicate key means "already
-//! parked"). Dates are BSON datetimes, `partition` an Int32, `offset` an Int64; an absent field is
-//! absent (never null) and no `_class` is written. The value is `payload` (text) when it is valid
+//! contract both libraries write. A letter's `_id` is `<processor>:<source>:<segment>:<position>`
+//! (`<processor>:<topic>:<partition>:<offset>` on Kafka), so parking the same record twice finds
+//! the first letter (a duplicate key means "already parked"). Dates are BSON datetimes; `topic` is
+//! the source, `partition` the segment and `offset` the position, as
+//! [`positions`](crate::positions) stores them (an Int32 and an Int64 for decimal ones, as
+//! always); an absent field is absent (never null) and no `_class` is written. The value is `payload` (text) when it is valid
 //! UTF-8, `payloadBinary` when it is not, neither when it is empty.
 
 use std::collections::{BTreeMap, HashSet};
@@ -17,7 +19,7 @@ use mongodb::bson::{Binary, Bson, DateTime, Document, doc, spec::BinarySubtype};
 use mongodb::{Collection, Database};
 use serde::{Deserialize, Serialize};
 
-use crate::{OrStoreError, date, is_duplicate_key, session, store_error};
+use crate::{OrStoreError, date, is_duplicate_key, positions, session, store_error};
 
 pub(crate) const DEAD_LETTERS_COLLECTION: &str = "dead_letters";
 
@@ -84,8 +86,8 @@ pub struct DeadLetterDocument {
     id: String,
     processor: String,
     topic: String,
-    partition: i32,
-    offset: i64,
+    partition: Bson,
+    offset: Bson,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -131,9 +133,9 @@ impl DeadLetterDocument {
         DeadLetterDocument {
             id: letter.id.clone(),
             processor: letter.processor.clone(),
-            topic: letter.topic.clone(),
-            partition: letter.partition,
-            offset: letter.offset,
+            topic: letter.source.clone(),
+            partition: positions::segment(&letter.segment),
+            offset: positions::position(&letter.position),
             key: letter.key.clone(),
             event_id: letter.event_id.clone(),
             event_type: letter.event_type.clone(),
@@ -160,9 +162,9 @@ impl DeadLetterDocument {
         DeadLetter {
             id: self.id,
             processor: self.processor,
-            topic: self.topic,
-            partition: self.partition,
-            offset: self.offset,
+            source: self.topic,
+            segment: positions::text(&self.partition).unwrap_or_default(),
+            position: positions::text(&self.offset).unwrap_or_default(),
             key: self.key,
             event_id: self.event_id,
             event_type: self.event_type,
@@ -200,7 +202,7 @@ struct SummaryDocument {
     id: String,
     #[serde(default)]
     key: Option<String>,
-    offset: i64,
+    offset: Bson,
     reason: ReasonDocument,
     parked_at: DateTime,
 }
@@ -220,7 +222,7 @@ impl MongoDeadLetterStore {
         self.letters.clone_with_type()
     }
 
-    /// The `_id` of the first letter matching `filter`, by offset then `_id`.
+    /// The `_id` of the first letter matching `filter`, by position then `_id`.
     async fn first(&self, filter: Document) -> Result<Option<String>, StoreError> {
         let found = self
             .raw()
@@ -271,12 +273,12 @@ impl DeadLetterStore for MongoDeadLetterStore {
         &'a self,
         processor: &'a str,
         key: &'a str,
-        offset: i64,
+        position: &'a str,
     ) -> BoxFuture<'a, Result<Option<String>, StoreError>> {
         Box::pin(self.first(doc! {
             "processor": processor,
             "key": key,
-            "offset": { "$lt": offset },
+            "offset": { "$lt": positions::position(position) },
             "reason": { "$ne": DeadLetterReason::Invalid.as_str() },
         }))
     }
@@ -284,21 +286,22 @@ impl DeadLetterStore for MongoDeadLetterStore {
     fn parked_keys<'a>(
         &'a self,
         processor: &'a str,
-        topic: &'a str,
-        partitions: &'a [i32],
+        source: &'a str,
+        segments: &'a [String],
     ) -> BoxFuture<'a, Result<HashSet<String>, StoreError>> {
         Box::pin(async move {
-            if partitions.is_empty() {
+            if segments.is_empty() {
                 return Ok(HashSet::new());
             }
+            let segments: Vec<Bson> = segments.iter().map(|s| positions::segment(s)).collect();
             let keys = self
                 .letters
                 .distinct(
                     "key",
                     doc! {
                         "processor": processor,
-                        "topic": topic,
-                        "partition": { "$in": partitions.to_vec() },
+                        "topic": source,
+                        "partition": { "$in": segments },
                         "reason": { "$ne": DeadLetterReason::Invalid.as_str() },
                         "key": { "$exists": true },
                     },
@@ -357,6 +360,7 @@ impl DeadLetterStore for MongoDeadLetterStore {
                 .clone_with_type::<SummaryDocument>()
                 .find(doc! { "processor": processor })
                 .projection(doc! { "_id": 1, "key": 1, "offset": 1, "reason": 1, "parkedAt": 1 })
+                .sort(doc! { "offset": 1, "_id": 1 })
                 .await
                 .store()?
                 .try_collect()
@@ -367,7 +371,7 @@ impl DeadLetterStore for MongoDeadLetterStore {
                 .map(|d| DeadLetterSummary {
                     id: d.id,
                     key: d.key,
-                    offset: d.offset,
+                    position: positions::text(&d.offset).unwrap_or_default(),
                     reason: d.reason.into(),
                     parked_at_ms: d.parked_at.timestamp_millis(),
                 })

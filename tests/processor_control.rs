@@ -1,7 +1,7 @@
 //! Processor control (ADR 0023, P6b) through `KrakenMessaging`, against a real Kafka and MongoDB
 //! (and the in-process fake hub): positioned markers, pause and resume (persisted, converging,
 //! surviving a restart), the leased reset (prepare leaves the group, a second operation is
-//! LOCKED, the lease expires by itself, an active member is GROUP_NOT_EMPTY, the replay of a
+//! LOCKED, the lease expires by itself, an active member is SUBSCRIBERS_ACTIVE, the replay of a
 //! range with its reset handlers, `disallow_replay` and the sagas skipped), and the dead letters
 //! through control requests.
 
@@ -59,15 +59,16 @@ async fn builder(
     mongo: &str,
     topic: &str,
 ) -> KrakenMessagingBuilder {
-    KrakenMessaging::builder(config(service, hub, kafka, topic))
+    KrakenMessaging::builder(config(service, hub, topic))
         .await
         .unwrap()
         .store(support::mongo_store(mongo).await)
+        .event_store(support::kafka_events(kafka))
 }
 
-fn config(service: &str, hub: &str, kafka: &str, topic: &str) -> Config {
-    let mut c = Config::new(service, hub, kafka);
-    c.kafka_topic = topic.to_string();
+fn config(service: &str, hub: &str, topic: &str) -> Config {
+    let mut c = Config::new(service, hub);
+    c.events_source = topic.to_string();
     c.consumer_max_attempts = 1;
     c.outbox_enabled = false;
     c.reconnect_backoff_min = Duration::from_millis(100);
@@ -300,11 +301,18 @@ fn reset(reply: Option<ControlReply>) -> proto::ResetOutcome {
     }
 }
 
+/// The ranges of `outcome` as Kafka's partitions and offsets.
 fn ranges(outcome: &proto::ResetOutcome) -> Vec<(i32, i64, i64)> {
     outcome
         .ranges
         .iter()
-        .map(|r| (r.partition, r.from, r.until))
+        .map(|r| {
+            (
+                r.segment.parse().unwrap(),
+                r.from.parse().unwrap(),
+                r.until.parse().unwrap(),
+            )
+        })
         .collect()
 }
 
@@ -866,7 +874,7 @@ async fn a_reset_to_earliest_replays_the_range_once_without_sagas_or_disallowed_
 }
 
 /// The targets on one instance: `latest` replays nothing; a time and explicit offsets replay
-/// from there; an active member of the group is GROUP_NOT_EMPTY and a
+/// from there; an active member of the group is SUBSCRIBERS_ACTIVE and a
 /// failing reset handler RESET_HANDLER_FAILED (saying it ran), both without a marker or an offset
 /// touched; a bad target is
 /// INVALID and an execute without a prepare NOT_PREPARED.
@@ -969,7 +977,7 @@ async fn reset_targets_and_refusals() {
     .unwrap();
     ok(hub.control("audit", prepare("op-a", 30_000), ASK).await);
     let (code, message) = refused(hub.control("audit", execute("op-a", earliest()), ASK).await);
-    assert_eq!(code, ControlRefusal::GroupNotEmpty, "{message}");
+    assert_eq!(code, ControlRefusal::SubscribersActive, "{message}");
     assert!(message.contains("old-instance"), "{message}");
     assert_eq!(committed(&kafka.bootstrap, group, topic, 0), 4);
     assert!(marker(&db, "processor:audit:n-1").await.is_some());
@@ -987,7 +995,7 @@ async fn reset_targets_and_refusals() {
     assert_eq!(code, ControlRefusal::ResetHandlerFailed, "{message}");
     assert!(message.contains("projection store down"), "{message}");
     assert!(
-        message.contains("reset handlers ran (1), no markers deleted, offsets not moved"),
+        message.contains("reset handlers ran (1), no markers deleted, positions not moved"),
         "{message}"
     );
     assert_eq!(committed(&kafka.bootstrap, group, topic, 0), 4);
@@ -1009,10 +1017,13 @@ async fn reset_targets_and_refusals() {
     // Bad targets.
     ok(hub.control("audit", prepare("op-c", 30_000), ASK).await);
     let offsets = |all: &[(i32, i64)]| {
-        reset_target::To::Offsets(proto::PartitionOffsets {
-            offsets: all
+        reset_target::To::Positions(proto::SegmentPositions {
+            positions: all
                 .iter()
-                .map(|&(partition, offset)| proto::PartitionOffset { partition, offset })
+                .map(|&(partition, offset)| proto::SegmentPosition {
+                    segment: partition.to_string(),
+                    position: offset.to_string(),
+                })
                 .collect(),
         })
     };
@@ -1166,11 +1177,11 @@ async fn the_dead_letters_through_control_requests() {
     assert_eq!(
         (
             head.processor.as_str(),
-            head.topic.as_str(),
-            head.partition,
-            head.offset
+            head.source.as_str(),
+            head.segment.as_str(),
+            head.position.as_str()
         ),
-        ("audit", topic, 0, 0)
+        ("audit", topic, "0", "0")
     );
     assert_eq!(
         (
@@ -1651,7 +1662,7 @@ async fn a_lease_lost_while_the_reset_handlers_run_stops_the_reset_before_the_ma
         "lease lost",
         "reset handlers ran (1)",
         "no markers deleted",
-        "offsets not moved",
+        "positions not moved",
     ] {
         assert!(message.contains(said), "{said}: {message}");
     }
@@ -1728,4 +1739,171 @@ async fn a_letter_parked_during_a_replay_is_retried_as_a_replay() {
         "the retry of a replayed record is a replay"
     );
     app.shutdown().await;
+}
+
+/// Review focus 4 (ADR 0027): segments reassigned during an open replay range keep replaying up
+/// to `replay_until` on their new owner and nowhere else. One instance holds both segments of an
+/// in-process event store (`support::event_store`) when it resets them to earliest (the ranges
+/// end at the two records each already handled), and gets its consumer back paused; a second
+/// instance joins and takes segment 1 over. On the resume each replays the range of its own
+/// segment (without the handler that disallows replay) and handles what came after the reset
+/// as new records; neither ever sees the other's segment.
+#[tokio::test]
+async fn replay_range_survives_reassignment() {
+    require_docker!();
+    let mongo = support::containers::mongo().await;
+    let uri = mongo.uri_for("reassign");
+    let db = support::mongo_db(&uri).await;
+    let events =
+        support::event_store::Log::new(kraken_messaging::event_store::Capability::ALL.to_vec());
+    let topic = "rr.events";
+    // (instance, note) of every run of the handler, and of the one that disallows replay.
+    let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let once: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let start = |instance: &'static str| {
+        let (seen, once, uri, events) = (
+            Arc::clone(&seen),
+            Arc::clone(&once),
+            uri.clone(),
+            events.clone(),
+        );
+        async move {
+            KrakenMessaging::builder(config("svc-rr", "static://127.0.0.1:1", topic))
+                .await
+                .unwrap()
+                .store(support::mongo_store(&uri).await)
+                .event_store(Arc::new(events))
+                .event::<Noted, _, _>(move |e, _| {
+                    seen.lock()
+                        .unwrap()
+                        .push((instance.to_string(), e.note.clone()));
+                    async { Ok(()) }
+                })
+                .event_with::<Noted, _, _>(EventOptions::new().disallow_replay(), move |e, _| {
+                    once.lock()
+                        .unwrap()
+                        .push((instance.to_string(), e.note.clone()));
+                    async { Ok(()) }
+                })
+                .start()
+                .await
+                .unwrap()
+        }
+    };
+    // Without a key the double spreads the records round robin: n-0 and n-2 go to segment 1,
+    // n-1 and n-3 to segment 0, each at positions 0 and 1.
+    let publish = |note: &'static str| {
+        let events = events.clone();
+        async move {
+            use kraken_messaging::event_store::{EventStore, OutgoingEvent};
+            events
+                .publish(&OutgoingEvent {
+                    source: topic.into(),
+                    id: note.into(),
+                    type_name: "c.Noted".into(),
+                    key: None,
+                    headers: std::collections::HashMap::from([
+                        ("type".to_string(), "c.Noted".to_string()),
+                        ("id".to_string(), note.to_string()),
+                    ]),
+                    payload: serde_json::to_vec(&Noted {
+                        note: note.to_string(),
+                    })
+                    .unwrap(),
+                })
+                .await
+                .unwrap();
+        }
+    };
+    let runs = |log: &Arc<Mutex<Vec<(String, String)>>>, instance: &str| -> Vec<String> {
+        let mut notes: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(i, _)| i == instance)
+            .map(|(_, n)| n.clone())
+            .collect();
+        notes.sort();
+        notes
+    };
+
+    let a = start("a").await;
+    for note in ["n-0", "n-1", "n-2", "n-3"] {
+        publish(note).await;
+    }
+    eventually("a handled the four", WITHIN, || async {
+        runs(&seen, "a").len() == 4 && runs(&once, "a").len() == 4
+    })
+    .await;
+
+    // Paused, then reset to earliest while a alone holds both segments.
+    let control = a.processor_control();
+    let ask = |action| {
+        let control = control.clone();
+        async move {
+            Some(
+                control
+                    .handle(proto::ControlRequest {
+                        control_id: "c".into(),
+                        processor: "default".into(),
+                        action: Some(action),
+                    })
+                    .await,
+            )
+        }
+    };
+    ok(ask(pause()).await);
+    ok(ask(prepare("op-rr", 30_000)).await);
+    let outcome = reset(ask(execute("op-rr", earliest())).await);
+    assert_eq!(ranges(&outcome), [(0, 0, 2), (1, 0, 2)]);
+    assert_eq!(outcome.markers_deleted, 4);
+    // After the reset: new records, past the ranges (n-4 to segment 1, n-5 to segment 0).
+    publish("n-4").await;
+    publish("n-5").await;
+    ok(ask(finish("op-rr", false)).await);
+
+    // b joins while paused and takes segment 1 over; the ranges stay open on both owners.
+    let b = start("b").await;
+    let segments = |app: &KrakenMessaging| -> Vec<(String, String)> {
+        status(app, "default")
+            .segments
+            .iter()
+            .map(|s| (s.segment.clone(), s.replay_until.clone()))
+            .collect()
+    };
+    eventually("one segment each, both replaying", WITHIN, || async {
+        segments(&a) == [("0".to_string(), "2".to_string())]
+            && segments(&b) == [("1".to_string(), "2".to_string())]
+    })
+    .await;
+    assert!(status(&b, "default").replaying);
+
+    ok(ask(resume()).await);
+    eventually(
+        "each replayed its range and handled the new one",
+        WITHIN,
+        || async { runs(&seen, "a").len() == 7 && runs(&seen, "b").len() == 3 },
+    )
+    .await;
+    // The replay of each segment ran on its owner only; the new records once, not as a replay.
+    assert_eq!(
+        runs(&seen, "a"),
+        ["n-0", "n-1", "n-1", "n-2", "n-3", "n-3", "n-5"]
+    );
+    assert_eq!(runs(&seen, "b"), ["n-0", "n-2", "n-4"]);
+    assert_eq!(runs(&once, "a"), ["n-0", "n-1", "n-2", "n-3", "n-5"]);
+    assert_eq!(runs(&once, "b"), ["n-4"], "only past the range");
+    eventually("the ranges removed by their owners", WITHIN, || async {
+        replay(&db, "default").await.is_empty()
+    })
+    .await;
+    assert!(!status(&a, "default").replaying && !status(&b, "default").replaying);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        runs(&seen, "a").len() + runs(&seen, "b").len(),
+        10,
+        "nothing more"
+    );
+    b.shutdown().await;
+    a.shutdown().await;
 }

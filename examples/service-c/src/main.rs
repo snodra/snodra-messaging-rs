@@ -24,9 +24,10 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
-use kraken_messaging::external::{ExternalSource, IdempotencyKey};
+use kraken_messaging::external::IdempotencyKey;
 use kraken_messaging::processors::EventOptions;
 use kraken_messaging::{Config, KrakenMessaging, MessagingError};
+use kraken_messaging_kafka::{ExternalSource, KafkaConfig, KafkaEventStore, KafkaExternalSource};
 use kraken_messaging_mongo::MongoStore;
 use messages::{
     BannerFailed, BannerPrinted, Counter, GreetingDelivered, IncrementCounter, Inventory,
@@ -112,9 +113,19 @@ async fn main() -> Result<(), MessagingError> {
         MessagingError::InvalidMessage("KRAKEN_MONGODB_URI must name a database".into())
     })?;
     let store = MongoStore::new(mongo, db);
+    // The event store: Kafka (`KRAKEN_KAFKA_BOOTSTRAP`), and the printer's partner topic on it.
+    let kafka = KafkaConfig::from_env();
+    let printer_source = KafkaExternalSource::new(
+        printer::SOURCE,
+        ExternalSource::new(&banners.reply.topic),
+        &service,
+        &kafka.bootstrap_servers,
+    )?;
+    let events = KafkaEventStore::new(kafka)?;
     let builder = KrakenMessaging::builder(config)
         .await?
-        .store(Arc::new(store));
+        .store(Arc::new(store))
+        .event_store(Arc::new(events));
     let emitter = builder.emitter();
     let count_emitter = emitter.clone();
     let shout_events = builder.events();
@@ -268,11 +279,7 @@ async fn main() -> Result<(), MessagingError> {
                 async move { printer::poll(&printer, &events, &cmd).await }
             },
         )
-        .external_source(
-            printer::SOURCE,
-            ExternalSource::new(&banners.reply.topic),
-            printer::translate,
-        )
+        .external_source(printer::SOURCE, printer_source, printer::translate)
         .event::<BannerPrinted, _, _>(move |e, _ctx| {
             printed_outcomes.printed(&e);
             async move {

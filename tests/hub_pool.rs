@@ -772,7 +772,7 @@ async fn processor_status_goes_to_every_hub() {
         pool.set_processor_status(Arc::new(|| {
             vec![proto::ProcessorStatus {
                 name: "orders".into(),
-                group_id: "svc.orders".into(),
+                subscription: "svc.orders".into(),
                 state: proto::ProcessorState::ProcessorRunning as i32,
                 ..Default::default()
             }]

@@ -1,6 +1,7 @@
-//! The processor status (ADR 0022) against a real Kafka: the committed offset and high watermark
-//! are read off the consumer task (a handler that blocks does not stop them), so the lag of
-//! records produced while the service was stopped shows; the partitions follow a rebalance.
+//! The processor status (ADR 0022) against a real Kafka (the Kafka event store add-on): the
+//! committed position and the head are read off the processor's task (a handler that blocks does
+//! not stop them), so the lag of records produced while the service was stopped shows; the
+//! segments follow a reassignment.
 
 mod support;
 
@@ -41,15 +42,16 @@ async fn builder(
     mongo: &str,
     topic: &str,
 ) -> KrakenMessagingBuilder {
-    KrakenMessaging::builder(config(service, hub, kafka, topic))
+    KrakenMessaging::builder(config(service, hub, topic))
         .await
         .unwrap()
         .store(support::mongo_store(mongo).await)
+        .event_store(support::kafka_events(kafka))
 }
 
-fn config(service: &str, hub: &str, kafka: &str, topic: &str) -> Config {
-    let mut c = Config::new(service, hub, kafka);
-    c.kafka_topic = topic.to_string();
+fn config(service: &str, hub: &str, topic: &str) -> Config {
+    let mut c = Config::new(service, hub);
+    c.events_source = topic.to_string();
     c.outbox_enabled = false;
     c
 }
@@ -123,7 +125,11 @@ async fn the_lag_of_records_produced_while_stopped_shows_while_the_handler_is_bu
         Duration::from_secs(60),
         || {
             let s = default_of(&app);
-            s.processed_total == 3 && s.partitions.first().is_some_and(|p| p.committed == 3)
+            // The acknowledgements count at once, the head from the subscription's next read.
+            s.processed_total == 3
+                && s.segments
+                    .first()
+                    .is_some_and(|p| p.committed == "3" && p.head == "3")
         },
     )
     .await;
@@ -132,15 +138,18 @@ async fn the_lag_of_records_produced_while_stopped_shows_while_the_handler_is_bu
         ProcessorState::try_from(s.state),
         Ok(ProcessorState::ProcessorRunning)
     );
-    assert_eq!(s.partitions.len(), 1);
+    assert_eq!(s.segments.len(), 1);
     assert_eq!(
         (
-            s.partitions[0].position,
-            s.partitions[0].high_watermark,
-            s.partitions[0].lag
+            s.segments[0].position.as_str(),
+            s.segments[0].head.as_str(),
+            s.segments[0].lag
         ),
-        (3, 3, 0)
+        ("3", "3", 0)
     );
+    assert_eq!(s.subscription, "svc-st.default");
+    assert_eq!(s.source, topic);
+    assert_eq!(s.event_store, "kafka");
     app.shutdown().await;
 
     // Five more while it is stopped; the next run's handler blocks on the first one.
@@ -148,37 +157,36 @@ async fn the_lag_of_records_produced_while_stopped_shows_while_the_handler_is_bu
     let gate = Arc::new(Semaphore::new(0));
     let held = Arc::clone(&gate);
     let meter = support::metrics::TestMeter::new();
-    let app = KrakenMessaging::builder_with_meter(
-        config("svc-st", &hub.address(), &kafka.bootstrap, topic),
-        meter.meter(),
-    )
-    .await
-    .unwrap()
-    .store(support::mongo_store(&uri).await)
-    .event::<Ticked, _, _>(move |_, _| {
-        let held = Arc::clone(&held);
-        async move {
-            held.acquire().await.unwrap().forget();
-            Ok(())
-        }
-    })
-    .start()
-    .await
-    .unwrap();
+    let app =
+        KrakenMessaging::builder_with_meter(config("svc-st", &hub.address(), topic), meter.meter())
+            .await
+            .unwrap()
+            .store(support::mongo_store(&uri).await)
+            .event_store(support::kafka_events(&kafka.bootstrap))
+            .event::<Ticked, _, _>(move |_, _| {
+                let held = Arc::clone(&held);
+                async move {
+                    held.acquire().await.unwrap().forget();
+                    Ok(())
+                }
+            })
+            .start()
+            .await
+            .unwrap();
     eventually("the lag of the five shows", Duration::from_secs(60), || {
         default_of(&app)
-            .partitions
+            .segments
             .first()
-            .is_some_and(|p| p.committed == 3 && p.high_watermark == 8)
+            .is_some_and(|p| p.committed == "3" && p.head == "8")
     })
     .await;
-    let p = default_of(&app).partitions[0];
-    assert_eq!((p.partition, p.position, p.lag), (0, -1, 5), "{p:?}");
+    let p = default_of(&app).segments[0].clone();
+    assert_eq!((p.segment.as_str(), p.lag), ("0", 5), "{p:?}");
     // The gauges read the same status.
     assert_eq!(
         meter.value(
             kraken_messaging::metrics::PROCESSOR_LAG,
-            &[("processor", "default"), ("partition", "0")]
+            &[("processor", "default"), ("segment", "0")]
         ),
         Some(5.0)
     );
@@ -199,9 +207,9 @@ async fn the_lag_of_records_produced_while_stopped_shows_while_the_handler_is_bu
     gate.add_permits(5);
     eventually("caught up", Duration::from_secs(60), || {
         default_of(&app)
-            .partitions
+            .segments
             .first()
-            .is_some_and(|p| p.committed == 8 && p.position == 8 && p.lag == 0)
+            .is_some_and(|p| p.committed == "8" && p.position == "8" && p.lag == 0)
     })
     .await;
     assert_eq!(default_of(&app).processed_total, 5);
@@ -209,7 +217,7 @@ async fn the_lag_of_records_produced_while_stopped_shows_while_the_handler_is_bu
 }
 
 #[tokio::test]
-async fn the_partitions_follow_a_rebalance() {
+async fn the_segments_follow_a_reassignment() {
     require_docker!();
     let hub = FakeHub::start().await;
     let kafka = support::containers::kafka().await;
@@ -235,16 +243,16 @@ async fn the_partitions_follow_a_rebalance() {
             .await
             .unwrap()
     };
-    let partitions = |app: &KrakenMessaging| -> Vec<i32> {
+    let partitions = |app: &KrakenMessaging| -> Vec<String> {
         default_of(app)
-            .partitions
+            .segments
             .iter()
-            .map(|p| p.partition)
+            .map(|p| p.segment.clone())
             .collect()
     };
     let a = start().await;
     eventually("a alone holds both", Duration::from_secs(60), || {
-        partitions(&a) == [0, 1]
+        partitions(&a) == ["0", "1"]
     })
     .await;
     assert_eq!(
@@ -263,7 +271,7 @@ async fn the_partitions_follow_a_rebalance() {
     .await;
     b.shutdown().await;
     eventually("a holds both again", Duration::from_secs(90), || {
-        partitions(&a) == [0, 1]
+        partitions(&a) == ["0", "1"]
     })
     .await;
     a.shutdown().await;

@@ -1,6 +1,6 @@
 //! A partner's Kafka topic as a source of records (ADR 0021 rulings 20, 40, 44a): the Kafka half
-//! of the external sources. [`KafkaExternalSource`] gives a [`Subscription`] over the topic in
-//! the partner's own consumer group, with the offset acknowledged after the core dispatched the
+//! of the external sources. [`KafkaExternalSource`] is the core's [`ExternalSourceProvider`]: a
+//! [`Subscription`] over the topic in the partner's own consumer group, with the offset acknowledged after the core dispatched the
 //! record (at least once); translating a record into an event, the retries and the dedupe id
 //! (`<name>:<partition>:<offset>`, from the delivery's segment and position) are the core's.
 //!
@@ -11,7 +11,9 @@
 
 use std::collections::HashMap;
 
+use futures::future::BoxFuture;
 use kraken_messaging::event_store::{EventStoreError, Subscription};
+use kraken_messaging::external::ExternalSourceProvider;
 
 use crate::subscription::KafkaSubscription;
 
@@ -131,6 +133,20 @@ impl KafkaExternalSource {
             false,
         )?;
         Ok(Box::new(subscription))
+    }
+}
+
+impl ExternalSourceProvider for KafkaExternalSource {
+    fn source(&self) -> &str {
+        &self.topic
+    }
+
+    fn subscription(&self) -> &str {
+        &self.group_id
+    }
+
+    fn subscribe(&self) -> BoxFuture<'_, Result<Box<dyn Subscription>, EventStoreError>> {
+        Box::pin(KafkaExternalSource::subscribe(self))
     }
 }
 

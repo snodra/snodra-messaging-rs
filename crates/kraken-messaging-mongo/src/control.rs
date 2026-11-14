@@ -9,11 +9,11 @@ use kraken_messaging::event_store::ReplayRange;
 use kraken_messaging::store::{
     ControlOperation, Locked, ProcessorControlState, ProcessorControlStore, RESET_KIND, StoreError,
 };
-use mongodb::bson::{DateTime, Document, doc};
+use mongodb::bson::{Bson, DateTime, Document, doc};
 use mongodb::{Collection, Database};
 use serde::{Deserialize, Serialize};
 
-use crate::{OrStoreError, date, is_duplicate_key, store_error};
+use crate::{OrStoreError, date, is_duplicate_key, positions, store_error};
 
 pub(crate) const PROCESSOR_CONTROL_COLLECTION: &str = "processor_control";
 
@@ -72,46 +72,36 @@ impl OperationDocument {
     }
 }
 
-/// A replay range: `{topic, partition, from, until}`, the source as the topic, the segment as the
-/// partition (an Int32) and the positions as offsets (Int64s), as stored before positions became
-/// neutral.
+/// A replay range: `{topic, partition, from, until}`, the source as the topic and the segment and
+/// positions as [`positions`](crate::positions) stores them (an Int32 and Int64s for decimal
+/// ones, as always).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RangeDocument {
     topic: String,
-    partition: i32,
-    from: i64,
-    until: i64,
+    partition: Bson,
+    from: Bson,
+    until: Bson,
 }
 
 impl From<RangeDocument> for ReplayRange {
     fn from(r: RangeDocument) -> Self {
+        let text = |b: &Bson| positions::text(b).unwrap_or_default();
         ReplayRange {
             source: r.topic,
-            segment: r.partition.to_string(),
-            from: r.from.to_string(),
-            until: r.until.to_string(),
+            segment: text(&r.partition),
+            from: text(&r.from),
+            until: text(&r.until),
         }
     }
 }
 
-/// `range` as the stored `(partition, from, until)`; `InvalidMessage` when its segment or a
-/// position is not decimal.
-pub(crate) fn stored_range(range: &ReplayRange) -> Result<(i32, i64, i64), StoreError> {
-    let invalid = || {
-        StoreError::Failed(MessagingError::InvalidMessage(format!(
-            "replay range {range:?}: the store keeps a decimal segment and decimal positions"
-        )))
-    };
-    Ok((
-        range.segment.parse().map_err(|_| invalid())?,
-        range.from.parse().map_err(|_| invalid())?,
-        range.until.parse().map_err(|_| invalid())?,
-    ))
-}
-
-fn range_document(range: &ReplayRange) -> Result<Document, StoreError> {
-    let (partition, from, until) = stored_range(range)?;
-    Ok(doc! { "topic": &range.source, "partition": partition, "from": from, "until": until })
+fn range_document(range: &ReplayRange) -> Document {
+    doc! {
+        "topic": &range.source,
+        "partition": positions::segment(&range.segment),
+        "from": positions::position(&range.from),
+        "until": positions::position(&range.until),
+    }
 }
 
 pub(crate) struct MongoProcessorControlStore {
@@ -345,10 +335,7 @@ impl ProcessorControlStore for MongoProcessorControlStore {
         now_ms: i64,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
-            let ranges = ranges
-                .iter()
-                .map(range_document)
-                .collect::<Result<Vec<Document>, StoreError>>()?;
+            let ranges: Vec<Document> = ranges.iter().map(range_document).collect();
             self.raw()
                 .update_one(
                     doc! { "_id": processor },
@@ -371,7 +358,7 @@ impl ProcessorControlStore for MongoProcessorControlStore {
         now_ms: i64,
     ) -> BoxFuture<'a, Result<bool, StoreError>> {
         Box::pin(async move {
-            let range = range_document(range)?;
+            let range = range_document(range);
             Ok(self
                 .raw()
                 .update_one(
@@ -404,7 +391,7 @@ mod tests {
 
     #[test]
     fn a_range_is_stored_as_topic_partition_and_offsets_and_read_back() {
-        let stored = range_document(&range("3", "10", "20")).expect("decimal");
+        let stored = range_document(&range("3", "10", "20"));
         assert_eq!(
             stored,
             doc! { "topic": "kraken.events", "partition": 3_i32, "from": 10_i64, "until": 20_i64 }
@@ -414,19 +401,14 @@ mod tests {
     }
 
     #[test]
-    fn a_range_that_is_not_decimal_is_refused() {
-        for bad in [
-            range("p-0", "1", "2"),
-            range("0", "x", "2"),
-            range("0", "1", ""),
-        ] {
-            assert!(
-                matches!(
-                    range_document(&bad),
-                    Err(StoreError::Failed(MessagingError::InvalidMessage(_)))
-                ),
-                "{bad:?}"
-            );
-        }
+    fn a_range_that_is_not_decimal_is_stored_as_text_and_read_back() {
+        let odd = range("p-0", "a1", "b2");
+        let stored = range_document(&odd);
+        assert_eq!(
+            stored,
+            doc! { "topic": "kraken.events", "partition": "p-0", "from": "a1", "until": "b2" }
+        );
+        let read: RangeDocument = mongodb::bson::from_document(stored).expect("read");
+        assert_eq!(ReplayRange::from(read), odd);
     }
 }

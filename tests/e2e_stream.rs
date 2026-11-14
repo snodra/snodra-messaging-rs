@@ -50,7 +50,7 @@ async fn two_hubs() -> (HubContainer, HubContainer) {
 }
 
 fn config(service: &str, hubs: &str) -> Config {
-    let mut c = Config::new(service, hubs, "127.0.0.1:1");
+    let mut c = Config::new(service, hubs);
     c.outbox_enabled = false;
     c.consumer_enabled = false;
     c.reconnect_backoff_min = Duration::from_millis(100);

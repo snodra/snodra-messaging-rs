@@ -1,7 +1,8 @@
-//! `EventBus::publish` appends to the message store's outbox; the publisher relays it to Kafka.
+//! `EventBus::publish` appends to the message store's outbox; the publisher relays it to the event
+//! store.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::context::MessageContext;
@@ -14,6 +15,9 @@ use crate::types::Event;
 /// What publishing without a store fails with.
 pub(crate) const PUBLISH_NEEDS_STORE: &str =
     "publishing an event needs a message store: add .store(...)";
+/// What publishing without an event store fails with.
+pub(crate) const PUBLISH_NEEDS_EVENT_STORE: &str =
+    "publishing an event needs an event store: add .event_store(...)";
 
 /// Builds the outbox entry for `event`: headers from the handler context when there is one.
 pub fn new_outbox_entry<E: Event>(
@@ -105,6 +109,8 @@ pub(crate) fn check_payload_text(type_name: &str, payload: &[u8]) -> Result<(), 
 #[derive(Clone)]
 pub struct EventBus {
     outbox: Arc<OnceLock<Arc<dyn OutboxStore>>>,
+    /// Set by a start without an event store.
+    no_event_store: Arc<AtomicBool>,
     seq: Arc<AtomicI64>,
 }
 
@@ -127,6 +133,7 @@ impl EventBus {
     pub fn new() -> EventBus {
         EventBus {
             outbox: Arc::new(OnceLock::new()),
+            no_event_store: Arc::new(AtomicBool::new(false)),
             seq: Arc::new(AtomicI64::new(now_ms() << 20)),
         }
     }
@@ -143,10 +150,23 @@ impl EventBus {
         let _ = self.outbox.set(outbox);
     }
 
+    /// The service started without an event store: nothing relays the outbox, so publishing
+    /// fails (on this bus and its every clone), naming the missing add-on.
+    pub(crate) fn without_event_store(&self) {
+        self.no_event_store.store(true, Ordering::SeqCst);
+    }
+
     fn outbox(&self) -> Result<&Arc<dyn OutboxStore>, MessagingError> {
-        self.outbox
+        let outbox = self
+            .outbox
             .get()
-            .ok_or_else(|| MessagingError::InvalidMessage(PUBLISH_NEEDS_STORE.into()))
+            .ok_or_else(|| MessagingError::InvalidMessage(PUBLISH_NEEDS_STORE.into()))?;
+        if self.no_event_store.load(Ordering::SeqCst) {
+            return Err(MessagingError::InvalidMessage(
+                PUBLISH_NEEDS_EVENT_STORE.into(),
+            ));
+        }
+        Ok(outbox)
     }
 
     /// Appends `event` to the outbox on its own, outside any transaction.

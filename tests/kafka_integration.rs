@@ -6,12 +6,12 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use kraken_messaging::config::DeadLetterMode;
-use kraken_messaging::event_store::headers;
-use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::kafka::{
+use kraken_messaging::event_store::{SubscriptionSpec, headers};
+use kraken_messaging::events::{
     EventBus, EventConsumer, LocalEventDispatcher, NoSagas, OutboxPublisher,
     OutboxPublisherSettings, ProcessorSettings,
 };
+use kraken_messaging::hub::HandlerRegistry;
 use kraken_messaging::metrics::{self, Metrics};
 use kraken_messaging::saga::Clock;
 use kraken_messaging::store::MessageStore;
@@ -78,9 +78,11 @@ fn consumer(
     EventConsumer::processor(
         ProcessorSettings {
             name: "default".into(),
-            bootstrap_servers: bootstrap.into(),
-            group_id: format!("{service}.default"),
-            topic: TOPIC.into(),
+            subscription: SubscriptionSpec {
+                name: format!("{service}.default"),
+                source: TOPIC.into(),
+            },
+            events: support::kafka_events(bootstrap),
             max_attempts,
             backoff: Duration::from_millis(50),
             dead_letter_mode: DeadLetterMode::Log,
@@ -107,10 +109,10 @@ async fn outbox_relays_to_kafka_with_kotlin_headers() {
     let meter = TestMeter::new();
     let publisher = OutboxPublisher::new(
         store.outbox(),
+        support::kafka_events(&kafka.bootstrap),
         OutboxPublisherSettings {
-            bootstrap_servers: kafka.bootstrap.clone(),
-            topic: TOPIC.into(),
-            source: "svc-a".into(),
+            source: TOPIC.into(),
+            service_name: "svc-a".into(),
             poll_interval: Duration::from_millis(100),
             batch_size: 100,
             max_attempts: 10,
@@ -431,10 +433,10 @@ async fn failed_send_marks_attempts() {
     let meter = TestMeter::new();
     let publisher = OutboxPublisher::new(
         store.outbox(),
+        support::kafka_events("127.0.0.1:1"),
         OutboxPublisherSettings {
-            bootstrap_servers: "127.0.0.1:1".to_string(),
-            topic: TOPIC.into(),
-            source: "svc-a".into(),
+            source: TOPIC.into(),
+            service_name: "svc-a".into(),
             poll_interval: Duration::from_millis(100),
             batch_size: 2,
             max_attempts: 10,
@@ -508,10 +510,10 @@ async fn non_retriable_send_marks_failed_immediately() {
     .unwrap();
     let publisher = OutboxPublisher::new(
         store.outbox(),
+        support::kafka_events("127.0.0.1:1"),
         OutboxPublisherSettings {
-            bootstrap_servers: "127.0.0.1:1".to_string(),
-            topic: TOPIC.into(),
-            source: "svc-a".into(),
+            source: TOPIC.into(),
+            service_name: "svc-a".into(),
             poll_interval: Duration::from_millis(100),
             batch_size: 100,
             max_attempts: 10,

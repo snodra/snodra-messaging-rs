@@ -9,12 +9,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use kraken_messaging::events::LocalEventDispatcher;
 use kraken_messaging::external::webhook::{
     SECRET_HEADER, SIGNATURE_HEADER, constant_time_eq, hmac_hex, verify, verify_with,
 };
 use kraken_messaging::external::{ExternalEventIngress, IngressResult};
 use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::kafka::LocalEventDispatcher;
 use kraken_messaging::saga::{NoopSagaMetrics, SagaDefinition, SagaRetry, SagaRuntime, SagaType};
 use kraken_messaging::{Event, MessageContext, MessagingError, RetryPolicy, message_type};
 use mongodb::bson::doc;

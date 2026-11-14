@@ -9,10 +9,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use kraken_messaging::MessagingError;
-use kraken_messaging::external::TranslatedEvent;
-use kraken_messaging::external::kafka::{BorrowedMessage, Message};
+use kraken_messaging::events::EventBus;
 use kraken_messaging::external::webhook;
-use kraken_messaging::kafka::EventBus;
+use kraken_messaging::external::{ExternalRecord, TranslatedEvent};
 use serde::{Deserialize, Serialize};
 
 use crate::messages::{BannerPrinted, PollBannerJob};
@@ -235,8 +234,8 @@ fn classify(code: u16, what: &str) -> Result<(), MessagingError> {
 /// The translator of the `printer-banner` source: a record of the printer's topic for service-c
 /// becomes [`BannerPrinted`], with the printer's delivery id as the dedupe key (a record produced
 /// twice applies once). A record that is no notification is skipped (`InvalidMessage`).
-pub fn translate(record: &BorrowedMessage<'_>) -> Result<Option<TranslatedEvent>, MessagingError> {
-    translate_payload(record.payload().unwrap_or_default())
+pub fn translate(record: &ExternalRecord) -> Result<Option<TranslatedEvent>, MessagingError> {
+    translate_payload(&record.payload)
 }
 
 pub fn translate_payload(payload: &[u8]) -> Result<Option<TranslatedEvent>, MessagingError> {
@@ -281,7 +280,7 @@ mod tests {
     };
     use crate::messages::PollBannerJob;
     use kraken_messaging::MessagingError;
-    use kraken_messaging::kafka::EventBus;
+    use kraken_messaging::events::EventBus;
 
     /// A printer on a free loopback port that answers every request with `DONE` for `jobId` and
     /// records the path and query it was asked for.

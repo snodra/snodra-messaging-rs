@@ -15,7 +15,7 @@ pub mod hub_headers {
 
 #[derive(Clone, Default)]
 pub struct MessageContext {
-    /// `Request.id` on the hub path, the `id` header on the Kafka path.
+    /// `Request.id` on the hub path, the `id` header on the event path.
     pub message_id: String,
     pub type_name: String,
     pub correlation_id: String,
@@ -28,7 +28,7 @@ pub struct MessageContext {
 
 impl MessageContext {
     /// The acting user: from the resolved identity on the hub path, from the `userId` header on
-    /// the Kafka path (events carry no token), as Kotlin's `MessageContext.userId` does.
+    /// the event path (events carry no token), as Kotlin's `MessageContext.userId` does.
     pub fn user_id(&self) -> Option<&str> {
         self.identity
             .as_ref()

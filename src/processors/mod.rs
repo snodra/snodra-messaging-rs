@@ -1,8 +1,8 @@
-//! Named event processors (ADR 0022, P6a): each processor is its own Kafka consumer, with its own
-//! consumer group, markers, dead letters and status.
+//! Named event processors (ADR 0022, P6a): each processor is its own subscription of the event
+//! store (ADR 0027), with its own markers, dead letters and status.
 //!
-//! - Every processor's group is `<service>.<name>` and its markers `processor:<name>:<eventId>`,
-//!   `default` included.
+//! - Every processor's subscription is `<service>.<name>` (on Kafka its consumer group, the name
+//!   it always had) and its markers `processor:<name>:<eventId>`, `default` included.
 //! - The unnamed processor `default` holds the handlers registered with
 //!   [`event`](crate::KrakenMessagingBuilder::event) and the sagas.
 //! - A named processor holds the handlers registered with
@@ -101,9 +101,11 @@ pub fn validate_processor_name(name: &str, what: &str) -> Result<(), MessagingEr
     }
 }
 
-/// The consumer group of processor `name` when the service's group is `base`: `<base>.<name>`.
-pub fn group_id(base: &str, name: &str) -> String {
-    format!("{base}.{name}")
+/// The subscription of processor `name` of the service `service`: `<service>.<name>` (what the
+/// processor's consumer group was named before the event store became an add-on, so a deployed
+/// service keeps its groups).
+pub fn subscription_name(service: &str, name: &str) -> String {
+    format!("{service}.{name}")
 }
 
 /// The prefix of processor `name`'s markers: `processor:<name>:`.
@@ -151,9 +153,12 @@ mod tests {
     }
 
     #[test]
-    fn groups_and_markers_are_uniform_default_included() {
-        assert_eq!(group_id("service-c", "default"), "service-c.default");
-        assert_eq!(group_id("service-c", "orders"), "service-c.orders");
+    fn subscription_names_are_todays_consumer_groups_default_included() {
+        assert_eq!(
+            subscription_name("service-c", "default"),
+            "service-c.default"
+        );
+        assert_eq!(subscription_name("service-c", "orders"), "service-c.orders");
         assert_eq!(marker_prefix("default"), "processor:default:");
         assert_eq!(marker_prefix("orders"), "processor:orders:");
     }

@@ -85,8 +85,8 @@ async fn the_hub_pauses_resets_and_retries_a_processor_with_its_write_token() {
     let kafka = support::containers::kafka().await;
     let mongo = support::containers::mongo().await;
     let topic = "e2e.ctl.events";
-    let mut config = Config::new(SERVICE, &hub.address, &kafka.bootstrap);
-    config.kafka_topic = topic.to_string();
+    let mut config = Config::new(SERVICE, &hub.address);
+    config.events_source = topic.to_string();
     config.outbox_enabled = false;
     config.consumer_max_attempts = 1;
     config.hub_status_interval = Duration::from_millis(500);
@@ -104,6 +104,7 @@ async fn the_hub_pauses_resets_and_retries_a_processor_with_its_write_token() {
         .await
         .unwrap()
         .store(support::mongo_store(&mongo.uri_for("ctl")).await)
+        .event_store(support::kafka_events(&kafka.bootstrap))
         .event_in::<Noted, _, _>("audit", move |e, _| {
             let (seen, failing) = (Arc::clone(&s), Arc::clone(&f));
             async move {
@@ -281,7 +282,7 @@ async fn the_hub_pauses_resets_and_retries_a_processor_with_its_write_token() {
         app.processors()
             .into_iter()
             .find(|p| p.name == "audit")
-            .is_some_and(|p| p.partitions.first().is_some_and(|x| x.committed == 4))
+            .is_some_and(|p| p.segments.first().is_some_and(|x| x.committed == "4"))
     })
     .await;
     let (status, body) = call(
@@ -297,7 +298,7 @@ async fn the_hub_pauses_resets_and_retries_a_processor_with_its_write_token() {
     assert_eq!(body["outcome"], "ok", "{body}");
     assert_eq!(
         body["ranges"],
-        json!([{ "partition": 0, "from": 0, "until": 4 }]),
+        json!([{ "segment": "0", "from": "0", "until": "4" }]),
         "{body}"
     );
     assert_eq!(body["resetHandlers"], 1, "{body}");

@@ -44,7 +44,7 @@ use super::store::{
 use crate::codec;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
-use crate::kafka::SagaStage;
+use crate::events::SagaStage;
 use crate::store::{StoreError, Tx};
 use crate::types::MessageType;
 

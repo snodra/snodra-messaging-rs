@@ -38,7 +38,7 @@ use super::store::{
     SagaDocument, SagaFailureDocument,
 };
 use crate::context::MessageContext;
-use crate::kafka::SagaStage;
+use crate::events::SagaStage;
 use crate::retry::RetryPolicy;
 use crate::store::{StoreError, Tx, TxProvider};
 use crate::types::{Command, Event, MessageType};
@@ -698,7 +698,7 @@ impl SagaDispatchStore for InMemorySagaStore {
         // What the outbox would refuse, as every store refuses it.
         for e in entries.iter().filter(|e| e.kind == DispatchKind::Event) {
             if let Err(refused) =
-                crate::kafka::check_payload_text(&e.type_name, e.payload.as_bytes())
+                crate::events::check_payload_text(&e.type_name, e.payload.as_bytes())
             {
                 return ready(Err(StoreError::Failed(refused)));
             }

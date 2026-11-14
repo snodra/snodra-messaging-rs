@@ -79,6 +79,7 @@ pub fn token_without_realm_access(subject: &str) -> String {
     .unwrap()
 }
 
+pub mod event_store;
 pub mod fake_hub;
 pub mod idp;
 pub mod logs;
@@ -147,5 +148,24 @@ pub async fn mongo_store_bare(
     std::sync::Arc::new(kraken_messaging_mongo::MongoStore::new(
         db.client().clone(),
         db,
+    ))
+}
+
+/// The Kafka event store at `bootstrap` (the Kafka add-on), as a service hands the builder.
+pub fn kafka_events(
+    bootstrap: &str,
+) -> std::sync::Arc<dyn kraken_messaging::event_store::EventStore> {
+    std::sync::Arc::new(
+        kraken_messaging_kafka::KafkaEventStore::new(kraken_messaging_kafka::KafkaConfig::new(
+            bootstrap,
+        ))
+        .expect("kafka event store"),
+    )
+}
+
+/// An in-process event store with every capability (`support::event_store`).
+pub fn memory_events() -> std::sync::Arc<dyn kraken_messaging::event_store::EventStore> {
+    std::sync::Arc::new(event_store::Log::new(
+        kraken_messaging::event_store::Capability::ALL.to_vec(),
     ))
 }

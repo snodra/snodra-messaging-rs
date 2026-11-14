@@ -381,7 +381,7 @@ async fn no_secret_and_no_token_ever_reach_a_log_a_debug_print_or_an_error() {
             "{:?}",
             kraken_messaging::Config {
                 hub_oauth2: Some(oauth2(&idp, "svc", SECRET)),
-                ..kraken_messaging::Config::new("svc", "hub:7000", "kafka:19092")
+                ..kraken_messaging::Config::new("svc", "hub:7000")
             }
         ),
     ];

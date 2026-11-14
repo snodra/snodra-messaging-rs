@@ -234,7 +234,7 @@ impl ProcessorControl {
             mode => Err(refused(Refusal::new(
                 ControlRefusal::Invalid,
                 format!(
-                    "dead letters are not kept in mode {} (KRAKEN_KAFKA_DEAD_LETTER_MODE)",
+                    "dead letters are not kept in mode {} (KRAKEN_EVENTS_DEAD_LETTER_MODE)",
                     mode.as_str()
                 ),
             ))),
@@ -346,9 +346,9 @@ fn summary(l: &DeadLetter) -> proto::DeadLetterSummary {
     proto::DeadLetterSummary {
         id: l.id.clone(),
         processor: l.processor.clone(),
-        topic: l.topic.clone(),
-        partition: l.partition,
-        offset: l.offset,
+        source: l.source.clone(),
+        segment: l.segment.clone(),
+        position: l.position.clone(),
         key: l.key.clone().unwrap_or_default(),
         event_id: l.event_id.clone().unwrap_or_default(),
         event_type: l.event_type.clone().unwrap_or_default(),

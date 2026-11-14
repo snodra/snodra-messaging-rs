@@ -136,7 +136,7 @@ impl SagaContext {
         // a payload that is no JSON object, an integer above i64::MAX) fails the handler now,
         // naming the event, instead of the entry later (ruling 69). The store's
         // `SagaDispatchStore::record` refuses it too, in the saga's transaction.
-        crate::kafka::check_payload(E::TYPE, &serde_json::to_value(event)?)?;
+        crate::events::check_payload(E::TYPE, &serde_json::to_value(event)?)?;
         self.record(DispatchKind::Event, E::TYPE, event, key)
     }
 
