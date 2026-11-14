@@ -1,12 +1,13 @@
 //! The outbox in memory.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
 
 use super::{Data, Inner, OutboxRow, conflict, ready};
-use crate::store::{OutboxEntry, OutboxStore, StoreError, Tx};
+use crate::store::{AppendListener, OutboxEntry, OutboxStore, StoreError, Tx};
 use crate::time::after;
 
 pub(super) struct MemoryOutbox(pub(super) Arc<Inner>);
@@ -72,12 +73,23 @@ impl OutboxStore for MemoryOutbox {
 
     /// Called after every committed append: [`append_now`](OutboxStore::append_now) at once,
     /// [`append`](OutboxStore::append) when its transaction commits.
-    fn on_append(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+    fn on_append(&self, wake: Arc<dyn Fn() + Send + Sync>) -> AppendListener {
+        let id = self.0.next_waker.fetch_add(1, Ordering::Relaxed);
         self.0
             .wakers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .push(wake);
+            .insert(id, wake);
+        let inner = Arc::downgrade(&self.0);
+        AppendListener::new(move || {
+            if let Some(inner) = inner.upgrade() {
+                inner
+                    .wakers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&id);
+            }
+        })
     }
 
     fn claim<'a>(

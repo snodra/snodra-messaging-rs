@@ -66,6 +66,12 @@ pub struct Config {
     /// comma-separated list of them, or one `dns:///name:port` whose addresses are re-resolved
     /// every 30 s. One address is the single-hub setup.
     pub hub_address: String,
+    /// Whether the service connects to the hubs (`KRAKEN_HUB_ENABLED`, default true). Off, it
+    /// never connects (`hub_address` must still parse, nothing dials it): events, processors, dead letters, sagas and
+    /// idempotent handlers work, and every command, query or subscription sent to another service
+    /// fails at once with `HubUnavailable` naming the setting. For tests and local runs
+    /// (`testing::InMemoryStores` turns it off).
+    pub hub_enabled: bool,
     /// How often an `InstanceStatus` goes to every hub (default 5 s, at least 1 ms).
     pub hub_status_interval: Duration,
     /// Request timeout sent as `timeout_ms` when a call sets none (`SendOptions.timeout` wins).
@@ -206,6 +212,7 @@ impl Config {
             service_name: service_name.to_string(),
             instance_id: uuid::Uuid::new_v4().to_string(),
             hub_address: hub_address.to_string(),
+            hub_enabled: true,
             hub_status_interval: Duration::from_secs(5),
             hub_request_timeout: None,
             reconnect_backoff_min: Duration::from_millis(500),
@@ -294,7 +301,7 @@ impl Config {
 
     /// `KRAKEN_SERVICE_NAME` is required; `KRAKEN_HUB_ADDRESS` defaults to
     /// `static://kraken-hub:7000`. Optional:
-    /// `KRAKEN_INSTANCE_ID`, `KRAKEN_EVENTS_SOURCE`, `KRAKEN_JWKS_URL`, `KRAKEN_ISSUER`, `KRAKEN_HUB_REQUEST_TIMEOUT_MS`,
+    /// `KRAKEN_INSTANCE_ID`, `KRAKEN_HUB_ENABLED`, `KRAKEN_EVENTS_SOURCE`, `KRAKEN_JWKS_URL`, `KRAKEN_ISSUER`, `KRAKEN_HUB_REQUEST_TIMEOUT_MS`,
     /// `KRAKEN_HUB_STATUS_INTERVAL_MS`, `KRAKEN_RECONNECT_BACKOFF_MIN_MS`,
     /// `KRAKEN_RECONNECT_BACKOFF_MAX_MS`,
     /// `KRAKEN_MAX_CONCURRENT_HANDLERS`, `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS`,
@@ -344,6 +351,9 @@ impl Config {
         );
         if let Some(id) = optional("KRAKEN_INSTANCE_ID") {
             c.instance_id = id;
+        }
+        if let Some(v) = optional("KRAKEN_HUB_ENABLED") {
+            c.hub_enabled = flag("KRAKEN_HUB_ENABLED", &v)?;
         }
         if let Some(t) = optional("KRAKEN_EVENTS_SOURCE") {
             c.events_source = t;
@@ -1875,6 +1885,13 @@ mod tests {
         ]);
         assert_eq!(c.outbox_lease, Duration::from_secs(90));
         assert!(!c.store_init_schema);
+    }
+
+    #[test]
+    fn the_hub_can_be_turned_off() {
+        assert!(from(&[]).hub_enabled, "on by default");
+        assert!(!from(&[("KRAKEN_HUB_ENABLED", "false")]).hub_enabled);
+        assert!(try_from(&[("KRAKEN_HUB_ENABLED", "maybe")]).is_err());
     }
 
     #[test]

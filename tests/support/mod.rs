@@ -88,12 +88,11 @@ pub mod order_saga;
 pub mod pki;
 pub mod saga;
 
-/// Opt-in logging for debugging a test: `RUST_LOG=debug cargo test -- --nocapture`.
+/// Opt-in logging for debugging a test: `RUST_LOG=debug cargo test -- --nocapture`. The same
+/// global subscriber as the log captures' ([`logs::install_global`]), so neither turns the other
+/// off.
 pub fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_test_writer()
-        .try_init();
+    logs::install_global();
 }
 
 /// Integration tests need Docker; they skip (with a notice) when it is absent.

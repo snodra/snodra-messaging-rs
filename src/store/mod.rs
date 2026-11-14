@@ -35,7 +35,7 @@ pub use dead_letters::{
     MAX_ERROR_MESSAGE_CHARS, Parked, letter_id,
 };
 pub use external::{ExternalCall, ExternalCallStatus, ExternalCallStore};
-pub use outbox::{OutboxEntry, OutboxStore};
+pub use outbox::{AppendListener, OutboxEntry, OutboxStore};
 pub use processed::{ProcessedEventStore, ProcessedMarker};
 pub use tx::{Tx, TxProvider};
 

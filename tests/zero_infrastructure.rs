@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use kraken_messaging::store::DeadLetterReason;
 use kraken_messaging::testing::InMemoryStores;
-use kraken_messaging::{Event, KrakenMessaging, MessagingError, message_type};
+use kraken_messaging::{Event, KrakenMessaging, MessagingError, SendOptions, message_type};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -129,7 +129,8 @@ async fn waiting_for_what_never_comes_ends() {
     );
 }
 
-/// The relay publishes an append at once (the store wakes it), not at its next poll.
+/// The relay publishes an append at once (the store wakes it), not at its next poll; its
+/// listener goes with it.
 #[tokio::test]
 async fn an_event_is_relayed_without_waiting_for_the_poll() {
     let stores = InMemoryStores::new();
@@ -138,25 +139,147 @@ async fn an_event_is_relayed_without_waiting_for_the_poll() {
     let builder = stores.install(KrakenMessaging::builder(config).await.unwrap());
     let events = builder.events();
     let app = builder.start().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await; // the relay's first poll is done
-    events
+    assert_eq!(stores.store().append_listeners(), 1, "the relay listens");
+    let confirmed = |order: &str| OrderConfirmed {
+        order: order.into(),
+    };
+    // The first may go out with the relay's first poll; the second only through the wake-up
+    // (the next poll is 10 minutes away).
+    for (n, order) in ["o-1", "o-2"].into_iter().enumerate() {
+        events
+            .publish(&confirmed(order), Some(order))
+            .await
+            .unwrap();
+        let relayed = stores
+            .wait_published::<OrderConfirmed>(n + 1, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(relayed[n], confirmed(order));
+    }
+    app.shutdown().await;
+    assert_eq!(
+        stores.store().append_listeners(),
+        0,
+        "no listener outlives its relay"
+    );
+}
+
+/// The application's clock is tokio's: on paused time a saga's deadline an hour away fires when
+/// an hour passes, not before.
+#[tokio::test(start_paused = true)]
+async fn paused_time_moves_the_applications_clock() {
+    #[derive(Default, Serialize, Deserialize)]
+    struct Timed {
+        order: String,
+    }
+    let stores = InMemoryStores::new();
+    let app = stores
+        .install(
+            KrakenMessaging::builder(stores.config("zero"))
+                .await
+                .unwrap(),
+        )
+        .saga::<Timed>("zero.Timed", |saga| {
+            saga.start_on::<OrderPlaced>(
+                "order",
+                |e| Some(e.order.clone()),
+                |s, e, ctx| {
+                    s.order = e.order.clone();
+                    ctx.schedule_after(Duration::from_secs(3600), "timeout", None::<&()>)?;
+                    Ok(())
+                },
+            )
+            .on_deadline::<serde::de::IgnoredAny>("timeout", |s, _, ctx| {
+                ctx.publish(
+                    &OrderConfirmed {
+                        order: s.order.clone(),
+                    },
+                    None,
+                )?;
+                ctx.end();
+                Ok(())
+            })
+        })
+        .start()
+        .await
+        .unwrap();
+    stores
         .publish(
-            &OrderConfirmed {
-                order: "o-9".into(),
+            &OrderPlaced {
+                order: "o-1".into(),
             },
-            Some("o-9"),
+            Some("o-1"),
         )
         .await
         .unwrap();
-    let relayed = stores
-        .wait_published::<OrderConfirmed>(1, Duration::from_secs(5))
+    while stores.store().contents().deadlines.is_empty() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(3000)).await;
+    assert!(
+        stores.published::<OrderConfirmed>().is_empty(),
+        "not before the hour"
+    );
+    tokio::time::sleep(Duration::from_secs(700)).await;
+    let fired = stores
+        .wait_published::<OrderConfirmed>(1, WITHIN)
         .await
         .unwrap();
     assert_eq!(
-        relayed,
+        fired,
         [OrderConfirmed {
-            order: "o-9".into()
+            order: "o-1".into()
         }]
     );
     app.shutdown().await;
+}
+
+/// With the hub turned off, nothing connects, and a command to another service fails at once,
+/// naming the setting.
+#[tokio::test]
+async fn without_a_hub_a_command_fails_at_once_naming_the_setting() {
+    let logs = support::logs::Captured::default();
+    let _guard = logs.install();
+    let stores = InMemoryStores::new();
+    let app = stores
+        .install(
+            KrakenMessaging::builder(stores.config("zero"))
+                .await
+                .unwrap(),
+        )
+        .start()
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let refused = app
+        .commands()
+        .send_command(
+            &PlaceOrder {
+                order: "o-1".into(),
+            },
+            SendOptions::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, MessagingError::HubUnavailable(why) if why.contains("KRAKEN_HUB_ENABLED")),
+        "{refused:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(1), "at once");
+    assert!(!app.await_hub(Duration::from_millis(300)).await);
+    app.shutdown().await;
+    assert!(
+        !logs.text().contains("127.0.0.1:1"),
+        "nothing dials the hub address:\n{}",
+        logs.text()
+    );
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct PlaceOrder {
+    order: String,
+}
+message_type!(PlaceOrder, "zero.PlaceOrder");
+impl kraken_messaging::Command for PlaceOrder {
+    type Reply = ();
 }

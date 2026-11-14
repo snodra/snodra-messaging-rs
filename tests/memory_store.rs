@@ -251,9 +251,10 @@ async fn an_append_wakes_the_relay_once_committed() {
     let outbox = store.outbox();
     let woken = Arc::new(AtomicUsize::new(0));
     let count = Arc::clone(&woken);
-    outbox.on_append(Arc::new(move || {
+    let listener = outbox.on_append(Arc::new(move || {
         count.fetch_add(1, Ordering::SeqCst);
     }));
+    assert_eq!(store.append_listeners(), 1);
     outbox.append_now(entry("e-1")).await.expect("append_now");
     assert_eq!(woken.load(Ordering::SeqCst), 1);
     let mut tx = store.tx().begin().await.expect("begin");
@@ -265,6 +266,10 @@ async fn an_append_wakes_the_relay_once_committed() {
     outbox.append(&mut tx, entry("e-3")).await.expect("append");
     store.tx().abort(&mut tx).await;
     assert_eq!(woken.load(Ordering::SeqCst), 2, "rolled back");
+    drop(listener);
+    assert_eq!(store.append_listeners(), 0, "dropped: removed");
+    outbox.append_now(entry("e-4")).await.expect("append_now");
+    assert_eq!(woken.load(Ordering::SeqCst), 2, "no longer called");
 }
 
 /// A claim's lease runs on the store's clock: by default tokio's, so it passes in paused time.

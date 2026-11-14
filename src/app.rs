@@ -967,6 +967,10 @@ impl KrakenMessagingBuilder {
         }));
 
         hubs.set_registered_types(registry.registered_types());
+        if !config.hub_enabled {
+            hubs.turn_off();
+            tracing::info!("the hub is turned off (KRAKEN_HUB_ENABLED=false): not connecting");
+        }
         hubs.start();
         let loop_sender = Arc::clone(&sender);
         let loop_cancel = cancel.clone();
@@ -1077,7 +1081,12 @@ impl KrakenMessagingBuilder {
             )?;
             tasks.push(sources.start(cancel.clone()));
         }
-        tracing::info!(service = %config.service_name, instance = %hubs.instance_id(), hubs = ?hubs.targets(), commands = ?registry.command_types(), queries = ?registry.exclusive_query_types(), shared_queries = ?registry.shared_query_types(), streaming_queries = ?registry.streaming_query_types(), subscription_queries = ?registry.subscription_query_types(), events = ?registry.event_types(), sagas = ?runtime.as_ref().map(|r| r.saga_types()).unwrap_or_default(), idempotent = ?registry.idempotent_handlers(), processors = ?monitors.iter().map(|m| m.name().to_string()).collect::<Vec<_>>(), dead_letter_mode = config.dead_letter_mode.as_str(), store = store.as_ref().map_or("none", |s| s.name()), event_store = event_store.as_ref().map_or("none", |e| e.name()), "kraken messaging started");
+        let hub_targets = if config.hub_enabled {
+            format!("{:?}", hubs.targets())
+        } else {
+            "off".to_string()
+        };
+        tracing::info!(service = %config.service_name, instance = %hubs.instance_id(), hubs = %hub_targets, commands = ?registry.command_types(), queries = ?registry.exclusive_query_types(), shared_queries = ?registry.shared_query_types(), streaming_queries = ?registry.streaming_query_types(), subscription_queries = ?registry.subscription_query_types(), events = ?registry.event_types(), sagas = ?runtime.as_ref().map(|r| r.saga_types()).unwrap_or_default(), idempotent = ?registry.idempotent_handlers(), processors = ?monitors.iter().map(|m| m.name().to_string()).collect::<Vec<_>>(), dead_letter_mode = config.dead_letter_mode.as_str(), store = store.as_ref().map_or("none", |s| s.name()), event_store = event_store.as_ref().map_or("none", |e| e.name()), "kraken messaging started");
         Ok(KrakenMessaging {
             hubs,
             sender,

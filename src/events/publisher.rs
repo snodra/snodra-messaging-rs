@@ -174,13 +174,11 @@ impl OutboxPublisher {
     /// an append the store reports ([`OutboxStore::on_append`]).
     pub fn start(self: Arc<Self>, cancel: CancellationToken) -> JoinHandle<()> {
         let appended = Arc::new(tokio::sync::Notify::new());
-        let waker = Arc::downgrade(&appended);
-        self.outbox.on_append(Arc::new(move || {
-            if let Some(appended) = waker.upgrade() {
-                appended.notify_one();
-            }
-        }));
+        let woken = Arc::clone(&appended);
+        let listener = self.outbox.on_append(Arc::new(move || woken.notify_one()));
         tokio::spawn(async move {
+            // Registered for as long as the relay runs.
+            let _listener = listener;
             loop {
                 let sent = match self.relay_once().await {
                     Ok(n) => n,
@@ -304,19 +302,26 @@ impl OutboxPublisher {
     /// The event of `d`: its headers, with `type`, `id`, `timestamp` and `source` (the service)
     /// set from the entry.
     fn event(&self, d: &OutboxEntry) -> OutgoingEvent {
-        let mut all = d.headers.clone();
-        all.insert(headers::TYPE.into(), d.type_name.clone());
-        all.insert(headers::ID.into(), d.id.clone());
-        all.insert(headers::TIMESTAMP.into(), rfc3339(d.created_at_ms));
-        all.insert(headers::SOURCE.into(), self.service_name.clone());
-        OutgoingEvent {
-            source: self.source.clone(),
-            id: d.id.clone(),
-            type_name: d.type_name.clone(),
-            key: d.key.clone(),
-            headers: all,
-            payload: d.payload.clone(),
-        }
+        outgoing_event(d, &self.source, &self.service_name)
+    }
+}
+
+/// The event the outbox entry `entry` of the service `service` becomes on the event store's
+/// `source`: its headers, plus the type, the id, the timestamp (its creation) and the source (the
+/// publishing service) headers.
+pub(crate) fn outgoing_event(entry: &OutboxEntry, source: &str, service: &str) -> OutgoingEvent {
+    let mut all = entry.headers.clone();
+    all.insert(headers::TYPE.into(), entry.type_name.clone());
+    all.insert(headers::ID.into(), entry.id.clone());
+    all.insert(headers::TIMESTAMP.into(), rfc3339(entry.created_at_ms));
+    all.insert(headers::SOURCE.into(), service.to_string());
+    OutgoingEvent {
+        source: source.to_string(),
+        id: entry.id.clone(),
+        type_name: entry.type_name.clone(),
+        key: entry.key.clone(),
+        headers: all,
+        payload: entry.payload.clone(),
     }
 }
 

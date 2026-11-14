@@ -1,10 +1,22 @@
 //! The in-memory message store (ADR 0028): every store of [`crate::store`] in the process's
 //! memory, for tests, local runs and single-process demos, with no database.
 //!
-//! ```ignore
-//! let app = KrakenMessaging::builder(config).await?
+//! ```no_run
+//! # use std::sync::Arc;
+//! # use kraken_messaging::event_store::memory::MemoryEventStore;
+//! # use kraken_messaging::store::memory::MemoryStore;
+//! # use kraken_messaging::{Config, KrakenMessaging, MessagingError};
+//! # async fn run(config: Config) -> Result<(), MessagingError> {
+//! let app = KrakenMessaging::builder(config)
+//!     .await?
 //!     .store(Arc::new(MemoryStore::new()))
-//!     .event_store(Arc::new(MemoryEventStore::default())) /* ... */;
+//!     .event_store(Arc::new(MemoryEventStore::default()))
+//!     // the service's handlers
+//!     .start()
+//!     .await?;
+//! # app.shutdown().await;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! It keeps the contract of a database add-on, which the store conformance kit checks:
@@ -85,6 +97,7 @@ impl MemoryStore {
                 ttl_clock: Clock::tokio(),
                 next_tx: AtomicU64::new(1),
                 wakers: Mutex::default(),
+                next_waker: AtomicU64::new(1),
             }),
         }
     }
@@ -100,8 +113,10 @@ pub(super) struct Inner {
     ttl_clock: Clock,
     /// The id of the next transaction.
     next_tx: AtomicU64,
-    /// Called after an outbox append commits ([`OutboxStore::on_append`]).
-    wakers: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
+    /// Called after an outbox append commits ([`OutboxStore::on_append`]), by listener id.
+    wakers: Mutex<BTreeMap<u64, Arc<dyn Fn() + Send + Sync>>>,
+    /// The id of the next listener.
+    next_waker: AtomicU64,
 }
 
 impl Inner {
@@ -118,11 +133,13 @@ impl Inner {
 
     /// Calls every [`OutboxStore::on_append`] waker (never under the data lock).
     fn wake(&self) {
-        let wakers = self
+        let wakers: Vec<_> = self
             .wakers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .clone();
+            .values()
+            .cloned()
+            .collect();
         for wake in wakers {
             wake();
         }
@@ -648,6 +665,15 @@ pub struct MemoryContents {
 
 #[cfg(feature = "testing")]
 impl MemoryStore {
+    /// How many [`OutboxStore::on_append`] listeners are registered.
+    pub fn append_listeners(&self) -> usize {
+        self.inner
+            .wakers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
+    }
+
     /// A copy of what the store holds, committed.
     pub fn contents(&self) -> MemoryContents {
         let data = self.inner.data();

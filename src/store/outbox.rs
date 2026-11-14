@@ -88,14 +88,39 @@ pub trait OutboxStore: Send + Sync {
     fn pending(&self) -> BoxFuture<'_, Result<u64, StoreError>>;
 
     /// Registers `wake`, called each time an append commits (on its own, or with its
-    /// transaction), so the relay publishes at once instead of at its next poll. A store that
-    /// cannot tell ignores it (the default): the relay then polls
-    /// (`Config::outbox_poll_interval`). `wake` must return at once.
-    fn on_append(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+    /// transaction), so the relay publishes at once instead of at its next poll; registered while
+    /// the returned [`AppendListener`] lives. A store that cannot tell ignores it (the default):
+    /// the relay then polls (`Config::outbox_poll_interval`). `wake` must return at once.
+    fn on_append(&self, wake: Arc<dyn Fn() + Send + Sync>) -> AppendListener {
         let _ = wake;
+        AppendListener::none()
     }
 
     /// `created_at_ms` of the oldest pending entry (neither sent nor failed, held or not); `None`
     /// when none is pending: the outbox age gauge.
     fn oldest_pending(&self) -> BoxFuture<'_, Result<Option<i64>, StoreError>>;
+}
+
+/// A listener registered by [`OutboxStore::on_append`]: dropping it removes the listener.
+#[must_use = "the listener is removed when this is dropped"]
+pub struct AppendListener(Option<Box<dyn FnOnce() + Send>>);
+
+impl AppendListener {
+    /// A listener that `remove` takes away when dropped.
+    pub fn new(remove: impl FnOnce() + Send + 'static) -> AppendListener {
+        AppendListener(Some(Box::new(remove)))
+    }
+
+    /// Nothing registered (a store that does not call its listeners).
+    pub fn none() -> AppendListener {
+        AppendListener(None)
+    }
+}
+
+impl Drop for AppendListener {
+    fn drop(&mut self) {
+        if let Some(remove) = self.0.take() {
+            remove();
+        }
+    }
 }

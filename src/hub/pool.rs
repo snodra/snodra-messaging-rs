@@ -223,6 +223,8 @@ pub struct HubPool {
     processor_status: Mutex<Option<ProcessorStatusSource>>,
     /// Built around one connection the caller owns ([`HubPool::of`]): no tasks of its own.
     external: bool,
+    /// Turned off ([`turn_off`](Self::turn_off), `Config::hub_enabled` false): never connects.
+    off: AtomicBool,
     started: AtomicBool,
     cancel: CancellationToken,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -312,6 +314,7 @@ impl HubPool {
             roll_delay: Mutex::new(Arc::new(|bound| roll_delay(bound, random_unit()))),
             processor_status: Mutex::new(None),
             external,
+            off: AtomicBool::new(false),
             started: AtomicBool::new(false),
             cancel: CancellationToken::new(),
             tasks: Mutex::new(vec![]),
@@ -363,9 +366,30 @@ impl HubPool {
         *self.roll_delay.lock().unwrap() = source;
     }
 
-    /// Starts every connection, the status reports and (for `dns:///`) the resolution loop.
+    /// Turns the pool off before [`start`](Self::start): it never connects, and a send fails at
+    /// once with `HubUnavailable` naming `KRAKEN_HUB_ENABLED`.
+    pub fn turn_off(&self) {
+        self.off.store(true, Ordering::SeqCst);
+    }
+
+    /// What a send fails with when no hub took it.
+    fn unavailable(&self) -> MessagingError {
+        MessagingError::HubUnavailable(if self.off.load(Ordering::SeqCst) {
+            "the hub is turned off (KRAKEN_HUB_ENABLED=false, Config::hub_enabled): nothing is \
+             sent to other services"
+                .into()
+        } else {
+            "not connected to the hub".into()
+        })
+    }
+
+    /// Starts every connection, the status reports and (for `dns:///`) the resolution loop;
+    /// nothing when turned off.
     pub fn start(self: &Arc<Self>) {
-        if self.external || self.started.swap(true, Ordering::SeqCst) {
+        if self.external
+            || self.off.load(Ordering::SeqCst)
+            || self.started.swap(true, Ordering::SeqCst)
+        {
             return;
         }
         for m in self.members() {
@@ -578,8 +602,7 @@ impl HubPool {
                 }
             }
         }
-        Err(last
-            .unwrap_or_else(|| MessagingError::HubUnavailable("not connected to the hub".into())))
+        Err(last.unwrap_or_else(|| self.unavailable()))
     }
 
     /// Like [`send_where`](Self::send_where) over the live hubs whose address is not in `tried`, which also
@@ -606,8 +629,7 @@ impl HubPool {
                 }
             }
         }
-        Err(last
-            .unwrap_or_else(|| MessagingError::HubUnavailable("not connected to the hub".into())))
+        Err(last.unwrap_or_else(|| self.unavailable()))
     }
 
     /// Writes `msg` to the hub stream `stream`, if it is still the current stream of its

@@ -3,22 +3,40 @@
 //! broker, no database and no container. The test publishes events to the service as another
 //! service would, and reads back what the service published and its dead letters:
 //!
-//! ```ignore
+//! ```no_run
+//! # use std::time::Duration;
+//! # use kraken_messaging::testing::InMemoryStores;
+//! # use kraken_messaging::{Event, KrakenMessaging, MessagingError, message_type};
+//! # #[derive(serde::Serialize, serde::Deserialize)]
+//! # struct OrderPlaced { order: String }
+//! # message_type!(OrderPlaced, "orders.OrderPlaced");
+//! # impl Event for OrderPlaced {}
+//! # #[derive(serde::Serialize, serde::Deserialize)]
+//! # struct OrderConfirmed { order: String }
+//! # message_type!(OrderConfirmed, "orders.OrderConfirmed");
+//! # impl Event for OrderConfirmed {}
+//! # async fn run() -> Result<(), MessagingError> {
 //! let stores = InMemoryStores::new();
 //! let app = stores
 //!     .install(KrakenMessaging::builder(stores.config("orders")).await?)
-//!     .event::<OrderPlaced, _, _>(place_order) // the service's own registrations
+//!     // the service's own registrations
+//!     .event::<OrderPlaced, _, _>(|_placed, _ctx| async { Ok(()) })
 //!     .start()
 //!     .await?;
-//! let event_id = stores.publish(&OrderPlaced { .. }, Some("o-1")).await?;
+//! let order = OrderPlaced { order: "o-1".into() };
+//! let event_id = stores.publish(&order, Some("o-1")).await?;
 //! let confirmed: Vec<OrderConfirmed> = stores.wait_published(1, Duration::from_secs(10)).await?;
 //! assert!(stores.processed(&event_id));
 //! let letters = stores.dead_letters().await?;
+//! # app.shutdown().await;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! Events, processors, dead letters, sagas and idempotent handlers run as on any store; commands
-//! and queries need a hub, which [`InMemoryStores::config`] does not point at (a test of those
-//! uses a hub as before). The stores warn at startup that they are not durable.
+//! and queries need a hub, which [`InMemoryStores::config`] turns off (a test of those uses a hub
+//! as before). The application's clock is [`Clock::tokio`], so paused time moves it. The stores
+//! warn at startup that they are not durable.
 
 use std::time::Duration;
 
@@ -26,11 +44,11 @@ use crate::app::KrakenMessagingBuilder;
 use crate::config::Config;
 use crate::error::MessagingError;
 use crate::event_store::memory::MemoryEventStore;
-use crate::event_store::{EventStore, OutgoingEvent, headers};
-use crate::events::new_outbox_entry;
+use crate::event_store::{EventStore, headers};
+use crate::events::{new_outbox_entry, outgoing_event};
+use crate::saga::Clock;
 use crate::store::memory::MemoryStore;
 use crate::store::{DeadLetter, MessageStore};
-use crate::time::rfc3339;
 use crate::types::Event;
 
 /// The `source` header of the events [`InMemoryStores::publish`] publishes: "another service".
@@ -64,20 +82,26 @@ impl InMemoryStores {
         }
     }
 
-    /// A configuration for `service` in this mode: its events on this pair's source and a hub
-    /// address nothing listens at (`static://127.0.0.1:1`), since events need no hub. (The
-    /// relay needs no short poll: the in-memory store wakes it on every append.)
+    /// A configuration for `service` in this mode: its events on this pair's source and the hub
+    /// turned off ([`Config::hub_enabled`] false: nothing connects or logs reconnects; a command
+    /// or query to another service fails at once). The relay needs no short poll: the in-memory
+    /// store wakes it on every append.
     pub fn config(&self, service: &str) -> Config {
         let mut config = Config::new(service, "static://127.0.0.1:1");
         config.events_source = self.source.clone();
+        config.hub_enabled = false;
         config
     }
 
-    /// `builder` with both stores.
+    /// `builder` with both stores and [`Clock::tokio`] as the application's clock, so a test on
+    /// paused time (`#[tokio::test(start_paused = true)]`, `tokio::time::advance`) moves the
+    /// leases, claims, deadlines and every time the library stamps. A later `.clock(..)` on the
+    /// builder replaces it.
     pub fn install(&self, builder: KrakenMessagingBuilder) -> KrakenMessagingBuilder {
         builder
             .store(std::sync::Arc::new(self.store.clone()))
             .event_store(std::sync::Arc::new(self.events.clone()))
+            .clock(Clock::tokio())
     }
 
     /// The event store.
@@ -98,19 +122,7 @@ impl InMemoryStores {
         key: Option<&str>,
     ) -> Result<String, MessagingError> {
         let entry = new_outbox_entry(event, key, None, 0)?;
-        let mut all = entry.headers;
-        all.insert(headers::TYPE.into(), entry.type_name.clone());
-        all.insert(headers::ID.into(), entry.id.clone());
-        all.insert(headers::TIMESTAMP.into(), rfc3339(entry.created_at_ms));
-        all.insert(headers::SOURCE.into(), TEST_PUBLISHER.into());
-        let outgoing = OutgoingEvent {
-            source: self.source.clone(),
-            id: entry.id.clone(),
-            type_name: entry.type_name,
-            key: entry.key,
-            headers: all,
-            payload: entry.payload,
-        };
+        let outgoing = outgoing_event(&entry, &self.source, TEST_PUBLISHER);
         self.events
             .publish(&outgoing)
             .await

@@ -136,6 +136,7 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 | `KRAKEN_SERVICE_NAME` | required | hub `service_name`, base of every processor's consumer group (`<service>.<processor>`, `default` included), event `source` |
 | `KRAKEN_INSTANCE_ID` | a fresh UUID per `Config` | `Config.instance_id`: the hub `Register.instance_id`, and the `service.instance.id` the application gives its meter provider (see [Metrics](#metrics)); unique among the service's instances (a pod name, for example) |
 | `KRAKEN_HUB_ADDRESS` | `static://kraken-hub:7000` | the hub's gRPC target (`static://` optional), a comma-separated list of them, or one `dns:///name:port` re-resolved every 30 s (see [Multiple hubs](#multiple-hubs)); one target is the single-hub setup |
+| `KRAKEN_HUB_ENABLED` | true | `Config.hub_enabled`: `false` never connects to a hub (the address must still parse): events, processors, dead letters, sagas and idempotent handlers work, and a command, query or subscription to another service fails at once with `HubUnavailable`. For tests and local runs (see [In-memory stores](#in-memory-stores)) |
 | `KRAKEN_HUB_STATUS_INTERVAL_MS` | 5000 | how often `InstanceStatus` goes to every hub (at least 1) |
 | `KRAKEN_EVENTS_SOURCE` | `kraken.events` | the event store's source the service publishes to and its processors read (the Kafka add-on's topic; its servers: `KRAKEN_KAFKA_BOOTSTRAP`, `KafkaConfig::from_env`) |
 | `KRAKEN_JWKS_URL`, `KRAKEN_ISSUER` | unset | set both to verify forwarded tokens (RS256, `exp`, `iss`); unset = read signed tokens unverified, warned once |
@@ -1136,6 +1137,9 @@ let app = KrakenMessaging::builder(config).await?
 - **Not durable.** Everything is lost when the process ends, and both stores keep everything they
   are given until then (bounding it is the caller's concern). `start()` warns at WARN:
   `in-memory message store: not durable` and `in-memory event store: not durable`.
+- **Linear cost.** Nothing is purged, and the message store scans every entry under one lock for
+  each relay wake-up and claim: the longer a process runs and the more it relays, the slower each
+  pass. Fine for tests, local runs and demos, not for load.
 - **One process.** Every clone of a store is the same store: hand clones to the instances of a
   test to make them compete for a processor's segments, or relay one outbox.
 - **The event store** (`event_store::memory`) keeps one log per source split into a fixed number of
@@ -1175,8 +1179,12 @@ assert!(stores.processed(&event_id)); // the event's processed marker is committ
 let letters = stores.dead_letters().await?;
 ```
 
-Events, processors, dead letters, sagas and idempotent handlers need no hub; commands and queries
-do, and `stores.config(..)` points at none. `MemoryEventStore::events(source)` and
+`stores.config(..)` turns the hub off (`Config::hub_enabled = false`, `KRAKEN_HUB_ENABLED=false`
+in any service): nothing connects, and a command, query or subscription to another service fails at
+once with `HubUnavailable` naming the setting; events, processors, dead letters, sagas and
+idempotent handlers need no hub. `stores.install(..)` makes `Clock::tokio()` the application's clock,
+so a test on paused time (`#[tokio::test(start_paused = true)]`) moves the leases, claims and saga
+deadlines (a later `.clock(..)` replaces it). `MemoryEventStore::events(source)` and
 `MemoryStore::contents()` show what each store holds. `examples/service-c` tests its `audit`
 processor this way (`src/audit.rs`).
 
@@ -1526,7 +1534,7 @@ report to; it also keeps `app.saga_stats()`. The instrument names are constants 
 ```bash
 brew install cmake protobuf          # librdkafka is built from source; protoc for the proto
 cargo build
-cargo test                            # unit tests + integration tests (Docker required for the latter)
+cargo test --all-features             # unit + integration tests (the in-memory suites need the feature `testing`; Docker for the container-backed ones)
 ```
 
 Most tests run on the in-memory stores (see [In-memory stores](#in-memory-stores)) and need no

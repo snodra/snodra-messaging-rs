@@ -19,6 +19,8 @@ pub use consumer::{
 pub use dispatch::{LocalEventDispatcher, NoSagas, SagaStage};
 pub use outbox::{EventBus, new_outbox_entry};
 pub(crate) use outbox::{check_payload, check_payload_text};
+#[cfg(feature = "testing")]
+pub(crate) use publisher::outgoing_event;
 pub use publisher::{OUTBOX_SEND_TIMEOUT, OutboxPublisher, OutboxPublisherSettings};
 pub(crate) use resubscribe::{Ended, Resubscribing, keep_subscribed};
 pub use resubscribe::{RESUBSCRIBE_MAX, RESUBSCRIBE_MIN};
