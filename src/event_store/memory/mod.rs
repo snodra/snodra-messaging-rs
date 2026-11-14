@@ -1,10 +1,22 @@
 //! The in-memory event store (ADR 0027): the whole event-store contract inside one process, for
 //! tests, local runs and single-process demos, with no infrastructure.
 //!
-//! ```ignore
-//! let app = KrakenMessaging::builder(config).await?
+//! ```no_run
+//! # use std::sync::Arc;
+//! # use kraken_messaging::event_store::memory::MemoryEventStore;
+//! # use kraken_messaging::store::memory::MemoryStore;
+//! # use kraken_messaging::{Config, KrakenMessaging, MessagingError};
+//! # async fn run(config: Config) -> Result<(), MessagingError> {
+//! let app = KrakenMessaging::builder(config)
+//!     .await?
 //!     .event_store(Arc::new(MemoryEventStore::default()))
-//!     .store(Arc::new(MemoryStore::new())) /* ... */;
+//!     .store(Arc::new(MemoryStore::new()))
+//!     // the service's handlers
+//!     .start()
+//!     .await?;
+//! # app.shutdown().await;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! - **One log per source**, split into a fixed number of segments
@@ -143,6 +155,7 @@ impl MemoryEventStore {
                 browse: config.browse,
                 clock: config.clock,
                 tails: AtomicUsize::new(0),
+                searches: AtomicUsize::new(0),
             }),
         }
     }
@@ -159,6 +172,8 @@ pub(super) struct Shared {
     clock: Clock,
     /// Tails open now.
     tails: AtomicUsize,
+    /// Searches, record reads, sources and lag listings running now.
+    searches: AtomicUsize,
 }
 
 impl Shared {

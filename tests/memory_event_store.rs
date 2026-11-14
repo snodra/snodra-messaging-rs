@@ -338,7 +338,7 @@ async fn a_segment_moves_only_after_its_holder_let_it_go() {
 }
 
 /// The subscription waits on the store, not on a timer: under paused time it delivers as soon as
-/// an event is published, and a tail ends after its duration of paused time.
+/// an event is published, 30 s of paused time later.
 #[tokio::test(start_paused = true)]
 async fn it_runs_on_paused_time() {
     let events = MemoryEventStore::default();
@@ -359,6 +359,65 @@ async fn it_runs_on_paused_time() {
     assert_eq!(d.headers["id"], "e-1");
     assert_eq!(started.elapsed(), Duration::from_secs(30));
     sub.close().await;
+}
+
+/// A search that reads a large source does not hold the store for its length: a publish made
+/// while it runs waits at most a chunk's copy, not the search.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_search_does_not_hold_up_a_publish() {
+    const EVENTS: usize = 300_000;
+    let events = store(MemoryEventStoreConfig {
+        browse: BrowseSettings {
+            sources: vec![SOURCE.to_string()],
+            max_scanned: 1_000_000,
+            ..BrowseSettings::default()
+        },
+        ..MemoryEventStoreConfig::default()
+    });
+    for i in 0..EVENTS {
+        events
+            .publish(&event(SOURCE, &format!("k-{}", i % 64), &format!("e-{i}")))
+            .await
+            .expect("publish");
+    }
+    let browser = events.browser().expect("a browser");
+    let request = kraken_messaging::event_store::browse::SearchRequest {
+        filters: kraken_messaging::event_store::browse::EventFilter {
+            q: Some("nowhere in any payload".into()),
+            ..Default::default()
+        },
+        max_scanned: Some(1_000_000),
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    let search = tokio::spawn(async move { browser.search(request).await });
+    let mut slowest = Duration::ZERO;
+    let mut published = 0;
+    while !search.is_finished() {
+        let before = std::time::Instant::now();
+        events
+            .publish(&event(SOURCE, "k-late", &format!("late-{published}")))
+            .await
+            .expect("publish");
+        slowest = slowest.max(before.elapsed());
+        published += 1;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let took = started.elapsed();
+    let page = search.await.expect("the search task").expect("the search");
+    assert!(
+        page.scanned >= EVENTS as u64,
+        "the search read the whole source: {}",
+        page.scanned
+    );
+    assert!(
+        took > Duration::from_millis(100) && published > 10,
+        "the search is long enough to tell ({took:?}, {published} publishes meanwhile)"
+    );
+    assert!(
+        slowest * 4 < took,
+        "a publish waited {slowest:?} during a search of {took:?}"
+    );
 }
 
 /// At most `max_tails` tails at once: one more is busy, and a tail that ended frees its slot.
