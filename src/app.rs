@@ -64,6 +64,9 @@ use crate::types::{Command, Event, MessageType, Query, StreamingQuery, Subscript
 
 /// How long a shutdown waits for the subscriptions' `ReplyEnd`s to be written.
 const SUBSCRIPTION_END_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a graceful shutdown waits for the hubs to ack its empty registration (as
+/// kraken-messaging's `HubLifecycle.stop`).
+pub const DEREGISTER_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long a shutdown waits for the saga relay, the deadline scheduler and the sampler (ruling 64).
 const SAGA_STOP_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -311,7 +314,8 @@ impl KrakenMessaging {
 
     /// True once a hub (with several: at least one, so requests can be sent) confirmed this
     /// instance's registration. kraken-messaging's `HubConnections.awaitRegistered` waits for
-    /// every hub; that is [`await_all_hubs`](Self::await_all_hubs) here.
+    /// every hub; that is [`await_all_hubs`](Self::await_all_hubs) here. False at once when the
+    /// hub is turned off ([`Config::hub_enabled`](crate::Config::hub_enabled)).
     pub async fn await_hub(&self, timeout: Duration) -> bool {
         self.hubs.await_registered(timeout).await
     }
@@ -319,17 +323,25 @@ impl KrakenMessaging {
     /// True once every hub of `hub_address` confirmed this instance's registration (with
     /// `dns:///`: every address of the latest resolution; a second target of a hub already reached
     /// does not count). Use it when every hub must be able to route to this instance before
-    /// going on, e.g. before taking traffic in a rollout.
+    /// going on, e.g. before taking traffic in a rollout. False at once when the hub is turned
+    /// off.
     pub async fn await_all_hubs(&self, timeout: Duration) -> bool {
         self.hubs.await_all_registered(timeout).await
     }
 
-    /// Stops the saga relay (its sends in flight finish, bounded), the deadline scheduler and the
-    /// gauge sampler, then drains in-flight handlers (bounded), completes the subscriptions served here with a
-    /// `ReplyEnd` (best effort, bounded), closes every hub stream (each hub drops this instance
-    /// at once), stops the outbox publisher and the consumer. Pending outgoing requests fail
-    /// with `HubConnectionLost`.
+    /// First registers no types with every hub and waits for their acks (at most
+    /// [`DEREGISTER_TIMEOUT`]): each hub stops routing to this instance and hands the requests
+    /// it queued for it to the other instances at once (kraken-messaging's `HubLifecycle.stop`).
+    /// Then stops the saga relay (its sends in flight finish, bounded), the deadline scheduler
+    /// and the gauge sampler, drains in-flight handlers (bounded; their replies still go
+    /// through), completes the subscriptions served here with a `ReplyEnd` (best effort,
+    /// bounded), closes every hub stream (each hub drops this instance at once), stops the
+    /// outbox publisher and the consumer. Pending outgoing requests fail with
+    /// `HubConnectionLost`.
     pub async fn shutdown(self) {
+        if !self.hubs.deregister(DEREGISTER_TIMEOUT).await {
+            tracing::debug!("not every hub confirmed the empty registration before shutdown");
+        }
         // The saga relay and the deadline scheduler first, while the hub and the consumer still
         // run: the relay's sends in flight finish (or are abandoned after 15 s, their leases
         // expire and another instance takes the sagas over).

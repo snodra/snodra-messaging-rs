@@ -482,3 +482,123 @@ async fn shutdown_fails_outgoing_requests_in_flight_with_hub_connection_lost() {
     release.notify_one();
     b.shutdown().await;
 }
+
+#[derive(Serialize, Deserialize)]
+struct Drain {}
+message_type!(Drain, "t.Drain");
+impl Command for Drain {
+    type Reply = String;
+}
+
+#[derive(Serialize, Deserialize)]
+struct Who {}
+message_type!(Who, "t.Who");
+impl Command for Who {
+    type Reply = String;
+}
+
+/// An instance of `svc-d` named `name`, one handler at a time: `t.Who` answers its name, and
+/// `t.Drain` too, after `gate` opens when one is given (`started` is told when it begins).
+async fn drain_instance(
+    hub: &str,
+    name: &'static str,
+    gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Semaphore>)>,
+) -> KrakenMessaging {
+    let mut cfg = config("svc-d", hub);
+    cfg.outbox_enabled = false;
+    cfg.consumer_enabled = false;
+    cfg.max_concurrent_handlers = 1;
+    KrakenMessaging::builder(cfg)
+        .await
+        .unwrap()
+        .command::<Who, _, _>(move |_, _| async move { Ok(name.to_string()) })
+        .command::<Drain, _, _>(move |_, _| {
+            let gate = gate.clone();
+            async move {
+                if let Some((started, open)) = gate {
+                    started.notify_one();
+                    open.acquire().await.expect("the gate").forget();
+                }
+                Ok(name.to_string())
+            }
+        })
+        .start()
+        .await
+        .unwrap()
+}
+
+/// Kotlin parity (`HubLifecycle.stop`): a graceful shutdown first registers no types with the hub,
+/// so the requests the hub queued for this instance go to another instance at once, not after
+/// the handler drain (up to 10 s) and the stream's close.
+#[tokio::test]
+async fn graceful_shutdown_hands_queued_requests_to_another_instance_at_once() {
+    require_docker!();
+    let hub = support::containers::hub().await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let open = Arc::new(tokio::sync::Semaphore::new(0));
+    let a = drain_instance(
+        &hub.address,
+        "a",
+        Some((Arc::clone(&started), Arc::clone(&open))),
+    )
+    .await;
+    let b = drain_instance(&hub.address, "b", None).await;
+    let mut cfg = config("svc-caller", &hub.address);
+    cfg.outbox_enabled = false;
+    cfg.consumer_enabled = false;
+    let builder = KrakenMessaging::builder(cfg).await.unwrap();
+    let sender = builder.sender();
+    let caller = builder.start().await.unwrap();
+    for app in [&a, &b, &caller] {
+        assert!(app.await_hub(Duration::from_secs(15)).await);
+    }
+    let keyed = |key: &str| SendOptions {
+        routing_key: Some(key.to_string()),
+        timeout: Some(Duration::from_secs(30)),
+        ..Default::default()
+    };
+    // A key the hub routes to A.
+    let mut key = None;
+    for i in 0..200 {
+        let k = format!("k-{i}");
+        if sender.send_command(&Who {}, keyed(&k)).await.unwrap() == "a" {
+            key = Some(k);
+            break;
+        }
+    }
+    let key = key.expect("a key routed to instance a");
+
+    // The first takes A's only permit and waits at the gate; the next two queue at the hub for A.
+    let call = |key: String| {
+        let sender = sender.clone();
+        tokio::spawn(async move { sender.send_command(&Drain {}, keyed(&key)).await })
+    };
+    let first = call(key.clone());
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("A took the first request");
+    let queued = [call(key.clone()), call(key.clone())];
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let shutdown = tokio::spawn(a.shutdown());
+    let handed_over = std::time::Instant::now();
+    for q in queued {
+        let served = tokio::time::timeout(Duration::from_secs(3), q)
+            .await
+            .expect("a queued request served by another instance while A drains")
+            .unwrap()
+            .expect("served");
+        assert_eq!(served, "b");
+    }
+    assert!(
+        handed_over.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        handed_over.elapsed()
+    );
+    // A's handler still finishes its own request, and its reply goes through.
+    open.add_permits(1);
+    assert_eq!(first.await.unwrap().expect("A's own request"), "a");
+    shutdown.await.unwrap();
+    b.shutdown().await;
+    caller.shutdown().await;
+}

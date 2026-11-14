@@ -136,7 +136,7 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
 | `KRAKEN_SERVICE_NAME` | required | hub `service_name`, base of every processor's consumer group (`<service>.<processor>`, `default` included), event `source` |
 | `KRAKEN_INSTANCE_ID` | a fresh UUID per `Config` | `Config.instance_id`: the hub `Register.instance_id`, and the `service.instance.id` the application gives its meter provider (see [Metrics](#metrics)); unique among the service's instances (a pod name, for example) |
 | `KRAKEN_HUB_ADDRESS` | `static://kraken-hub:7000` | the hub's gRPC target (`static://` optional), a comma-separated list of them, or one `dns:///name:port` re-resolved every 30 s (see [Multiple hubs](#multiple-hubs)); one target is the single-hub setup |
-| `KRAKEN_HUB_ENABLED` | true | `Config.hub_enabled`: `false` never connects to a hub (the address must still parse): events, processors, dead letters, sagas and idempotent handlers work, and a command, query or subscription to another service fails at once with `HubUnavailable`. For tests and local runs (see [In-memory stores](#in-memory-stores)) |
+| `KRAKEN_HUB_ENABLED` | true | `Config.hub_enabled`: `false` never connects to a hub (the address must still parse): events, processors, dead letters, sagas and idempotent handlers work, and every command, query and subscription sent fails at once with `HubUnavailable`, those to the service's own handlers included (a sender always goes through the hub); the saga relay still delivers a command type the instance handles to its own handler, and any other saga command goes into the relay's retries. For tests and local runs (see [In-memory stores](#in-memory-stores)) |
 | `KRAKEN_HUB_STATUS_INTERVAL_MS` | 5000 | how often `InstanceStatus` goes to every hub (at least 1) |
 | `KRAKEN_EVENTS_SOURCE` | `kraken.events` | the event store's source the service publishes to and its processors read (the Kafka add-on's topic; its servers: `KRAKEN_KAFKA_BOOTSTRAP`, `KafkaConfig::from_env`) |
 | `KRAKEN_JWKS_URL`, `KRAKEN_ISSUER` | unset | set both to verify forwarded tokens (RS256, `exp`, `iss`); unset = read signed tokens unverified, warned once |
@@ -200,7 +200,7 @@ the caller's `correlationId` and bearer token are forwarded automatically (task-
   hands the store the builder's clock and prepares its schema (`KRAKEN_STORE_INIT_SCHEMA`).
 - **Verified identity** checks signature, `exp`, `nbf` and `iss`; `aud` is not validated (Keycloak sets it, Spring's
   decoder ignores it too). A JWKS outage is `UNAUTHENTICATED` for the caller, never an internal error with a URL.
-- **Shutdown** drains in-flight handlers (10 s bound), closes every hub stream, fails this instance's outgoing requests still in flight with `HubConnectionLost`, stops the publisher and the consumer.
+- **Shutdown** first registers no types with every hub and waits for the acks (at most 1 s), so each hub hands the requests it queued for this instance to the other instances at once (as the Kotlin starter does), then drains in-flight handlers (10 s bound; their replies still go through), closes every hub stream, fails this instance's outgoing requests still in flight with `HubConnectionLost`, stops the publisher and the consumer.
 - **Start** does not wait for the hub. `await_hub(timeout)` tells you when the registration was
   confirmed by at least one hub (requests can then be sent; before that they fail with
   `HubUnavailable`); `await_all_hubs(timeout)` waits until every hub confirmed it (with
@@ -1180,9 +1180,11 @@ let letters = stores.dead_letters().await?;
 ```
 
 `stores.config(..)` turns the hub off (`Config::hub_enabled = false`, `KRAKEN_HUB_ENABLED=false`
-in any service): nothing connects, and a command, query or subscription to another service fails at
-once with `HubUnavailable` naming the setting; events, processors, dead letters, sagas and
-idempotent handlers need no hub. `stores.install(..)` makes `Clock::tokio()` the application's clock,
+in any service): nothing connects, and every command, query and subscription fails at once with
+`HubUnavailable` naming the setting, those to the service's own handlers included (a sender
+always goes through the hub); the saga relay still delivers a command type the instance handles
+to its own handler, and any other saga command goes into the relay's retries. Events,
+processors, dead letters, sagas and idempotent handlers need no hub. `stores.install(..)` makes `Clock::tokio()` the application's clock,
 so a test on paused time (`#[tokio::test(start_paused = true)]`) moves the leases, claims and saga
 deadlines (a later `.clock(..)` replaces it). `MemoryEventStore::events(source)` and
 `MemoryStore::contents()` show what each store holds. `examples/service-c` tests its `audit`

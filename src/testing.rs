@@ -83,8 +83,10 @@ impl InMemoryStores {
     }
 
     /// A configuration for `service` in this mode: its events on this pair's source and the hub
-    /// turned off ([`Config::hub_enabled`] false: nothing connects or logs reconnects; a command
-    /// or query to another service fails at once). The relay needs no short poll: the in-memory
+    /// turned off ([`Config::hub_enabled`] false: nothing connects or logs reconnects; every
+    /// command, query and subscription sent fails at once, those to the service's own handlers
+    /// included; the saga relay still delivers a command type the instance handles to its own
+    /// handler, and any other saga command goes into the relay's retries). The relay needs no short poll: the in-memory
     /// store wakes it on every append.
     pub fn config(&self, service: &str) -> Config {
         let mut config = Config::new(service, "static://127.0.0.1:1");
@@ -95,8 +97,8 @@ impl InMemoryStores {
 
     /// `builder` with both stores and [`Clock::tokio`] as the application's clock, so a test on
     /// paused time (`#[tokio::test(start_paused = true)]`, `tokio::time::advance`) moves the
-    /// leases, claims, deadlines and every time the library stamps. A later `.clock(..)` on the
-    /// builder replaces it.
+    /// outbox leases and claims, the saga deadlines and every time the library stamps. A later
+    /// `.clock(..)` on the builder replaces it.
     pub fn install(&self, builder: KrakenMessagingBuilder) -> KrakenMessagingBuilder {
         builder
             .store(std::sync::Arc::new(self.store.clone()))

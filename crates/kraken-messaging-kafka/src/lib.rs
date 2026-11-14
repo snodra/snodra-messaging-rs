@@ -27,6 +27,13 @@
 //! are refused when the store or browser opens, as when set in code. Values never appear in
 //! `Debug` output or logs: [`KafkaConfig`] shows the property names only.
 //!
+//! **Which value wins** for one property: the environment ([`KafkaConfig::from_env`]) fills the
+//! properties for every client; a [`KafkaConfig::producer_property`] or
+//! [`KafkaConfig::consumer_property`] overrides them for its clients; a later
+//! [`KafkaConfig::property`] (or `producer_property`, `consumer_property`) of the same name
+//! replaces the earlier one, the environment's included. The fixed keys are set last, by the
+//! store itself.
+//!
 //! **TLS** (`security.protocol=SSL` or `SASL_SSL`) needs the cargo feature `ssl` of this crate,
 //! which builds librdkafka with a vendored, statically linked OpenSSL (no system OpenSSL at run
 //! time, so a distroless image works). Without it, a configuration asking for TLS is refused when

@@ -407,7 +407,8 @@ impl Drop for Slot {
 }
 
 impl EventBrowser for MemoryBrowser {
-    /// Runs on a blocking thread (a page may read many records), holding a search slot.
+    /// Runs on a blocking thread (a page may read many records), holding a search slot: needs a
+    /// tokio runtime.
     fn search(&self, request: SearchRequest) -> BoxFuture<'_, Result<SearchPage, BrowseError>> {
         Box::pin(async move {
             let slot = self.search_slot()?;
@@ -482,6 +483,16 @@ mod tests {
         ));
         assert!(matches!(
             browser.lag(LagRequest::default()).await,
+            Err(BrowseError::Busy(_))
+        ));
+        assert!(matches!(
+            browser
+                .get(GetRequest {
+                    segment: "0".into(),
+                    position: "0".into(),
+                    ..GetRequest::default()
+                })
+                .await,
             Err(BrowseError::Busy(_))
         ));
         drop(held);

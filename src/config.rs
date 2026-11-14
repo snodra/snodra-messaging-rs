@@ -67,9 +67,12 @@ pub struct Config {
     /// every 30 s. One address is the single-hub setup.
     pub hub_address: String,
     /// Whether the service connects to the hubs (`KRAKEN_HUB_ENABLED`, default true). Off, it
-    /// never connects (`hub_address` must still parse, nothing dials it): events, processors, dead letters, sagas and
-    /// idempotent handlers work, and every command, query or subscription sent to another service
-    /// fails at once with `HubUnavailable` naming the setting. For tests and local runs
+    /// never connects (`hub_address` must still parse, nothing dials it): events, processors,
+    /// dead letters, sagas and idempotent handlers work, and every command, query and
+    /// subscription sent fails at once with `HubUnavailable` naming the setting, those to the
+    /// service's own handlers included (a sender always goes through the hub). The saga relay
+    /// still delivers a command type this instance handles to its own handler; any other saga
+    /// command goes into the relay's retries. For tests and local runs
     /// (`testing::InMemoryStores` turns it off).
     pub hub_enabled: bool,
     /// How often an `InstanceStatus` goes to every hub (default 5 s, at least 1 ms).

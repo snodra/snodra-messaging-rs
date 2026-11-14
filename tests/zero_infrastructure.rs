@@ -212,9 +212,13 @@ async fn paused_time_moves_the_applications_clock() {
         )
         .await
         .unwrap();
-    while stores.store().contents().deadlines.is_empty() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    tokio::time::timeout(WITHIN, async {
+        while stores.store().contents().deadlines.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the saga's deadline is scheduled");
     tokio::time::sleep(Duration::from_secs(3000)).await;
     assert!(
         stores.published::<OrderConfirmed>().is_empty(),
@@ -282,4 +286,28 @@ struct PlaceOrder {
 message_type!(PlaceOrder, "zero.PlaceOrder");
 impl kraken_messaging::Command for PlaceOrder {
     type Reply = ();
+}
+
+/// With the hub turned off, waiting for it answers `false` at once rather than at the timeout.
+#[tokio::test]
+async fn awaiting_a_hub_that_is_off_answers_false_at_once() {
+    let stores = InMemoryStores::new();
+    let app = stores
+        .install(
+            KrakenMessaging::builder(stores.config("zero"))
+                .await
+                .unwrap(),
+        )
+        .start()
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    assert!(!app.await_hub(Duration::from_secs(30)).await);
+    assert!(!app.await_all_hubs(Duration::from_secs(30)).await);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "answered after {:?}",
+        started.elapsed()
+    );
+    app.shutdown().await;
 }

@@ -953,6 +953,31 @@ impl HubConnection {
             .map_err(|_| MessagingError::HubUnavailable("hub stream closed".into()))
     }
 
+    /// The first step of a graceful shutdown (kraken-messaging's `HubLifecycle.stop`): registers
+    /// no types from now on (a stream opened later registers none either) and writes that
+    /// `Register` to the current handshaken stream, then waits at most `within` for the hub's
+    /// ack. The hub stops routing to this instance and hands its queue to other instances at
+    /// once, while replies to requests it already forwarded still go through. False when there
+    /// is no handshaken stream or the ack did not come in time.
+    pub(crate) async fn deregister_for_shutdown(&self, within: Duration) -> bool {
+        self.set_registered_types(RegisteredTypes::default());
+        let mut acks = self.handshake.subscribe();
+        acks.borrow_and_update();
+        if self.reregister().await.is_err() {
+            return false;
+        }
+        tokio::time::timeout(within, async {
+            while acks.changed().await.is_ok() {
+                if acks.borrow_and_update().is_some() {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     /// Closes stream `stream` gracefully (half-close, then waiting for the hub, bounded) and
     /// reconnects at once, reading the certificate files again: the third and fourth steps of a
     /// certificate rollover. Does nothing when `stream` is not the one being served.

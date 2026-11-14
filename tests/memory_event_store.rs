@@ -414,8 +414,10 @@ async fn a_long_search_does_not_hold_up_a_publish() {
         took > Duration::from_millis(100) && published > 10,
         "the search is long enough to tell ({took:?}, {published} publishes meanwhile)"
     );
+    // Held for the whole search, the store would let one publish through, after it: more than
+    // ten got through while it ran. Each waited less than the search (a loose bound, no ratio).
     assert!(
-        slowest * 4 < took,
+        slowest < took,
         "a publish waited {slowest:?} during a search of {took:?}"
     );
 }

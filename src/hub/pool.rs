@@ -416,8 +416,12 @@ impl HubPool {
     }
 
     /// True once at least one hub confirmed the registration (the client can send); see
-    /// [`await_all_registered`](Self::await_all_registered) for every hub.
+    /// [`await_all_registered`](Self::await_all_registered) for every hub. False at once when the
+    /// pool is turned off ([`turn_off`](Self::turn_off)): no hub ever will.
     pub async fn await_registered(&self, timeout: Duration) -> bool {
+        if self.off.load(Ordering::SeqCst) {
+            return false;
+        }
         let mut changes = self.changes.subscribe();
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -436,8 +440,11 @@ impl HubPool {
     /// True once every hub of the pool confirmed the registration (kraken-messaging's
     /// `HubConnections.awaitRegistered`): there is at least one connection, and every connection still in use
     /// (not a closed duplicate, not draining) has a handshaken stream. With `dns:///`, the hubs of
-    /// the latest resolution.
+    /// the latest resolution. False at once when the pool is turned off.
     pub async fn await_all_registered(&self, timeout: Duration) -> bool {
+        if self.off.load(Ordering::SeqCst) {
+            return false;
+        }
         let mut changes = self.changes.subscribe();
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -661,6 +668,26 @@ impl HubPool {
     /// Lets the pool see whether requests written to a stream are unanswered (draining).
     pub(crate) fn add_pending_probe(&self, probe: PendingProbe) {
         self.probes.lock().unwrap().push(probe);
+    }
+
+    /// The first step of a graceful shutdown: registers no types with every hub (each stops
+    /// routing to this instance and hands its queued requests to the other instances at once;
+    /// replies to what it already forwarded still go through) and waits at most `within` for
+    /// every hub's ack. True when every connected hub acked in time; nothing to do (and true)
+    /// when the pool is turned off.
+    pub async fn deregister(&self, within: Duration) -> bool {
+        if self.off.load(Ordering::SeqCst) {
+            return true;
+        }
+        let members = self.members();
+        futures::future::join_all(
+            members
+                .iter()
+                .map(|m| m.conn.deregister_for_shutdown(within)),
+        )
+        .await
+        .into_iter()
+        .all(|acked| acked)
     }
 
     /// Stops the background tasks and closes every stream (each hub drops this instance at once).
