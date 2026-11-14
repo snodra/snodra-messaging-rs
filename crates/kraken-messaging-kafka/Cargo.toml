@@ -18,6 +18,11 @@ tokio-util = { version = "0.7.20", features = ["rt"] }
 tracing = "0.1.44"
 uuid = { version = "1", features = ["v4"] }
 
+[features]
+# TLS to Kafka (security.protocol SSL or SASL_SSL): librdkafka with a vendored OpenSSL, built from
+# source and linked statically (no system OpenSSL at build or run time; a distroless image works).
+ssl = ["rdkafka/ssl-vendored"]
+
 [dev-dependencies]
 kraken-messaging-rs = { path = "../..", features = ["testing"] }
 kraken-messaging-mongo = { path = "../kraken-messaging-mongo" }

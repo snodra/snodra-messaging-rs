@@ -419,6 +419,23 @@ pub struct KafkaBrowser {
 impl KafkaBrowser {
     /// A browser of `bootstrap` with the store's consumer `properties`, under `settings`
     /// (checked by the store). Connects nothing.
+    /// A browser alone, without the rest of the store (no producer): what a program that only
+    /// reads the event store needs. Checks `config` as [`KafkaEventStore::new`] does (the
+    /// browser reads `config.browse`'s topics with the consumer properties) and connects nothing
+    /// before its first call.
+    ///
+    /// [`KafkaEventStore::new`]: crate::KafkaEventStore::new
+    pub fn open(
+        config: &crate::KafkaConfig,
+    ) -> Result<KafkaBrowser, kraken_messaging::event_store::EventStoreError> {
+        config.validate()?;
+        Ok(KafkaBrowser::new(
+            &config.bootstrap_servers,
+            config.consumer(),
+            config.browse.clone(),
+        ))
+    }
+
     pub(crate) fn new(
         bootstrap: &str,
         properties: HashMap<String, String>,

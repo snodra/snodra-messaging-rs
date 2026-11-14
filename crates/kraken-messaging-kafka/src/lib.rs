@@ -16,6 +16,21 @@
 //! `kafka:19092`), extra librdkafka properties (security, for example) for every client the
 //! store creates, for its producer only or for its consumers only (the browser's consumers
 //! included), and the browser's sources and bounds ([`KafkaConfig::browse`]).
+//!
+//! **Properties from the environment** ([`KafkaConfig::from_env`]): every variable
+//! `KRAKEN_KAFKA_PROPERTY_<NAME>` is a property for every client, its name the `<NAME>` in lower
+//! case with `_` standing for `.` and `__` for a literal `_`:
+//! `KRAKEN_KAFKA_PROPERTY_SECURITY_PROTOCOL=SASL_SSL` is `security.protocol`,
+//! `KRAKEN_KAFKA_PROPERTY_SASL_MECHANISM=SCRAM-SHA-512` is `sasl.mechanism`, and
+//! `KRAKEN_KAFKA_PROPERTY_LOG__LEVEL=6` is `log_level` (the only string property of librdkafka
+//! with an underscore; the others are callbacks set in code). The fixed keys ([`FIXED_KEYS`])
+//! are refused when the store or browser opens, as when set in code. Values never appear in
+//! `Debug` output or logs: [`KafkaConfig`] shows the property names only.
+//!
+//! **TLS** (`security.protocol=SSL` or `SASL_SSL`) needs the cargo feature `ssl` of this crate,
+//! which builds librdkafka with a vendored, statically linked OpenSSL (no system OpenSSL at run
+//! time, so a distroless image works). Without it, a configuration asking for TLS is refused when
+//! the store or browser opens, naming the feature.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -48,8 +63,12 @@ pub const NAME: &str = "kafka";
 /// What the store offers.
 const CAPABILITIES: [Capability; 4] = Capability::ALL;
 
-/// How the store reaches Kafka.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The prefix of the environment variables that carry extra properties
+/// ([`KafkaConfig::from_env`]).
+pub const PROPERTY_PREFIX: &str = "KRAKEN_KAFKA_PROPERTY_";
+
+/// How the store reaches Kafka. Its `Debug` shows the properties' names, never their values.
+#[derive(Clone, PartialEq, Eq)]
 pub struct KafkaConfig {
     /// `host:port` list (`bootstrap.servers`).
     pub bootstrap_servers: String,
@@ -78,11 +97,27 @@ impl KafkaConfig {
         }
     }
 
-    /// `KRAKEN_KAFKA_BOOTSTRAP` (default `kafka:19092`).
+    /// `KRAKEN_KAFKA_BOOTSTRAP` (default `kafka:19092`), and every `KRAKEN_KAFKA_PROPERTY_<NAME>`
+    /// as a property for every client (see the crate docs for the names).
     pub fn from_env() -> KafkaConfig {
-        KafkaConfig::new(&bootstrap_or_default(
-            std::env::var("KRAKEN_KAFKA_BOOTSTRAP").ok(),
-        ))
+        KafkaConfig::from_vars(std::env::vars())
+    }
+
+    /// [`from_env`](Self::from_env) over `vars` (name, value).
+    pub fn from_vars(vars: impl IntoIterator<Item = (String, String)>) -> KafkaConfig {
+        let mut bootstrap = None;
+        let mut properties = HashMap::new();
+        for (name, value) in vars {
+            if name == "KRAKEN_KAFKA_BOOTSTRAP" {
+                bootstrap = Some(value);
+            } else if let Some(property) = property_name(&name) {
+                properties.insert(property, value);
+            }
+        }
+        KafkaConfig {
+            properties,
+            ..KafkaConfig::new(&bootstrap_or_default(bootstrap))
+        }
     }
 
     /// One more librdkafka property, for every client.
@@ -135,9 +170,66 @@ impl KafkaConfig {
             .and_then(|()| {
                 external::reject_fixed_keys("the Kafka producer properties", &self.producer())
             })
+            .and_then(|()| reject_tls_without_feature(&self.producer()))
+            .and_then(|()| reject_tls_without_feature(&self.consumer()))
             .and_then(|()| self.browse.validate())
             .map_err(EventStoreError::Invalid)
     }
+}
+
+impl std::fmt::Debug for KafkaConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaConfig")
+            .field("bootstrap_servers", &self.bootstrap_servers)
+            .field("properties", &names(&self.properties))
+            .field("producer_properties", &names(&self.producer_properties))
+            .field("consumer_properties", &names(&self.consumer_properties))
+            .field("browse", &self.browse)
+            .finish()
+    }
+}
+
+/// The names of `properties`, sorted (what `Debug` shows of them: never a value).
+pub(crate) fn names(properties: &HashMap<String, String>) -> Vec<&str> {
+    let mut names: Vec<&str> = properties.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    names
+}
+
+/// The property a `KRAKEN_KAFKA_PROPERTY_<NAME>` variable sets: `<NAME>` in lower case, `__` a
+/// literal `_`, `_` a `.`; `None` for any other variable or an empty name.
+fn property_name(variable: &str) -> Option<String> {
+    let name = variable.strip_prefix(PROPERTY_PREFIX)?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(
+        name.to_ascii_lowercase()
+            .split("__")
+            .map(|part| part.replace('_', "."))
+            .collect::<Vec<_>>()
+            .join("_"),
+    )
+}
+
+/// Whether this build can speak TLS to Kafka (the cargo feature `ssl`).
+pub const TLS_SUPPORTED: bool = cfg!(feature = "ssl");
+
+/// Refuses `security.protocol` `SSL` or `SASL_SSL` in a build without the feature `ssl`.
+pub(crate) fn reject_tls_without_feature(
+    properties: &HashMap<String, String>,
+) -> Result<(), String> {
+    let asks_tls = properties
+        .get("security.protocol")
+        .is_some_and(|p| p.eq_ignore_ascii_case("ssl") || p.eq_ignore_ascii_case("sasl_ssl"));
+    if asks_tls && !TLS_SUPPORTED {
+        return Err(
+            "security.protocol asks for TLS, but kraken-messaging-kafka was built without its \
+             `ssl` feature: enable it (kraken-messaging-kafka = { ..., features = [\"ssl\"] })"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// The Kafka event store: one producer shared by every publish; each subscription and each admin
@@ -280,6 +372,115 @@ mod tests {
         assert_eq!(store.name(), "kafka");
         assert_eq!(store.capabilities(), Capability::ALL);
         assert!(store.browser().is_some(), "browse: a browser");
+    }
+
+    #[test]
+    fn properties_come_from_the_environment_by_name() {
+        assert_eq!(
+            property_name("KRAKEN_KAFKA_PROPERTY_SECURITY_PROTOCOL").as_deref(),
+            Some("security.protocol")
+        );
+        assert_eq!(
+            property_name("KRAKEN_KAFKA_PROPERTY_SASL_MECHANISM").as_deref(),
+            Some("sasl.mechanism")
+        );
+        assert_eq!(
+            property_name("KRAKEN_KAFKA_PROPERTY_LOG__LEVEL").as_deref(),
+            Some("log_level")
+        );
+        assert_eq!(property_name("KRAKEN_KAFKA_PROPERTY_"), None);
+        assert_eq!(property_name("KRAKEN_KAFKA_BOOTSTRAP"), None);
+        let vars = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let config = KafkaConfig::from_vars(vars(&[
+            ("KRAKEN_KAFKA_BOOTSTRAP", "k1:9092"),
+            ("KRAKEN_KAFKA_PROPERTY_SASL_USERNAME", "svc"),
+            ("KRAKEN_KAFKA_PROPERTY_SASL_PASSWORD", "s3cr3t-value"),
+            ("PATH", "/bin"),
+        ]));
+        assert_eq!(config.bootstrap_servers, "k1:9092");
+        assert_eq!(config.properties["sasl.username"], "svc");
+        assert_eq!(config.properties["sasl.password"], "s3cr3t-value");
+        assert_eq!(config.properties.len(), 2);
+        assert_eq!(
+            KafkaConfig::from_vars(vec![]).bootstrap_servers,
+            "kafka:19092"
+        );
+        // A fixed key from the environment is refused when the store opens.
+        let fixed = KafkaConfig::from_vars(vars(&[("KRAKEN_KAFKA_PROPERTY_GROUP_ID", "x")]));
+        assert!(matches!(
+            KafkaEventStore::new(fixed).err(),
+            Some(EventStoreError::Invalid(m)) if m.contains("group.id")
+        ));
+    }
+
+    #[test]
+    fn debug_shows_property_names_never_values() {
+        let config = KafkaConfig::new("h:1")
+            .property("sasl.password", "s3cr3t-value")
+            .producer_property("ssl.key.password", "other-s3cr3t")
+            .consumer_property("sasl.username", "svc-user");
+        let shown = format!("{config:?}");
+        assert!(shown.contains("sasl.password") && shown.contains("ssl.key.password"));
+        for value in ["s3cr3t-value", "other-s3cr3t", "svc-user"] {
+            assert!(!shown.contains(value), "{shown}");
+        }
+        let source = ExternalSource {
+            properties: HashMap::from([("sasl.password".to_string(), "s3cr3t-value".to_string())]),
+            ..ExternalSource::new("partner.topic")
+        };
+        assert!(!format!("{source:?}").contains("s3cr3t-value"));
+    }
+
+    /// Without the `ssl` feature, asking for TLS fails at open, naming the feature.
+    #[cfg(not(feature = "ssl"))]
+    #[test]
+    fn tls_without_the_feature_is_refused_at_open() {
+        for protocol in ["SSL", "sasl_ssl"] {
+            let config = KafkaConfig::new("h:1").property("security.protocol", protocol);
+            for refused in [
+                KafkaEventStore::new(config.clone()).err(),
+                KafkaBrowser::open(&config).err(),
+            ] {
+                assert!(
+                    matches!(&refused, Some(EventStoreError::Invalid(m)) if m.contains("`ssl` feature")),
+                    "{protocol}: {refused:?}"
+                );
+            }
+        }
+        assert!(
+            KafkaEventStore::new(
+                KafkaConfig::new("h:1").property("security.protocol", "PLAINTEXT")
+            )
+            .is_ok()
+        );
+    }
+
+    /// With it, a TLS configuration opens (librdkafka accepts `security.protocol=SSL`).
+    #[cfg(feature = "ssl")]
+    #[test]
+    fn tls_with_the_feature_opens() {
+        let config = KafkaConfig::new("h:1").property("security.protocol", "SSL");
+        assert!(KafkaEventStore::new(config.clone()).is_ok());
+        assert!(KafkaBrowser::open(&config).is_ok());
+    }
+
+    #[test]
+    fn a_browser_opens_alone_and_checks_its_configuration() {
+        let browser = KafkaBrowser::open(&KafkaConfig::new("127.0.0.1:1")).expect("a browser");
+        let _as_trait: Arc<dyn EventBrowser> = Arc::new(browser);
+        assert!(matches!(
+            KafkaBrowser::open(&KafkaConfig::new(" ")).err(),
+            Some(EventStoreError::Invalid(_))
+        ));
+        assert!(matches!(
+            KafkaBrowser::open(&KafkaConfig::new("h:1").consumer_property("group.id", "x")).err(),
+            Some(EventStoreError::Invalid(_))
+        ));
     }
 
     #[test]

@@ -31,7 +31,8 @@ pub const FIXED_KEYS: [&str; 5] = [
 /// `bootstrap_servers` defaults to the service's own Kafka, `group_id` to
 /// `<service-name>.external.<name>`; `properties` are extra consumer properties (librdkafka
 /// names), never one of [`FIXED_KEYS`].
-#[derive(Clone, Debug, Default)]
+/// Its `Debug` shows the properties' names, never their values.
+#[derive(Clone, Default)]
 pub struct ExternalSource {
     pub bootstrap_servers: Option<String>,
     pub topic: String,
@@ -63,14 +64,37 @@ pub(crate) fn reject_fixed_keys(
     }
 }
 
-/// A registered partner topic, ready to be read.
-#[derive(Clone, Debug)]
+impl std::fmt::Debug for ExternalSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalSource")
+            .field("bootstrap_servers", &self.bootstrap_servers)
+            .field("topic", &self.topic)
+            .field("group_id", &self.group_id)
+            .field("properties", &crate::names(&self.properties))
+            .finish()
+    }
+}
+
+/// A registered partner topic, ready to be read. Its `Debug` shows the properties' names only.
+#[derive(Clone)]
 pub struct KafkaExternalSource {
     name: String,
     topic: String,
     group_id: String,
     bootstrap_servers: String,
     properties: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for KafkaExternalSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaExternalSource")
+            .field("name", &self.name)
+            .field("topic", &self.topic)
+            .field("group_id", &self.group_id)
+            .field("bootstrap_servers", &self.bootstrap_servers)
+            .field("properties", &crate::names(&self.properties))
+            .finish()
+    }
 }
 
 impl KafkaExternalSource {
@@ -92,6 +116,7 @@ impl KafkaExternalSource {
             return invalid(format!("external source '{name}' needs a topic"));
         }
         reject_fixed_keys(&format!("external source '{name}'"), &source.properties)
+            .and_then(|()| crate::reject_tls_without_feature(&source.properties))
             .map_err(EventStoreError::Invalid)?;
         Ok(KafkaExternalSource {
             name: name.to_string(),
