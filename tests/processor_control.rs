@@ -1742,36 +1742,37 @@ async fn a_letter_parked_during_a_replay_is_retried_as_a_replay() {
 }
 
 /// Review focus 4 (ADR 0027): segments reassigned during an open replay range keep replaying up
-/// to `replay_until` on their new owner and nowhere else. One instance holds both segments of an
-/// in-process event store (`support::event_store`) when it resets them to earliest (the ranges
+/// to `replay_until` on their new owner and nowhere else, on the in-memory stores (no container).
+/// One instance holds both segments of the event store when it resets them to earliest (the ranges
 /// end at the two records each already handled), and gets its consumer back paused; a second
 /// instance joins and takes segment 1 over. On the resume each replays the range of its own
 /// segment (without the handler that disallows replay) and handles what came after the reset
 /// as new records; neither ever sees the other's segment.
 #[tokio::test]
 async fn replay_range_survives_reassignment() {
-    require_docker!();
-    let mongo = support::containers::mongo().await;
-    let uri = mongo.uri_for("reassign");
-    let db = support::mongo_db(&uri).await;
-    let events =
-        support::event_store::Log::new(kraken_messaging::event_store::Capability::ALL.to_vec());
+    let store = kraken_messaging::store::memory::MemoryStore::new();
+    use kraken_messaging::event_store::memory::{MemoryEventStore, MemoryEventStoreConfig};
+    let events = MemoryEventStore::new(MemoryEventStoreConfig {
+        segments: 2,
+        ..MemoryEventStoreConfig::default()
+    })
+    .unwrap();
     let topic = "rr.events";
     // (instance, note) of every run of the handler, and of the one that disallows replay.
     let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
     let once: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
     let start = |instance: &'static str| {
-        let (seen, once, uri, events) = (
+        let (seen, once, store, events) = (
             Arc::clone(&seen),
             Arc::clone(&once),
-            uri.clone(),
+            store.clone(),
             events.clone(),
         );
         async move {
             KrakenMessaging::builder(config("svc-rr", "static://127.0.0.1:1", topic))
                 .await
                 .unwrap()
-                .store(support::mongo_store(&uri).await)
+                .store(Arc::new(store))
                 .event_store(Arc::new(events))
                 .event::<Noted, _, _>(move |e, _| {
                     seen.lock()
@@ -1790,8 +1791,8 @@ async fn replay_range_survives_reassignment() {
                 .unwrap()
         }
     };
-    // Without a key the double spreads the records round robin: n-0 and n-2 go to segment 1,
-    // n-1 and n-3 to segment 0, each at positions 0 and 1.
+    // Without a key the event store spreads the records round robin from segment 0: n-0 and n-2
+    // go to segment 0, n-1 and n-3 to segment 1, each at positions 0 and 1.
     let publish = |note: &'static str| {
         let events = events.clone();
         async move {
@@ -1857,7 +1858,7 @@ async fn replay_range_survives_reassignment() {
     let outcome = reset(ask(execute("op-rr", earliest())).await);
     assert_eq!(ranges(&outcome), [(0, 0, 2), (1, 0, 2)]);
     assert_eq!(outcome.markers_deleted, 4);
-    // After the reset: new records, past the ranges (n-4 to segment 1, n-5 to segment 0).
+    // After the reset: new records, past the ranges (n-4 to segment 0, n-5 to segment 1).
     publish("n-4").await;
     publish("n-5").await;
     ok(ask(finish("op-rr", false)).await);
@@ -1888,13 +1889,15 @@ async fn replay_range_survives_reassignment() {
     // The replay of each segment ran on its owner only; the new records once, not as a replay.
     assert_eq!(
         runs(&seen, "a"),
-        ["n-0", "n-1", "n-1", "n-2", "n-3", "n-3", "n-5"]
+        ["n-0", "n-0", "n-1", "n-2", "n-2", "n-3", "n-4"]
     );
-    assert_eq!(runs(&seen, "b"), ["n-0", "n-2", "n-4"]);
-    assert_eq!(runs(&once, "a"), ["n-0", "n-1", "n-2", "n-3", "n-5"]);
-    assert_eq!(runs(&once, "b"), ["n-4"], "only past the range");
+    assert_eq!(runs(&seen, "b"), ["n-1", "n-3", "n-5"]);
+    assert_eq!(runs(&once, "a"), ["n-0", "n-1", "n-2", "n-3", "n-4"]);
+    assert_eq!(runs(&once, "b"), ["n-5"], "only past the range");
     eventually("the ranges removed by their owners", WITHIN, || async {
-        replay(&db, "default").await.is_empty()
+        use kraken_messaging::store::MessageStore;
+        let control = store.processor_control();
+        control.get("default").await.unwrap().replay.is_empty()
     })
     .await;
     assert!(!status(&a, "default").replaying && !status(&b, "default").replaying);

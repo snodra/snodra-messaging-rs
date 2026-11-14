@@ -1,8 +1,7 @@
 //! The core over the event-store interface (ADR 0027), on the in-process event store double
 //! (`support::event_store`): a broken subscription is subscribed again, a control action the event
 //! store's capabilities do not cover is refused `UNSUPPORTED`, and the processor status names the
-//! event store and its capabilities. Only the last one needs a container (MongoDB, for the
-//! processor's control document).
+//! event store and its capabilities. No container: the message store is the in-memory one.
 
 mod support;
 
@@ -20,19 +19,12 @@ use kraken_messaging::metrics::Metrics;
 use kraken_messaging::proto::control_reply::Result as Answer;
 use kraken_messaging::proto::control_request::Action;
 use kraken_messaging::proto::{self, ControlRefusal, ControlRequest, ProcessorState, reset_target};
+use kraken_messaging::store::MessageStore;
+use kraken_messaging::store::memory::MemoryStore;
 use kraken_messaging::{Config, Event, KrakenMessaging, message_type};
 use serde::{Deserialize, Serialize};
 use support::event_store::Log;
 use tokio_util::sync::CancellationToken;
-
-macro_rules! require_docker {
-    () => {
-        if !support::docker_available() {
-            eprintln!("docker not available, skipping");
-            return;
-        }
-    };
-}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Noted {
@@ -76,7 +68,7 @@ async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
 /// positions.
 #[tokio::test]
 async fn a_failed_subscription_is_subscribed_again_after_a_backoff() {
-    let events = Log::new(Capability::ALL.to_vec());
+    let events = Log::full();
     let spec = SubscriptionSpec {
         name: "core.default".into(),
         source: SOURCE.into(),
@@ -169,9 +161,7 @@ fn request(action: Action) -> ControlRequest {
 /// store offers.
 #[tokio::test]
 async fn control_action_without_capability_is_unsupported() {
-    require_docker!();
-    let mongo = support::containers::mongo().await;
-    let uri = mongo.uri_for("unsupported");
+    let store = MemoryStore::new();
     let mut config = Config::new("core", "static://127.0.0.1:1");
     config.events_source = SOURCE.into();
     config.outbox_enabled = false;
@@ -179,7 +169,7 @@ async fn control_action_without_capability_is_unsupported() {
     let app = KrakenMessaging::builder(config)
         .await
         .unwrap()
-        .store(support::mongo_store(&uri).await)
+        .store(Arc::new(store.clone()))
         .event_store(Arc::new(events.clone()))
         .event::<Noted, _, _>(|_, _| async { Ok(()) })
         .start()
@@ -232,16 +222,7 @@ async fn control_action_without_capability_is_unsupported() {
         "the processor kept its subscription"
     );
     assert_eq!(app.processors().remove(0).operation_id, "");
-    let doc = support::mongo_db(&uri)
-        .await
-        .collection::<mongodb::bson::Document>("processor_control")
-        .find_one(mongodb::bson::doc! { "_id": "default" })
-        .await
-        .unwrap();
-    assert!(
-        doc.as_ref().is_none_or(|d| !d.contains_key("operation")
-            || d.get("operation") == Some(&mongodb::bson::Bson::Null)),
-        "{doc:?}"
-    );
+    let control = store.processor_control().get("default").await.unwrap();
+    assert_eq!(control.operation, None, "no lock: {control:?}");
     app.shutdown().await;
 }

@@ -36,6 +36,7 @@ use futures::future::BoxFuture;
 
 mod admin;
 pub mod browse;
+pub mod memory;
 mod subscription;
 mod types;
 

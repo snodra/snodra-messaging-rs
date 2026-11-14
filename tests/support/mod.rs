@@ -163,9 +163,7 @@ pub fn kafka_events(
     )
 }
 
-/// An in-process event store with every capability (`support::event_store`).
+/// The in-memory event store.
 pub fn memory_events() -> std::sync::Arc<dyn kraken_messaging::event_store::EventStore> {
-    std::sync::Arc::new(event_store::Log::new(
-        kraken_messaging::event_store::Capability::ALL.to_vec(),
-    ))
+    std::sync::Arc::new(kraken_messaging::event_store::memory::MemoryEventStore::default())
 }
