@@ -16,7 +16,8 @@ use kraken_messaging::event_store::browse::{
     BrowseError, BrowseSettings, Chunks, EndReason, EventBrowser, EventRecord, EventSummary,
     Examined, Filters, GetRequest, LagRequest, LagView, Range, RecordView, SearchPage, SearchPlan,
     SearchRequest, SegmentBounds, SegmentLag, SourceView, SourcesRequest, SourcesView,
-    SubscriptionLag, TailRequest, TailStart, TailStream, Want, heartbeat, merge, tail_channel,
+    SubscriptionLag, TailRequest, TailStart, TailStream, Want, heartbeat_period, merge,
+    tail_channel,
 };
 use kraken_messaging::event_store::{
     Capability, Delivery, EventStore, EventStoreError, OutgoingEvent, ReplayRange, ResetTarget,
@@ -553,11 +554,11 @@ impl LogBrowser {
 
     fn get_now(&self, request: &GetRequest) -> Result<EventRecord, BrowseError> {
         let source = self.settings().source(request.source.as_deref())?;
-        let s = segment(&request.segment).map_err(|e| BrowseError::Invalid(e.to_string()))?;
-        let at: usize = request
-            .position
+        let (segment_name, position) = request.place()?;
+        let s = segment(segment_name).map_err(|e| BrowseError::Invalid(e.to_string()))?;
+        let at: usize = position
             .parse()
-            .map_err(|_| BrowseError::Invalid(format!("no position {:?}", request.position)))?;
+            .map_err(|_| BrowseError::Invalid("not a position of the double".into()))?;
         let state = self.log.state();
         let record = state
             .sources
@@ -676,7 +677,7 @@ impl LogBrowser {
                 .map_or(0, |d| d.as_millis() as i64),
         };
         let (mut feed, stream) =
-            tail_channel(settings.tail_buffer, heartbeat(request.heartbeat_ms));
+            tail_channel(settings.tail_buffer, heartbeat_period(request.heartbeat_ms));
         feed.start(start);
         let log = self.log.clone();
         tokio::spawn(async move {

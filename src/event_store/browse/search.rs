@@ -1,8 +1,9 @@
-//! A search page over an event store whose positions in a segment are whole numbers that rise
-//! (an offset, an index): the segments read backwards in chunks and merged newest first, the
+//! A search page over an event store whose positions in a segment are whole numbers that rise by
+//! one per event appended: the segments read backwards in chunks and merged newest first, the
 //! cursor that continues it, and [`SearchPlan`], which turns a [`SearchRequest`] into the bounds
-//! of one page. An add-on with other positions answers [`EventBrowser::search`](super::EventBrowser::search)
-//! its own way, with the same [`SearchPage`].
+//! of one page. An add-on with other positions answers
+//! [`EventBrowser::search`](super::EventBrowser::search) its own way, with the same
+//! [`SearchPage`].
 
 use std::cmp::Ordering;
 use std::time::{Duration, Instant};
@@ -22,7 +23,7 @@ pub const CHUNK: usize = 500;
 /// ...and at first in a page: each next chunk of a segment is twice the last, so every segment
 /// has its newest records in hand early even on a slow link.
 pub const FIRST_CHUNK: usize = 50;
-/// The longest cursor accepted, in characters.
+/// The longest cursor accepted, in bytes.
 pub const MAX_CURSOR: usize = 64 * 1024;
 
 /// Where a search goes on: for every segment, the position below which the next page reads (the
@@ -186,6 +187,10 @@ fn newer(a: &Lane, b: &Lane) -> Ordering {
 /// newest first (time; ties by segment, then position, descending) until `budget.limit`
 /// results, `budget.max_scanned` records read or `budget.deadline`, whichever comes first.
 ///
+/// A page reads at least one record per segment that is not done, whatever `max_scanned` says:
+/// with fewer, the segments past the budget would never be read and a search whose first
+/// segments hold matches would never move on.
+///
 /// Within a segment the order is the position order: when the times of a segment do not rise,
 /// the merged list is not a strict global sort. A page that ends before it returns anything
 /// still moves on: a segment whose chunk arrived is positioned just above its newest match
@@ -198,8 +203,10 @@ pub fn merge<C: Chunks>(
     ranges: &[Range],
     budget: Budget,
 ) -> Result<Page, C::Error> {
+    // At least one record per segment (see above).
+    let max_scanned = budget.max_scanned.max(ranges.len() as u64);
     // Enough per chunk that one round over the segments fits the scan budget.
-    let chunk = (budget.max_scanned / (ranges.len().max(1) as u64)).clamp(1, CHUNK as u64) as i64;
+    let chunk = (max_scanned / (ranges.len().max(1) as u64)).clamp(1, CHUNK as u64) as i64;
     let mut lanes: Vec<Lane> = ranges
         .iter()
         .map(|r| Lane {
@@ -219,7 +226,7 @@ pub fn merge<C: Chunks>(
             .filter(|i| lanes[*i].buffer.is_empty() && !lanes[*i].done())
             .collect();
         if !needy.is_empty() {
-            if scanned >= budget.max_scanned {
+            if scanned >= max_scanned {
                 stopped_by = Some(StoppedBy::ScanBudget);
                 break;
             }
@@ -229,7 +236,7 @@ pub fn merge<C: Chunks>(
             }
             // The scan budget left, shared by the segments of this read (one record each at
             // least, so fewer segments when fewer records are left).
-            let left = budget.max_scanned - scanned;
+            let left = max_scanned - scanned;
             let needy = &needy[..needy.len().min(usize::try_from(left).unwrap_or(usize::MAX))];
             let share = i64::try_from(left / needy.len() as u64).unwrap_or(i64::MAX);
             let wants: Vec<Want> = needy
@@ -850,6 +857,34 @@ mod tests {
         let page = run(&mut fake, budget(100, u64::MAX));
         assert_eq!(page.results.len(), 10);
         assert!(page.exhausted);
+    }
+
+    /// A scan budget below the number of segments still reads every segment (one record each):
+    /// pages move on even when the first segments hold matches at their heads.
+    #[test]
+    fn a_budget_below_the_segments_still_moves_on() {
+        let data: Vec<(i32, Records)> = (0..4)
+            .map(|p| (p, (0..5).map(|o| (o, o * 4 + p as i64, true)).collect()))
+            .collect();
+        let expected = places(&run(&mut Fake::new(&data), budget(100, 1_000)));
+        let mut fake = Fake::new(&data);
+        let mut ranges = fake.ranges();
+        let mut got = Vec::new();
+        for pages in 1.. {
+            assert!(pages <= 100, "no progress: {got:?}");
+            let page = merge(&mut fake, &ranges, budget(100, 2)).unwrap();
+            assert!(
+                page.scanned <= 4,
+                "one record per segment: {}",
+                page.scanned
+            );
+            got.extend(places(&page));
+            if page.exhausted {
+                break;
+            }
+            ranges = after(&ranges, &page);
+        }
+        assert_eq!(got, expected);
     }
 
     #[test]

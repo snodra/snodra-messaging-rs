@@ -20,8 +20,11 @@
 //! - **Each call of `make_events`** is one service instance: a store reading the same event store
 //!   (an in-process store returns the same one each time).
 //! - **When the event store declares [`Browse`](Capability::Browse)**, its browser
-//!   ([`EventStore::browser`]) reads `source` (one of its [`BrowseSettings::sources`](super::browse::BrowseSettings::sources)),
-//!   with bounds no lower than the defaults' results (the kit asks for 50 at most).
+//!   ([`EventStore::browser`]) reads `source` (one of its
+//!   [`BrowseSettings::sources`](super::browse::BrowseSettings::sources)), with bounds no lower
+//!   than the defaults' results (the kit asks for 50 at most). The newest-first checks publish
+//!   their events 20 ms apart and assume the event store stamps them in milliseconds of its own
+//!   (or the publisher's) clock, so each is newer than the one before.
 //! - The checks run one after the other, each on subscription names of its own; a new name starts
 //!   at the earliest position, so each check reads what the earlier ones appended and looks only
 //!   at its own events (by their `id` header). Every check is public, so a failing one can be run
@@ -66,9 +69,8 @@ const SLICE: Duration = Duration::from_millis(250);
 const EVENT_TYPE: &str = "conformance.Event";
 
 /// Runs every check, and each one of a capability the event store declares (without `replay`,
-/// `lag` or `browse`, the check that it says so), by name; the first failing check panics naming itself
-/// and the event store. See the module docs for `source`,
-/// `make_events` and `store`.
+/// `lag` or `browse`, the check that it says so), by name; the first failing check panics naming
+/// itself and the event store. See the module docs for `source`, `make_events` and `store`.
 pub async fn run_event_store_conformance(
     source: &str,
     make_events: impl Fn() -> Arc<dyn EventStore>,
@@ -930,6 +932,27 @@ pub async fn search_finds_by_type_key_and_correlation(kit: &EventStoreKit<'_>) {
         );
     }
 
+    let long = "9".repeat(MAX_SEGMENT_BYTES + 1);
+    for (segment, position) in [
+        (long.as_str(), first.position.as_str()),
+        (first.segment.as_str(), long.as_str()),
+    ] {
+        let refused = bounded(
+            "get",
+            browser.get(GetRequest {
+                source: Some(kit.source.to_string()),
+                segment: segment.to_string(),
+                position: position.to_string(),
+                payload: false,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(&refused, Err(BrowseError::Invalid(m)) if !m.contains(&long)),
+            "a segment or position over 128 bytes is invalid, never echoed: {refused:?}"
+        );
+    }
+
     let sources = bounded("sources", browser.sources(SourcesRequest {}))
         .await
         .unwrap_or_else(|e| panic!("sources: {e}"));
@@ -1044,29 +1067,70 @@ pub async fn search_stops_at_bounds(kit: &EventStoreKit<'_>) {
         );
     }
 
+    // A page reads at least one record per segment (else the segments past the budget would
+    // never be read): the scan budget here is the number of segments, and the source holds more.
+    let segments = bounded("sources", browser.sources(SourcesRequest {}))
+        .await
+        .unwrap_or_else(|e| panic!("sources: {e}"))
+        .sources
+        .into_iter()
+        .find(|s| s.source == kit.source)
+        .map_or(0, |s| s.segments.len() as u64);
+    assert!(
+        segments >= 2,
+        "the source's segments are listed: {segments}"
+    );
+    let fillers: Vec<OutgoingEvent> = (0..segments)
+        .map(|_| typed(kit.source, &fresh("key"), &format!("{ty}.Filler"), "f"))
+        .collect();
+    publish_all(&*events, &fillers).await;
     let nothing = EventFilter {
         type_name: Some(format!("conformance.{}.Nothing", fresh("browse"))),
         ..EventFilter::default()
     };
-    let budget = |cursor: Option<String>| SearchRequest {
+    let budget = |filters: EventFilter, cursor: Option<String>| SearchRequest {
         source: Some(kit.source.to_string()),
-        filters: nothing.clone(),
+        filters,
         cursor,
-        max_scanned: Some(3),
+        max_scanned: Some(segments),
         ..SearchRequest::default()
     };
-    let first = search(&*browser, budget(None)).await;
+    let first = search(&*browser, budget(nothing.clone(), None)).await;
     assert!(
-        first.results.is_empty() && first.scanned <= 3,
-        "no match, at most 3 records read: {first:?}"
+        first.results.is_empty() && first.scanned <= segments,
+        "no match, at most {segments} records read: {first:?}"
     );
     assert_eq!(first.stopped_by, Some(StoppedBy::ScanBudget), "{first:?}");
     assert!(!first.exhausted && first.cursor.is_some(), "{first:?}");
-    let next = search(&*browser, budget(first.cursor.clone())).await;
-    assert!(next.scanned <= 3, "at most 3 records read: {next:?}");
-    assert!(
-        next.exhausted || next.cursor != first.cursor,
-        "the next page moved on: {next:?}"
+
+    // Progress: pages of that budget, each continuing the last, find the five, newest first,
+    // none twice.
+    let mut pages = 0;
+    let mut cursor = None;
+    let mut got: Vec<String> = Vec::new();
+    while got.len() < ids.len() {
+        pages += 1;
+        assert!(
+            pages <= 100,
+            "the five within 100 pages of {segments} records, got {got:?}"
+        );
+        let page = search(&*browser, budget(by_type.clone(), cursor.clone())).await;
+        assert!(
+            page.scanned <= segments,
+            "at most {segments} records read: {page:?}"
+        );
+        got.extend(page.results.iter().map(summary_id));
+        if page.exhausted {
+            break;
+        }
+        cursor = Some(
+            page.cursor
+                .expect("a page that is not exhausted has a cursor"),
+        );
+    }
+    assert_eq!(
+        got, ids,
+        "pages under a scan budget: newest first, none twice"
     );
 
     for (what, bad) in [
@@ -1131,14 +1195,17 @@ pub async fn tail_streams_new_events(kit: &EventStoreKit<'_>) {
         max_duration_ms: None,
     };
     let mut tail = open_tail(&*browser, request.clone()).await;
-    let mut parts = Parts::default();
-    match parts.next(&mut tail, "the start").await {
-        TailEvent::Start(start) => {
+    match bounded("tail: the start", tail.next()).await {
+        Some(TailEvent::Start(start)) => {
             assert_eq!(start.source, kit.source, "{start:?}");
             assert!(start.segments >= 2, "{start:?}");
         }
         other => panic!("the first part is the start: {other:?}"),
     }
+    let mut parts = Parts {
+        started: true,
+        ..Parts::default()
+    };
     let after = [
         typed(kit.source, &k1, &ty, &fresh("correlation")),
         typed(kit.source, &k2, &ty, &fresh("correlation")),
@@ -1153,20 +1220,11 @@ pub async fn tail_streams_new_events(kit: &EventStoreKit<'_>) {
     publish_all(&*events, &[after[0].clone(), unmatched.clone()]).await;
     publish_all(&*events, &after[1..]).await;
     let want: Vec<String> = ids(&after);
-    let deadline = Instant::now() + WAIT;
-    while !want
-        .iter()
-        .all(|id| parts.records.iter().any(|r| summary_id(r) == *id))
-    {
-        assert!(
-            Instant::now() < deadline,
-            "the three events within {WAIT:?}: {:?}",
-            parts.records
-        );
-        if let TailEvent::End(end) = parts.next(&mut tail, "the events").await {
-            panic!("the tail ended early: {end:?}");
-        }
-    }
+    parts
+        .until(&mut tail, "the three events", |p| {
+            want.iter().all(|id| p.has(id))
+        })
+        .await;
     let seen: Vec<String> = parts.records.iter().map(summary_id).collect();
     assert!(!seen.contains(&before.id), "not the event before the start");
     assert!(
@@ -1181,13 +1239,9 @@ pub async fn tail_streams_new_events(kit: &EventStoreKit<'_>) {
     for r in &parts.records {
         assert_eq!(r.source, kit.source, "{r:?}");
     }
-    let deadline = Instant::now() + WAIT;
-    while parts.heartbeats == 0 {
-        assert!(Instant::now() < deadline, "a heartbeat within {WAIT:?}");
-        if let TailEvent::End(end) = parts.next(&mut tail, "a heartbeat").await {
-            panic!("the tail ended early: {end:?}");
-        }
-    }
+    parts
+        .until(&mut tail, "a heartbeat", |p| p.heartbeats > 0)
+        .await;
     drop(tail);
 
     let mut short = open_tail(
@@ -1200,16 +1254,10 @@ pub async fn tail_streams_new_events(kit: &EventStoreKit<'_>) {
     .await;
     let mut parts = Parts::default();
     let started = Instant::now();
-    let reason = loop {
-        assert!(
-            started.elapsed() < WAIT,
-            "a tail of 1 s ends within {WAIT:?}"
-        );
-        if let TailEvent::End(end) = parts.next(&mut short, "the end").await {
-            break end.reason;
-        }
-    };
-    assert_eq!(reason, EndReason::MaxDuration);
+    parts
+        .until(&mut short, "the end of a tail of 1 s", |p| p.end.is_some())
+        .await;
+    assert_eq!(parts.end, Some(EndReason::MaxDuration));
     assert!(
         started.elapsed() >= Duration::from_millis(900),
         "it lasted its duration: {:?}",
@@ -1383,19 +1431,18 @@ async fn browse_everything(
                 type_name: Some(tailed.clone()),
                 ..EventFilter::default()
             },
-            ..TailRequest::default()
+            heartbeat_ms: Some(200),
+            max_duration_ms: Some(WAIT.as_millis() as u64 * 2),
         },
     )
     .await;
     let mut parts = Parts::default();
-    parts.next(&mut tail, "the start").await;
+    parts.until(&mut tail, "the start", |p| p.started).await;
     let new = typed(kit.source, &fresh("key"), &tailed, &fresh("correlation"));
     publish_all(events, std::slice::from_ref(&new)).await;
-    while !parts.records.iter().any(|r| summary_id(r) == new.id) {
-        if let TailEvent::End(end) = parts.next(&mut tail, "the tailed event").await {
-            panic!("the tail ended early: {end:?}");
-        }
-    }
+    parts
+        .until(&mut tail, "the tailed event", |p| p.has(&new.id))
+        .await;
 }
 
 // ---- helpers -----------------------------------------------------------------------------------
@@ -1789,26 +1836,48 @@ async fn open_tail(browser: &dyn EventBrowser, request: TailRequest) -> TailStre
 /// What a tail gave.
 #[derive(Default)]
 struct Parts {
+    started: bool,
     records: Vec<EventSummary>,
     heartbeats: usize,
-    ended: bool,
+    end: Option<EndReason>,
 }
 
 impl Parts {
-    /// The next part, at most [`WAIT`] away; no part may follow the `end`, and the stream may not
-    /// close before one.
-    async fn next(&mut self, tail: &mut TailStream, what: &str) -> TailEvent {
-        let part = bounded(&format!("tail: {what}"), tail.next())
-            .await
-            .unwrap_or_else(|| panic!("tail: {what}: the stream closed without an end"));
-        assert!(!self.ended, "tail: a part after the end: {part:?}");
-        match &part {
-            TailEvent::Record(r) => self.records.push(r.clone()),
-            TailEvent::Heartbeat(_) => self.heartbeats += 1,
-            TailEvent::End(_) => self.ended = true,
-            TailEvent::Start(_) => {}
+    /// Reads parts until `done` holds, at most [`WAIT`] in all (heartbeats do not extend it). The
+    /// first part must be the start, no part may follow the end, the stream may not close before
+    /// one, and a tail that ends before `done` fails the check.
+    async fn until(&mut self, tail: &mut TailStream, what: &str, done: impl Fn(&Parts) -> bool) {
+        let deadline = Instant::now() + WAIT;
+        while !done(self) {
+            if let Some(end) = self.end {
+                panic!("tail: {what}: the tail ended first ({end:?})");
+            }
+            let part = tokio::time::timeout_at(deadline, tail.next())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "tail: {what} within {WAIT:?} (started {}, {} records, {} heartbeats)",
+                        self.started,
+                        self.records.len(),
+                        self.heartbeats
+                    )
+                })
+                .unwrap_or_else(|| panic!("tail: {what}: the stream closed without an end"));
+            match part {
+                TailEvent::Start(_) if !self.started => self.started = true,
+                ref other if !self.started => {
+                    panic!("tail: the first part is the start: {other:?}")
+                }
+                TailEvent::Start(start) => panic!("tail: a second start: {start:?}"),
+                TailEvent::Record(r) => self.records.push(r),
+                TailEvent::Heartbeat(_) => self.heartbeats += 1,
+                TailEvent::End(end) => self.end = Some(end.reason),
+            }
         }
-        part
+    }
+
+    fn has(&self, id: &str) -> bool {
+        self.records.iter().any(|r| summary_id(r) == id)
     }
 }
 

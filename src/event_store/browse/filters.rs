@@ -4,8 +4,8 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::BrowseError;
 use super::records::{RecordView, escaped};
+use super::{BrowseError, quoted};
 
 /// A filter value (and `q`) is at most this many bytes.
 pub const MAX_FILTER: usize = 1024;
@@ -95,6 +95,9 @@ impl Filters {
                 None => Ok(None),
                 Some(TimeArg::Millis(ms)) => Ok(Some(*ms)),
                 Some(TimeArg::Text(s)) if s.is_empty() => Ok(None),
+                Some(TimeArg::Text(s)) if s.len() > MAX_FILTER => Err(BrowseError::Invalid(
+                    format!("{name} is longer than {MAX_FILTER} bytes"),
+                )),
                 Some(TimeArg::Text(s)) => parse_time(s)
                     .map(Some)
                     .map_err(|e| BrowseError::Invalid(format!("{name}: {e}"))),
@@ -184,19 +187,16 @@ impl Filters {
     }
 
     /// A digest of `source` and the filters (16 hex digits), which a cursor carries: a cursor
-    /// only continues the search it came from, on whichever browser instance reads it.
+    /// only continues the search it came from, on whichever browser instance reads it. Every
+    /// value is framed by its length, so no value can pass for another field.
     pub fn digest(&self, source: &str) -> String {
         let mut text = String::new();
         let mut put = |name: &str, v: Option<&str>| {
             text.push_str(name);
             match v {
-                Some(v) => {
-                    text.push('=');
-                    text.push_str(v);
-                }
-                None => text.push('-'),
+                Some(v) => text.push_str(&format!("={}:{v};", v.len())),
+                None => text.push_str("-;"),
             }
-            text.push('\u{0}');
         };
         put("source", Some(source));
         put("from", self.from.map(|v| v.to_string()).as_deref());
@@ -222,9 +222,16 @@ impl Filters {
 pub fn parse_time(s: &str) -> Result<i64, String> {
     let s = s.trim();
     if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
-        return s.parse::<i64>().map_err(|_| format!("{s:?} is too large"));
+        return s
+            .parse::<i64>()
+            .map_err(|_| format!("{} is too large", quoted(s)));
     }
-    rfc3339(s).ok_or_else(|| format!("{s:?} is neither epoch milliseconds nor an RFC 3339 time"))
+    rfc3339(s).ok_or_else(|| {
+        format!(
+            "{} is neither epoch milliseconds nor an RFC 3339 time",
+            quoted(s)
+        )
+    })
 }
 
 fn rfc3339(s: &str) -> Option<i64> {
@@ -419,6 +426,11 @@ mod tests {
                 "{bad:?}"
             );
         }
+        let err = Filters::parse(&filter(&[("from", &long)]), false).unwrap_err();
+        assert!(err.message().contains("longer than"), "{err}");
+        let not_a_time = format!("soon{}", "x".repeat(MAX_FILTER - 10));
+        let err = Filters::parse(&filter(&[("to", &not_a_time)]), false).unwrap_err();
+        assert!(err.message().len() < 200, "the value is cut: {err}");
         for name in ["from", "to"] {
             let err = Filters::parse(&filter(&[(name, "1")]), true).unwrap_err();
             assert!(err.message().contains(name), "{err}");
@@ -491,5 +503,26 @@ mod tests {
             Filters::default().digest("kraken.events"),
             "the source header is not the source"
         );
+        // A value holding what would separate fields in a plain text cannot pass for two.
+        let one = Filters {
+            key: Some("a\u{0}sourceHeader=b".into()),
+            ..Filters::default()
+        };
+        let two = Filters {
+            key: Some("a".into()),
+            source: Some("b\u{0}sourceHeader-".into()),
+            ..Filters::default()
+        };
+        assert_ne!(one.digest("s"), two.digest("s"));
+        let framed_one = Filters {
+            key: Some("a;sourceHeader=1:b".into()),
+            ..Filters::default()
+        };
+        let framed_two = Filters {
+            key: Some("a".into()),
+            source: Some("b".into()),
+            ..Filters::default()
+        };
+        assert_ne!(framed_one.digest("s"), framed_two.digest("s"));
     }
 }

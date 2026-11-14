@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::filters::EventFilter;
 use super::records::{EventRecord, EventSummary};
 use crate::error::MessagingError;
+use crate::event_store::{MAX_POSITION_BYTES, MAX_SEGMENT_BYTES};
 use crate::types::{Query, StreamingQuery};
 
 /// The query type of [`SearchRequest`].
@@ -26,14 +27,28 @@ pub const TAIL: &str = "kraken.events.Tail";
 pub const DEFAULT_LIMIT: usize = 50;
 /// How often a tail sends a heartbeat when the request names no `heartbeatMs`.
 pub const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(15);
-/// The shortest heartbeat period a tail takes.
+/// The shortest heartbeat period a tail takes...
 pub const MIN_HEARTBEAT: Duration = Duration::from_millis(100);
+/// ...and the longest.
+pub const MAX_HEARTBEAT: Duration = Duration::from_secs(3600);
+/// The most results a browser may be set to return per page (ADR 0025 ruling 21).
+pub const MAX_RESULTS_SETTING: usize = 1000;
+/// The longest time a browser may be set to give a call.
+pub const MAX_TIMEOUT_SETTING: Duration = Duration::from_secs(5 * 60);
+/// The shortest and the longest a browser may be set to keep a tail open.
+pub const MIN_TAIL_DURATION_SETTING: Duration = Duration::from_secs(1);
+pub const MAX_TAIL_DURATION_SETTING: Duration = Duration::from_secs(24 * 3600);
+/// The most events a browser may be set to buffer for a tail's reader.
+pub const MAX_TAIL_BUFFER_SETTING: usize = 65_536;
+/// The most payload bytes a browser may be set to carry in a record.
+pub const MAX_PAYLOAD_SETTING: usize = 16 * 1024 * 1024;
 
-/// What every call of the browser may fail with, as JSON
-/// `{"error": "invalid" | "not-found" | "busy" | "unavailable", "message": "<text>"}`.
+/// What every call of the browser may fail with, as JSON `{"error": "invalid" | "not-found" |
+/// "busy" | "unavailable", "message": "<text>"}`.
 ///
 /// Over the hub, a handler answers it as a handler error (`HANDLER_ERROR`) whose message is the
-/// text and whose `details` are this JSON ([`MessagingError::from`], [`BrowseError::from_details`]).
+/// text and whose `details` are this JSON ([`MessagingError::from`],
+/// [`BrowseError::from_details`]).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "error", content = "message", rename_all = "kebab-case")]
 pub enum BrowseError {
@@ -139,7 +154,12 @@ impl Default for BrowseSettings {
 }
 
 impl BrowseSettings {
-    /// The settings' mistakes: no source, an empty one, or a bound of zero.
+    /// The settings' mistakes: no source, an empty one, a bound of zero, or a bound past its
+    /// maximum: `max_results` at most [`MAX_RESULTS_SETTING`] (1000), `timeout` at most
+    /// [`MAX_TIMEOUT_SETTING`] (5 min), `tail_duration` from [`MIN_TAIL_DURATION_SETTING`]
+    /// (1 s) to [`MAX_TAIL_DURATION_SETTING`] (24 h), `tail_buffer` at most
+    /// [`MAX_TAIL_BUFFER_SETTING`] (65 536), `max_payload` at most [`MAX_PAYLOAD_SETTING`]
+    /// (16 MiB). Within these, no deadline a browser computes from them can overflow.
     pub fn validate(&self) -> Result<(), String> {
         if self.sources.is_empty() || self.sources.iter().any(|s| s.trim().is_empty()) {
             return Err("the browser needs at least one source, none of them empty".into());
@@ -158,6 +178,40 @@ impl BrowseSettings {
                 return Err(format!("the browser's {name} must be positive"));
             }
         }
+        for (name, over, max) in [
+            (
+                "max_results",
+                self.max_results > MAX_RESULTS_SETTING,
+                MAX_RESULTS_SETTING.to_string(),
+            ),
+            (
+                "timeout",
+                self.timeout > MAX_TIMEOUT_SETTING,
+                format!("{MAX_TIMEOUT_SETTING:?}"),
+            ),
+            (
+                "tail_duration",
+                self.tail_duration > MAX_TAIL_DURATION_SETTING,
+                format!("{MAX_TAIL_DURATION_SETTING:?}"),
+            ),
+            (
+                "tail_buffer",
+                self.tail_buffer > MAX_TAIL_BUFFER_SETTING,
+                MAX_TAIL_BUFFER_SETTING.to_string(),
+            ),
+            (
+                "max_payload",
+                self.max_payload > MAX_PAYLOAD_SETTING,
+                MAX_PAYLOAD_SETTING.to_string(),
+            ),
+        ] {
+            if over {
+                return Err(format!("the browser's {name} is at most {max}"));
+            }
+        }
+        if self.tail_duration < MIN_TAIL_DURATION_SETTING {
+            return Err("the browser's tail_duration is at least 1 s".into());
+        }
         Ok(())
     }
 
@@ -172,13 +226,15 @@ impl BrowseSettings {
                 .ok_or_else(|| BrowseError::Invalid("no source is browsable here".into())),
             Some(s) if self.sources.iter().any(|c| c == s) => Ok(s.to_string()),
             Some(s) => Err(BrowseError::Invalid(format!(
-                "source {s:?} is not browsable here; the browser reads {}",
+                "source {} is not browsable here; the browser reads {}",
+                quoted(s),
                 self.sources.join(", ")
             ))),
         }
     }
 
-    /// The time a tail lasts: `requested` (ms) when set, at most [`tail_duration`](Self::tail_duration).
+    /// The time a tail lasts: `requested` (ms) when set, at most
+    /// [`tail_duration`](Self::tail_duration).
     pub fn tail_duration(&self, requested: Option<u64>) -> Result<Duration, BrowseError> {
         match requested {
             None => Ok(self.tail_duration),
@@ -190,11 +246,26 @@ impl BrowseSettings {
     }
 }
 
-/// The heartbeat period of a tail: `requested` (ms) when set, at least [`MIN_HEARTBEAT`].
-pub fn heartbeat(requested: Option<u64>) -> Duration {
+/// The heartbeat period of a tail: `requested` (ms) when set, within [`MIN_HEARTBEAT`] ..
+/// [`MAX_HEARTBEAT`].
+pub fn heartbeat_period(requested: Option<u64>) -> Duration {
     requested.map_or(DEFAULT_HEARTBEAT, |ms| {
-        Duration::from_millis(ms).max(MIN_HEARTBEAT)
+        Duration::from_millis(ms).clamp(MIN_HEARTBEAT, MAX_HEARTBEAT)
     })
+}
+
+/// The most bytes of a value an error message quotes.
+const MAX_QUOTED: usize = 64;
+
+/// `s` quoted for an error message, cut to [`MAX_QUOTED`] bytes (`...` when cut): an error
+/// never echoes unbounded input.
+pub fn quoted(s: &str) -> String {
+    let (shown, cut_off) = super::records::cut(s, MAX_QUOTED);
+    if cut_off {
+        format!("{shown:?}...")
+    } else {
+        format!("{shown:?}")
+    }
 }
 
 // ---- kraken.events.Search -----------------------------------------------------------------------
@@ -215,7 +286,8 @@ pub struct SearchRequest {
     /// The `cursor` of the previous page, sent with the same source and filters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
-    /// Records read at most (lowers the browser's budget, 50 000).
+    /// Records read at most (lowers the browser's budget, 50 000); a page still reads one record
+    /// per segment at least.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_scanned: Option<u64>,
     /// Milliseconds the page may take (lowers the browser's budget, 10 s).
@@ -259,7 +331,8 @@ impl Query for SearchRequest {
 
 // ---- kraken.events.Get --------------------------------------------------------------------------
 
-/// `kraken.events.Get`: one event, every header, and its payload when asked for.
+/// `kraken.events.Get`: one event, every header, and its payload when asked for. Check
+/// [`place`](Self::place) before reading.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GetRequest {
@@ -271,6 +344,26 @@ pub struct GetRequest {
     /// Carry the payload (the hub asks only under the payload rules of ADR 0025).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub payload: bool,
+}
+
+impl GetRequest {
+    /// The segment and the position, each 1 to 128 bytes ([`MAX_SEGMENT_BYTES`],
+    /// [`MAX_POSITION_BYTES`]); [`BrowseError::Invalid`] otherwise. An add-on checks them with
+    /// this before reading.
+    pub fn place(&self) -> Result<(&str, &str), BrowseError> {
+        for (name, value, max) in [
+            ("segment", &self.segment, MAX_SEGMENT_BYTES),
+            ("position", &self.position, MAX_POSITION_BYTES),
+        ] {
+            if value.is_empty() || value.len() > max {
+                return Err(BrowseError::Invalid(format!(
+                    "the {name} is 1 to {max} bytes, not {}",
+                    value.len()
+                )));
+            }
+        }
+        Ok((&self.segment, &self.position))
+    }
 }
 
 crate::message_type!(GetRequest, "kraken.events.Get");
@@ -348,7 +441,7 @@ pub struct LagView {
 #[serde(rename_all = "camelCase")]
 pub struct SubscriptionLag {
     pub subscription: String,
-    /// As the event store reports it (on Kafka `Stable`, `Empty`, ...).
+    /// As the event store reports it, in its own names.
     pub state: String,
     /// Instances reading it now.
     pub members: u64,
@@ -527,6 +620,23 @@ mod tests {
     }
 
     #[test]
+    fn a_get_names_a_segment_and_a_position_of_1_to_128_bytes() {
+        let get = |segment: &str, position: &str| GetRequest {
+            segment: segment.into(),
+            position: position.into(),
+            ..GetRequest::default()
+        };
+        assert_eq!(get("3", "42").place(), Ok(("3", "42")));
+        let long = "x".repeat(129);
+        for bad in [get("", "1"), get("1", ""), get(&long, "1"), get("1", &long)] {
+            let err = bad.place().unwrap_err();
+            assert!(matches!(err, BrowseError::Invalid(_)), "{bad:?}");
+            assert!(!err.message().contains(&long), "never echoed: {err}");
+        }
+        assert!(get(&"x".repeat(128), &"9".repeat(128)).place().is_ok());
+    }
+
+    #[test]
     fn tail_parts_are_tagged_by_kind() {
         let parts = [
             (
@@ -584,17 +694,54 @@ mod tests {
                 max_tails: 0,
                 ..BrowseSettings::default()
             },
+            BrowseSettings {
+                max_results: 1001,
+                ..BrowseSettings::default()
+            },
+            BrowseSettings {
+                timeout: Duration::from_secs(301),
+                ..BrowseSettings::default()
+            },
+            BrowseSettings {
+                tail_duration: Duration::from_millis(999),
+                ..BrowseSettings::default()
+            },
+            BrowseSettings {
+                tail_duration: Duration::from_secs(24 * 3600 + 1),
+                ..BrowseSettings::default()
+            },
+            BrowseSettings {
+                tail_buffer: 65_537,
+                ..BrowseSettings::default()
+            },
+            BrowseSettings {
+                max_payload: 16 * 1024 * 1024 + 1,
+                ..BrowseSettings::default()
+            },
         ] {
             assert!(bad.validate().is_err(), "{bad:?}");
         }
+        let widest = BrowseSettings {
+            max_results: 1000,
+            timeout: Duration::from_secs(300),
+            tail_duration: Duration::from_secs(24 * 3600),
+            tail_buffer: 65_536,
+            max_payload: 16 * 1024 * 1024,
+            ..BrowseSettings::default()
+        };
+        assert_eq!(widest.validate(), Ok(()));
         assert_eq!(s.source(None).as_deref(), Ok("kraken.events"));
         assert_eq!(s.source(Some("")).as_deref(), Ok("kraken.events"));
         assert!(matches!(s.source(Some("b")), Err(BrowseError::Invalid(_))));
         assert_eq!(s.tail_duration(Some(2_000)), Ok(Duration::from_secs(2)));
         assert_eq!(s.tail_duration(Some(u64::MAX)), Ok(s.tail_duration));
         assert!(s.tail_duration(Some(0)).is_err());
-        assert_eq!(heartbeat(None), DEFAULT_HEARTBEAT);
-        assert_eq!(heartbeat(Some(1)), MIN_HEARTBEAT);
-        assert_eq!(heartbeat(Some(2_000)), Duration::from_secs(2));
+        assert_eq!(heartbeat_period(None), DEFAULT_HEARTBEAT);
+        assert_eq!(heartbeat_period(Some(1)), MIN_HEARTBEAT);
+        assert_eq!(heartbeat_period(Some(2_000)), Duration::from_secs(2));
+        assert_eq!(heartbeat_period(Some(u64::MAX)), MAX_HEARTBEAT);
+        let long = "s".repeat(10_000);
+        let err = s.source(Some(&long)).unwrap_err();
+        assert!(err.message().len() < 200, "the source is cut: {err}");
     }
 }

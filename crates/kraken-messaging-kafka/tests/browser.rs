@@ -967,7 +967,24 @@ async fn a_tail_delivers_new_records_ends_on_time_and_drops_a_slow_reader() {
         .await
         .expect("the slot was given back");
     assert!(matches!(next_part(&mut again).await, TailEvent::Start(_)));
+
+    // A reader that drops a live tail frees its slot at the tail's next poll.
     drop(again);
+    let dropped = Instant::now();
+    let reopened = loop {
+        match short.tail(TailRequest::default()).await {
+            Ok(tail) => break tail,
+            Err(BrowseError::Busy(_)) => {
+                assert!(
+                    dropped.elapsed() < Duration::from_secs(2),
+                    "the slot is free within 2 s of the drop"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    };
+    drop(reopened);
 
     // A reader that does not read: its tail ends, and the slot comes back.
     let long = browser(

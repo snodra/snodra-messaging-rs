@@ -15,7 +15,8 @@
 //!   publish order.
 //! - **At-least-once with acknowledgement**: the core acknowledges after the handler and the
 //!   processed-event record committed; what was not acknowledged comes again, and the message
-//!   store's processed events skip it (ADR 0028, [`ProcessedEventStore`](crate::store::ProcessedEventStore)).
+//!   store's processed events skip it (ADR 0028,
+//!   [`ProcessedEventStore`](crate::store::ProcessedEventStore)).
 //! - **Pause and resume**: a subscription stops delivering without losing its place.
 //! - **The headers**: the seven [`headers`] travel as the event store's native metadata.
 //!

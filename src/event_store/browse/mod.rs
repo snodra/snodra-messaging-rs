@@ -1,6 +1,7 @@
 //! The event browser (ADR 0027, capability [`Browse`](super::Capability::Browse)): reading an
 //! event store's sources the way an operator does, never as a subscription. An event store that
-//! declares `browse` gives an [`EventBrowser`] ([`EventStore::browser`](super::EventStore::browser)).
+//! declares `browse` gives an [`EventBrowser`]
+//! ([`EventStore::browser`](super::EventStore::browser)).
 //!
 //! The browser binary (`kraken-event-browser`) answers five hub query types with it; the hub
 //! turns its dashboard API into them. Each request and answer below is the JSON of the type
@@ -24,9 +25,11 @@
 //!  "limit": 50,                                    // optional: 1 to max (100), default 50
 //!  "cursor": "eyJmIjoi...",                        // optional: the previous page's
 //!  "maxScanned": 50000, "timeoutMs": 10000}        // optional: lower the browser's budgets
+//!                                                  // (a page reads 1 record per segment at least)
 //! ```
 //!
-//! An empty text counts as absent; each filter value is at most 1 KiB.
+//! An empty text counts as absent; each filter value (`from` and `to` as text too) is at most
+//! 1 KiB.
 //!
 //! ```json
 //! {"source": "kraken.events",
@@ -46,14 +49,15 @@
 //!  "key": "order-42" | null,                       // \xNN for bytes not UTF-8, cut to 128 bytes
 //!  "keyTruncated": true,                           // only when cut
 //!  "headers": {"type": "...", "id": "...", "correlationId": "...", "timestamp": "...",
-//!              "source": "...", "userId": "...", "traceparent": "..."},  // those present, cut to 256 bytes
+//!              "source": "...", "userId": "...", "traceparent": "..."},
+//!                                                  // those present, each cut to 256 bytes
 //!  "size": 17}                                     // payload bytes
 //! ```
 //!
 //! # `kraken.events.Get` ([`GetRequest`] → [`EventRecord`])
 //!
 //! ```json
-//! {"source": "kraken.events", "segment": "3", "position": "42",  // source optional
+//! {"source": "kraken.events", "segment": "3", "position": "42",  // source optional; 1-128 bytes
 //!  "payload": true}                                // optional, default false
 //! ```
 //!
@@ -83,7 +87,7 @@
 //!
 //! ```json
 //! {"source": "kraken.events", "missing": true,     // missing only when it does not exist
-//!  "subscriptions": [{"subscription": "orders.projector", "state": "Empty", "members": 0,
+//!  "subscriptions": [{"subscription": "orders.projector", "state": "<the store's>", "members": 0,
 //!                     "segments": [{"segment": "0", "committed": "4" | null, "head": "10",
 //!                                   "lag": 6 | null}],
 //!                     "lag": 6}],                  // by lag descending, then name
@@ -95,6 +99,7 @@
 //! ```json
 //! {"source": "kraken.events", "filters": {<no from, no to>},   // both optional
 //!  "heartbeatMs": 15000, "maxDurationMs": 900000}             // optional
+//!                                // heartbeat: 100 ms to 1 h, sent when no part came for that long
 //! ```
 //!
 //! Each part is one of
@@ -111,6 +116,8 @@
 //! Every call may fail with `{"error": "invalid" | "not-found" | "busy" | "unavailable",
 //! "message": "<text>"}`, carried over the hub as a handler error (`HANDLER_ERROR`) whose message
 //! is the text and whose `details` are that JSON. A tail fails this way before its `start` only.
+//! A request that does not decode (a wrong JSON type, a negative number, `1.5` for an integer)
+//! never reaches the browser: the library answers it `INVALID_MESSAGE`, without these details.
 //!
 //! # What every browser does
 //!
@@ -134,9 +141,11 @@ mod tail;
 pub use filters::{EventFilter, Filters, MAX_FILTER, TimeArg, TypeFilter, parse_time};
 pub use queries::{
     BrowseError, BrowseSettings, DEFAULT_HEARTBEAT, DEFAULT_LIMIT, EndReason, GET, GetRequest,
-    Heartbeat, LAG, LagRequest, LagView, MIN_HEARTBEAT, SEARCH, SOURCES, SearchPage, SearchRequest,
-    SegmentBounds, SegmentLag, SourceView, SourcesRequest, SourcesView, StoppedBy, SubscriptionLag,
-    TAIL, TailEnd, TailEvent, TailRequest, TailStart, heartbeat,
+    Heartbeat, LAG, LagRequest, LagView, MAX_HEARTBEAT, MAX_PAYLOAD_SETTING, MAX_RESULTS_SETTING,
+    MAX_TAIL_BUFFER_SETTING, MAX_TAIL_DURATION_SETTING, MAX_TIMEOUT_SETTING, MIN_HEARTBEAT,
+    MIN_TAIL_DURATION_SETTING, SEARCH, SOURCES, SearchPage, SearchRequest, SegmentBounds,
+    SegmentLag, SourceView, SourcesRequest, SourcesView, StoppedBy, SubscriptionLag, TAIL, TailEnd,
+    TailEvent, TailRequest, TailStart, heartbeat_period, quoted,
 };
 pub use records::{
     EventRecord, EventSummary, HeaderView, MAX_HEADER_NAME, MAX_HEADER_VALUE, MAX_HEADERS, MAX_KEY,

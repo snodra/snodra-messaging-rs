@@ -24,7 +24,8 @@ use kraken_messaging::event_store::browse::{
     BrowseError, BrowseSettings, CHUNK, Chunks, EndReason, EventBrowser, EventRecord, EventSummary,
     Examined, Filters, GetRequest, LagRequest, LagView, Range, RecordView, SearchPage, SearchPlan,
     SearchRequest, SegmentBounds, SegmentLag, SourceView, SourcesRequest, SourcesView,
-    SubscriptionLag, TailRequest, TailStart, TailStream, Want, heartbeat, merge, tail_channel,
+    SubscriptionLag, TailRequest, TailStart, TailStream, Want, heartbeat_period, merge, quoted,
+    tail_channel,
 };
 use rdkafka::client::ClientContext;
 use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
@@ -76,7 +77,8 @@ fn partition_of(segment: &str) -> Result<i32, BrowseError> {
         .filter(|p| *p >= 0)
         .ok_or_else(|| {
             BrowseError::Invalid(format!(
-                "segment {segment:?} is not a partition (a non-negative number)"
+                "segment {} is not a partition (a non-negative number)",
+                quoted(segment)
             ))
         })
 }
@@ -89,7 +91,8 @@ fn offset_of(position: &str) -> Result<i64, BrowseError> {
         .filter(|o| *o >= 0)
         .ok_or_else(|| {
             BrowseError::Invalid(format!(
-                "position {position:?} is not an offset (a non-negative number)"
+                "position {} is not an offset (a non-negative number)",
+                quoted(position)
             ))
         })
 }
@@ -522,8 +525,9 @@ impl KafkaBrowser {
 
     async fn record(&self, request: GetRequest) -> Result<EventRecord, BrowseError> {
         let topic = self.settings.source(request.source.as_deref())?;
-        let partition = partition_of(&request.segment)?;
-        let offset = offset_of(&request.position)?;
+        let (segment, position) = request.place()?;
+        let partition = partition_of(segment)?;
+        let offset = offset_of(position)?;
         let payload = request.payload.then_some(self.settings.max_payload);
         let kafka = self.kafka.clone();
         let slot = self.read_slot()?;
@@ -737,8 +741,10 @@ impl KafkaBrowser {
             ))
         })?;
         let budget = self.settings.timeout;
-        let (mut feed, stream) =
-            tail_channel(self.settings.tail_buffer, heartbeat(request.heartbeat_ms));
+        let (mut feed, stream) = tail_channel(
+            self.settings.tail_buffer,
+            heartbeat_period(request.heartbeat_ms),
+        );
         let (started_tx, started) = oneshot::channel::<Result<(), BrowseError>>();
         tokio::task::spawn_blocking(move || {
             let _slot = slot;
