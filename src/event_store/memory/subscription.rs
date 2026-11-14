@@ -20,6 +20,8 @@ pub(super) struct MemorySubscription {
     /// Where the next delivery is looked for first, so a busy segment cannot starve the others.
     turn: usize,
     left: bool,
+    /// A `Revoked` was given and no `Assigned` since: the next step closes the change.
+    changing: bool,
 }
 
 impl MemorySubscription {
@@ -32,6 +34,7 @@ impl MemorySubscription {
             paused: false,
             turn: 0,
             left: false,
+            changing: false,
         }
     }
 
@@ -58,6 +61,7 @@ impl MemorySubscription {
                 }
             }
             shared.wake();
+            self.changing = true;
             return Some(SubscriptionEvent::Revoked(names(&revoked)));
         }
         let added: Vec<usize> = (0..shared.segments)
@@ -73,7 +77,12 @@ impl MemorySubscription {
                 self.cursors
                     .insert(s, group.committed.get(&s).copied().unwrap_or(0));
             }
+            self.changing = false;
             return Some(SubscriptionEvent::Assigned(names(&added)));
+        }
+        if std::mem::take(&mut self.changing) {
+            // Every revocation is closed by an assignment, an empty one when nothing new came.
+            return Some(SubscriptionEvent::Assigned(Vec::new()));
         }
         if self.paused || self.cursors.is_empty() {
             return None;

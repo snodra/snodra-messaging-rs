@@ -266,8 +266,9 @@ pub async fn every_processor_gets_every_event(kit: &EventStoreKit<'_>) {
     b.close().await;
 }
 
-/// Two instances of one subscription split its segments (adding the second spreads them) and
-/// share its events: each event goes to one of them, and both get some.
+/// Two instances of one subscription split its segments (adding the second spreads them, every
+/// revocation closed by an assignment, possibly empty) and share its events: each event goes to
+/// one of them, and both get some.
 pub async fn instances_share_a_processor(kit: &EventStoreKit<'_>) {
     let (first, second) = (kit.instance(), kit.instance());
     let spec = kit.spec();
@@ -280,9 +281,14 @@ pub async fn instances_share_a_processor(kit: &EventStoreKit<'_>) {
     both_until(
         &mut a,
         &mut b,
-        "both instances hold segments, none held by both",
+        "both instances hold segments, none held by both, every revocation closed by an \
+         assignment",
         |a, b| {
-            !a.assigned.is_empty() && !b.assigned.is_empty() && a.assigned.is_disjoint(&b.assigned)
+            !a.assigned.is_empty()
+                && !b.assigned.is_empty()
+                && a.assigned.is_disjoint(&b.assigned)
+                && !a.changing
+                && !b.changing
         },
     )
     .await;
@@ -1472,6 +1478,9 @@ struct Reader {
     hold_everything: bool,
     /// `Revoked` changes seen.
     revoked: usize,
+    /// A `Revoked` came and no `Assigned` after it yet (the contract closes every revocation
+    /// with an assignment, possibly empty).
+    changing: bool,
 }
 
 impl Reader {
@@ -1490,6 +1499,7 @@ impl Reader {
             held: HashSet::new(),
             hold_everything: false,
             revoked: 0,
+            changing: false,
         }
     }
 
@@ -1548,6 +1558,7 @@ impl Reader {
     fn take(&mut self, event: SubscriptionEvent) {
         match event {
             SubscriptionEvent::Assigned(segments) => {
+                self.changing = false;
                 for segment in segments {
                     assert!(
                         !segment.is_empty() && segment.len() <= MAX_SEGMENT_BYTES,
@@ -1559,6 +1570,7 @@ impl Reader {
             }
             SubscriptionEvent::Revoked(segments) => {
                 self.revoked += 1;
+                self.changing = true;
                 for segment in segments {
                     self.assigned.remove(&segment);
                 }

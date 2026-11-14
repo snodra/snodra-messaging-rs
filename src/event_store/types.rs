@@ -155,7 +155,8 @@ pub enum SubscriptionEvent {
     /// These segments became this subscription's (in addition to the ones it has).
     Assigned(Vec<String>),
     /// These segments are this subscription's no longer; what it delivered of them and did not
-    /// acknowledge comes again to whichever subscription gets them.
+    /// acknowledge comes again to whichever subscription gets them. Always followed by an
+    /// `Assigned` (possibly empty), which ends the change.
     Revoked(Vec<String>),
     /// An event of a segment assigned to this subscription.
     Delivery(Delivery),

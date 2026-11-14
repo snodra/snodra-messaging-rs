@@ -12,6 +12,10 @@ use super::{EventStoreError, SegmentStatus, SubscriptionEvent};
 ///   assignment changes.
 /// - **Order per segment.** A segment's events come in their order, each after the
 ///   [`SubscriptionEvent::Assigned`] naming its segment and before any `Revoked` of it.
+/// - **Every `Revoked` is followed by an `Assigned`** (an empty one when nothing new comes): the
+///   assignment change is over only then (the core reports the processor `STARTING` in between).
+///   An event store that only moves segments away (a single active consumer losing one) still
+///   closes the change with `Assigned([])`.
 /// - **At-least-once.** An event is acknowledged with [`ack`](Self::ack) after its handling
 ///   committed; one not acknowledged comes again to the next subscription of the same name that
 ///   gets its segment (after a [`close`](Self::close), a crash or a reassignment), or to this one
