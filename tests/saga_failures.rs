@@ -1,5 +1,7 @@
 //! The failure admin (S2 Task 8, ADR 0021 rulings 3 and 36): parked saga events are listed,
-//! retried and discarded, against a real MongoDB. The Rust form of the Kotlin `SagaFailuresTest`.
+//! retried and discarded, on the in-memory message store. The Rust form of the Kotlin
+//! `SagaFailuresTest`.
+#![cfg(feature = "testing")]
 
 mod support;
 
@@ -15,19 +17,8 @@ use kraken_messaging::saga::{NoopSagaMetrics, SagaFailures, SagaRetry, SagaRunti
 use kraken_messaging::store::{StoreError, Tx, TxProvider};
 use kraken_messaging::time::epoch_ms;
 use kraken_messaging::{MessageType, MessagingError, RetryPolicy};
-use kraken_messaging_mongo::documents::FailureDoc;
-use mongodb::bson::doc;
 use support::order_saga::*;
 use support::saga::{Store, event_ctx, state, t0};
-
-macro_rules! require_docker {
-    () => {
-        if !support::docker_available() {
-            eprintln!("docker not available, skipping");
-            return;
-        }
-    };
-}
 
 fn retry(max_attempts: u32) -> SagaRetry {
     SagaRetry::new(RetryPolicy {
@@ -96,7 +87,6 @@ impl Fx {
 
 #[tokio::test]
 async fn retry_applies_a_parked_event_once_and_removes_the_failure() {
-    require_docker!();
     let fx = Fx::start().await;
     fx.deliver("f1", "e-f1").await;
     assert_eq!(fx.ids(Some("rt.Flaky")).await, ["rt.Flaky:e-f1"]);
@@ -136,7 +126,6 @@ async fn retry_applies_a_parked_event_once_and_removes_the_failure() {
 
 #[tokio::test]
 async fn a_retry_that_fails_again_keeps_it_parked_with_attempts_increased() {
-    require_docker!();
     let fx = Fx::start().await;
     fx.deliver("f2", "e-f2").await;
     let before = fx.failures.list(Some("rt.Flaky")).await.unwrap().remove(0);
@@ -161,7 +150,7 @@ async fn a_retry_that_fails_again_keeps_it_parked_with_attempts_increased() {
 /// retry, i.e. between the last failed attempt and the bookkeeping that records it.
 struct DiscardAfterRollbacks {
     inner: Arc<dyn TxProvider>,
-    db: mongodb::Database,
+    failures: Arc<dyn kraken_messaging::store::FailureStore>,
     failure_id: String,
     after: usize,
     rollbacks: AtomicUsize,
@@ -184,9 +173,8 @@ impl TxProvider for DiscardAfterRollbacks {
         Box::pin(async move {
             self.inner.abort(tx).await;
             if self.rollbacks.fetch_add(1, Ordering::SeqCst) + 1 == self.after {
-                self.db
-                    .collection::<mongodb::bson::Document>("saga_failures")
-                    .delete_one(doc! { "_id": &self.failure_id })
+                self.failures
+                    .delete(&mut Tx::none(), &self.failure_id)
                     .await
                     .unwrap();
             }
@@ -196,13 +184,12 @@ impl TxProvider for DiscardAfterRollbacks {
 
 #[tokio::test]
 async fn a_discard_that_lands_during_a_failing_retry_is_not_undone_by_the_retrys_bookkeeping() {
-    require_docker!();
     let store = Store::start().await;
     let broken = Arc::new(AtomicBool::new(true));
     let base = store.ports();
     let racing = Arc::new(DiscardAfterRollbacks {
         inner: Arc::clone(&base.tx),
-        db: store.db.clone(),
+        failures: Arc::clone(&base.failures),
         failure_id: "rt.Flaky:e-f9".into(),
         after: 4, // two attempts of the first delivery roll back, then the two of the retry
         rollbacks: AtomicUsize::new(0),
@@ -256,7 +243,6 @@ async fn a_discard_that_lands_during_a_failing_retry_is_not_undone_by_the_retrys
 
 #[tokio::test]
 async fn retry_all_retries_every_failure_of_a_type() {
-    require_docker!();
     let fx = Fx::start().await;
     for (order, id) in [("f3", "e-f3"), ("f4", "e-f4"), ("f5", "e-f5")] {
         fx.deliver(order, id).await;
@@ -267,9 +253,9 @@ async fn retry_all_retries_every_failure_of_a_type() {
     other.id = "rt.Other:e-x".into();
     other.saga_type = "rt.Other".into();
     fx.store
-        .db
-        .collection::<FailureDoc>("saga_failures")
-        .insert_one(FailureDoc::from(&other))
+        .ports()
+        .failures
+        .save(&mut Tx::none(), &other)
         .await
         .unwrap();
     fx.broken.store(false, Ordering::SeqCst);
@@ -286,7 +272,6 @@ async fn retry_all_retries_every_failure_of_a_type() {
 
 #[tokio::test]
 async fn discard_removes_it_without_applying() {
-    require_docker!();
     let fx = Fx::start().await;
     fx.deliver("f6", "e-f6").await;
     fx.broken.store(false, Ordering::SeqCst);
@@ -304,7 +289,6 @@ async fn discard_removes_it_without_applying() {
 
 #[tokio::test]
 async fn retry_of_an_unknown_id_is_false() {
-    require_docker!();
     let fx = Fx::start().await;
 
     assert!(!fx.failures.retry("rt.Flaky:nope").await.unwrap());
@@ -320,16 +304,15 @@ async fn retry_of_an_unknown_id_is_false() {
 
 #[tokio::test]
 async fn a_failure_of_a_saga_type_this_service_does_not_have_is_refused_and_left_as_it_was() {
-    require_docker!();
     let fx = Fx::start().await;
     fx.deliver("f7", "e-f7").await;
     let mut gone = fx.failures.list(Some("rt.Flaky")).await.unwrap().remove(0);
     gone.id = "rt.Gone:e-f7".into();
     gone.saga_type = "rt.Gone".into();
     fx.store
-        .db
-        .collection::<FailureDoc>("saga_failures")
-        .insert_one(FailureDoc::from(&gone))
+        .ports()
+        .failures
+        .save(&mut Tx::none(), &gone)
         .await
         .unwrap();
 

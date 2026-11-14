@@ -1,7 +1,8 @@
 //! Partner Kafka topics become local kraken events (S2 Task 10, ADR 0021 rulings 20, 40; ADR 0027):
 //! the core's external sources over the Kafka add-on's `KafkaExternalSource`, the Rust form of the
-//! Kotlin `ExternalKafkaSourcesTest`, against a real Kafka and MongoDB. One broker serves every
+//! Kotlin `ExternalKafkaSourcesTest`, against a real Kafka (the in-memory message store keeps the rest). One broker serves every
 //! scenario (each on a topic and source of its own).
+#![cfg(feature = "testing")]
 
 mod support;
 
@@ -17,7 +18,6 @@ use kraken_messaging::hub::HandlerRegistry;
 use kraken_messaging::saga::{NoopSagaMetrics, SagaDefinition, SagaRetry, SagaRuntime, SagaType};
 use kraken_messaging::{Event, MessageContext, MessagingError, RetryPolicy, message_type};
 use kraken_messaging_kafka::{ExternalSource, KafkaExternalSource};
-use mongodb::bson::doc;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
@@ -387,7 +387,7 @@ async fn partner_records_become_local_events_deduplicated_never_published_and_re
 
     // -- the event is not published to kraken.events
     assert_eq!(
-        ek.store.count("outbox", doc! {}).await,
+        ek.store.outbox().await.len(),
         0,
         "nothing reached the outbox that relays to kraken.events"
     );

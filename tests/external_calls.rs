@@ -1,5 +1,6 @@
 //! Idempotent adapter handlers over `external_calls` (S2 Task 9, ADR 0021 rulings 12, 17, 38, 39,
-//! 41-43): the Rust form of the Kotlin `IdempotentHandlerTest`, against a real MongoDB.
+//! 41-43): the Rust form of the Kotlin `IdempotentHandlerTest`, on the in-memory message store.
+#![cfg(feature = "testing")]
 
 mod support;
 
@@ -26,19 +27,8 @@ use kraken_messaging::saga::{
 use kraken_messaging::store::{ExternalCall, ExternalCallStatus, MessageStore};
 use kraken_messaging::time::epoch_ms;
 use kraken_messaging::{Command, Event, MessagingError, RetryPolicy, SendOptions, message_type};
-use kraken_messaging_mongo::documents::DispatchDoc;
-use mongodb::bson::doc;
 use serde::{Deserialize, Serialize};
 use support::saga::{Store, event_ctx, state, t0};
-
-macro_rules! require_docker {
-    () => {
-        if !support::docker_available() {
-            eprintln!("docker not available, skipping");
-            return;
-        }
-    };
-}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -341,7 +331,6 @@ fn is_unknown(details: &[u8]) -> bool {
 
 #[tokio::test]
 async fn a_second_call_with_the_same_key_returns_the_stored_reply_without_running_the_body() {
-    require_docker!();
     let ex = Ex::start().await;
 
     let first = receipt(&ex.print(Some("job-1")).await);
@@ -370,7 +359,6 @@ async fn a_second_call_with_the_same_key_returns_the_stored_reply_without_runnin
 
 #[tokio::test]
 async fn a_failed_call_re_throws_the_stored_error() {
-    require_docker!();
     let ex = Ex::start().await;
     ex.adapter.behave(|p, _| {
         Err(MessagingError::RemoteHandler {
@@ -412,7 +400,6 @@ async fn a_failed_call_re_throws_the_stored_error() {
 
 #[tokio::test]
 async fn a_retryable_failure_lets_the_next_call_run_the_body_again() {
-    require_docker!();
     let ex = Ex::start().await;
     ex.adapter.behave(|p, n| {
         if n == 0 {
@@ -441,7 +428,6 @@ async fn a_retryable_failure_lets_the_next_call_run_the_body_again() {
 
 #[tokio::test]
 async fn an_adapter_that_reports_an_unknown_outcome_itself_leaves_the_record_unknown() {
-    require_docker!();
     let ex = Ex::start().await;
     ex.adapter.behave(|_, _| {
         Err(MessagingError::UnknownOutcome(
@@ -464,7 +450,6 @@ async fn an_adapter_that_reports_an_unknown_outcome_itself_leaves_the_record_unk
 
 #[tokio::test]
 async fn a_failure_to_write_succeeded_after_the_body_succeeded_is_an_unknown_outcome() {
-    require_docker!();
     let ex = Ex::start().await;
     ex.calls.fail_next_succeeded_write();
 
@@ -488,7 +473,6 @@ async fn a_failure_to_write_succeeded_after_the_body_succeeded_is_an_unknown_out
 
 #[tokio::test]
 async fn with_external_idempotent_a_failure_to_write_succeeded_is_retryable() {
-    require_docker!();
     let ex = Ex::start().await;
     ex.calls.fail_next_succeeded_write();
 
@@ -508,7 +492,6 @@ async fn with_external_idempotent_a_failure_to_write_succeeded_is_retryable() {
 #[tokio::test]
 async fn an_in_progress_record_past_its_lease_becomes_unknown_and_the_call_fails_with_unknown_outcome()
  {
-    require_docker!();
     let ex = Ex::start().await;
     ex.insert_in_progress("job-1").await;
     ex.store.clock.set(t0() + LEASE + Duration::from_secs(1)); // the first call crashed mid-way, a lease ago
@@ -535,7 +518,6 @@ async fn an_in_progress_record_past_its_lease_becomes_unknown_and_the_call_fails
 
 #[tokio::test]
 async fn an_in_progress_record_within_its_lease_asks_the_caller_to_come_back() {
-    require_docker!();
     let ex = Ex::start().await;
     ex.insert_in_progress("job-1").await;
 
@@ -554,7 +536,6 @@ async fn an_in_progress_record_within_its_lease_asks_the_caller_to_come_back() {
 
 #[tokio::test]
 async fn with_external_idempotent_the_expired_call_is_retried() {
-    require_docker!();
     let ex = Ex::start().await;
     ex.insert_in_progress("job-1").await;
     ex.store.clock.set(t0() + LEASE + Duration::from_secs(1));
@@ -572,7 +553,6 @@ async fn with_external_idempotent_the_expired_call_is_retried() {
 
 #[tokio::test]
 async fn a_missing_key_is_a_call_time_error_naming_the_handler() {
-    require_docker!();
     let ex = Ex::start().await;
 
     let (code, message, _) = failure(&ex.print(None).await);
@@ -588,7 +568,6 @@ async fn a_missing_key_is_a_call_time_error_naming_the_handler() {
 
 #[tokio::test]
 async fn the_key_can_be_computed_from_the_message() {
-    require_docker!();
     let ex = Ex::start().await;
     let poll = |job: &str, attempt: u32| format!(r#"{{"jobId":"{job}","attempt":{attempt}}}"#);
 
@@ -611,7 +590,6 @@ async fn the_key_can_be_computed_from_the_message() {
 
 #[tokio::test]
 async fn an_idempotent_event_handler_runs_once_per_key() {
-    require_docker!();
     let ex = Ex::start().await;
     let local = ex.local_dispatcher();
     let payload = br#"{"jobId":"j9"}"#;
@@ -632,7 +610,6 @@ async fn an_idempotent_event_handler_runs_once_per_key() {
 
 #[tokio::test]
 async fn the_call_record_is_written_apart_from_the_callers_transaction() {
-    require_docker!();
     let ex = Ex::start().await;
     let local = ex.local_dispatcher();
     let payload = br#"{"jobId":"j9"}"#;
@@ -678,7 +655,6 @@ async fn the_call_record_is_written_apart_from_the_callers_transaction() {
 
 #[tokio::test]
 async fn a_handler_whose_external_calls_were_never_bound_fails_loudly() {
-    require_docker!();
     let store = Store::start().await;
     let adapter = Adapter::new();
     let mut registry = HandlerRegistry::new();
@@ -852,22 +828,18 @@ async fn harness() -> Harness {
 
 impl Harness {
     async fn entry(&self) -> SagaDispatchDocument {
-        let found: Vec<DispatchDoc> = self
-            .ex
+        self.ex
             .store
-            .find("saga_dispatch", doc! { "kind": "COMMAND" })
-            .await;
-        found
+            .dispatch()
+            .await
             .into_iter()
-            .map(SagaDispatchDocument::from)
-            .next()
+            .find(|e| e.kind == kraken_messaging::saga::store::DispatchKind::Command)
             .unwrap()
     }
 }
 
 #[tokio::test]
 async fn a_crash_between_the_send_and_the_mark_re_sends_with_the_same_key_and_the_body_runs_once() {
-    require_docker!();
     let h = harness().await;
     let entry = h.entry().await;
     assert_eq!(entry.kind, DispatchKind::Command);
@@ -891,12 +863,11 @@ async fn a_crash_between_the_send_and_the_mark_re_sends_with_the_same_key_and_th
         h.ex.record(&entry.id).await.unwrap().status,
         ExternalCallStatus::Succeeded
     );
-    assert_eq!(h.ex.store.count("external_calls", doc! {}).await, 1);
+    assert_eq!(h.ex.store.external_calls().await.len(), 1);
 }
 
 #[tokio::test]
 async fn the_relay_maps_an_unknown_outcome_to_saga_command_failed_unknown_outcome() {
-    require_docker!();
     let h = harness().await;
     let entry = h.entry().await;
     h.ex.insert_in_progress(&entry.id).await;
@@ -917,11 +888,11 @@ async fn the_relay_maps_an_unknown_outcome_to_saga_command_failed_unknown_outcom
     assert!(h.entry().await.failed_at_ms.is_some());
     assert_eq!(
         h.ex.store
-            .count(
-                "saga_dispatch",
-                doc! { "failedAt": null, "dispatchedAt": null }
-            )
-            .await,
+            .dispatch()
+            .await
+            .iter()
+            .filter(|e| e.failed_at_ms.is_none() && e.dispatched_at_ms.is_none())
+            .count(),
         0,
         "nothing left pending"
     );
@@ -929,7 +900,6 @@ async fn the_relay_maps_an_unknown_outcome_to_saga_command_failed_unknown_outcom
 
 #[tokio::test]
 async fn a_retryable_adapter_failure_through_the_local_sender_is_transient() {
-    require_docker!();
     let ex = Ex::start().await;
     ex.adapter
         .behave(|_, _| Err(MessagingError::RetryableExternal("partner busy".into())));
@@ -999,7 +969,6 @@ impl Ex {
 #[tokio::test]
 async fn a_call_that_finds_an_expired_record_succeeded_meanwhile_answers_with_its_reply_not_unknown()
  {
-    require_docker!();
     let ex = Ex::start().await;
     let go = Arc::new(tokio::sync::Notify::new());
     let slow = slow_call(&ex.calls, "job-9", false, &go, || Ok(7));
@@ -1033,7 +1002,6 @@ async fn a_call_that_finds_an_expired_record_succeeded_meanwhile_answers_with_it
 
 #[tokio::test]
 async fn a_call_whose_record_was_taken_over_cannot_overwrite_the_new_owners_success() {
-    require_docker!();
     let ex = Ex::start().await;
     let go = Arc::new(tokio::sync::Notify::new());
     let slow = slow_call(&ex.calls, "job-9", true, &go, || Ok(7));
@@ -1074,7 +1042,6 @@ async fn a_call_whose_record_was_taken_over_cannot_overwrite_the_new_owners_succ
 
 #[tokio::test]
 async fn a_call_whose_record_was_taken_over_cannot_delete_or_settle_the_new_owners_record() {
-    require_docker!();
     let ex = Ex::start().await;
     let failures: [(&str, Outcome); 4] = [
         ("retryable", || {
@@ -1125,7 +1092,6 @@ async fn a_call_whose_record_was_taken_over_cannot_delete_or_settle_the_new_owne
 #[tokio::test]
 async fn a_call_whose_record_another_call_gave_up_as_unknown_reports_an_unknown_outcome_not_success()
  {
-    require_docker!();
     let ex = Ex::start().await;
     let go = Arc::new(tokio::sync::Notify::new());
     let slow = slow_call(&ex.calls, "job-9", false, &go, || Ok(7));
@@ -1154,7 +1120,6 @@ async fn a_call_whose_record_another_call_gave_up_as_unknown_reports_an_unknown_
 
 #[tokio::test]
 async fn a_call_whose_record_was_reset_and_begun_afresh_cannot_settle_the_new_call() {
-    require_docker!();
     let ex = Ex::start().await;
     let go_first = Arc::new(tokio::sync::Notify::new());
     let first = slow_call(&ex.calls, "job-9", true, &go_first, || Ok(7));
