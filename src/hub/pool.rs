@@ -59,7 +59,7 @@
 //!   when its stream is closed fail like on any lost stream. A certificate with less than a tenth
 //!   of its lifetime (at most 24 h) left, and no renewed file, is warned about once.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -573,6 +573,24 @@ impl HubPool {
         let ids: Vec<&str> = live.iter().map(|l| l.hub_id.as_str()).collect();
         let first = *rank_keyed(&ids, routing_key).first()?;
         Some(live[first].ack.clone())
+    }
+
+    /// The latest refusal of this instance's registration by each hub that refuses it now
+    /// ([`HubConnection::last_rejection`]), by hub: its id when it registered this instance
+    /// before ([`HubConnection::last_hub_id`]), else the target dialled as `host:port` (a refused
+    /// `Register` carries no hub id). A hub that accepts a registration again leaves the map.
+    pub fn rejections(&self) -> BTreeMap<String, String> {
+        self.members()
+            .iter()
+            .filter_map(|m| {
+                let rejection = m.conn.last_rejection()?;
+                let hub = m
+                    .conn
+                    .last_hub_id()
+                    .unwrap_or_else(|| super::targets::target_id(m.address()));
+                Some((hub, rejection))
+            })
+            .collect()
     }
 
     /// Requests that arrived on any hub and whose handler has not finished.

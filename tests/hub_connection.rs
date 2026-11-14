@@ -707,3 +707,54 @@ async fn wait_for_tcp_returns_once_the_port_accepts_and_gives_up_otherwise() {
     assert!(started.elapsed() >= Duration::from_millis(300));
     late.abort();
 }
+
+/// The application reads why a hub refuses the instance (`KrakenMessaging::hub_rejections`): by
+/// the target dialled while that hub never registered it, by its hub id once it did; gone once
+/// the hub accepts a registration again.
+#[tokio::test]
+async fn the_application_reads_each_hubs_latest_rejection() {
+    let hub = FakeHub::start().await;
+    hub.reject_next_with_already_exists();
+    let mut config = kraken_messaging::Config::new("svc-rejected", &hub.address());
+    config.outbox_enabled = false;
+    config.reconnect_backoff_min = Duration::from_millis(50);
+    config.reconnect_backoff_max = Duration::from_millis(300);
+    let app = kraken_messaging::KrakenMessaging::builder(config)
+        .await
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let target = hub.address().trim_start_matches("static://").to_string();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let refused = loop {
+        let rejections = app.hub_rejections();
+        if !rejections.is_empty() {
+            break rejections;
+        }
+        assert!(Instant::now() < deadline, "no rejection read");
+        sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(refused.keys().collect::<Vec<_>>(), [&target]);
+    assert!(
+        refused[&target].contains("owned by other-service"),
+        "{refused:?}"
+    );
+    assert!(app.await_hub(Duration::from_secs(5)).await);
+    assert!(app.hub_rejections().is_empty(), "accepted again");
+
+    hub.reject_next_with_already_exists();
+    hub.drop_streams();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.hub_rejections().is_empty() {
+        assert!(Instant::now() < deadline, "no second rejection read");
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        app.hub_rejections().keys().collect::<Vec<_>>(),
+        ["fake-hub"],
+        "by its hub id once it registered the instance"
+    );
+    app.shutdown().await;
+    hub.stop();
+}

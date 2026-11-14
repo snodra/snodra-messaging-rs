@@ -297,6 +297,16 @@ impl KrakenMessaging {
         self.hubs.hub_ids()
     }
 
+    /// Why hubs refuse this instance now: the latest refusal of its registration by each hub that
+    /// refuses it (a `Register` rejected, e.g. a type another service owns or an identity the hub
+    /// does not accept, or no access token for it), by hub id (the target dialled, `host:port`,
+    /// for a hub that never registered this instance: a refusal carries no hub id). Empty while
+    /// every hub accepts it; a hub leaves the map once it accepts a registration again. The
+    /// library also logs each distinct refusal once at error and retries at the backoff ceiling.
+    pub fn hub_rejections(&self) -> std::collections::BTreeMap<String, String> {
+        self.hubs.rejections()
+    }
+
     /// How this instance authenticates to the hubs: `none`, a static `token`, a `jwt`
     /// (Keycloak client credentials, ADR 0019) or a client `certificate` (mutual TLS, ADR 0020),
     /// the current access token's expiry, the last token fetch error and the token fetch counts by

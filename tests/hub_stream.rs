@@ -683,6 +683,45 @@ async fn a_lost_hub_stream_cancels_the_streaming_handlers_it_carried_but_not_the
     h.shutdown().await;
 }
 
+/// A streaming handler cancelled because its hub stream was lost is finished: the instance no
+/// longer counts it in flight (`InstanceStatus.handlers_in_flight`, the gauge), on the new stream
+/// either.
+#[tokio::test]
+async fn a_streaming_handler_cancelled_by_a_lost_stream_is_no_longer_in_flight() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let h = handler(&hub.address(), "svc-h", "h1", &probe, 3).await;
+    let payload = serde_json::to_vec(&export(1_000, 20, None)).unwrap();
+    hub.send_to_clients(forwarded("s#1", "t.Export", &payload, 4))
+        .await;
+    eventually("the streaming handler runs", async || {
+        hub.parts().len() == 4
+    })
+    .await;
+    assert_eq!(h.pool.handlers_in_flight(), 1);
+    hub.drop_streams();
+    eventually("the streaming handler aborted", async || {
+        probe.dropped.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert!(h.pool.await_all_registered(Duration::from_secs(5)).await);
+    eventually("nothing in flight", async || {
+        h.pool.handlers_in_flight() == 0
+    })
+    .await;
+    let seen = hub.statuses().len();
+    eventually(
+        "a status on the new stream reports none in flight",
+        async || {
+            hub.statuses()[seen..]
+                .iter()
+                .any(|(stream, s)| *stream > 1 && s.handlers_in_flight == 0)
+        },
+    )
+    .await;
+    h.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_request_whose_mode_does_not_match_the_handler_is_invalid_request() {
     let hub = FakeHub::start().await;

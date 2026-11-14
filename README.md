@@ -318,7 +318,7 @@ every instance registers on every hub, and the client picks a hub per request.
   instance runs at once, and the extra requests wait locally (same rule as kraken-messaging).
 - **Status.** Every `KRAKEN_HUB_STATUS_INTERVAL_MS` the instance sends `InstanceStatus` to every
   hub: `connected_hub_ids` (the acknowledged hubs), `handlers_in_flight` (handlers running over all
-  hubs) and the [event processors](#event-processors)' status. Each hub shows the report in its topology
+  hubs; a subscription runs no handler and is not counted) and the [event processors](#event-processors)' status. Each hub shows the report in its topology
   (`connectedHubIds`, `statusAgeMs`) and its dashboard flags instances missing a hub.
 - **Logs** of each connection carry its `address` (and the `hub` id once acknowledged). The crate
   has no metrics of its own.
@@ -1334,8 +1334,10 @@ default is a random UUID). Like `ALREADY_EXISTS` and `INVALID_ARGUMENT` before, 
 rejections, not outages:
 
 - `HubConnection::last_rejection()` holds the hub's message (until a stream registers, which clears
-  it); `await_hub` / `await_all_hubs` keep returning `false` while the hub refuses, as for the
-  other rejections.
+  it); the application reads it with `app.hub_rejections()`: every hub refusing the instance now, by
+  hub id (by the target dialled, `host:port`, for a hub that never registered it: a refusal carries
+  no hub id), empty while every hub accepts it. `await_hub` / `await_all_hubs` keep returning
+  `false` while the hub refuses, as for the other rejections.
 - The reconnect waits the **backoff cap** (`reconnect_backoff_max`, 80-100 % of it), not the floor:
   no tight loop against a hub that will keep saying no.
 - The log line `hub rejected the registration` is at `error` once per distinct (code, message),

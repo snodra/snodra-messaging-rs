@@ -61,7 +61,8 @@ use tonic::{Code, Status};
 use crate::error::MessagingError;
 use crate::proto::hub_client::HubClient;
 use crate::proto::{
-    self, ClientMessage, Heartbeat, Permits, Register, RegisterAck, client_message, server_message,
+    self, ClientMessage, Heartbeat, Permits, Register, RegisterAck, RequestMode, client_message,
+    server_message,
 };
 use crate::retry::{jittered, random_unit};
 use crate::security::{HubTls, SecretString};
@@ -522,6 +523,8 @@ pub struct HubConnection {
     /// acknowledged). The hub acks them in order, so the n-th written is acked once n acks came.
     later_registers: watch::Sender<(StreamId, u64, u64)>,
     last_rejection: Mutex<Option<String>>,
+    /// The id of the hub the last handshaken stream registered with, kept once that stream ended.
+    last_hub_id: Mutex<Option<String>>,
     /// The token resolved for the stream being opened (the last one read from `token_file`); what
     /// every `Register` of the stream carries.
     token: Mutex<Option<SecretString>>,
@@ -666,6 +669,7 @@ impl HubConnection {
             handshake,
             later_registers,
             last_rejection: Mutex::new(None),
+            last_hub_id: Mutex::new(None),
             token: Mutex::new(None),
             jwt: Mutex::new(None),
             presented: Mutex::new(None),
@@ -781,8 +785,17 @@ impl HubConnection {
         self.connected.load(Ordering::SeqCst)
     }
 
+    /// Why the hub refuses this instance now: the message of its latest refusal of a `Register`
+    /// (or of the access token's endpoint, when no stream could be opened); `None` once a
+    /// registration is accepted again.
     pub fn last_rejection(&self) -> Option<String> {
         self.last_rejection.lock().unwrap().clone()
+    }
+
+    /// The id of the hub this connection last registered with (as [`hub_id`](Self::hub_id)),
+    /// kept after that stream ended; `None` until a first registration.
+    pub fn last_hub_id(&self) -> Option<String> {
+        self.last_hub_id.lock().unwrap().clone()
     }
 
     /// How this connection authenticates: the kind, for a JWT the expiry of the current access
@@ -1387,7 +1400,12 @@ impl HubConnection {
                         }
                         server_message::Message::Heartbeat(_) => last_echo = tokio::time::Instant::now(),
                         server_message::Message::Request(request) => {
-                            grants.received();
+                            // A subscription is passive: the hub spent no permit on it and no
+                            // handler runs for it, so it is neither a permit to give back nor a
+                            // handler in flight (it would stay counted for good).
+                            if request.mode != RequestMode::Subscription as i32 {
+                                grants.received();
+                            }
                             self.forward(Inbound::Request { request, reply_to: reply_to.clone() }).await?
                         }
                         server_message::Message::Reply(r) => self.forward(Inbound::Reply(r)).await?,
@@ -1757,6 +1775,7 @@ impl HubConnection {
         });
         // A registered stream is the end of any earlier rejection.
         *self.last_rejection.lock().unwrap() = None;
+        *self.last_hub_id.lock().unwrap() = Some(hub_id(ack, &self.settings.address));
         let first = self.handshake.send_replace(Some(ack.clone())).is_none();
         if first {
             self.changed();
