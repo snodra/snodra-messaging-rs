@@ -13,7 +13,7 @@
 //!
 //! Settings ([`KafkaConfig`]): the bootstrap servers (`KRAKEN_KAFKA_BOOTSTRAP`, default
 //! `kafka:19092`) and extra librdkafka properties (security, for example) for every client the
-//! store creates.
+//! store creates, for its producer only or for its consumers only.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -47,8 +47,14 @@ const CAPABILITIES: [Capability; 4] = Capability::ALL;
 pub struct KafkaConfig {
     /// `host:port` list (`bootstrap.servers`).
     pub bootstrap_servers: String,
-    /// Extra librdkafka properties for every client, never one of [`FIXED_KEYS`].
+    /// Extra librdkafka properties for every client (security, for example), never one of
+    /// [`FIXED_KEYS`].
     pub properties: HashMap<String, String>,
+    /// Extra librdkafka properties for the producer only (a consumer would log them as ignored).
+    pub producer_properties: HashMap<String, String>,
+    /// Extra librdkafka properties for the consumers only (the subscriptions and the admins; the
+    /// producer would log them as ignored), never one of [`FIXED_KEYS`].
+    pub consumer_properties: HashMap<String, String>,
 }
 
 impl KafkaConfig {
@@ -57,6 +63,8 @@ impl KafkaConfig {
         KafkaConfig {
             bootstrap_servers: bootstrap_servers.to_string(),
             properties: HashMap::new(),
+            producer_properties: HashMap::new(),
+            consumer_properties: HashMap::new(),
         }
     }
 
@@ -67,10 +75,38 @@ impl KafkaConfig {
         ))
     }
 
-    /// One more librdkafka property.
+    /// One more librdkafka property, for every client.
     pub fn property(mut self, key: &str, value: &str) -> KafkaConfig {
         self.properties.insert(key.to_string(), value.to_string());
         self
+    }
+
+    /// One more librdkafka property, for the producer only.
+    pub fn producer_property(mut self, key: &str, value: &str) -> KafkaConfig {
+        self.producer_properties
+            .insert(key.to_string(), value.to_string());
+        self
+    }
+
+    /// One more librdkafka property, for the consumers only.
+    pub fn consumer_property(mut self, key: &str, value: &str) -> KafkaConfig {
+        self.consumer_properties
+            .insert(key.to_string(), value.to_string());
+        self
+    }
+
+    /// The properties of the producer: every client's, then the producer's own.
+    pub(crate) fn producer(&self) -> HashMap<String, String> {
+        let mut all = self.properties.clone();
+        all.extend(self.producer_properties.clone());
+        all
+    }
+
+    /// The properties of a consumer: every client's, then the consumers' own.
+    pub(crate) fn consumer(&self) -> HashMap<String, String> {
+        let mut all = self.properties.clone();
+        all.extend(self.consumer_properties.clone());
+        all
     }
 
     fn validate(&self) -> Result<(), EventStoreError> {
@@ -79,7 +115,10 @@ impl KafkaConfig {
                 "the Kafka bootstrap servers are empty".into(),
             ));
         }
-        external::reject_fixed_keys("the Kafka properties", &self.properties)
+        external::reject_fixed_keys("the Kafka properties", &self.consumer())
+            .and_then(|()| {
+                external::reject_fixed_keys("the Kafka producer properties", &self.producer())
+            })
             .map_err(EventStoreError::Invalid)
     }
 }
@@ -150,7 +189,7 @@ impl EventStore for KafkaEventStore {
                 &self.config.bootstrap_servers,
                 &spec.name,
                 &spec.source,
-                &self.config.properties,
+                &self.config.consumer(),
                 true,
             )?;
             Ok(Box::new(subscription) as Box<dyn Subscription>)
@@ -165,7 +204,7 @@ impl EventStore for KafkaEventStore {
             &self.config.bootstrap_servers,
             &spec.name,
             &spec.source,
-            &self.config.properties,
+            &self.config.consumer(),
         )?))
     }
 
@@ -221,6 +260,35 @@ mod tests {
             KafkaEventStore::new(KafkaConfig::new(" ")),
             Err(EventStoreError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn each_client_gets_the_common_properties_and_its_own_only() {
+        let config = KafkaConfig::new("h:1")
+            .property("security.protocol", "SSL")
+            .producer_property("linger.ms", "5")
+            .consumer_property("session.timeout.ms", "30000");
+        let producer = config.producer();
+        assert_eq!(
+            producer.get("security.protocol").map(String::as_str),
+            Some("SSL")
+        );
+        assert_eq!(producer.get("linger.ms").map(String::as_str), Some("5"));
+        assert!(!producer.contains_key("session.timeout.ms"));
+        let consumer = config.consumer();
+        assert_eq!(
+            consumer.get("security.protocol").map(String::as_str),
+            Some("SSL")
+        );
+        assert_eq!(
+            consumer.get("session.timeout.ms").map(String::as_str),
+            Some("30000")
+        );
+        assert!(!consumer.contains_key("linger.ms"));
+        assert!(
+            KafkaEventStore::new(KafkaConfig::new("h:1").consumer_property("group.id", "x"))
+                .is_err()
+        );
     }
 
     #[test]

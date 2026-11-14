@@ -15,10 +15,14 @@
 //! - **Status** is read by a task of the subscription itself every [`OFFSETS_REFRESH`]
 //!   (committed offsets and high watermarks, on a blocking thread); [`segments`] only reads what
 //!   it last found, plus the acknowledgements made since.
+//! - **Errors** librdkafka recovers from (a client error, a failed rebalance, a receive error of a
+//!   partition) are logged and kept for [`take_error`]; only a fatal consumer error ends the
+//!   subscription (`next` fails, the caller subscribes again).
 //!
 //! [`segments`]: Subscription::segments
+//! [`take_error`]: Subscription::take_error
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -78,6 +82,8 @@ struct Shared {
     paused: AtomicBool,
     /// Counts the rebalances: a seek-back is forgotten by the next one.
     generation: AtomicU64,
+    /// The latest error recovered from, until [`Subscription::take_error`] takes it.
+    error: Mutex<Option<String>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -106,6 +112,11 @@ impl Shared {
 
     fn has_changes(&self) -> bool {
         !lock(&self.changes).is_empty()
+    }
+
+    /// Keeps `error` for the status (the latest wins).
+    fn error(&self, error: String) {
+        *lock(&self.error) = Some(error);
     }
 
     fn assigned(&self) -> Vec<i32> {
@@ -167,6 +178,7 @@ impl ClientContext for SubscriptionContext {
             return;
         }
         tracing::warn!(topic = %self.shared.topic, "kafka error: {error}: {reason}");
+        self.shared.error(format!("kafka: {error}: {reason}"));
     }
 }
 
@@ -212,6 +224,7 @@ impl ConsumerContext for SubscriptionContext {
             }
             Rebalance::Error(e) => {
                 tracing::warn!(topic = %shared.topic, "rebalance error: {e}");
+                shared.error(format!("rebalance: {e}"));
             }
         }
     }
@@ -432,7 +445,17 @@ impl Subscription for KafkaSubscription {
                                 tokio::time::sleep(ERROR_BACKOFF).await;
                                 continue;
                             }
+                            // A partition's error: librdkafka goes on fetching (the consumer
+                            // always did too); the status shows it.
+                            Err(e @ KafkaError::MessageConsumption(_)) => {
+                                tracing::warn!(topic = %self.shared.topic, "kafka receive error: {e}");
+                                self.shared.error(format!("kafka receive: {e}"));
+                                tokio::time::sleep(ERROR_BACKOFF).await;
+                                continue;
+                            }
+                            // The consumer cannot go on: the caller subscribes again.
                             Err(e) => {
+                                tracing::warn!(topic = %self.shared.topic, "kafka receive error, the subscription ends: {e}");
                                 tokio::time::sleep(ERROR_BACKOFF).await;
                                 return Err(failed(e));
                             }
@@ -513,15 +536,11 @@ impl Subscription for KafkaSubscription {
         let acked = lock(&self.shared.acked).clone();
         let broker = lock(&self.shared.broker).clone();
         let text = |n: i64| n.to_string();
-        // Sorted by segment (text order, as the kit and the hub see them).
-        let sorted: BTreeMap<String, i32> = self
-            .shared
+        // Partitions by number: their names in segment order.
+        self.shared
             .assigned()
             .into_iter()
             .map(|p| (p.to_string(), p))
-            .collect();
-        sorted
-            .into_iter()
             .map(|(segment, p)| {
                 let read = broker.get(&p).copied().unwrap_or_default();
                 let committed = [read.committed, acked.get(&p).copied()]
@@ -543,6 +562,10 @@ impl Subscription for KafkaSubscription {
                 }
             })
             .collect()
+    }
+
+    fn take_error(&mut self) -> Option<String> {
+        lock(&self.shared.error).take()
     }
 
     fn close(self: Box<Self>) -> BoxFuture<'static, ()> {
@@ -656,7 +679,20 @@ fn read_offsets(
 
 #[cfg(test)]
 mod tests {
+    use kraken_messaging::event_store::segment_order;
+
     use super::*;
+
+    #[test]
+    fn partition_names_by_number_are_in_segment_order() {
+        let mut names: Vec<String> = [0, 2, 10, 11, 1].iter().map(i32::to_string).collect();
+        let by_number: Vec<String> = BTreeSet::from([0, 2, 10, 11, 1])
+            .iter()
+            .map(i32::to_string)
+            .collect();
+        names.sort_by(|a, b| segment_order(a, b));
+        assert_eq!(names, by_number);
+    }
 
     #[test]
     fn the_stores_own_topics_may_be_created_a_partners_never() {

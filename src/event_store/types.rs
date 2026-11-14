@@ -1,6 +1,7 @@
 //! What crosses the event-store interface: the events published, the deliveries read, the
 //! capabilities declared and the errors.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 /// The headers every event carries (ADR 0027), as the event store's native metadata.
@@ -35,6 +36,25 @@ pub mod headers {
 pub const MAX_SEGMENT_BYTES: usize = 128;
 /// The most bytes of a position (hub.proto bounds: a longer one reads as unknown on the hub).
 pub const MAX_POSITION_BYTES: usize = 128;
+
+/// The order segments are listed in (the hub's): names of ASCII digits only by their value (any
+/// length, no overflow; equal values by their text), before every other name, which go by their
+/// bytes.
+pub fn segment_order(a: &str, b: &str) -> Ordering {
+    let decimal = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match (decimal(a), decimal(b)) {
+        (true, true) => {
+            let (x, y) = (a.trim_start_matches('0'), b.trim_start_matches('0'));
+            x.len()
+                .cmp(&y.len())
+                .then_with(|| x.cmp(y))
+                .then_with(|| a.cmp(b))
+        }
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => a.as_bytes().cmp(b.as_bytes()),
+    }
+}
 
 /// The dead-letter source of `source` (`<source>.dlt`): where the dead-letter mode `event-store`
 /// sends what a processor cannot handle, on an event store declaring
@@ -176,7 +196,10 @@ pub enum EventStoreError {
     SubscribersActive(String),
     /// The event store lacks the capability (`CONTROL_REFUSAL_UNSUPPORTED`).
     Unsupported(Capability),
-    /// The event store failed or cannot be reached.
+    /// The event store refused the event for good (too large, not authorized, a destination it
+    /// cannot have): publishing it again cannot succeed, so the outbox relay gives it up at once.
+    Rejected(String),
+    /// The event store failed or cannot be reached; trying again may succeed.
     Failed(String),
 }
 
@@ -190,6 +213,7 @@ impl std::fmt::Display for EventStoreError {
             EventStoreError::Unsupported(capability) => {
                 write!(f, "the event store lacks the capability {capability}")
             }
+            EventStoreError::Rejected(why) => write!(f, "rejected by the event store: {why}"),
             EventStoreError::Failed(why) => write!(f, "event store: {why}"),
         }
     }
@@ -208,6 +232,42 @@ mod tests {
         for c in Capability::ALL {
             assert_eq!(c.to_string(), c.as_str());
         }
+    }
+
+    #[test]
+    fn segments_order_as_the_hub_lists_them() {
+        let mut names = vec![
+            "b",
+            "+5",
+            "7",
+            "99999999999999999999999",
+            "007",
+            "18446744073709551616",
+            "10",
+            "a",
+            "0",
+            "",
+            "00",
+            "5",
+        ];
+        names.sort_by(|a, b| segment_order(a, b));
+        assert_eq!(
+            names,
+            [
+                "0",
+                "00",
+                "5",
+                "007",
+                "7",
+                "10",
+                "18446744073709551616",
+                "99999999999999999999999",
+                "",
+                "+5",
+                "a",
+                "b"
+            ]
+        );
     }
 
     #[test]

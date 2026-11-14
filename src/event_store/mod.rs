@@ -42,7 +42,7 @@ pub use admin::{ReplayRange, ResetTarget, SubscriptionAdmin};
 pub use subscription::Subscription;
 pub use types::{
     Capability, Delivery, EventStoreError, MAX_POSITION_BYTES, MAX_SEGMENT_BYTES, OutgoingEvent,
-    SegmentStatus, SubscriptionEvent, SubscriptionSpec, dead_letter_source, headers,
+    SegmentStatus, SubscriptionEvent, SubscriptionSpec, dead_letter_source, headers, segment_order,
 };
 
 /// An event-store add-on.
@@ -61,6 +61,8 @@ pub trait EventStore: Send + Sync {
 
     /// Appends `event` to `event.source`; returns once the event store accepted it. Two publishes
     /// of one key, the second called after the first returned, are delivered in that order.
+    /// [`EventStoreError::Rejected`] when the event store will never take this event (the relay
+    /// gives it up at once), [`EventStoreError::Failed`] when another try may succeed.
     fn publish<'a>(
         &'a self,
         event: &'a OutgoingEvent,

@@ -16,9 +16,13 @@ use super::{EventStoreError, SegmentStatus, SubscriptionEvent};
 ///   committed; one not acknowledged comes again to the next subscription of the same name that
 ///   gets its segment (after a [`close`](Self::close), a crash or a reassignment), or to this one
 ///   after [`redeliver`](Self::redeliver).
+/// - **A failure ends it.** An error from `next` means the subscription is broken: the caller
+///   closes it and subscribes again after a backoff (a store retries what it can recover from
+///   inside `next`, and reports it through [`take_error`](Self::take_error)).
 pub trait Subscription: Send {
     /// The next assignment change or delivery; waits for one. Cancel-safe: dropping the future
     /// before it completes loses nothing (the core races it with its shutdown and its timers).
+    /// An error ends the subscription (see above).
     fn next(&mut self) -> BoxFuture<'_, Result<SubscriptionEvent, EventStoreError>>;
 
     /// Acknowledges the delivery at `position` of `segment` and every earlier one of that
@@ -40,9 +44,17 @@ pub trait Subscription: Send {
     /// Delivers again from where the pause stopped. Idempotent.
     fn resume(&mut self);
 
-    /// The segments assigned now, sorted by segment, with their positions and lag as last known
-    /// (refreshed by the subscription itself; never a blocking call).
+    /// The segments assigned now, in [`segment_order`](super::segment_order), with their
+    /// positions and lag as last known (refreshed by the subscription itself; never a blocking
+    /// call).
     fn segments(&self) -> Vec<SegmentStatus>;
+
+    /// The latest trouble the subscription recovered from by itself since the last call (a lost
+    /// connection, a failed reassignment, an error it retried), as text for the processor's
+    /// status (`last_error`); `None` when there was none. Never blocking.
+    fn take_error(&mut self) -> Option<String> {
+        None
+    }
 
     /// Leaves the subscription after flushing the acknowledgements: its segments go to the other
     /// subscriptions of the name.

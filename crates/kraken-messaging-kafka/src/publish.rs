@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use kraken_messaging::event_store::{EventStoreError, OutgoingEvent, headers};
+use rdkafka::error::KafkaError;
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
@@ -17,7 +18,7 @@ pub const SEND_TIMEOUT: Duration = Duration::from_secs(40);
 /// attempts.
 pub(crate) fn producer(config: &KafkaConfig) -> Result<FutureProducer, EventStoreError> {
     let mut client = rdkafka::config::ClientConfig::new();
-    for (k, v) in &config.properties {
+    for (k, v) in &config.producer() {
         client.set(k, v);
     }
     client
@@ -78,7 +79,25 @@ pub(crate) async fn send(
         .send(record, Timeout::After(SEND_TIMEOUT))
         .await
         .map(|_| ())
-        .map_err(|(e, _)| failed(e))
+        .map_err(|(e, _)| publish_error(e))
+}
+
+/// A failure no retry can fix (oversized or invalid records, unknown or unauthorized topics: the
+/// Kotlin starter's NON_RETRIABLE set) is [`EventStoreError::Rejected`]; anything else `Failed`.
+fn publish_error(e: KafkaError) -> EventStoreError {
+    use rdkafka::types::RDKafkaErrorCode as Code;
+    match e.rdkafka_error_code() {
+        Some(
+            Code::MessageSizeTooLarge
+            | Code::InvalidMessage
+            | Code::InvalidMessageSize
+            | Code::InvalidTopic
+            | Code::TopicAuthorizationFailed
+            | Code::ClusterAuthorizationFailed
+            | Code::InvalidRecord,
+        ) => EventStoreError::Rejected(format!("kafka: {e}")),
+        _ => failed(e),
+    }
 }
 
 #[cfg(test)]
@@ -114,6 +133,41 @@ mod tests {
                 "source"
             ]
         );
+    }
+
+    #[test]
+    fn a_failure_no_retry_can_fix_is_rejected_others_failed() {
+        use rdkafka::types::RDKafkaErrorCode as Code;
+        for code in [
+            Code::MessageSizeTooLarge,
+            Code::InvalidMessage,
+            Code::InvalidMessageSize,
+            Code::InvalidTopic,
+            Code::TopicAuthorizationFailed,
+            Code::ClusterAuthorizationFailed,
+            Code::InvalidRecord,
+        ] {
+            assert!(
+                matches!(
+                    publish_error(KafkaError::MessageProduction(code)),
+                    EventStoreError::Rejected(_)
+                ),
+                "{code:?}"
+            );
+        }
+        for code in [
+            Code::MessageTimedOut,
+            Code::BrokerTransportFailure,
+            Code::NotEnoughReplicas,
+        ] {
+            assert!(
+                matches!(
+                    publish_error(KafkaError::MessageProduction(code)),
+                    EventStoreError::Failed(_)
+                ),
+                "{code:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -354,9 +354,9 @@ pub async fn redelivered_after_commit_is_skipped(kit: &EventStoreKit<'_>) {
         type_name: EVENT_TYPE.into(),
         processed_at_ms: now_ms(),
         processor: Some(spec.name.clone()),
-        topic: None,
-        partition: None,
-        offset: None,
+        source: None,
+        segment: None,
+        position: None,
     };
     let txs = kit.store.tx();
     let processed = kit.store.processed_events();
@@ -681,12 +681,16 @@ pub async fn lag_counts_unacked(kit: &EventStoreKit<'_>) {
             "the source drained within {WAIT:?}"
         );
     }
-    let segments: BTreeSet<String> = reader
+    let listed: Vec<String> = reader
         .subscription()
         .segments()
         .into_iter()
         .map(|s| s.segment)
         .collect();
+    let mut ordered = listed.clone();
+    ordered.sort_by(|a, b| super::segment_order(a, b));
+    assert_eq!(listed, ordered, "segments() lists them in segment order");
+    let segments: BTreeSet<String> = listed.into_iter().collect();
     assert_eq!(segments, reader.assigned, "segments() lists the assignment");
 
     let sent: Vec<OutgoingEvent> = (0..5)
