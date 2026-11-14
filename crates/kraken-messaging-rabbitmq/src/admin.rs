@@ -15,6 +15,7 @@ use tokio::time::Instant;
 use crate::conn::{Broker, Nodes, Part};
 use crate::management::Management;
 use crate::read::{self, Bounds};
+use crate::subscription::Live;
 
 /// The longest one admin call may read the streams for.
 const CALL_BUDGET: Duration = Duration::from_secs(20);
@@ -39,6 +40,7 @@ pub(crate) fn block<F: Future>(f: F) -> F::Output {
 pub struct RabbitAdmin {
     broker: Broker,
     management: Management,
+    live: Live,
     spec: SubscriptionSpec,
 }
 
@@ -53,11 +55,13 @@ impl RabbitAdmin {
     pub(crate) fn new(
         broker: Broker,
         management: Management,
+        live: Live,
         spec: &SubscriptionSpec,
     ) -> RabbitAdmin {
         RabbitAdmin {
             broker,
             management,
+            live,
             spec: spec.clone(),
         }
     }
@@ -99,6 +103,14 @@ impl RabbitAdmin {
             })?;
             let stored = conn.stored_offset(&self.spec.name, &part.stream).await?;
             let bounds = read::bounds(&conn, &part.stream, deadline).await?;
+            if let Some(stored) = stored.filter(|s| *s > bounds.head) {
+                // The stored offset past the head read: one of the two is wrong, so nothing is
+                // planned from them.
+                return Err(EventStoreError::Failed(format!(
+                    "rabbitmq: the offset stored for {} on {} ({stored}) is past the head read ({})",
+                    self.spec.name, part.stream, bounds.head
+                )));
+            }
             all.push(Now {
                 part,
                 stored,
@@ -127,6 +139,8 @@ fn check_position(now: &Now, position: u64) -> Result<(), EventStoreError> {
 }
 
 impl SubscriptionAdmin for RabbitAdmin {
+    /// The members the management API shows (an error, never "none", when it cannot tell),
+    /// plus this process's own open subscriptions of the name.
     fn members(&self) -> Result<Vec<String>, EventStoreError> {
         let streams = self.with_nodes(async |nodes| {
             Ok(self
@@ -136,7 +150,12 @@ impl SubscriptionAdmin for RabbitAdmin {
                 .map(|p| p.stream)
                 .collect::<Vec<_>>())
         })?;
-        block(self.management.members(&self.spec.name, &streams))
+        let mut members: std::collections::BTreeSet<String> =
+            block(self.management.members(&self.spec.name, &streams))?
+                .into_iter()
+                .collect();
+        members.extend(self.live.members(&self.spec));
+        Ok(members.into_iter().collect())
     }
 
     fn plan(&self, target: &ResetTarget) -> Result<Vec<ReplayRange>, EventStoreError> {
@@ -218,12 +237,27 @@ impl SubscriptionAdmin for RabbitAdmin {
                 check_position(n, from)?;
                 moves.push((n.part.stream.clone(), from));
             }
-            for (stream, from) in moves {
-                let conn = nodes.leader(&stream).await?.ok_or_else(|| {
+            for (stream, from) in &moves {
+                let conn = nodes.leader(stream).await?.ok_or_else(|| {
                     EventStoreError::Failed(format!("rabbitmq: the stream {stream} is gone"))
                 })?;
-                conn.store_offset(&self.spec.name, &stream, from, STORE_WAIT)
+                conn.store_offset(&self.spec.name, stream, *from, STORE_WAIT)
                     .await?;
+            }
+            // Read back once all are stored: an instance that joined meanwhile and stored its
+            // own position undoes the reset, which then fails.
+            for (stream, from) in &moves {
+                let conn = nodes.leader(stream).await?.ok_or_else(|| {
+                    EventStoreError::Failed(format!("rabbitmq: the stream {stream} is gone"))
+                })?;
+                let now = conn.stored_offset(&self.spec.name, stream).await?;
+                if now != Some(*from) {
+                    return Err(EventStoreError::SubscribersActive(format!(
+                        "the offset of {} on {stream} is {now:?} after the reset stored {from}: an \
+                         instance read and stored meanwhile",
+                        self.spec.name
+                    )));
+                }
             }
             Ok(())
         })

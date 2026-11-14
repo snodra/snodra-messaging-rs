@@ -16,6 +16,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::config::RabbitConfig;
 use crate::wire;
 
+/// The longest one request on a connection may wait for its answer.
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest a connection's open or close may take.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// With a load balancer: how many connections through it may land on another node before the
@@ -88,27 +90,31 @@ impl Routes {
 fn route(routes: &Routes, item: Option<Result<Response, ClientError>>) {
     match item {
         Some(Ok(response)) => match response.kind_ref() {
-            ResponseKind::Deliver(deliver) => {
-                let header = wire::chunk_header(deliver);
-                routes.send(
+            ResponseKind::Deliver(deliver) => match wire::chunk_header(deliver) {
+                Some(header) => routes.send(
                     header.subscription_id,
                     Frame::Chunk(Chunk {
                         first_offset: header.first_offset,
                         timestamp_ms: header.timestamp_ms,
                         messages: deliver.messages.clone(),
                     }),
-                );
-            }
-            ResponseKind::ConsumerUpdate(update) => {
-                let (correlation_id, sub, active) = wire::consumer_update(update);
-                routes.send(
+                ),
+                // Never waiting on a chunk that could not be read: its subscription ends.
+                None => routes.send(
+                    deliver.subscription_id,
+                    Frame::Closed("a delivered chunk could not be read".into()),
+                ),
+            },
+            ResponseKind::ConsumerUpdate(update) => match wire::consumer_update(update) {
+                Some((correlation_id, sub, active)) => routes.send(
                     sub,
                     Frame::Update {
                         correlation_id,
                         active,
                     },
-                );
-            }
+                ),
+                None => routes.close("a consumer update could not be read"),
+            },
             ResponseKind::PublishConfirm(confirm) => {
                 let mut waiting = lock(&routes.confirms);
                 for id in &confirm.publishing_ids {
@@ -129,9 +135,11 @@ fn route(routes: &Routes, item: Option<Result<Response, ClientError>>) {
                 let stream = wire::metadata_update_stream(update);
                 let subs = lock(&routes.subs);
                 for (s, tx) in subs.values() {
-                    if *s == stream {
+                    // A stream that cannot be read from the update: every subscription ends.
+                    if stream.as_ref().is_none_or(|stream| s == stream) {
                         let _ = tx.send(Frame::Closed(format!(
-                            "the stream {stream} changed (deleted or moved)"
+                            "the stream {} changed (deleted or moved)",
+                            stream.as_deref().unwrap_or(s)
                         )));
                     }
                 }
@@ -150,7 +158,7 @@ pub(crate) struct Conn {
     /// The node as the broker advertises it.
     pub node: (String, u32),
     next_sub: AtomicU8,
-    next_publisher: AtomicU8,
+    next_publisher: std::sync::atomic::AtomicU16,
 }
 
 impl Conn {
@@ -183,8 +191,49 @@ impl Conn {
             routes,
             node,
             next_sub: AtomicU8::new(0),
-            next_publisher: AtomicU8::new(0),
+            next_publisher: std::sync::atomic::AtomicU16::new(0),
         })
+    }
+
+    /// Whether the connection answers a request within [`REQUEST_TIMEOUT`].
+    ///
+    /// The request is a query of an offset (on a stream this connection reads): its answer
+    /// carries no text. The client's decoder panics on a frame split across reads when the frame
+    /// holds text (a metadata answer listing many streams, for one), which would stop the very
+    /// connection being checked.
+    pub async fn answers(&self) -> bool {
+        let stream = lock(&self.routes.subs)
+            .values()
+            .next()
+            .map(|(s, _)| s.clone());
+        let Some(stream) = stream else {
+            return true;
+        };
+        let query = self
+            .client
+            .query_offset("kraken-liveness".to_string(), &stream);
+        matches!(
+            tokio::time::timeout(REQUEST_TIMEOUT, query).await,
+            Ok(Ok(_) | Err(ClientError::RequestError(_)))
+        )
+    }
+
+    /// `request` bounded by [`REQUEST_TIMEOUT`]. A connection that does not answer in time is
+    /// taken as gone (its subscriptions end, the next call opens another): the client reads
+    /// every frame on one task, which its decoder stops on some frames (see `answers`).
+    pub async fn timed<T>(
+        &self,
+        request: impl std::future::Future<Output = Result<T, ClientError>>,
+    ) -> Result<T, ClientError> {
+        match tokio::time::timeout(REQUEST_TIMEOUT, request).await {
+            Ok(answer) => answer,
+            Err(_) => {
+                self.routes.close(&format!(
+                    "the connection gave no answer within {REQUEST_TIMEOUT:?}"
+                ));
+                Err(ClientError::ConnectionClosed)
+            }
+        }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -212,9 +261,11 @@ impl Conn {
         lock(&self.routes.subs).remove(&sub);
     }
 
-    /// The next publisher id of this connection (each stream published to gets one).
-    pub fn publisher_id(&self) -> u8 {
-        self.next_publisher.fetch_add(1, Ordering::SeqCst)
+    /// The next publisher id of this connection (each stream published to gets one); `None`
+    /// once the 256 ids of the protocol are used (the caller opens another connection, never
+    /// reusing an id that may still be declared).
+    pub fn publisher_id(&self) -> Option<u8> {
+        u8::try_from(self.next_publisher.fetch_add(1, Ordering::SeqCst)).ok()
     }
 
     /// Waits for the confirm (or the error) of `publishing_id`; closed without one when the
@@ -247,11 +298,8 @@ impl Conn {
         reference: &str,
         stream: &str,
     ) -> Result<Option<u64>, EventStoreError> {
-        match self
-            .client
-            .query_offset(reference.to_string(), stream)
-            .await
-        {
+        let query = self.client.query_offset(reference.to_string(), stream);
+        match self.timed(query).await {
             Ok(offset) => Ok(Some(offset)),
             Err(ClientError::RequestError(ResponseCode::OffsetNotFound)) => Ok(None),
             Err(e) => Err(failed(format!(
@@ -415,15 +463,15 @@ impl Nodes {
         }
     }
 
-    /// A connection to any node (for the commands any node answers).
+    /// A connection to any node, for the metadata and partition queries only.
     pub async fn seed(&mut self) -> Result<Arc<Conn>, EventStoreError> {
         if let Some(seed) = self.seed.as_ref().filter(|c| !c.is_closed()) {
             return Ok(Arc::clone(seed));
         }
+        // The seed carries the metadata and partition queries only, never a stream's data: the
+        // client's decoder panics on an answer holding text (a metadata answer) that a read
+        // splits, which a connection busy with chunks makes likely, and stops reading.
         let conn = Arc::new(self.broker.any().await?);
-        self.conns
-            .entry(conn.node.clone())
-            .or_insert_with(|| Arc::clone(&conn));
         self.seed = Some(Arc::clone(&conn));
         Ok(conn)
     }
@@ -432,8 +480,7 @@ impl Nodes {
     pub async fn leader(&mut self, stream: &str) -> Result<Option<Arc<Conn>>, EventStoreError> {
         let seed = self.seed().await?;
         let metadata = seed
-            .client
-            .metadata(vec![stream.to_string()])
+            .timed(seed.client.metadata(vec![stream.to_string()]))
             .await
             .map_err(failed)?;
         let Some(found) = metadata.get(stream) else {
@@ -460,8 +507,7 @@ impl Nodes {
     pub async fn layout(&mut self, source: &str) -> Result<Option<Vec<Part>>, EventStoreError> {
         let seed = self.seed().await?;
         let partitions = seed
-            .client
-            .partitions(source.to_string())
+            .timed(seed.client.partitions(source.to_string()))
             .await
             .map_err(failed)?;
         if partitions.is_ok() && !partitions.streams.is_empty() {
@@ -481,8 +527,7 @@ impl Nodes {
             return Ok(Some(parts));
         }
         let metadata = seed
-            .client
-            .metadata(vec![source.to_string()])
+            .timed(seed.client.metadata(vec![source.to_string()]))
             .await
             .map_err(failed)?;
         Ok(metadata
@@ -496,6 +541,16 @@ impl Nodes {
             }))
     }
 
+    /// Forgets `conn` (the next call opens another to its node) and closes it on a task.
+    pub fn forget(&mut self, conn: &Arc<Conn>) {
+        self.conns.retain(|_, c| !Arc::ptr_eq(c, conn));
+        if self.seed.as_ref().is_some_and(|c| Arc::ptr_eq(c, conn)) {
+            self.seed = None;
+        }
+        let conn = Arc::clone(conn);
+        tokio::spawn(async move { conn.close().await });
+    }
+
     /// Forgets the connections that are gone (they reconnect on the next call).
     pub fn prune(&mut self) {
         self.conns.retain(|_, c| !c.is_closed());
@@ -506,8 +561,8 @@ impl Nodes {
 
     /// Closes every connection.
     pub async fn close(&mut self) {
-        self.seed = None;
-        let conns: Vec<Arc<Conn>> = self.conns.drain().map(|(_, c)| c).collect();
+        let mut conns: Vec<Arc<Conn>> = self.conns.drain().map(|(_, c)| c).collect();
+        conns.extend(self.seed.take());
         futures::future::join_all(conns.iter().map(|c| c.close())).await;
     }
 }
@@ -516,7 +571,8 @@ impl Drop for Nodes {
     /// Connections left open (a caller that never closed) are closed on a task: the client keeps
     /// a connection alive as long as its own tasks run.
     fn drop(&mut self) {
-        let conns: Vec<Arc<Conn>> = self.conns.drain().map(|(_, c)| c).collect();
+        let mut conns: Vec<Arc<Conn>> = self.conns.drain().map(|(_, c)| c).collect();
+        conns.extend(self.seed.take());
         if conns.iter().all(|c| c.is_closed()) {
             return;
         }
@@ -554,5 +610,19 @@ mod tests {
             matches!(&failed, Err(EventStoreError::Failed(m)) if m.contains("127.0.0.1:1")),
             "{failed:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ids {
+    /// The publisher ids of a connection end after 256, never wrapping onto one in use.
+    #[test]
+    fn publisher_ids_never_wrap() {
+        let next = std::sync::atomic::AtomicU16::new(0);
+        let id = || u8::try_from(next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)).ok();
+        let all: Vec<Option<u8>> = (0..257).map(|_| id()).collect();
+        assert_eq!(all[0], Some(0));
+        assert_eq!(all[255], Some(255));
+        assert_eq!(all[256], None);
     }
 }

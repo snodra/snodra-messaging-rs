@@ -12,6 +12,8 @@ use tokio::sync::Mutex;
 use crate::conn::{Broker, Conn, Nodes, Part, failed};
 use crate::wire;
 
+/// How long a source's partitions are published to before they are read again.
+pub const LAYOUT_FOR: Duration = Duration::from_secs(30);
 /// The longest a publish waits for the broker's confirm.
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// The largest publish frame the store sends: the client's and the broker's default frame size
@@ -28,8 +30,9 @@ type Sent = (
 
 struct State {
     nodes: Nodes,
-    /// Per source: its streams.
-    layouts: HashMap<String, Vec<Part>>,
+    /// Per source: its streams, and when they were read (read again after [`LAYOUT_FOR`], so a
+    /// partition added to a super stream is published to).
+    layouts: HashMap<String, (Vec<Part>, std::time::Instant)>,
     /// Per stream: its leader's connection and the publisher declared there.
     publishers: HashMap<String, (Arc<Conn>, u8)>,
     next_id: u64,
@@ -111,8 +114,12 @@ impl State {
                 event.id
             )));
         }
-        let parts = match self.layouts.get(&event.source) {
-            Some(parts) => parts.clone(),
+        let parts = match self
+            .layouts
+            .get(&event.source)
+            .filter(|(_, at)| at.elapsed() < LAYOUT_FOR)
+        {
+            Some((parts, _)) => parts.clone(),
             None => {
                 let parts = self.nodes.layout(&event.source).await?.ok_or_else(|| {
                     failed(format!(
@@ -121,7 +128,10 @@ impl State {
                         event.source, event.source
                     ))
                 })?;
-                self.layouts.insert(event.source.clone(), parts.clone());
+                self.layouts.insert(
+                    event.source.clone(),
+                    (parts.clone(), std::time::Instant::now()),
+                );
                 parts
             }
         };
@@ -147,10 +157,16 @@ impl State {
             .leader(stream)
             .await?
             .ok_or_else(|| failed(format!("the stream {stream} does not exist")))?;
-        let id = conn.publisher_id();
+        let Some(id) = conn.publisher_id() else {
+            self.publishers.retain(|_, (c, _)| !Arc::ptr_eq(c, &conn));
+            self.nodes.forget(&conn);
+            return Err(failed(format!(
+                "256 publishers were declared on the connection to {}:{}: it is replaced",
+                conn.node.0, conn.node.1
+            )));
+        };
         let response = conn
-            .client
-            .declare_publisher(id, None, stream)
+            .timed(conn.client.declare_publisher(id, None, stream))
             .await
             .map_err(|e| failed(format!("declaring a publisher on {stream}: {e}")))?;
         if !response.is_ok() {

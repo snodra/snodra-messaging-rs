@@ -78,23 +78,40 @@ fn free_port() -> u16 {
 
 /// Starts the broker (removed when the value is dropped).
 pub async fn rabbitmq() -> RabbitMq {
-    let (port, http) = (free_port(), free_port());
-    let conf = format!("stream.advertised_host = 127.0.0.1\nstream.advertised_port = {port}\n");
-    let container = GenericImage::new(IMAGE.0, IMAGE.1)
-        .with_exposed_port(5552.tcp())
-        .with_exposed_port(15672.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("Server startup complete"))
-        .with_copy_to(
-            "/etc/rabbitmq/enabled_plugins",
-            b"[rabbitmq_management,rabbitmq_stream,rabbitmq_stream_management].\n".to_vec(),
-        )
-        .with_copy_to("/etc/rabbitmq/conf.d/20-stream.conf", conf.into_bytes())
-        .with_mapped_port(port, 5552.tcp())
-        .with_mapped_port(http, 15672.tcp())
-        .with_startup_timeout(Duration::from_secs(120))
-        .start()
+    // The stream port is published on a host port the node advertises, so it is picked here;
+    // the management port is Docker's. A picked port taken meanwhile by another process ("failed
+    // to bind port") is picked again.
+    let mut tries = 0;
+    let (container, port) = loop {
+        tries += 1;
+        let port = free_port();
+        let conf = format!("stream.advertised_host = 127.0.0.1\nstream.advertised_port = {port}\n");
+        let started = GenericImage::new(IMAGE.0, IMAGE.1)
+            .with_exposed_port(5552.tcp())
+            .with_exposed_port(15672.tcp())
+            .with_wait_for(WaitFor::message_on_stdout("Server startup complete"))
+            .with_copy_to(
+                "/etc/rabbitmq/enabled_plugins",
+                b"[rabbitmq_management,rabbitmq_stream,rabbitmq_stream_management].\n".to_vec(),
+            )
+            .with_copy_to("/etc/rabbitmq/conf.d/20-stream.conf", conf.into_bytes())
+            .with_mapped_port(port, 5552.tcp())
+            .with_mapped_port(0, 15672.tcp())
+            .with_startup_timeout(Duration::from_secs(120))
+            .start()
+            .await;
+        match started {
+            Ok(container) => break (container, port),
+            Err(e) if tries < 3 && e.to_string().contains("bind") => {
+                eprintln!("rabbitmq container: {e}; trying again");
+            }
+            Err(e) => panic!("rabbitmq container: {e}"),
+        }
+    };
+    let http = container
+        .get_host_port_ipv4(15672.tcp())
         .await
-        .expect("rabbitmq container");
+        .expect("the management port");
     let broker = RabbitMq {
         _container: container,
         stream: format!("127.0.0.1:{port}"),

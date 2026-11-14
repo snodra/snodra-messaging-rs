@@ -7,9 +7,12 @@
 //!   (the change is over). On activation the subscription
 //!   reads the offset stored under its name and answers the broker with it (the first offset
 //!   when none is stored); on deactivation it stores what was acknowledged first.
-//! - **Acknowledgement** stores the offset after the acknowledged delivery under the
-//!   subscription's name (server-side offset tracking), asynchronously; [`close`] stores what is
-//!   left and waits until the broker reads it back.
+//! - **Acknowledgement** moves the position stored under the subscription's name (server-side
+//!   offset tracking: the offset after the acknowledged delivery). Every stored offset is an entry
+//!   in the stream itself, so it is stored every [`StorePolicy::messages`] acknowledgements or
+//!   [`StorePolicy::interval`], whichever comes first, and always on deactivation and at
+//!   [`close`], which waits until the broker reads it back. An acknowledgement of an offset not
+//!   handed out since the partition last became active is ignored.
 //! - **Flow**: each partition has one chunk in flight (one credit); the next is asked for once
 //!   the deliveries waiting are under [`READY_LIMIT`], never while paused.
 //! - **Redelivery** cannot seek a single active consumer in place: the deliveries handed out and
@@ -25,7 +28,7 @@
 //! [`redeliver`]: Subscription::redeliver
 //! [`segments`]: Subscription::segments
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -84,7 +87,51 @@ struct Part {
     head: Option<u64>,
     /// A chunk was received and the next not asked for yet.
     owed: bool,
+    /// One past the last offset handed out since the partition became active (`None`: nothing
+    /// handed out yet in this activation).
+    handed: Option<u64>,
     cmds: mpsc::UnboundedSender<Cmd>,
+}
+
+impl Part {
+    /// Acknowledges `offset` and every earlier one; `false` when it does not move the
+    /// acknowledged position: already acknowledged, or not handed out in this activation (an
+    /// acknowledgement from an earlier activation, whose deliveries may have been handled by
+    /// another instance since).
+    fn ack(&mut self, offset: u64) -> bool {
+        let next = offset + 1;
+        let handed_now = self.handed.is_some_and(|h| offset < h)
+            && self.stored.is_none_or(|start| offset >= start);
+        if !self.active || !handed_now || self.acked.is_some_and(|done| done >= next) {
+            return false;
+        }
+        self.acked = Some(next);
+        self.inflight.retain(|d| self::offset(d) > offset);
+        true
+    }
+
+    /// Hands out again, ahead of the rest, the deliveries handed out at or after `from` and not
+    /// acknowledged.
+    fn redeliver(&mut self, from: u64) {
+        let again: Vec<Delivery> = self
+            .inflight
+            .iter()
+            .filter(|d| offset(d) >= from)
+            .cloned()
+            .collect();
+        self.inflight.retain(|d| offset(d) < from);
+        for d in again.into_iter().rev() {
+            self.ready.push_front(d);
+        }
+    }
+
+    /// The next delivery to hand out.
+    fn hand_out(&mut self) -> Option<Delivery> {
+        let d = self.ready.pop_front()?;
+        self.handed = Some(self.handed.unwrap_or(0).max(offset(&d) + 1));
+        self.inflight.push_back(d.clone());
+        Some(d)
+    }
 }
 
 #[derive(Default)]
@@ -126,6 +173,57 @@ fn offset(d: &Delivery) -> u64 {
     d.position.parse().unwrap_or(0)
 }
 
+/// The subscriptions of this process that are open now, per (source, name), by member id (the
+/// `kraken-member` property): a reset must not move a subscription this very process reads,
+/// whatever the management API says.
+#[derive(Clone, Default)]
+pub(crate) struct Live(Arc<Mutex<HashMap<(String, String), Members>>>);
+
+/// The member ids of one subscription open in this process.
+type Members = BTreeSet<String>;
+
+impl Live {
+    pub fn enter(&self, spec: &SubscriptionSpec, member: &str) -> LiveGuard {
+        let key = (spec.source.clone(), spec.name.clone());
+        lock(&self.0)
+            .entry(key.clone())
+            .or_default()
+            .insert(member.to_string());
+        LiveGuard {
+            live: self.clone(),
+            key,
+            member: member.to_string(),
+        }
+    }
+
+    /// The member ids of this process's open subscriptions of `spec`.
+    pub fn members(&self, spec: &SubscriptionSpec) -> BTreeSet<String> {
+        lock(&self.0)
+            .get(&(spec.source.clone(), spec.name.clone()))
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// One open subscription in [`Live`], until dropped.
+pub(crate) struct LiveGuard {
+    live: Live,
+    key: (String, String),
+    member: String,
+}
+
+impl Drop for LiveGuard {
+    fn drop(&mut self) {
+        let mut all = lock(&self.live.0);
+        if let Some(members) = all.get_mut(&self.key) {
+            members.remove(&self.member);
+            if members.is_empty() {
+                all.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// One instance's subscription of a name on a source. Use [`close`](Subscription::close): it
 /// stores the acknowledged offsets and leaves; dropping the subscription stores nothing (an
 /// unacknowledged delivery comes again) and closes its connections on a task.
@@ -139,6 +237,9 @@ pub struct RabbitSubscription {
     _stop: DropGuard,
     /// Where `next` looks first, so every partition gets its turn.
     turn: usize,
+    store: StorePolicy,
+    /// Counts this subscription among the process's open ones until it is closed or dropped.
+    live: Option<LiveGuard>,
 }
 
 impl RabbitSubscription {
@@ -148,6 +249,7 @@ impl RabbitSubscription {
         broker: Broker,
         spec: &SubscriptionSpec,
         member: &str,
+        store: StorePolicy,
     ) -> Result<RabbitSubscription, EventStoreError> {
         if spec.source.trim().is_empty() {
             return Err(EventStoreError::Invalid("the source is empty".into()));
@@ -185,6 +287,8 @@ impl RabbitSubscription {
             _stop: cancel.clone().drop_guard(),
             cancel: cancel.clone(),
             turn: 0,
+            store,
+            live: None,
         };
         let mut parts = layout;
         parts.sort_by(|a, b| segment_order(&a.segment, &b.segment));
@@ -197,12 +301,23 @@ impl RabbitSubscription {
                 return Err(e);
             }
         }
+        let mut conns: Vec<Arc<Conn>> = Vec::new();
+        for (conn, _) in &subscription.subs {
+            if !conns.iter().any(|c| Arc::ptr_eq(c, conn)) {
+                conns.push(Arc::clone(conn));
+            }
+        }
         subscription.refresher = Some(tokio::spawn(refresh(
             Nodes::new(broker),
+            conns,
             Arc::clone(&shared),
             cancel,
         )));
         Ok(subscription)
+    }
+
+    pub(crate) fn hold(&mut self, guard: LiveGuard) {
+        self.live = Some(guard);
     }
 
     /// One single active consumer of `stream`.
@@ -231,6 +346,7 @@ impl RabbitSubscription {
             stored: None,
             head: None,
             owed: false,
+            handed: None,
             cmds,
         });
         self.tasks.push(tokio::spawn(
@@ -241,6 +357,8 @@ impl RabbitSubscription {
                 segment: segment.to_string(),
                 stream: stream.to_string(),
                 last_stored: None,
+                store: self.store,
+                unstored: 0,
             }
             .run(frames, cmd_rx, self.cancel.clone()),
         ));
@@ -254,8 +372,10 @@ impl RabbitSubscription {
             properties.insert("super-stream".to_string(), self.shared.source.clone());
         }
         match conn
-            .client
-            .subscribe(sub, stream, OffsetSpecification::Next, 1, properties)
+            .timed(
+                conn.client
+                    .subscribe(sub, stream, OffsetSpecification::Next, 1, properties),
+            )
             .await
         {
             Ok(response) if response.is_ok() => Ok(()),
@@ -278,6 +398,29 @@ struct PartTask {
     stream: String,
     /// What this task last stored (or found stored).
     last_stored: Option<u64>,
+    /// When the acknowledged offset is stored: every so many acknowledgements, or this often.
+    store: StorePolicy,
+    /// Acknowledgements since the last store.
+    unstored: u64,
+}
+
+/// When a subscription stores its acknowledged offset: every offset stored is an entry in the
+/// stream itself, so not on every acknowledgement but every `messages` acknowledgements or
+/// every `interval`, whichever comes first, and always on deactivation and close.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorePolicy {
+    pub messages: u64,
+    pub interval: Duration,
+}
+
+impl Default for StorePolicy {
+    /// The Java stream client's automatic tracking: 10 000 messages, 5 s.
+    fn default() -> Self {
+        StorePolicy {
+            messages: 10_000,
+            interval: Duration::from_secs(5),
+        }
+    }
 }
 
 impl PartTask {
@@ -287,19 +430,27 @@ impl PartTask {
         mut cmds: mpsc::UnboundedReceiver<Cmd>,
         cancel: CancellationToken,
     ) {
+        let mut every = tokio::time::interval(self.store.interval);
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return,
                 cmd = cmds.recv() => match cmd {
                     None => return,
-                    Some(Cmd::Store) => self.store().await,
+                    Some(Cmd::Store) => {
+                        self.unstored += 1;
+                        if self.unstored >= self.store.messages {
+                            self.store().await;
+                        }
+                    }
                     Some(Cmd::Credit) => self.credit().await,
                     Some(Cmd::Flush(done)) => {
                         self.flush().await;
                         let _ = done.send(());
                     }
                 },
+                _ = every.tick() => self.store().await,
                 frame = frames.recv() => match frame {
                     None => return self.shared.broken(format!("{}: the connection closed", self.stream)),
                     Some(Frame::Closed(why)) => return self.shared.broken(format!("{}: {why}", self.stream)),
@@ -331,7 +482,10 @@ impl PartTask {
             .store_offset(&self.shared.name, &self.stream, acked)
             .await
         {
-            Ok(()) => self.last_stored = Some(acked),
+            Ok(()) => {
+                self.last_stored = Some(acked);
+                self.unstored = 0;
+            }
             Err(e) => {
                 tracing::warn!(stream = %self.stream, "the acknowledged offset was not stored: {e}");
                 lock(&self.shared.state).error = Some(format!("storing the offset: {e}"));
@@ -350,7 +504,10 @@ impl PartTask {
             .store_offset(&self.shared.name, &self.stream, acked, STORE_WAIT)
             .await
         {
-            Ok(()) => self.last_stored = Some(acked),
+            Ok(()) => {
+                self.last_stored = Some(acked);
+                self.unstored = 0;
+            }
             Err(e) => {
                 tracing::warn!(stream = %self.stream, "the acknowledged offset was not stored: {e}")
             }
@@ -399,17 +556,20 @@ impl PartTask {
     }
 
     async fn activate(&mut self, correlation_id: u32) {
-        let stored = match self
+        let read = self
             .conn
             .stored_offset(&self.shared.name, &self.stream)
-            .await
-        {
-            Ok(stored) => stored,
+            .await;
+        let (stored, from) = match resume_from(read) {
+            Ok(resume) => resume,
             Err(e) => {
-                // Read again from the first offset: duplicates are skipped, a loss is not.
-                tracing::warn!(stream = %self.stream, "the stored offset was not read, reading from the first: {e}");
-                lock(&self.shared.state).error = Some(e.to_string());
-                None
+                // Never from the first offset on a failed read (the whole partition again, its
+                // markers maybe purged): the subscription ends and the core subscribes again.
+                self.shared.broken(format!(
+                    "{}: the stored offset was not read on activation: {e}",
+                    self.stream
+                ));
+                return;
             }
         };
         self.last_stored = stored;
@@ -426,6 +586,7 @@ impl PartTask {
                 part.next = stored.unwrap_or(0);
                 part.stored = stored;
                 part.acked = None;
+                part.handed = None;
                 part.ready.clear();
                 part.inflight.clear();
                 part.head = part.head.max(stored);
@@ -440,10 +601,7 @@ impl PartTask {
         if credit {
             self.credit().await;
         }
-        self.answer(
-            correlation_id,
-            stored.map_or(OffsetSpecification::First, OffsetSpecification::Offset),
-        );
+        self.answer(correlation_id, from);
     }
 
     async fn deactivate(&mut self, correlation_id: u32) {
@@ -481,7 +639,11 @@ impl PartTask {
     }
 
     /// Answers a consumer update. The client's call waits for a response the broker never
-    /// sends, so it runs on a task of its own, bounded.
+    /// sends, so it runs on a task of its own, bounded by 5 s: the tasks alive at once are at
+    /// most the consumer updates of the last 5 s, and the broker sends one per partition per
+    /// activation or deactivation of this consumer (a rebalance), never per message. The client
+    /// also keeps one entry of its request map per call until the connection closes (an
+    /// upstream defect; the same number, per connection lifetime).
     fn answer(&self, correlation_id: u32, from: OffsetSpecification) {
         let conn = Arc::clone(&self.conn);
         tokio::spawn(async move {
@@ -515,8 +677,7 @@ impl Subscription for RabbitSubscription {
                             if !part.active {
                                 continue;
                             }
-                            if let Some(d) = part.ready.pop_front() {
-                                part.inflight.push_back(d.clone());
+                            if let Some(d) = part.hand_out() {
                                 if part.owed && part.ready.len() < READY_LIMIT {
                                     part.owed = false;
                                     let _ = part.cmds.send(Cmd::Credit);
@@ -535,35 +696,21 @@ impl Subscription for RabbitSubscription {
     fn ack(&mut self, segment: &str, position: &str) -> Result<(), EventStoreError> {
         let offset = parse(position)?;
         let mut state = lock(&self.shared.state);
-        let Some(part) = state.part(segment).filter(|p| p.active) else {
-            // Revoked meanwhile: the delivery comes again to whoever has the partition now.
-            return Ok(());
-        };
-        let next = offset + 1;
-        if part.acked.is_some_and(|done| done >= next) {
-            return Ok(());
+        // A segment revoked meanwhile, or an offset not handed out in this activation: ignored
+        // (the delivery comes again to whoever reads the partition).
+        if let Some(part) = state.part(segment)
+            && part.ack(offset)
+        {
+            let _ = part.cmds.send(Cmd::Store);
         }
-        part.acked = Some(next);
-        part.inflight.retain(|d| self::offset(d) > offset);
-        let _ = part.cmds.send(Cmd::Store);
         Ok(())
     }
 
     fn redeliver(&mut self, segment: &str, position: &str) -> Result<(), EventStoreError> {
         let from = parse(position)?;
         let mut state = lock(&self.shared.state);
-        let Some(part) = state.part(segment).filter(|p| p.active) else {
-            return Ok(());
-        };
-        let again: Vec<Delivery> = part
-            .inflight
-            .iter()
-            .filter(|d| offset(d) >= from)
-            .cloned()
-            .collect();
-        part.inflight.retain(|d| offset(d) < from);
-        for d in again.into_iter().rev() {
-            part.ready.push_front(d);
+        if let Some(part) = state.part(segment).filter(|p| p.active) {
+            part.redeliver(from);
         }
         drop(state);
         self.shared.wake();
@@ -657,6 +804,19 @@ impl Subscription for RabbitSubscription {
     }
 }
 
+/// Where an activated consumer resumes, from the read of its stored offset: after it, or at the
+/// first offset when the broker answers that none is stored; a failed read is an error (never
+/// the first offset).
+fn resume_from(
+    read: Result<Option<u64>, EventStoreError>,
+) -> Result<(Option<u64>, OffsetSpecification), EventStoreError> {
+    let stored = read?;
+    Ok((
+        stored,
+        stored.map_or(OffsetSpecification::First, OffsetSpecification::Offset),
+    ))
+}
+
 fn parse(position: &str) -> Result<u64, EventStoreError> {
     position
         .parse()
@@ -665,8 +825,27 @@ fn parse(position: &str) -> Result<u64, EventStoreError> {
 
 /// Every [`OFFSETS_REFRESH`] (sooner until every active partition's head is known): the head of
 /// each active partition, read on connections of the refresher's own.
-async fn refresh(mut nodes: Nodes, shared: Arc<Shared>, cancel: CancellationToken) {
+async fn refresh(
+    mut nodes: Nodes,
+    consuming: Vec<Arc<Conn>>,
+    shared: Arc<Shared>,
+    cancel: CancellationToken,
+) {
     loop {
+        // The consumers' connections still answer: the client reads every frame on a task of
+        // its own, and one it cannot decode (a chunk with sub-entries or compression, which
+        // kraken streams never carry) stops that task without a word.
+        for conn in &consuming {
+            if !conn.is_closed() && !conn.answers().await {
+                shared.broken(format!(
+                    "the connection to {}:{} stopped answering (a chunk the client cannot read? \
+                     kraken streams carry no sub-entries and no compression)",
+                    conn.node.0, conn.node.1
+                ));
+                nodes.close().await;
+                return;
+            }
+        }
         let active: Vec<(String, String)> = lock(&shared.state)
             .parts
             .iter()
@@ -688,7 +867,7 @@ async fn refresh(mut nodes: Nodes, shared: Arc<Shared>, cancel: CancellationToke
         let heads = tokio::select! {
             _ = cancel.cancelled() => break,
             heads = futures::future::join_all(conns.iter().map(|(segment, stream, conn)| async move {
-                (segment.clone(), read::bounds(conn, stream, deadline).await)
+                (segment.clone(), read::head(conn, stream, deadline).await)
             })) => heads,
         };
         let mut all_known = !active.is_empty();
@@ -724,4 +903,97 @@ async fn refresh(mut nodes: Nodes, shared: Arc<Shared>, cancel: CancellationToke
         }
     }
     nodes.close().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn part(stored: Option<u64>, offsets: &[u64]) -> Part {
+        let (cmds, _) = mpsc::unbounded_channel();
+        Part {
+            segment: "0".into(),
+            stream: "s-0".into(),
+            active: true,
+            next: offsets.last().map_or(0, |o| o + 1),
+            ready: offsets
+                .iter()
+                .map(|o| Delivery {
+                    segment: "0".into(),
+                    position: o.to_string(),
+                    key: None,
+                    headers: HashMap::new(),
+                    payload: vec![],
+                    timestamp_ms: 1,
+                })
+                .collect(),
+            inflight: VecDeque::new(),
+            acked: None,
+            stored,
+            head: None,
+            owed: false,
+            handed: None,
+            cmds,
+        }
+    }
+
+    /// An acknowledgement moves the position only for an offset handed out in this activation.
+    #[test]
+    fn an_ack_of_an_offset_not_handed_out_now_is_ignored() {
+        let mut p = part(Some(10), &[10, 11, 12]);
+        assert!(!p.ack(10), "nothing handed out yet");
+        p.hand_out();
+        p.hand_out();
+        assert!(!p.ack(12), "12 is not handed out yet");
+        assert!(!p.ack(9), "before this activation started");
+        assert!(p.ack(11));
+        assert_eq!(p.acked, Some(12));
+        assert!(!p.ack(10), "already acknowledged");
+        assert!(p.inflight.is_empty());
+        // A new activation forgets what the earlier one handed out.
+        p.handed = None;
+        assert!(!p.ack(12));
+    }
+
+    #[test]
+    fn redeliver_hands_out_again_from_the_offset_in_order() {
+        let mut p = part(None, &[0, 1, 2, 3]);
+        for _ in 0..3 {
+            p.hand_out();
+        }
+        p.redeliver(1);
+        let order: Vec<u64> = std::iter::from_fn(|| p.hand_out().map(|d| offset(&d))).collect();
+        assert_eq!(order, [1, 2, 3]);
+    }
+
+    /// The broker's "no offset stored" means the first offset; a failed read is an error.
+    #[test]
+    fn a_failed_read_of_the_stored_offset_never_means_the_first() {
+        assert!(matches!(
+            resume_from(Ok(None)),
+            Ok((None, OffsetSpecification::First))
+        ));
+        assert!(matches!(
+            resume_from(Ok(Some(7))),
+            Ok((Some(7), OffsetSpecification::Offset(7)))
+        ));
+        assert!(resume_from(Err(failed("timeout"))).is_err());
+    }
+
+    /// This process's open subscriptions of a name count as members until closed.
+    #[test]
+    fn open_subscriptions_are_members_until_dropped() {
+        let live = Live::default();
+        let spec = SubscriptionSpec {
+            name: "svc.p".into(),
+            source: "s".into(),
+        };
+        let a = live.enter(&spec, "m-1");
+        let b = live.enter(&spec, "m-2");
+        assert_eq!(live.members(&spec).len(), 2);
+        drop(a);
+        assert_eq!(live.members(&spec), BTreeSet::from(["m-2".to_string()]));
+        drop(b);
+        assert!(live.members(&spec).is_empty());
+    }
 }

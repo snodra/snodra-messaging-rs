@@ -158,14 +158,35 @@ pub fn segment_fits(segment: &str) -> bool {
     !segment.is_empty() && segment.len() <= MAX_SEGMENT_BYTES
 }
 
-/// The bytes `command` encodes to (the protocol crate keeps some fields private; their places
-/// on the wire are fixed by the protocol).
-fn encoded(command: &impl Encoder) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(64);
-    command
-        .encode(&mut bytes)
-        .expect("encoding into memory cannot fail");
-    bytes
+/// The first `limit` bytes `command` encodes to (the protocol crate keeps some fields private;
+/// their places on the wire are fixed by the protocol). Encoding stops there: a delivery's
+/// messages are never encoded or copied for it. `None` when it encodes to fewer.
+fn prefix(command: &impl Encoder, limit: usize) -> Option<Vec<u8>> {
+    /// Takes `limit` bytes, then refuses (which ends the encoding).
+    struct Prefix {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+    impl std::io::Write for Prefix {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let room = self.limit - self.bytes.len();
+            if room == 0 {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            let n = room.min(buf.len());
+            self.bytes.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut out = Prefix {
+        bytes: Vec::with_capacity(limit),
+        limit,
+    };
+    let _ = command.encode(&mut out);
+    (out.bytes.len() == limit).then_some(out.bytes)
 }
 
 /// What a delivered chunk says besides its messages.
@@ -179,36 +200,36 @@ pub struct ChunkHeader {
 }
 
 /// The header of `deliver`: subscription id (1 byte), magic version (1), chunk type (1), entries
-/// (2), records (4), timestamp (8, epoch ms), ...
-pub fn chunk_header(deliver: &DeliverCommand) -> ChunkHeader {
-    let mut bare = deliver.clone();
-    bare.messages.clear();
-    let bytes = encoded(&bare);
-    let timestamp = u64::from_be_bytes(bytes[9..17].try_into().expect("8 bytes"));
-    ChunkHeader {
+/// (2), records (4), timestamp (8, epoch ms), ... `None` when the bytes are not there (the
+/// caller fails the subscription rather than wait on it).
+pub fn chunk_header(deliver: &DeliverCommand) -> Option<ChunkHeader> {
+    let bytes = prefix(deliver, 17)?;
+    let timestamp = u64::from_be_bytes(bytes.get(9..17)?.try_into().ok()?);
+    Some(ChunkHeader {
         subscription_id: deliver.subscription_id,
         first_offset: deliver.chunk_first_offset,
         timestamp_ms: timestamp as i64,
-    }
+    })
 }
 
-/// A consumer update's correlation id, subscription id and whether it activates: correlation id
-/// (4 bytes), subscription id (1), active (1).
-pub fn consumer_update(update: &ConsumerUpdateCommand) -> (u32, u8, bool) {
-    let bytes = encoded(update);
-    (
-        u32::from_be_bytes(bytes[0..4].try_into().expect("4 bytes")),
-        bytes[4],
-        bytes[5] == 1,
-    )
+/// A consumer update's correlation id, subscription id and whether it activates; only the
+/// subscription id is read from the bytes: correlation id (4 bytes), subscription id (1).
+pub fn consumer_update(update: &ConsumerUpdateCommand) -> Option<(u32, u8, bool)> {
+    let bytes = prefix(update, 5)?;
+    Some((
+        update.get_correlation_id(),
+        *bytes.get(4)?,
+        update.is_active() == 1,
+    ))
 }
 
 /// The stream a metadata update is about: code (2 bytes), then the stream's name (a 2-byte
-/// length and its bytes).
-pub fn metadata_update_stream(update: &MetadataUpdateCommand) -> String {
-    let bytes = encoded(update);
-    let len = i16::from_be_bytes([bytes[2], bytes[3]]).max(0) as usize;
-    String::from_utf8_lossy(&bytes[4..(4 + len).min(bytes.len())]).into_owned()
+/// length and its bytes); `None` when the bytes are not there.
+pub fn metadata_update_stream(update: &MetadataUpdateCommand) -> Option<String> {
+    let mut bytes = Vec::new();
+    update.encode(&mut bytes).ok()?;
+    let len = usize::try_from(i16::from_be_bytes([*bytes.get(2)?, *bytes.get(3)?])).ok()?;
+    Some(String::from_utf8_lossy(bytes.get(4..4 + len)?).into_owned())
 }
 
 #[cfg(test)]
@@ -231,32 +252,30 @@ mod tests {
         }
     }
 
-    /// The Java client's `HashRoutingMurmurStrategy` answers these (murmur3 x86_32, seed 104729,
-    /// unsigned modulo): the Kotlin add-on routes every key to the same partition.
+    /// The partition table the Kotlin twin pins too (murmur3 x86_32, seed 104729, the hash as an
+    /// unsigned number modulo 6 partitions; a signed modulo is wrong for `order-7`, whose hash
+    /// has its top bit set).
     #[test]
     fn keys_hash_to_the_partition_the_stream_clients_pick() {
-        let expected = |key: &str, n: usize| {
-            let h = murmur3::murmur3_32(&mut Cursor::new(key.as_bytes()), 104_729).unwrap();
-            (h as u64 % n as u64) as usize
-        };
-        for key in [
-            "order-1",
-            "order-42",
-            "",
-            "ключ",
-            "a-much-longer-key-than-the-others",
+        for (key, hash, partition) in [
+            ("order-1", 0x3163_ba7a_u32, 0),
+            ("order-2", 0x4aa7_bf62, 2),
+            ("customer-123", 0x6fab_e837, 5),
+            ("order-7", 0x813d_1adb, 3),
+            ("", 0xc675_7d56, 4),
         ] {
-            for n in [1, 2, 3, 6] {
-                assert_eq!(partition_index(key, n), expected(key, n), "{key} over {n}");
-            }
+            let h = murmur3::murmur3_32(&mut Cursor::new(key.as_bytes()), HASH_SEED).unwrap();
+            assert_eq!(h, hash, "the hash of {key:?}");
+            assert_eq!(
+                partition_index(key, 6),
+                partition,
+                "the partition of {key:?}"
+            );
         }
-        // The same answer every time: order per key.
-        assert_eq!(partition_index("order-1", 6), partition_index("order-1", 6));
-        // The hash is murmur3 x86_32 (the reference vectors, seed 0).
-        assert_eq!(murmur3::murmur3_32(&mut Cursor::new(b""), 0).unwrap(), 0);
-        assert_eq!(
-            murmur3::murmur3_32(&mut Cursor::new(b"hello"), 0).unwrap(),
-            0x248b_fa47
+        assert_ne!(
+            (0x813d_1adb_u32 as i32 % 6).unsigned_abs() as usize,
+            partition_index("order-7", 6),
+            "a signed modulo gives another partition"
         );
     }
 
@@ -307,18 +326,258 @@ mod tests {
 
     #[test]
     fn the_private_fields_are_read_from_their_places_on_the_wire() {
-        let deliver = DeliverCommand::new(4, 0, 0, 2, 1_700_000_123_456, 1, 40, 0, 0, 0, vec![]);
+        let one = Message::builder().body(b"{}".to_vec()).build();
+        let deliver = DeliverCommand::new(4, 0, 0, 1, 1_700_000_123_456, 1, 40, 0, 0, 0, vec![one]);
         assert_eq!(
             chunk_header(&deliver),
-            ChunkHeader {
+            Some(ChunkHeader {
                 subscription_id: 4,
                 first_offset: 40,
                 timestamp_ms: 1_700_000_123_456
-            }
+            })
         );
         let update = ConsumerUpdateCommand::new(77, 9, 1);
-        assert_eq!(consumer_update(&update), (77, 9, true));
+        assert_eq!(consumer_update(&update), Some((77, 9, true)));
         let update = ConsumerUpdateCommand::new(78, 2, 0);
-        assert_eq!(consumer_update(&update), (78, 2, false));
+        assert_eq!(consumer_update(&update), Some((78, 2, false)));
+    }
+
+    /// A metadata update as the broker sends it (code, then the stream's name), decoded by the
+    /// protocol crate, gives its stream back.
+    #[test]
+    fn a_metadata_update_names_its_stream() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&6u16.to_be_bytes()); // stream not available
+        frame.extend_from_slice(&(15i16).to_be_bytes());
+        frame.extend_from_slice(b"kraken.events-3");
+        let (_, update) = MetadataUpdateCommand::decode(&frame).expect("a metadata update");
+        assert_eq!(
+            metadata_update_stream(&update).as_deref(),
+            Some("kraken.events-3")
+        );
+    }
+
+    /// Fewer bytes than a field's place: `None`, never a panic.
+    #[test]
+    fn a_short_encoding_reads_as_none() {
+        struct Short;
+        impl Encoder for Short {
+            fn encoded_size(&self) -> u32 {
+                3
+            }
+            fn encode(
+                &self,
+                writer: &mut impl std::io::Write,
+            ) -> Result<(), rabbitmq_stream_protocol::error::EncodeError> {
+                writer.write_all(&[1, 2, 3])?;
+                Ok(())
+            }
+        }
+        assert_eq!(prefix(&Short, 17), None);
+        assert_eq!(prefix(&Short, 2), Some(vec![1, 2]));
+    }
+}
+
+/// The encoded message, section by section, with the AMQP type codes of what kraken's layout
+/// fixes (the Kotlin add-on writes the same bytes' types).
+#[cfg(test)]
+mod golden {
+    use super::*;
+
+    /// One AMQP value: its type code and its body (a string's bytes, a list's or map's
+    /// elements).
+    #[derive(Debug, Clone, PartialEq)]
+    enum V {
+        Null,
+        Str(Vec<u8>),
+        Sym(Vec<u8>),
+        Bin(Vec<u8>),
+        List(Vec<V>),
+        Map(Vec<(V, V)>),
+        Other(u8),
+    }
+
+    fn take<'a>(b: &mut &'a [u8], n: usize) -> &'a [u8] {
+        let (head, rest) = b.split_at(n);
+        *b = rest;
+        head
+    }
+
+    fn u32_at(b: &mut &[u8]) -> usize {
+        u32::from_be_bytes(take(b, 4).try_into().unwrap()) as usize
+    }
+
+    fn value(b: &mut &[u8]) -> V {
+        let code = take(b, 1)[0];
+        match code {
+            0x40 => V::Null,
+            0xa1 => {
+                let n = take(b, 1)[0] as usize;
+                V::Str(take(b, n).to_vec())
+            }
+            0xb1 => {
+                let n = u32_at(b);
+                V::Str(take(b, n).to_vec())
+            }
+            0xa3 => {
+                let n = take(b, 1)[0] as usize;
+                V::Sym(take(b, n).to_vec())
+            }
+            0xb3 => {
+                let n = u32_at(b);
+                V::Sym(take(b, n).to_vec())
+            }
+            0xa0 => {
+                let n = take(b, 1)[0] as usize;
+                V::Bin(take(b, n).to_vec())
+            }
+            0xb0 => {
+                let n = u32_at(b);
+                V::Bin(take(b, n).to_vec())
+            }
+            0x45 => V::List(vec![]),
+            0xc0 | 0xc1 | 0xd0 | 0xd1 => {
+                let (size, count) = if code < 0xd0 {
+                    (take(b, 1)[0] as usize - 1, take(b, 1)[0] as usize)
+                } else {
+                    (u32_at(b) - 4, u32_at(b))
+                };
+                let mut inner = take(b, size);
+                let items: Vec<V> = (0..count).map(|_| value(&mut inner)).collect();
+                if code == 0xc1 || code == 0xd1 {
+                    V::Map(
+                        items
+                            .chunks(2)
+                            .map(|kv| (kv[0].clone(), kv[1].clone()))
+                            .collect(),
+                    )
+                } else {
+                    V::List(items)
+                }
+            }
+            0x83 => {
+                take(b, 8);
+                V::Other(code)
+            }
+            other => V::Other(other),
+        }
+    }
+
+    /// The sections of an encoded message: (descriptor code, value).
+    fn sections(mut b: &[u8]) -> Vec<(u8, V)> {
+        let mut all = Vec::new();
+        while !b.is_empty() {
+            assert_eq!(take(&mut b, 2), [0x00, 0x53], "a small-ulong descriptor");
+            let code = take(&mut b, 1)[0];
+            all.push((code, value(&mut b)));
+        }
+        all
+    }
+
+    #[test]
+    fn the_message_has_the_types_of_the_wire_layout() {
+        let event = OutgoingEvent {
+            source: "kraken.events".into(),
+            id: "e-42".into(),
+            type_name: "orders.Placed".into(),
+            key: Some("order-42".into()),
+            headers: HashMap::from([
+                ("type".to_string(), "orders.Placed".to_string()),
+                ("id".to_string(), "e-42".to_string()),
+            ]),
+            payload: br#"{"total":42}"#.to_vec(),
+        };
+        let mut bytes = Vec::new();
+        message(&event, 1).encode(&mut bytes).unwrap();
+        let sections = sections(&bytes);
+        let of = |code: u8| -> Vec<&V> {
+            sections
+                .iter()
+                .filter(|(c, _)| *c == code)
+                .map(|(_, v)| v)
+                .collect()
+        };
+        // Properties (0x73): message-id a string, content-type the symbol application/json.
+        let V::List(properties) = of(0x73)[0] else {
+            panic!("properties: {sections:?}")
+        };
+        assert_eq!(properties[0], V::Str(b"e-42".to_vec()), "message-id");
+        assert_eq!(
+            properties[6],
+            V::Sym(b"application/json".to_vec()),
+            "content-type"
+        );
+        // Message annotations (0x72): x-routing-key, a symbol, with a string value.
+        let V::Map(annotations) = of(0x72)[0] else {
+            panic!("annotations: {sections:?}")
+        };
+        assert_eq!(
+            annotations,
+            &vec![(
+                V::Sym(b"x-routing-key".to_vec()),
+                V::Str(b"order-42".to_vec())
+            )]
+        );
+        // Application properties (0x74): string keys, string values.
+        let V::Map(headers) = of(0x74)[0] else {
+            panic!("application properties: {sections:?}")
+        };
+        assert_eq!(headers.len(), 2);
+        for (k, v) in headers {
+            assert!(matches!((k, v), (V::Str(_), V::Str(_))), "{k:?} = {v:?}");
+        }
+        // Exactly one data section (0x75), the payload; no amqp-value.
+        assert_eq!(of(0x75), vec![&V::Bin(br#"{"total":42}"#.to_vec())]);
+        assert!(of(0x77).is_empty());
+    }
+
+    #[test]
+    fn an_unkeyed_event_has_no_annotation() {
+        let event = OutgoingEvent {
+            source: "s".into(),
+            id: "e-1".into(),
+            type_name: "t".into(),
+            key: None,
+            headers: HashMap::new(),
+            payload: b"{}".to_vec(),
+        };
+        let mut bytes = Vec::new();
+        message(&event, 1).encode(&mut bytes).unwrap();
+        assert!(sections(&bytes).iter().all(|(code, _)| *code != 0x72));
+    }
+
+    /// A chunk with sub-entries (batched or compressed by another producer), as the broker
+    /// delivers it: the protocol crate's decoder, which the client runs on its connection's
+    /// read task before any handler, cannot read it (it panics there, and the connection stops
+    /// reading). Nothing of the add-on runs first, so its guard is a liveness check of the
+    /// connection (the subscription's status refresh) and the deadline of every read.
+    #[test]
+    fn a_chunk_with_sub_entries_cannot_be_decoded_by_the_client() {
+        use rabbitmq_stream_protocol::Response;
+        use rabbitmq_stream_protocol::codec::Decoder;
+        let mut body = vec![1u8, 0, 0]; // subscription, magic, chunk type (user)
+        body.extend_from_slice(&1u16.to_be_bytes()); // one entry...
+        body.extend_from_slice(&5u32.to_be_bytes()); // ...holding five records
+        body.extend_from_slice(&1_700_000_000_000u64.to_be_bytes());
+        body.extend_from_slice(&1u64.to_be_bytes()); // epoch
+        body.extend_from_slice(&0u64.to_be_bytes()); // first offset
+        body.extend_from_slice(&0i32.to_be_bytes()); // crc
+        body.extend_from_slice(&16u32.to_be_bytes()); // data length
+        body.extend_from_slice(&0u32.to_be_bytes()); // trailer
+        body.extend_from_slice(&0u32.to_be_bytes()); // reserved
+        // A sub-entry: the type bit set, gzip, 5 records, lengths.
+        body.extend_from_slice(&[0x80 | 0x10, 0, 5, 0, 0, 0, 100, 0, 0, 0, 6]);
+        body.extend_from_slice(&[0; 6]);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&((4 + body.len()) as u32).to_be_bytes());
+        frame.extend_from_slice(&0x0008u16.to_be_bytes()); // deliver
+        frame.extend_from_slice(&1u16.to_be_bytes());
+        frame.extend_from_slice(&body);
+        let decoded = std::panic::catch_unwind(|| Response::decode(&frame).is_ok());
+        // Today a capacity overflow (the entry header read as a negative length).
+        assert!(
+            decoded.is_err(),
+            "the client reads sub-entries now ({decoded:?}): revisit the guard"
+        );
     }
 }

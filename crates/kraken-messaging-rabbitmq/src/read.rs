@@ -4,10 +4,13 @@
 //!
 //! The stream protocol has no command for a stream's offsets in the client this crate is built
 //! on (`StreamStats` is missing from `rabbitmq-stream-client` 0.11), so they are read: the first
-//! chunk gives the first offset, the last chunk the head. An empty stream sends no chunk at all;
-//! one that sends none within [`QUIET`] is taken as empty.
+//! chunk gives the first offset, the last chunk the head. An empty stream sends no chunk at all:
+//! a stream is taken as empty only when neither read gets a chunk within [`QUIET`]; one read
+//! answering and the other not is a failure, never an empty or shortened stream. (Neither the
+//! client nor its protocol crate 0.11 has the `StreamStats` command.)
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,8 +47,7 @@ impl ChunkReader {
             stream: stream.to_string(),
         };
         match conn
-            .client
-            .subscribe(sub, stream, from, 1, HashMap::new())
+            .timed(conn.client.subscribe(sub, stream, from, 1, HashMap::new()))
             .await
         {
             Ok(response) if response.is_ok() => Ok(reader),
@@ -108,18 +110,42 @@ pub(crate) struct Bounds {
     pub last_timestamp: Option<i64>,
 }
 
-/// The first chunk read from `from`, or `None` when the stream sends none within [`QUIET`]
-/// (bounded by `deadline`).
+/// What one read of a chunk at a stream's start or end found: its first offset, its messages,
+/// its time; `None` when the stream sent nothing within [`QUIET`].
+pub(crate) type Seen = Option<(u64, u64, i64)>;
+
+/// The first chunk read from `from` (first offset, messages, time), or `None` when the stream
+/// sends none within [`QUIET`] (bounded by `deadline`).
 async fn one_chunk(
     conn: &Arc<Conn>,
     stream: &str,
     from: OffsetSpecification,
     deadline: Instant,
-) -> Result<Option<Chunk>, EventStoreError> {
+) -> Result<Seen, EventStoreError> {
     let mut reader = ChunkReader::open(conn, stream, from).await?;
     let chunk = reader.next(deadline.min(Instant::now() + QUIET)).await;
     reader.close().await;
-    chunk
+    Ok(chunk?.map(|c| (c.first_offset, c.messages.len() as u64, c.timestamp_ms)))
+}
+
+/// The bounds from what the first and the last chunk reads found. Empty only when both were
+/// silent: one silent read beside one that answered is no answer (a slow or stalled read, never
+/// an empty or shortened stream), so it fails.
+pub(crate) fn bounds_of(stream: &str, first: Seen, last: Seen) -> Result<Bounds, EventStoreError> {
+    match (first, last) {
+        (None, None) => Ok(Bounds::default()),
+        (Some((first, _, _)), Some((last, count, timestamp))) => {
+            let head = last + count;
+            Ok(Bounds {
+                first: first.min(head),
+                head,
+                last_timestamp: Some(timestamp),
+            })
+        }
+        _ => Err(failed(format!(
+            "the bounds of {stream} were not read: one read answered, the other did not within {QUIET:?}"
+        ))),
+    }
 }
 
 /// The bounds of `stream` on its leader `conn`.
@@ -132,20 +158,63 @@ pub(crate) async fn bounds(
         one_chunk(conn, stream, OffsetSpecification::First, deadline),
         one_chunk(conn, stream, OffsetSpecification::Last, deadline),
     );
-    let (first, last) = (first?, last?);
-    Ok(match (first, last) {
-        (_, None) => Bounds::default(),
-        (first, Some(last)) => {
-            let head = last.first_offset + last.messages.len() as u64;
-            Bounds {
-                first: first
-                    .map_or(last.first_offset, |c| c.first_offset)
-                    .min(head),
-                head,
-                last_timestamp: Some(last.timestamp_ms),
-            }
+    bounds_of(stream, first?, last?)
+}
+
+/// The head of `stream` (and its last chunk's time), reading only the last chunk; the first is
+/// read too when the last is silent, to tell an empty stream (both silent) from a stalled read
+/// (which fails).
+pub(crate) async fn head(
+    conn: &Arc<Conn>,
+    stream: &str,
+    deadline: Instant,
+) -> Result<Bounds, EventStoreError> {
+    match one_chunk(conn, stream, OffsetSpecification::Last, deadline).await? {
+        Some((last, count, timestamp)) => Ok(Bounds {
+            first: 0,
+            head: last + count,
+            last_timestamp: Some(timestamp),
+        }),
+        None => {
+            let first = one_chunk(conn, stream, OffsetSpecification::First, deadline).await?;
+            bounds_of(stream, first, None)
         }
-    })
+    }
+}
+
+/// The streams found empty lately, so a browser call does not wait [`QUIET`] on each of them
+/// every time: an empty answer is kept for [`EMPTY_FOR`]. Answers with data are never kept.
+#[derive(Clone, Default)]
+pub(crate) struct EmptyCache(Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>);
+
+/// How long an empty answer is kept.
+pub(crate) const EMPTY_FOR: Duration = Duration::from_secs(5);
+
+impl EmptyCache {
+    fn fresh(&self, stream: &str) -> bool {
+        crate::conn::lock(&self.0)
+            .get(stream)
+            .is_some_and(|until| std::time::Instant::now() < *until)
+    }
+
+    /// `read`'s answer, or an empty one kept from an earlier call.
+    pub async fn bounds(
+        &self,
+        stream: &str,
+        read: impl Future<Output = Result<Bounds, EventStoreError>>,
+    ) -> Result<Bounds, EventStoreError> {
+        if self.fresh(stream) {
+            return Ok(Bounds::default());
+        }
+        let bounds = read.await?;
+        let mut kept = crate::conn::lock(&self.0);
+        if bounds.last_timestamp.is_none() {
+            kept.insert(stream.to_string(), std::time::Instant::now() + EMPTY_FOR);
+        } else {
+            kept.remove(stream);
+        }
+        Ok(bounds)
+    }
 }
 
 /// The first offset of `stream` written at or after `timestamp_ms` (the time of its chunk),
@@ -219,4 +288,59 @@ pub(crate) async fn read_range(
     };
     reader.close().await;
     complete
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A read double: what the first and last chunk reads found (`None`: silent, as a stalled
+    /// or slow read is).
+    #[test]
+    fn a_stream_is_empty_only_when_both_reads_are_silent() {
+        assert_eq!(bounds_of("s", None, None).unwrap(), Bounds::default());
+        assert_eq!(
+            bounds_of("s", Some((3, 2, 7)), Some((40, 5, 9))).unwrap(),
+            Bounds {
+                first: 3,
+                head: 45,
+                last_timestamp: Some(9)
+            }
+        );
+        // A stalled first read never shortens the stream to its last chunk, and a stalled last
+        // read never makes it empty (a reset to latest replaying it all).
+        for (first, last) in [(None, Some((40, 5, 9))), (Some((3, 2, 7)), None)] {
+            assert!(matches!(
+                bounds_of("s", first, last),
+                Err(EventStoreError::Failed(m)) if m.contains("not read")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_answer_is_kept_briefly_and_a_full_one_never() {
+        let cache = EmptyCache::default();
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let read = |b: Bounds| {
+            reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { Ok(b) }
+        };
+        let full = Bounds {
+            first: 0,
+            head: 3,
+            last_timestamp: Some(1),
+        };
+        assert_eq!(cache.bounds("a", read(full)).await.unwrap(), full);
+        assert_eq!(cache.bounds("a", read(full)).await.unwrap(), full);
+        cache.bounds("b", read(Bounds::default())).await.unwrap();
+        cache.bounds("b", read(full)).await.unwrap(); // not read: kept empty
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(
+            cache
+                .bounds("b", async { panic!("not read again") })
+                .await
+                .unwrap(),
+            Bounds::default()
+        );
+    }
 }

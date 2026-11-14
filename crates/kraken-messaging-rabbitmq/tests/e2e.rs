@@ -224,7 +224,20 @@ async fn a_service_of_two_instances_runs_on_rabbitmq_streams() {
         .publish(&Noted { note: "p-1".into() }, Some("k-p-1"))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // p-1 reached the event store (the outbox relayed it: confirmed by the broker)...
+    eventually(
+        "p-1 relayed to the event store",
+        Duration::from_secs(30),
+        || async {
+            store.contents().outbox.iter().any(|r| {
+                r.sent_at_ms.is_some() && String::from_utf8_lossy(&r.entry.payload).contains("p-1")
+            })
+        },
+    )
+    .await;
+    // ...and stays unhandled: a negative check over a short window (one second), on both
+    // instances, which have reported PAUSED.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(count("p-1"), 0, "held while paused");
     control(&http, &hub, "resume", json!({})).await;
     eventually(

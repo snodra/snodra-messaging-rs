@@ -1201,7 +1201,9 @@ crate docs give the whole layout on the wire.
 ```rust,ignore
 use kraken_messaging_rabbitmq::{RabbitConfig, RabbitEventStore};
 
-let events = RabbitEventStore::new(RabbitConfig::from_env()?)?;
+// `open` asks the management API (when configured) once: it must answer, and with its metrics
+// off no reset is offered. `new` connects nothing.
+let events = RabbitEventStore::open(RabbitConfig::from_env()?).await?;
 let app = KrakenMessaging::builder(config).await?
     .event_store(Arc::new(events))
     .store(store)
@@ -1242,12 +1244,21 @@ it, a reset is answered `UNSUPPORTED`.
 | `KRAKEN_RABBITMQ_TLS` | false | TLS (rustls, no OpenSSL) to every node |
 | `KRAKEN_RABBITMQ_TLS_CA_FILE` | none | PEM CA certificates the nodes are verified against; required with TLS (the store never connects unverified) |
 | `KRAKEN_RABBITMQ_LOAD_BALANCER` | false | the hosts are a load balancer: connect through it until it lands on the node needed |
-| `KRAKEN_RABBITMQ_MANAGEMENT_URL` | none | the management API (`http://rabbitmq:15672`): declares `replay`, shows live subscriptions |
+| `KRAKEN_RABBITMQ_OFFSET_STORE_MESSAGES` | 10000 | a processor stores its position every so many acknowledgements... |
+| `KRAKEN_RABBITMQ_OFFSET_STORE_INTERVAL_MS` | 5000 | ...or this often, whichever first, and always when a partition moves away and at shutdown (every stored position is an entry in the stream) |
+| `KRAKEN_RABBITMQ_MANAGEMENT_URL` | none | the management API (`http://rabbitmq:15672`, no credentials in the URL): declares `replay`, shows live subscriptions; metrics collection must be on (`management.disable_stats = false`) |
 | `KRAKEN_RABBITMQ_MANAGEMENT_USERNAME` / `_PASSWORD` / `_PASSWORD_FILE` | the stream user's | |
+| `KRAKEN_RABBITMQ_MANAGEMENT_CA_FILE` | none | PEM CA certificates of an `https` management API |
 | `KRAKEN_RABBITMQ_KNOWN_SUBSCRIPTIONS` | none | subscription names the event browser's lag view always lists |
 
 The source and its dead-letter source are the core's settings (`KRAKEN_EVENTS_SOURCE`,
 `<source>.dlt`), as for every event store.
+
+**Wire rules shared with the Kotlin module** (the crate docs give the whole layout): a
+processor's stored position is the **next offset to read** (never the "last processed" offset:
+a reset to 0 must be expressible), a consumer with none starts at the first offset; every
+consumer carries the property `kraken-member`; producers **never** use sub-entry batching or
+compression on kraken streams.
 
 **Limits, and what differs from Kafka:**
 
@@ -1259,9 +1270,10 @@ The source and its dead-letter source are the core's settings (`KRAKEN_EVENTS_SO
   overstate a lag that is not received yet (what was received and not acknowledged is counted one
   by one).
 - The stream's first offset and head are read from its first and last chunk (the Rust client has
-  no `StreamStats`); a stream that sends nothing for 1.5 s is taken as empty.
+  no `StreamStats`); a stream is empty only when both reads stay silent for 1.5 s (one answering
+  and the other not is an error, never an empty or shortened stream).
 - Partitions are read when a processor subscribes: a partition added later is read once the
-  instances subscribe again (a restart).
+  instances subscribe again (a restart); publishing reads them again every 30 s.
 - No producer deduplication: an event the outbox publishes again after a crash is a duplicate,
   which the processed-event markers skip. Each publish waits for the broker's confirm. An event
   over the 1 MiB frame, or refused for access, is given up at once.
@@ -1272,9 +1284,11 @@ The source and its dead-letter source are the core's settings (`KRAKEN_EVENTS_SO
   installed.
 
 Tests: `crates/kraken-messaging-rabbitmq/tests/conformance.rs` runs the event-store conformance kit
-on `rabbitmq:4.4.0-management` (stream and management plugins), `tests/e2e.rs` a service of two
-instances against the hub image (outbox, competing instances, pause and resume, a reset through
-the hub, a dead letter in the dead-letter stream).
+on `rabbitmq:4.4.0-management` (stream and management plugins), with and without the management
+API; `tests/offsets.rs` pins the offset-tracking rules; `tests/throughput.rs` measures publishing
+and consuming 10 000 events; `tests/e2e.rs` runs a service of two instances against the hub image
+(outbox, competing instances, pause and resume, a reset through the hub, a dead letter in the
+dead-letter stream).
 
 ## Security
 

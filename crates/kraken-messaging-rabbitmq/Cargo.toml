@@ -11,8 +11,8 @@ publish = false
 kraken-messaging-rs = { path = "../.." }
 # The stream protocol client (pure Rust, TLS through rustls). Its raw `Client` is used, not its
 # `Environment` consumers and producers: see the crate docs for why.
-rabbitmq-stream-client = "0.11.0"
-rabbitmq-stream-protocol = "0.11.0"
+rabbitmq-stream-client = "=0.11.0"
+rabbitmq-stream-protocol = "=0.11.0"
 # The client's hash routing (murmur3 x86_32, seed 104729), computed here per event.
 murmur3 = "0.5.2"
 # The management HTTP API (optional at run time): who reads a subscription now.
@@ -31,3 +31,5 @@ uuid = { version = "1", features = ["v4"] }
 kraken-messaging-rs = { path = "../..", features = ["testing"] }
 tokio = { version = "1.54.1", features = ["full", "test-util"] }
 testcontainers = "0.27"
+# A fake management API.
+wiremock = "0.6.5"

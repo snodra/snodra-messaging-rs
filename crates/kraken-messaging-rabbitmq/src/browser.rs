@@ -44,7 +44,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use crate::config::RabbitConfig;
 use crate::conn::{Broker, Conn, Nodes, Part, lock};
 use crate::management::Management;
-use crate::read::{self, Bounds, ChunkReader};
+use crate::read::{self, Bounds, ChunkReader, EmptyCache};
 use crate::wire;
 
 /// The lag view lists at most this many subscriptions (`truncated` beyond).
@@ -122,15 +122,29 @@ struct Located {
     bounds: Bounds,
 }
 
-/// The partitions of `source` with their bounds; `None` when it does not exist.
+/// What a call reads of each partition.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Need {
+    /// The first offset and the head.
+    Bounds,
+    /// The head only (`first` reads 0).
+    Head,
+}
+
+/// The partitions of `source` (only `segment` when given) with their bounds; `None` when the
+/// source does not exist. With `cache`, a partition found empty lately is not read again.
 async fn locate(
     nodes: &mut Nodes,
     source: &str,
     deadline: tokio::time::Instant,
+    need: Need,
+    segment: Option<&str>,
+    cache: Option<&EmptyCache>,
 ) -> Result<Option<Vec<Located>>, EventStoreError> {
     let Some(mut parts) = nodes.layout(source).await? else {
         return Ok(None);
     };
+    parts.retain(|p| segment.is_none_or(|s| p.segment == s));
     parts.sort_by(|a, b| kraken_messaging::event_store::segment_order(&a.segment, &b.segment));
     let mut conns = Vec::with_capacity(parts.len());
     for part in &parts {
@@ -139,12 +153,18 @@ async fn locate(
         })?;
         conns.push(conn);
     }
-    let bounds = futures::future::join_all(
-        parts
-            .iter()
-            .zip(&conns)
-            .map(|(part, conn)| read::bounds(conn, &part.stream, deadline)),
-    )
+    let bounds = futures::future::join_all(parts.iter().zip(&conns).map(|(part, conn)| async {
+        let read = async {
+            match need {
+                Need::Bounds => read::bounds(conn, &part.stream, deadline).await,
+                Need::Head => read::head(conn, &part.stream, deadline).await,
+            }
+        };
+        match cache {
+            Some(cache) => cache.bounds(&part.stream, read).await,
+            None => read.await,
+        }
+    }))
     .await;
     parts
         .into_iter()
@@ -222,6 +242,8 @@ pub struct RabbitBrowser {
     settings: BrowseSettings,
     management: Option<Management>,
     registry: Registry,
+    /// Partitions found empty lately (not read again for a few seconds).
+    empty: EmptyCache,
     reads: Arc<Semaphore>,
     tails: Arc<Semaphore>,
 }
@@ -234,11 +256,7 @@ impl RabbitBrowser {
     pub fn open(config: &RabbitConfig) -> Result<RabbitBrowser, EventStoreError> {
         config.validate()?;
         let config = Arc::new(config.clone());
-        let management = config
-            .management
-            .as_ref()
-            .map(|m| Management::new(m, &config.virtual_host))
-            .transpose()?;
+        let management = Management::of(&config)?;
         let broker = Broker::new(Arc::clone(&config), BROWSER_CONNECTION)?;
         Ok(RabbitBrowser::new(broker, management, Registry::default()))
     }
@@ -256,6 +274,7 @@ impl RabbitBrowser {
             }
         }
         RabbitBrowser {
+            empty: EmptyCache::default(),
             reads: Arc::new(Semaphore::new(settings.max_searches)),
             tails: Arc::new(Semaphore::new(settings.max_tails)),
             broker,
@@ -304,13 +323,23 @@ impl RabbitBrowser {
     async fn search_page(&self, request: SearchRequest) -> Result<SearchPage, BrowseError> {
         let plan = SearchPlan::new(&request, &self.settings)?;
         let slot = self.read_slot()?;
+        let empty = self.empty.clone();
         self.blocking(slot, plan.timeout, move |handle, nodes| {
             let started = Instant::now();
             let deadline = started + plan.timeout;
             let source = plan.source.as_str();
             let filters = &plan.filters;
             let located = handle.block_on(async {
-                let Some(located) = locate(nodes, source, until(deadline)).await? else {
+                let Some(located) = locate(
+                    nodes,
+                    source,
+                    until(deadline),
+                    Need::Bounds,
+                    None,
+                    Some(&empty),
+                )
+                .await?
+                else {
                     return Ok(None);
                 };
                 let mut ranges = Vec::with_capacity(located.len());
@@ -365,23 +394,33 @@ impl RabbitBrowser {
         let payload = request.payload.then_some(self.settings.max_payload);
         let slot = self.read_slot()?;
         let budget = self.settings.timeout;
+        let empty = self.empty.clone();
         self.blocking(slot, budget, move |handle, nodes| {
             handle.block_on(async {
                 let deadline = until(Instant::now() + budget);
-                let Some(located) = locate(nodes, &source, deadline).await.map_err(unavailable)?
+                let Some(located) = locate(
+                    nodes,
+                    &source,
+                    deadline,
+                    Need::Head,
+                    Some(&segment),
+                    Some(&empty),
+                )
+                .await
+                .map_err(unavailable)?
                 else {
                     return Err(BrowseError::NotFound(format!("source {source} does not exist")));
                 };
-                let Some(at) = located.iter().find(|l| l.part.segment == segment) else {
+                let Some(at) = located.first() else {
                     return Err(BrowseError::NotFound(format!(
                         "source {source} has no segment {}",
                         quoted(&segment)
                     )));
                 };
-                let Bounds { first, head, .. } = at.bounds;
-                if !(first..head).contains(&offset) {
+                let head = at.bounds.head;
+                if offset >= head {
                     return Err(BrowseError::NotFound(format!(
-                        "offset {offset} is outside segment {segment} of {source} (offsets {first} to {head}, the head excluded)"
+                        "offset {offset} is past segment {segment} of {source} (its head is {head})"
                     )));
                 }
                 let mut found = None;
@@ -417,14 +456,16 @@ impl RabbitBrowser {
         let slot = self.read_slot()?;
         let budget = self.settings.timeout;
         let sources = self.settings.sources.clone();
+        let empty = self.empty.clone();
         self.blocking(slot, budget, move |handle, nodes| {
             handle.block_on(async {
                 let deadline = until(Instant::now() + budget);
                 let mut views = Vec::with_capacity(sources.len());
                 for source in sources {
-                    let Some(located) = locate(nodes, &source, deadline)
-                        .await
-                        .map_err(unavailable)?
+                    let Some(located) =
+                        locate(nodes, &source, deadline, Need::Bounds, None, Some(&empty))
+                            .await
+                            .map_err(unavailable)?
                     else {
                         views.push(SourceView {
                             source,
@@ -460,12 +501,14 @@ impl RabbitBrowser {
         let budget = self.settings.timeout;
         let management = self.management.clone();
         let registry = self.registry.clone();
+        let empty = self.empty.clone();
         self.blocking(slot, budget, move |handle, nodes| {
             handle.block_on(async {
                 let deadline = until(Instant::now() + budget);
-                let Some(located) = locate(nodes, &source, deadline)
-                    .await
-                    .map_err(unavailable)?
+                let Some(located) =
+                    locate(nodes, &source, deadline, Need::Head, None, Some(&empty))
+                        .await
+                        .map_err(unavailable)?
                 else {
                     return Ok(LagView {
                         source,
@@ -475,17 +518,19 @@ impl RabbitBrowser {
                     });
                 };
                 let streams: Vec<String> = located.iter().map(|l| l.part.stream.clone()).collect();
-                let live: BTreeMap<String, BTreeSet<String>> = match &management {
-                    None => BTreeMap::new(),
+                // `None`: who reads is not known (no management API, or it failed).
+                let live: Option<BTreeMap<String, BTreeSet<String>>> = match &management {
+                    None => None,
                     Some(m) => match m.subscriptions(&streams).await {
-                        Ok(live) => live,
+                        Ok(live) => Some(live),
                         Err(e) => {
                             tracing::warn!("the lag view lists no live subscriptions: {e}");
-                            BTreeMap::new()
+                            None
                         }
                     },
                 };
-                for name in live.keys() {
+                let live_names = live.clone().unwrap_or_default();
+                for name in live_names.keys() {
                     registry.add(&source, name);
                 }
                 let names = registry.names(&source);
@@ -513,10 +558,10 @@ impl RabbitBrowser {
                     if segments.iter().all(|s| s.committed.is_none()) {
                         continue;
                     }
-                    let members = live.get(&name).map_or(0, BTreeSet::len) as u64;
+                    let members = live_names.get(&name).map_or(0, BTreeSet::len) as u64;
                     subscriptions.push(SubscriptionLag {
                         lag: segments.iter().filter_map(|s| s.lag).sum(),
-                        state: match (&management, members) {
+                        state: match (&live, members) {
                             (None, _) => "unknown",
                             (Some(_), 0) => "empty",
                             (Some(_), _) => "active",
@@ -568,7 +613,8 @@ impl RabbitBrowser {
             let mut nodes = Nodes::new(broker);
             let setup = async {
                 let deadline = until(Instant::now() + budget);
-                let Some(located) = locate(&mut nodes, &source, deadline)
+                // Fresh heads (never the cache): the tail starts after what is there now.
+                let Some(located) = locate(&mut nodes, &source, deadline, Need::Head, None, None)
                     .await
                     .map_err(unavailable)?
                 else {

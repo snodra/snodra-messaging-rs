@@ -1,9 +1,12 @@
 //! The add-on's settings ([`RabbitConfig`]), in code or from `KRAKEN_RABBITMQ_*` variables.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use kraken_messaging::event_store::EventStoreError;
 use kraken_messaging::event_store::browse::BrowseSettings;
+
+pub use crate::subscription::StorePolicy;
 
 /// The stream port without TLS.
 pub const DEFAULT_PORT: u16 = 5552;
@@ -12,23 +15,41 @@ pub const DEFAULT_TLS_PORT: u16 = 5551;
 /// The host when none is configured.
 pub const DEFAULT_HOST: &str = "rabbitmq";
 
-/// The management HTTP API (the plugin `rabbitmq_stream_management`): who reads a subscription
-/// now. Its `Debug` never shows the password.
+/// The management HTTP API (the plugins `rabbitmq_management` and `rabbitmq_stream_management`,
+/// with metrics collection on: `management.disable_stats` false): who reads a subscription now.
+/// Its `Debug` never shows the password.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Management {
-    /// `http(s)://host:port` (the API's root, without `/api`).
+    /// `http(s)://host:port` (the API's root, without `/api`), never with credentials in it.
     pub url: String,
-    pub username: String,
-    pub password: String,
+    /// `None`: the stream user's.
+    pub username: Option<String>,
+    /// `None`: the stream user's.
+    pub password: Option<String>,
+    /// PEM CA certificates an `https` API is verified against (besides the platform's roots).
+    pub ca_file: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Management {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Management")
-            .field("url", &self.url)
+            .field("url", &redacted(&self.url))
             .field("username", &self.username)
-            .field("password", &"<hidden>")
+            .field("password", &self.password.as_ref().map(|_| "<hidden>"))
+            .field("ca_file", &self.ca_file)
             .finish()
+    }
+}
+
+/// `url` without the credentials it may carry (`scheme://<hidden>@host`).
+pub(crate) fn redacted(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    match authority.rsplit_once('@') {
+        Some((_, host)) => format!("{scheme}://<hidden>@{host}{}", &rest[authority.len()..]),
+        None => url.to_string(),
     }
 }
 
@@ -59,6 +80,9 @@ pub struct RabbitConfig {
     /// Subscription names the browser's lag view always lists (with a stored offset), besides the
     /// ones this process subscribed and the ones the management API shows reading.
     pub known_subscriptions: Vec<String>,
+    /// When a subscription stores its acknowledged offset (every stored offset is an entry in
+    /// the stream).
+    pub offset_store: StorePolicy,
     /// The browser's sources (the first is the default) and bounds.
     pub browse: BrowseSettings,
 }
@@ -78,6 +102,7 @@ impl RabbitConfig {
             load_balancer: false,
             management: None,
             known_subscriptions: Vec::new(),
+            offset_store: StorePolicy::default(),
             browse: BrowseSettings::default(),
         }
     }
@@ -141,10 +166,24 @@ impl RabbitConfig {
         if let Some(url) = get("MANAGEMENT_URL") {
             config.management = Some(Management {
                 url,
-                username: get("MANAGEMENT_USERNAME").unwrap_or_else(|| config.username.clone()),
-                password: secret(&vars, "MANAGEMENT_PASSWORD")?
-                    .unwrap_or_else(|| config.password.clone()),
+                username: get("MANAGEMENT_USERNAME"),
+                password: secret(&vars, "MANAGEMENT_PASSWORD")?,
+                ca_file: get("MANAGEMENT_CA_FILE").map(PathBuf::from),
             });
+        }
+        if let Some(n) = get("OFFSET_STORE_MESSAGES") {
+            config.offset_store.messages = n.parse().map_err(|_| {
+                EventStoreError::Invalid(format!(
+                    "KRAKEN_RABBITMQ_OFFSET_STORE_MESSAGES is not a number: {n}"
+                ))
+            })?;
+        }
+        if let Some(ms) = get("OFFSET_STORE_INTERVAL_MS") {
+            config.offset_store.interval = Duration::from_millis(ms.parse().map_err(|_| {
+                EventStoreError::Invalid(format!(
+                    "KRAKEN_RABBITMQ_OFFSET_STORE_INTERVAL_MS is not a number: {ms}"
+                ))
+            })?);
         }
         config.known_subscriptions = list(get("KNOWN_SUBSCRIPTIONS"));
         Ok(config)
@@ -181,13 +220,14 @@ impl RabbitConfig {
         self
     }
 
-    /// The management HTTP API at `url`, with the stream user's credentials unless
-    /// [`management_credentials`](Self::management_credentials) says otherwise.
+    /// The management HTTP API at `url`, with the stream user's credentials (whenever they are
+    /// set) unless [`management_credentials`](Self::management_credentials) says otherwise.
     pub fn management(mut self, url: &str) -> RabbitConfig {
         self.management = Some(Management {
             url: url.to_string(),
-            username: self.username.clone(),
-            password: self.password.clone(),
+            username: None,
+            password: None,
+            ca_file: None,
         });
         self
     }
@@ -195,10 +235,35 @@ impl RabbitConfig {
     /// The management API's own user and password (after [`management`](Self::management)).
     pub fn management_credentials(mut self, username: &str, password: &str) -> RabbitConfig {
         if let Some(m) = &mut self.management {
-            m.username = username.to_string();
-            m.password = password.to_string();
+            m.username = Some(username.to_string());
+            m.password = Some(password.to_string());
         }
         self
+    }
+
+    /// The CA certificates of an `https` management API (after [`management`](Self::management)).
+    pub fn management_ca(mut self, ca_file: impl Into<PathBuf>) -> RabbitConfig {
+        if let Some(m) = &mut self.management {
+            m.ca_file = Some(ca_file.into());
+        }
+        self
+    }
+
+    /// When subscriptions store their acknowledged offsets.
+    pub fn offset_store(mut self, policy: StorePolicy) -> RabbitConfig {
+        self.offset_store = policy;
+        self
+    }
+
+    /// The management API's user and password: its own, else the stream user's.
+    pub(crate) fn management_login(&self) -> (String, String) {
+        let m = self.management.as_ref();
+        (
+            m.and_then(|m| m.username.clone())
+                .unwrap_or_else(|| self.username.clone()),
+            m.and_then(|m| m.password.clone())
+                .unwrap_or_else(|| self.password.clone()),
+        )
     }
 
     /// Subscription names the browser's lag view always lists.
@@ -267,13 +332,38 @@ impl RabbitConfig {
                     .into(),
             ));
         }
-        if let Some(m) = &self.management
-            && !(m.url.starts_with("http://") || m.url.starts_with("https://"))
-        {
-            return Err(EventStoreError::Invalid(format!(
-                "the RabbitMQ management URL {} is not http(s)://host:port",
-                m.url
-            )));
+        if let Some(m) = &self.management {
+            let rest = m
+                .url
+                .strip_prefix("http://")
+                .or_else(|| m.url.strip_prefix("https://"));
+            match rest {
+                None => {
+                    return Err(EventStoreError::Invalid(
+                        "the RabbitMQ management URL is not http(s)://host:port".into(),
+                    ));
+                }
+                // Credentials only through their settings: a URL carrying them is refused, and
+                // never shown.
+                Some(rest)
+                    if rest
+                        .split('/')
+                        .next()
+                        .is_some_and(|auth| auth.contains('@')) =>
+                {
+                    return Err(EventStoreError::Invalid(
+                        "the RabbitMQ management URL carries credentials: set \
+                         KRAKEN_RABBITMQ_MANAGEMENT_USERNAME and _PASSWORD instead"
+                            .into(),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        if self.offset_store.messages == 0 || self.offset_store.interval.is_zero() {
+            return Err(EventStoreError::Invalid(
+                "the offset store policy needs at least 1 message and 1 ms".into(),
+            ));
         }
         self.browse.validate().map_err(EventStoreError::Invalid)
     }
@@ -292,6 +382,7 @@ impl std::fmt::Debug for RabbitConfig {
             .field("load_balancer", &self.load_balancer)
             .field("management", &self.management)
             .field("known_subscriptions", &self.known_subscriptions)
+            .field("offset_store", &self.offset_store)
             .field("browse", &self.browse)
             .finish()
     }
@@ -376,10 +467,10 @@ mod tests {
         assert_eq!(config.password, "from-the-file");
         assert!(config.tls && config.load_balancer);
         assert_eq!(config.tls_ca_file, Some(PathBuf::from("/etc/ca.pem")));
-        let m = config.management.clone().unwrap();
+        assert_eq!(config.management.as_ref().unwrap().url, "http://r1:15672");
         assert_eq!(
-            (m.url.as_str(), m.username.as_str(), m.password.as_str()),
-            ("http://r1:15672", "svc", "from-the-file")
+            config.management_login(),
+            ("svc".to_string(), "from-the-file".to_string())
         );
         assert_eq!(
             config.known_subscriptions,
@@ -459,10 +550,58 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(config.password, "direct");
-        let m = config.management.unwrap();
         assert_eq!(
-            (m.username.as_str(), m.password.as_str()),
-            ("admin", "m-pass")
+            config.management_login(),
+            ("admin".to_string(), "m-pass".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod order {
+    use super::*;
+
+    /// The stream user's credentials set after the management API still reach it; its own,
+    /// set explicitly, win in either order.
+    #[test]
+    fn credentials_set_in_any_order_reach_the_management_api() {
+        let late = RabbitConfig::new("r")
+            .management("http://r:15672")
+            .credentials("svc", "pw");
+        assert_eq!(
+            late.management_login(),
+            ("svc".to_string(), "pw".to_string())
+        );
+        let own = RabbitConfig::new("r")
+            .management("http://r:15672")
+            .management_credentials("admin", "m")
+            .credentials("svc", "pw");
+        assert_eq!(
+            own.management_login(),
+            ("admin".to_string(), "m".to_string())
+        );
+    }
+
+    #[test]
+    fn the_offset_store_policy_comes_from_the_environment() {
+        let config = RabbitConfig::from_vars(vec![
+            (
+                "KRAKEN_RABBITMQ_OFFSET_STORE_MESSAGES".to_string(),
+                "50".to_string(),
+            ),
+            (
+                "KRAKEN_RABBITMQ_OFFSET_STORE_INTERVAL_MS".to_string(),
+                "250".to_string(),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            config.offset_store,
+            StorePolicy {
+                messages: 50,
+                interval: Duration::from_millis(250)
+            }
+        );
+        assert_eq!(RabbitConfig::new("r").offset_store, StorePolicy::default());
     }
 }
