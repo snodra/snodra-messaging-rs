@@ -25,12 +25,23 @@ pub fn t0() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(1_793_700_000)
 }
 
-/// The store of a saga test (feature `testing`: it reads [`MemoryStore::contents`]).
+/// The store of a saga test (feature `testing`: it reads [`MemoryStore::contents`]): the
+/// in-memory message store, or MongoDB ([`Store::start_mongo`]) for the tests that race real
+/// transactions of the MongoDB add-on.
 #[cfg(feature = "testing")]
 pub struct Store {
-    /// The in-memory message store.
+    /// The in-memory message store (unused on MongoDB).
     pub store: Arc<MemoryStore>,
     pub clock: ManualClock,
+    mongo: Option<Mongo>,
+}
+
+/// The MongoDB side of a [`Store`]: the add-on's store over a database of its own container.
+#[cfg(feature = "testing")]
+struct Mongo {
+    store: Arc<kraken_messaging_mongo::MongoStore>,
+    db: mongodb::Database,
+    _container: super::containers::MongoDb,
 }
 
 #[cfg(feature = "testing")]
@@ -41,20 +52,74 @@ impl Store {
         Store {
             store: Arc::new(MemoryStore::new()),
             clock: ManualClock::new(t0()),
+            mongo: None,
+        }
+    }
+
+    /// The MongoDB add-on's store (needs Docker), its indexes in place. The readers below that
+    /// tests on MongoDB use: `sagas`, `dispatch_of`, `failures`.
+    pub async fn start_mongo() -> Store {
+        let container = super::containers::mongo().await;
+        let client = mongodb::Client::with_uri_str(&container.uri).await.unwrap();
+        let db = client.default_database().unwrap();
+        let store = kraken_messaging_mongo::MongoStore::new(client, db.clone());
+        store
+            .init_schema(&kraken_messaging::Config::new("saga-tests", "127.0.0.1:1"))
+            .await
+            .unwrap();
+        Store {
+            store: Arc::new(MemoryStore::new()),
+            clock: ManualClock::new(t0()),
+            mongo: Some(Mongo {
+                store: Arc::new(store),
+                db,
+                _container: container,
+            }),
         }
     }
 
     pub fn ports(&self) -> SagaPorts {
-        SagaPorts::of(&*self.store)
+        match &self.mongo {
+            Some(mongo) => SagaPorts::of(&*mongo.store),
+            None => SagaPorts::of(&*self.store),
+        }
     }
 
     /// The store as the core takes it.
     pub fn message_store(&self) -> Arc<dyn MessageStore> {
-        self.store.clone()
+        match &self.mongo {
+            Some(mongo) => mongo.store.clone(),
+            None => self.store.clone(),
+        }
     }
 
-    /// What the store holds.
+    /// The documents of `collection` on MongoDB, as the add-on's document type `D`.
+    async fn mongo_find<D>(
+        &self,
+        collection: &str,
+        filter: mongodb::bson::Document,
+    ) -> Option<Vec<D>>
+    where
+        D: serde::de::DeserializeOwned + Send + Sync,
+    {
+        use futures::TryStreamExt;
+        let mongo = self.mongo.as_ref()?;
+        Some(
+            mongo
+                .db
+                .collection::<D>(collection)
+                .find(filter)
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// What the store holds (the in-memory store only).
     pub fn contents(&self) -> MemoryContents {
+        assert!(self.mongo.is_none(), "contents() reads the in-memory store");
         self.store.contents()
     }
 
@@ -77,6 +142,13 @@ impl Store {
     }
 
     pub async fn sagas(&self, type_name: &str) -> Vec<SagaDocument> {
+        use kraken_messaging_mongo::documents::SagaDoc;
+        if let Some(found) = self
+            .mongo_find::<SagaDoc>("sagas", mongodb::bson::doc! { "type": type_name })
+            .await
+        {
+            return found.into_iter().map(SagaDocument::from).collect();
+        }
         let mut found: Vec<SagaDocument> = self
             .contents()
             .sagas
@@ -95,6 +167,16 @@ impl Store {
     }
 
     pub async fn dispatch_of(&self, saga_id: &str) -> Vec<SagaDispatchDocument> {
+        use kraken_messaging_mongo::documents::DispatchDoc;
+        if let Some(found) = self
+            .mongo_find::<DispatchDoc>("saga_dispatch", mongodb::bson::doc! { "sagaId": saga_id })
+            .await
+        {
+            let mut entries: Vec<SagaDispatchDocument> =
+                found.into_iter().map(SagaDispatchDocument::from).collect();
+            entries.sort_by_key(|e| e.seq);
+            return entries;
+        }
         let mut entries: Vec<SagaDispatchDocument> = self
             .contents()
             .dispatch
@@ -110,6 +192,13 @@ impl Store {
     }
 
     pub async fn failures(&self) -> Vec<SagaFailureDocument> {
+        use kraken_messaging_mongo::documents::FailureDoc;
+        if let Some(found) = self
+            .mongo_find::<FailureDoc>("saga_failures", mongodb::bson::doc! {})
+            .await
+        {
+            return found.into_iter().map(SagaFailureDocument::from).collect();
+        }
         self.contents().failures
     }
 

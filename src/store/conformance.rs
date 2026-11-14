@@ -14,6 +14,12 @@
 //! whatever another check left pending and leaves nothing pending itself: the store must be the
 //! kit's alone while it runs. Every check is public, so a failing one can be run by itself.
 //!
+//! Two checks race two live transactions of the store on one saga
+//! ([`two_transactions_starting_one_saga_key_leave_one_live_saga`],
+//! [`two_transactions_updating_one_saga_version_commit_once`]): the loser's
+//! [`StoreError::Conflict`] may surface at its write (a database that locks the record, e.g.
+//! MongoDB's write conflict) or at its commit (a store that checks at the end); either passes.
+//!
 //! The kit must run on a multi-thread runtime (`#[tokio::test(flavor = "multi_thread")]`): two
 //! tasks race in [`concurrent_relays_publish_each_entry_once`],
 //! [`two_schedulers_claim_each_due_deadline_once`] and [`two_relays_never_hold_one_saga_lease`].
@@ -80,6 +86,8 @@ pub async fn run_store_conformance(store: Arc<dyn MessageStore>) {
         processor_control_write_inside_rolled_back_transaction_is_kept,
         external_call_idempotency_returns_first_result,
         saga_ports_round_trip,
+        two_transactions_starting_one_saga_key_leave_one_live_saga,
+        two_transactions_updating_one_saga_version_commit_once,
         saga_dispatch_store_refuses_an_event_the_outbox_would_refuse,
         due_deadline_is_claimed_once_until_its_lease_passes,
         two_schedulers_claim_each_due_deadline_once,
@@ -1984,6 +1992,132 @@ pub async fn saga_ports_round_trip(store: &dyn MessageStore) {
         .await
         .expect("mark_dispatched");
     txs.commit(&mut tx).await.expect("commit");
+}
+
+/// Two live transactions each start a saga (two ids) holding one start key and both try to
+/// commit: exactly one commits, the other conflicts (at its insert or at its commit), and one live
+/// saga holds the key.
+pub async fn two_transactions_starting_one_saga_key_leave_one_live_saga(store: &dyn MessageStore) {
+    let sagas = store.sagas().sagas;
+    let txs = store.tx();
+    let type_name = format!("conformance.Race{}", uuid::Uuid::new_v4().simple());
+    let start_key = format!("{type_name}|orderId=o-1");
+    let saga = |id: &str| SagaDocument {
+        id: id.to_string(),
+        type_name: type_name.clone(),
+        state: format!("{{\"by\":\"{id}\"}}"),
+        associations: vec![Association::new("orderId", "o-1")],
+        start_key: Some(start_key.clone()),
+        ended: false,
+        ended_at_ms: None,
+        version: 0,
+        created_at_ms: now_ms(),
+        updated_at_ms: now_ms(),
+    };
+    let ids = [
+        format!("race-{}", uuid::Uuid::new_v4()),
+        format!("race-{}", uuid::Uuid::new_v4()),
+    ];
+    let mut first = txs.begin().await.expect("begin");
+    let mut second = txs.begin().await.expect("begin");
+    let inserted = [
+        sagas.insert(&mut first, &saga(&ids[0])).await,
+        sagas.insert(&mut second, &saga(&ids[1])).await,
+    ];
+    let mut outcomes = Vec::new();
+    for (tx, insert) in [
+        (&mut first, inserted[0].as_ref()),
+        (&mut second, inserted[1].as_ref()),
+    ] {
+        outcomes.push(match insert {
+            Ok(()) => txs.commit(tx).await,
+            Err(e) => {
+                assert!(e.is_conflict(), "the losing insert conflicts: {e}");
+                txs.abort(tx).await;
+                Err(StoreError::Conflict("at the insert".into()))
+            }
+        });
+    }
+    let won: Vec<usize> = (0..2).filter(|i| outcomes[*i].is_ok()).collect();
+    assert_eq!(won.len(), 1, "exactly one commits: {outcomes:?}");
+    let lost = &outcomes[1 - won[0]];
+    assert!(
+        lost.as_ref().is_err_and(StoreError::is_conflict),
+        "the other conflicts: {lost:?}"
+    );
+    let mut tx = txs.plain().await.expect("plain");
+    let live = sagas
+        .find_live(&mut tx, &type_name, "orderId", "o-1")
+        .await
+        .expect("find_live");
+    assert_eq!(
+        live.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+        vec![ids[won[0]].clone()],
+        "one live saga holds the key, the winner's"
+    );
+}
+
+/// Two live transactions update one saga from one version and both try to commit: exactly one
+/// commits, the other conflicts (at its update or at its commit), and the stored saga is the
+/// winner's.
+pub async fn two_transactions_updating_one_saga_version_commit_once(store: &dyn MessageStore) {
+    let sagas = store.sagas().sagas;
+    let txs = store.tx();
+    let type_name = format!("conformance.Race{}", uuid::Uuid::new_v4().simple());
+    let saga = SagaDocument {
+        id: format!("race-{}", uuid::Uuid::new_v4()),
+        type_name,
+        state: "{\"step\":0}".into(),
+        associations: vec![Association::new("orderId", "o-1")],
+        start_key: None,
+        ended: false,
+        ended_at_ms: None,
+        version: 0,
+        created_at_ms: now_ms(),
+        updated_at_ms: now_ms(),
+    };
+    let mut tx = txs.begin().await.expect("begin");
+    sagas.insert(&mut tx, &saga).await.expect("insert");
+    txs.commit(&mut tx).await.expect("commit");
+
+    let next = |step: &str| SagaDocument {
+        state: format!("{{\"step\":\"{step}\"}}"),
+        version: 1,
+        ..saga.clone()
+    };
+    let (a, b) = (next("a"), next("b"));
+    let mut first = txs.begin().await.expect("begin");
+    let mut second = txs.begin().await.expect("begin");
+    let updated = [
+        sagas.update(&mut first, &a, 0).await,
+        sagas.update(&mut second, &b, 0).await,
+    ];
+    let mut outcomes = Vec::new();
+    for (tx, update) in [(&mut first, &updated[0]), (&mut second, &updated[1])] {
+        outcomes.push(match update {
+            Ok(true) => txs.commit(tx).await,
+            Ok(false) => panic!("an update at the version both read is not refused by the check"),
+            Err(e) => {
+                assert!(e.is_conflict(), "the losing update conflicts: {e}");
+                txs.abort(tx).await;
+                Err(StoreError::Conflict("at the update".into()))
+            }
+        });
+    }
+    let won: Vec<usize> = (0..2).filter(|i| outcomes[*i].is_ok()).collect();
+    assert_eq!(won.len(), 1, "exactly one commits: {outcomes:?}");
+    let lost = &outcomes[1 - won[0]];
+    assert!(
+        lost.as_ref().is_err_and(StoreError::is_conflict),
+        "the other conflicts: {lost:?}"
+    );
+    let mut tx = txs.plain().await.expect("plain");
+    let stored = sagas
+        .find_by_id(&mut tx, &saga.id)
+        .await
+        .expect("find_by_id")
+        .expect("the saga");
+    assert_eq!(stored, [a, b][won[0]].clone(), "the winner's");
 }
 
 /// `SagaDispatchStore::record` refuses an EVENT entry whose payload the outbox would refuse (not a

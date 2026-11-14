@@ -39,7 +39,10 @@ struct Rt {
 
 impl Rt {
     async fn start() -> Rt {
-        let store = Store::start().await;
+        Rt::on(Store::start().await)
+    }
+
+    fn on(store: Store) -> Rt {
         let gate = Gate::new();
         let metrics = RecordingMetrics::new();
         let runtime = Self::build(
@@ -273,7 +276,21 @@ async fn force_new_always_creates_a_new_instance_without_a_start_key() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_concurrent_start_events_for_one_key_end_in_one_instance_that_handled_both() {
-    let rt = Rt::start().await;
+    two_start_events_race(Rt::start().await).await;
+}
+
+/// The same race on the MongoDB add-on: its write conflicts, transient transaction errors and the
+/// partial unique start-key index under two live transactions become conflicts the runtime retries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_concurrent_start_events_for_one_key_end_in_one_instance_on_mongodb() {
+    if !support::docker_available() {
+        eprintln!("docker not available, skipping");
+        return;
+    }
+    two_start_events_race(Rt::on(Store::start_mongo().await)).await;
+}
+
+async fn two_start_events_race(rt: Rt) {
     rt.gate.meet_in_pairs(2);
 
     let (a, b) = (Arc::clone(&rt.runtime), Arc::clone(&rt.runtime));
@@ -295,7 +312,20 @@ async fn two_concurrent_start_events_for_one_key_end_in_one_instance_that_handle
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_concurrent_events_for_one_instance_never_interleave_and_both_apply() {
-    let rt = Rt::start().await;
+    two_events_race(Rt::start().await).await;
+}
+
+/// The same race on the MongoDB add-on (a write conflict on the saga's document).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_concurrent_events_for_one_instance_never_interleave_on_mongodb() {
+    if !support::docker_available() {
+        eprintln!("docker not available, skipping");
+        return;
+    }
+    two_events_race(Rt::on(Store::start_mongo().await)).await;
+}
+
+async fn two_events_race(rt: Rt) {
     rt.deliver(&placed("o6")).await;
     rt.gate.meet_in_pairs(2);
 
