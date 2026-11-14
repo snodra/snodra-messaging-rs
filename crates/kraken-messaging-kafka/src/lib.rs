@@ -62,12 +62,9 @@ impl KafkaConfig {
 
     /// `KRAKEN_KAFKA_BOOTSTRAP` (default `kafka:19092`).
     pub fn from_env() -> KafkaConfig {
-        KafkaConfig::new(
-            &std::env::var("KRAKEN_KAFKA_BOOTSTRAP")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| "kafka:19092".to_string()),
-        )
+        KafkaConfig::new(&bootstrap_or_default(
+            std::env::var("KRAKEN_KAFKA_BOOTSTRAP").ok(),
+        ))
     }
 
     /// One more librdkafka property.
@@ -154,6 +151,7 @@ impl EventStore for KafkaEventStore {
                 &spec.name,
                 &spec.source,
                 &self.config.properties,
+                true,
             )?;
             Ok(Box::new(subscription) as Box<dyn Subscription>)
         })
@@ -176,6 +174,13 @@ impl EventStore for KafkaEventStore {
     fn compare(&self, a: &str, b: &str) -> Ordering {
         compare(a, b)
     }
+}
+
+/// The configured bootstrap servers, `kafka:19092` when none (or a blank one) is set.
+fn bootstrap_or_default(configured: Option<String>) -> String {
+    configured
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "kafka:19092".to_string())
 }
 
 fn compare(a: &str, b: &str) -> Ordering {
@@ -219,10 +224,9 @@ mod tests {
     }
 
     #[test]
-    fn the_bootstrap_servers_default_for_the_environment() {
-        // Not set in the test environment: the default (the variable is read, never written).
-        if std::env::var("KRAKEN_KAFKA_BOOTSTRAP").is_err() {
-            assert_eq!(KafkaConfig::from_env().bootstrap_servers, "kafka:19092");
-        }
+    fn the_bootstrap_servers_default_when_none_is_configured() {
+        assert_eq!(bootstrap_or_default(None), "kafka:19092");
+        assert_eq!(bootstrap_or_default(Some("  ".into())), "kafka:19092");
+        assert_eq!(bootstrap_or_default(Some("k:9".into())), "k:9");
     }
 }

@@ -128,6 +128,7 @@ impl KafkaExternalSource {
             &self.group_id,
             &self.topic,
             &self.properties,
+            false,
         )?;
         Ok(Box::new(subscription))
     }

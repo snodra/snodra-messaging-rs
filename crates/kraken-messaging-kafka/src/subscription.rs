@@ -6,9 +6,8 @@
 //!   never handed out before the `Assigned` naming its partition: the callbacks run inside the
 //!   poll that fetches it.
 //! - **Acknowledgement** commits the offset after the record (asynchronously, as the consumer
-//!   always did); a partition about to be revoked has its acknowledged offsets committed first
-//!   (synchronously, inside the rebalance callback), and [`close`](Subscription::close) commits
-//!   them all before leaving the group.
+//!   always did), and [`close`](Subscription::close) commits them all (synchronously, on a
+//!   blocking thread) before leaving the group.
 //! - **Redelivery** seeks the partition back; records fetched before the seek that still arrive
 //!   are dropped (and the partition sought back again) until the sought record comes.
 //! - **Pause** pauses the assigned partitions and every partition assigned later; a record
@@ -28,6 +27,7 @@ use futures::future::BoxFuture;
 use kraken_messaging::event_store::{
     Delivery, EventStoreError, SegmentStatus, Subscription, SubscriptionEvent,
 };
+use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{
     BaseConsumer, CommitMode, Consumer, ConsumerContext, Rebalance, StreamConsumer,
 };
@@ -65,6 +65,8 @@ struct Shared {
     /// Woken when `changes` gets one (the callbacks run inside a poll that may deliver nothing).
     notify: Notify,
     topic: String,
+    /// The store's own topics are auto-created by their first record; a partner's never are.
+    own_topic: bool,
     /// The partitions assigned now.
     assigned: Mutex<BTreeSet<i32>>,
     /// Per partition: the offset the subscription delivers next.
@@ -85,9 +87,10 @@ struct BrokerOffsets {
 }
 
 impl Shared {
-    fn new(topic: &str) -> Shared {
+    fn new(topic: &str, own_topic: bool) -> Shared {
         Shared {
             topic: topic.to_string(),
+            own_topic,
             ..Shared::default()
         }
     }
@@ -117,51 +120,49 @@ impl Shared {
         tpl
     }
 
-    /// The acknowledged offsets of `partitions` (all when `None`) as a list to commit.
-    fn to_commit(&self, partitions: Option<&[i32]>) -> TopicPartitionList {
+    /// The acknowledged offsets as a list to commit.
+    fn to_commit(&self) -> TopicPartitionList {
         let mut tpl = TopicPartitionList::new();
         for (&p, &next) in lock(&self.acked).iter() {
-            if partitions.is_none_or(|ps| ps.contains(&p)) {
-                let _ = tpl.add_partition_offset(&self.topic, p, Offset::Offset(next));
-            }
+            let _ = tpl.add_partition_offset(&self.topic, p, Offset::Offset(next));
         }
         tpl
     }
 }
 
-/// Commits what was acknowledged on `partitions` (all when `None`) and waits for the broker.
-fn commit_acknowledged<C: ConsumerContext>(
-    consumer: &impl Consumer<C>,
-    shared: &Shared,
-    partitions: Option<&[i32]>,
-) {
-    let tpl = shared.to_commit(partitions);
+/// Commits everything acknowledged and waits for the broker (blocking).
+fn commit_acknowledged<C: ConsumerContext>(consumer: &impl Consumer<C>, shared: &Shared) {
+    let tpl = shared.to_commit();
     if tpl.count() == 0 {
         return;
     }
     if let Err(e) = consumer.commit(&tpl, CommitMode::Sync) {
-        tracing::debug!(topic = %shared.topic, "the acknowledged offsets were not committed: {e}");
+        tracing::warn!(topic = %shared.topic, "the acknowledged offsets were not committed: {e}");
     }
 }
 
-/// The consumer's callbacks: never blocking but for the commit of what a revoked partition
-/// acknowledged.
+/// The consumer's callbacks: they run on the task polling `next`, so they never block (the
+/// acknowledgements already sent their asynchronous commits).
 struct SubscriptionContext {
     shared: Arc<Shared>,
 }
 
 impl ClientContext for SubscriptionContext {
     fn error(&self, error: KafkaError, reason: &str) {
-        // An idle connection the broker closed is reconnected by librdkafka, and a subscribed topic
-        // that does not exist yet is auto-created by its first record: neither is a failure.
-        if matches!(
+        // An idle connection the broker closed is reconnected by librdkafka, and one of the
+        // store's own topics that does not exist yet is auto-created by its first record:
+        // neither is a failure. A partner's topic that is missing is worth a warning.
+        let missing_topic = matches!(
             error,
             KafkaError::Global(
-                RDKafkaErrorCode::BrokerTransportFailure
-                    | RDKafkaErrorCode::UnknownTopicOrPartition
-                    | RDKafkaErrorCode::UnknownTopic
+                RDKafkaErrorCode::UnknownTopicOrPartition | RDKafkaErrorCode::UnknownTopic
             )
-        ) {
+        );
+        if matches!(
+            error,
+            KafkaError::Global(RDKafkaErrorCode::BrokerTransportFailure)
+        ) || (missing_topic && self.shared.own_topic)
+        {
             tracing::debug!(topic = %self.shared.topic, "kafka: {error}: {reason}");
             return;
         }
@@ -170,13 +171,6 @@ impl ClientContext for SubscriptionContext {
 }
 
 impl ConsumerContext for SubscriptionContext {
-    fn pre_rebalance(&self, consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
-        if let Rebalance::Revoke(tpl) = rebalance {
-            let revoked: Vec<i32> = tpl.elements().iter().map(|e| e.partition()).collect();
-            commit_acknowledged(consumer, &self.shared, Some(&revoked));
-        }
-    }
-
     fn post_rebalance(&self, consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
         let shared = &self.shared;
         let partitions = |tpl: &TopicPartitionList| -> Vec<i32> {
@@ -225,7 +219,10 @@ impl ConsumerContext for SubscriptionContext {
 
 type Consumer_ = StreamConsumer<SubscriptionContext>;
 
-/// One instance's subscription of a group on a topic.
+/// One instance's subscription of a group on a topic. Use [`close`](Subscription::close): it
+/// flushes the acknowledgements and leaves the group off the runtime's threads; dropping the
+/// subscription instead flushes nothing (an unflushed record comes again) and leaves the group
+/// from whichever thread drops the consumer last, which blocks it for a moment.
 pub struct KafkaSubscription {
     consumer: Arc<Consumer_>,
     shared: Arc<Shared>,
@@ -250,25 +247,26 @@ enum Received {
 
 impl KafkaSubscription {
     /// Joins `group` reading `topic`; must run inside a tokio runtime (it starts the status
-    /// refresher).
+    /// refresher). `own_topic`: a topic of the store itself, created by its first record when
+    /// missing; a partner's topic (`false`) is never created.
     pub(crate) fn join(
         bootstrap_servers: &str,
         group: &str,
         topic: &str,
         properties: &HashMap<String, String>,
+        own_topic: bool,
     ) -> Result<KafkaSubscription, EventStoreError> {
         reject_fixed_keys("the Kafka properties", properties).map_err(EventStoreError::Invalid)?;
         if topic.trim().is_empty() {
             return Err(EventStoreError::Invalid("the source is empty".into()));
         }
-        let shared = Arc::new(Shared::new(topic));
-        let consumer: Consumer_ = consumer_config(bootstrap_servers, group, properties)
-            // A topic that does not exist yet is auto-created by its first record.
-            .set("allow.auto.create.topics", "true")
-            .create_with_context(SubscriptionContext {
-                shared: Arc::clone(&shared),
-            })
-            .map_err(failed)?;
+        let shared = Arc::new(Shared::new(topic, own_topic));
+        let consumer: Consumer_ =
+            subscription_config(bootstrap_servers, group, properties, own_topic)
+                .create_with_context(SubscriptionContext {
+                    shared: Arc::clone(&shared),
+                })
+                .map_err(failed)?;
         consumer.subscribe(&[topic]).map_err(failed)?;
         let consumer = Arc::new(consumer);
         let cancel = CancellationToken::new();
@@ -343,6 +341,22 @@ impl KafkaSubscription {
     }
 }
 
+/// The consumer settings of a subscription: the store's own topics may be created by their first
+/// record, a partner's are never created (whatever its `properties` say).
+fn subscription_config(
+    bootstrap_servers: &str,
+    group: &str,
+    properties: &HashMap<String, String>,
+    own_topic: bool,
+) -> ClientConfig {
+    let mut config = consumer_config(bootstrap_servers, group, properties);
+    config.set(
+        "allow.auto.create.topics",
+        if own_topic { "true" } else { "false" },
+    );
+    config
+}
+
 fn delivery(msg: &OwnedMessage) -> Delivery {
     Delivery {
         segment: msg.partition().to_string(),
@@ -410,7 +424,11 @@ impl Subscription for KafkaSubscription {
                                 RDKafkaErrorCode::UnknownTopicOrPartition
                                 | RDKafkaErrorCode::UnknownTopic,
                             )) => {
-                                tracing::debug!(topic = %self.shared.topic, "topic not available yet");
+                                if self.shared.own_topic {
+                                    tracing::debug!(topic = %self.shared.topic, "topic not available yet");
+                                } else {
+                                    tracing::warn!(topic = %self.shared.topic, "kafka receive error: the partner topic does not exist");
+                                }
                                 tokio::time::sleep(ERROR_BACKOFF).await;
                                 continue;
                             }
@@ -542,7 +560,7 @@ impl Subscription for KafkaSubscription {
             }
             // The commit and the departure from the group block: off the runtime's threads.
             let _ = tokio::task::spawn_blocking(move || {
-                commit_acknowledged(&*consumer, &shared, None);
+                commit_acknowledged(&*consumer, &shared);
                 drop(consumer);
             })
             .await;
@@ -564,7 +582,12 @@ async fn refresh(consumer: Arc<Consumer_>, shared: Arc<Shared>, cancel: Cancella
                     Arc::clone(&shared),
                     partitions.clone(),
                 );
-                tokio::task::spawn_blocking(move || read_offsets(&consumer, &shared, &partitions))
+                {
+                    let cancel = cancel.clone();
+                    tokio::task::spawn_blocking(move || {
+                        read_offsets(&consumer, &shared, &partitions, &cancel)
+                    })
+                }
             };
             let _ = read.await;
             let known = lock(&shared.broker);
@@ -582,7 +605,16 @@ async fn refresh(consumer: Arc<Consumer_>, shared: Arc<Shared>, cancel: Cancella
     }
 }
 
-fn read_offsets(consumer: &Consumer_, shared: &Shared, partitions: &[i32]) {
+/// Stops between two broker calls once `cancel` is cancelled (a close waits for one call at most).
+fn read_offsets(
+    consumer: &Consumer_,
+    shared: &Shared,
+    partitions: &[i32],
+    cancel: &CancellationToken,
+) {
+    if cancel.is_cancelled() {
+        return;
+    }
     let committed = match consumer.committed_offsets(shared.partitions(partitions), OFFSETS_TIMEOUT)
     {
         Ok(list) => Some(list),
@@ -592,6 +624,9 @@ fn read_offsets(consumer: &Consumer_, shared: &Shared, partitions: &[i32]) {
         }
     };
     for &p in partitions {
+        if cancel.is_cancelled() {
+            return;
+        }
         let committed = committed.as_ref().and_then(|list| {
             match list.find_partition(&shared.topic, p)?.offset() {
                 Offset::Offset(o) if o >= 0 => Some(o),
@@ -616,5 +651,22 @@ fn read_offsets(consumer: &Consumer_, shared: &Shared, partitions: &[i32]) {
                 known.committed = committed;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_stores_own_topics_may_be_created_a_partners_never() {
+        let own = subscription_config("h:1", "g", &HashMap::new(), true);
+        assert_eq!(own.get("allow.auto.create.topics"), Some("true"));
+        // Even a property saying otherwise does not create a partner's topic.
+        let props = HashMap::from([("allow.auto.create.topics".to_string(), "true".to_string())]);
+        let partner = subscription_config("h:1", "g", &props, false);
+        assert_eq!(partner.get("allow.auto.create.topics"), Some("false"));
+        assert_eq!(partner.get("group.id"), Some("g"));
+        assert_eq!(partner.get("enable.auto.commit"), Some("false"));
     }
 }
