@@ -3,18 +3,20 @@ name = "kraken-messaging-kafka"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
-description = "kraken messaging: the Kafka event store (publish, subscriptions, reset, lag, dead-letter topics) and partner Kafka topics"
+description = "kraken messaging: the Kafka event store (publish, subscriptions, reset, lag, dead-letter topics, the event browser) and partner Kafka topics"
 license = "MIT"
 publish = false
 
 [dependencies]
 kraken-messaging-rs = { path = "../.." }
-# librdkafka built from source (cmake), as in the core.
-rdkafka = { version = "0.39.0", features = ["cmake-build"] }
+# librdkafka built from source (cmake), with zstd: records any Kafka client compressed (a Java
+# client's compression.type=zstd too) can be read.
+rdkafka = { version = "0.39.0", features = ["cmake-build", "zstd"] }
 futures = "0.3"
 tokio = { version = "1.54.1", features = ["rt", "sync", "time", "macros"] }
 tokio-util = { version = "0.7.20", features = ["rt"] }
 tracing = "0.1.44"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 kraken-messaging-rs = { path = "../..", features = ["testing"] }
@@ -24,3 +26,4 @@ tokio = { version = "1.54.1", features = ["full", "test-util"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15.0", features = ["kafka", "mongo"] }
 uuid = { version = "1", features = ["v4"] }
+serde_json = "1.0.154"

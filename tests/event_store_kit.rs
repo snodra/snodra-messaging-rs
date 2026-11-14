@@ -72,6 +72,7 @@ async fn the_lag_check_passes_alone_on_an_empty_source() {
 }
 
 async fn run_kit(events: Log) {
+    let events = events.browsing(&["conformance.events"]);
     run_event_store_conformance(
         "conformance.events",
         move || Arc::new(events.clone()) as Arc<dyn EventStore>,

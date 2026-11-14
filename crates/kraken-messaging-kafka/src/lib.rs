@@ -9,29 +9,35 @@
 //!
 //! Capabilities: all four. `replay` (reset a group's offsets, [`admin`]), `lag` (committed
 //! offsets and high watermarks, refreshed by the subscription every [`OFFSETS_REFRESH`]),
-//! `native-dead-letter` (`.dlt` topics) and `browse` (the event browser reads the topic itself).
+//! `native-dead-letter` (`.dlt` topics) and `browse` ([`KafkaBrowser`]: search, one record, the
+//! topics, the consumer groups' lag and the tail, read-only, never a group of its own).
 //!
 //! Settings ([`KafkaConfig`]): the bootstrap servers (`KRAKEN_KAFKA_BOOTSTRAP`, default
-//! `kafka:19092`) and extra librdkafka properties (security, for example) for every client the
-//! store creates, for its producer only or for its consumers only.
+//! `kafka:19092`), extra librdkafka properties (security, for example) for every client the
+//! store creates, for its producer only or for its consumers only (the browser's consumers
+//! included), and the browser's sources and bounds ([`KafkaConfig::browse`]).
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use futures::future::BoxFuture;
+use kraken_messaging::event_store::browse::BrowseSettings;
 use kraken_messaging::event_store::{
-    Capability, EventStore, EventStoreError, OutgoingEvent, Subscription, SubscriptionAdmin,
-    SubscriptionSpec,
+    Capability, EventBrowser, EventStore, EventStoreError, OutgoingEvent, Subscription,
+    SubscriptionAdmin, SubscriptionSpec,
 };
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::FutureProducer;
 
 mod admin;
+mod browser;
 mod external;
 mod publish;
 mod subscription;
 
 pub use admin::KafkaAdmin;
+pub use browser::{BROWSER_GROUP_PREFIX, CLOSE_GRACE, KafkaBrowser, MAX_GROUPS, TO_SKEW};
 pub use external::{ExternalSource, FIXED_KEYS, KafkaExternalSource};
 pub use publish::SEND_TIMEOUT;
 pub use subscription::{KafkaSubscription, OFFSETS_REFRESH};
@@ -52,9 +58,12 @@ pub struct KafkaConfig {
     pub properties: HashMap<String, String>,
     /// Extra librdkafka properties for the producer only (a consumer would log them as ignored).
     pub producer_properties: HashMap<String, String>,
-    /// Extra librdkafka properties for the consumers only (the subscriptions and the admins; the
-    /// producer would log them as ignored), never one of [`FIXED_KEYS`].
+    /// Extra librdkafka properties for the consumers only (the subscriptions, the admins and the
+    /// browser; the producer would log them as ignored), never one of [`FIXED_KEYS`].
     pub consumer_properties: HashMap<String, String>,
+    /// The browser's topics (the first is the default) and bounds (ADR 0025's by default, on
+    /// `kraken.events`).
+    pub browse: BrowseSettings,
 }
 
 impl KafkaConfig {
@@ -65,6 +74,7 @@ impl KafkaConfig {
             properties: HashMap::new(),
             producer_properties: HashMap::new(),
             consumer_properties: HashMap::new(),
+            browse: BrowseSettings::default(),
         }
     }
 
@@ -95,6 +105,12 @@ impl KafkaConfig {
         self
     }
 
+    /// The browser's topics and bounds.
+    pub fn browse(mut self, settings: BrowseSettings) -> KafkaConfig {
+        self.browse = settings;
+        self
+    }
+
     /// The properties of the producer: every client's, then the producer's own.
     pub(crate) fn producer(&self) -> HashMap<String, String> {
         let mut all = self.properties.clone();
@@ -119,25 +135,36 @@ impl KafkaConfig {
             .and_then(|()| {
                 external::reject_fixed_keys("the Kafka producer properties", &self.producer())
             })
+            .and_then(|()| self.browse.validate())
             .map_err(EventStoreError::Invalid)
     }
 }
 
 /// The Kafka event store: one producer shared by every publish; each subscription and each admin
-/// gets a consumer of its own.
+/// gets a consumer of its own, and each browser call too.
 pub struct KafkaEventStore {
     config: KafkaConfig,
     producer: FutureProducer,
+    browser: Arc<KafkaBrowser>,
 }
 
 impl KafkaEventStore {
     /// Creates the producer (nothing connects before the first call). `Invalid` for empty
-    /// bootstrap servers or a property that is one of [`FIXED_KEYS`], `Failed` when librdkafka
-    /// refuses the settings.
+    /// bootstrap servers, a property that is one of [`FIXED_KEYS`] or browse settings without a
+    /// topic or with a zero bound, `Failed` when librdkafka refuses the settings.
     pub fn new(config: KafkaConfig) -> Result<KafkaEventStore, EventStoreError> {
         config.validate()?;
         let producer = publish::producer(&config)?;
-        Ok(KafkaEventStore { config, producer })
+        let browser = Arc::new(KafkaBrowser::new(
+            &config.bootstrap_servers,
+            config.consumer(),
+            config.browse.clone(),
+        ));
+        Ok(KafkaEventStore {
+            config,
+            producer,
+            browser,
+        })
     }
 }
 
@@ -213,6 +240,10 @@ impl EventStore for KafkaEventStore {
     fn compare(&self, a: &str, b: &str) -> Ordering {
         compare(a, b)
     }
+
+    fn browser(&self) -> Option<Arc<dyn EventBrowser>> {
+        Some(Arc::clone(&self.browser) as Arc<dyn EventBrowser>)
+    }
 }
 
 /// The configured bootstrap servers, `kafka:19092` when none (or a blank one) is set.
@@ -248,6 +279,7 @@ mod tests {
         let store = KafkaEventStore::new(KafkaConfig::new("127.0.0.1:1")).unwrap();
         assert_eq!(store.name(), "kafka");
         assert_eq!(store.capabilities(), Capability::ALL);
+        assert!(store.browser().is_some(), "browse: a browser");
     }
 
     #[test]
@@ -258,6 +290,14 @@ mod tests {
         assert!(matches!(&refused, EventStoreError::Invalid(m) if m.contains("group.id")));
         assert!(matches!(
             KafkaEventStore::new(KafkaConfig::new(" ")),
+            Err(EventStoreError::Invalid(_))
+        ));
+        let no_topic = KafkaConfig::new("h:1").browse(BrowseSettings {
+            sources: vec![],
+            ..BrowseSettings::default()
+        });
+        assert!(matches!(
+            KafkaEventStore::new(no_topic),
             Err(EventStoreError::Invalid(_))
         ));
     }

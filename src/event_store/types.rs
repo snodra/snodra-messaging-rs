@@ -70,7 +70,8 @@ pub enum Capability {
     /// Reset to earliest, latest, a time or explicit positions: reset handlers, replay ranges
     /// ([`SubscriptionAdmin`](super::SubscriptionAdmin)).
     Replay,
-    /// The event browser can read it: search, one record, the live tail.
+    /// The event browser can read it: search, one event, the sources, the subscriptions' lag,
+    /// the live tail ([`EventStore::browser`](super::EventStore::browser)).
     Browse,
     /// How far a subscription is behind, per segment ([`SegmentStatus::lag`]).
     Lag,

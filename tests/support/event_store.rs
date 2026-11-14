@@ -1,16 +1,23 @@
 //! An in-process event store (a test double, not the in-memory event store add-on, which comes
 //! later): sources of [`SEGMENTS`] segments, subscriptions sharing them round robin, committed
-//! positions per subscription name, and an admin. One [`Log`] (and its clones) is one event store
-//! shared by every "instance" of a test. The event-store kit proves it (`tests/event_store_kit.rs`).
+//! positions per subscription name, an admin and a browser. One [`Log`] (and its clones) is one
+//! event store shared by every "instance" of a test. The event-store kit proves it
+//! (`tests/event_store_kit.rs`).
 
 use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
+use kraken_messaging::event_store::browse::{
+    BrowseError, BrowseSettings, Chunks, EndReason, EventBrowser, EventRecord, EventSummary,
+    Examined, Filters, GetRequest, LagRequest, LagView, Range, RecordView, SearchPage, SearchPlan,
+    SearchRequest, SegmentBounds, SegmentLag, SourceView, SourcesRequest, SourcesView,
+    SubscriptionLag, TailRequest, TailStart, TailStream, Want, heartbeat, merge, tail_channel,
+};
 use kraken_messaging::event_store::{
     Capability, Delivery, EventStore, EventStoreError, OutgoingEvent, ReplayRange, ResetTarget,
     SegmentStatus, Subscription, SubscriptionAdmin, SubscriptionEvent, SubscriptionSpec,
@@ -24,6 +31,23 @@ struct Record {
     headers: HashMap<String, String>,
     payload: Vec<u8>,
     timestamp_ms: i64,
+}
+
+impl Record {
+    /// Calls `f` with the record as the browser reads it.
+    fn view<T>(&self, f: impl FnOnce(&RecordView<'_>) -> T) -> T {
+        let headers: Vec<(&[u8], Option<&[u8]>)> = self
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_bytes(), Some(value.as_bytes())))
+            .collect();
+        f(&RecordView {
+            timestamp: Some(self.timestamp_ms),
+            key: self.key.as_deref().map(str::as_bytes),
+            headers: &headers,
+            payload: Some(&self.payload),
+        })
+    }
 }
 
 /// A subscription name's committed positions and its members, in joining order.
@@ -85,6 +109,7 @@ pub struct Log {
     state: Arc<Mutex<State>>,
     capabilities: Vec<Capability>,
     stuck: Option<Stuck>,
+    browse: BrowseSettings,
 }
 
 impl Log {
@@ -93,6 +118,18 @@ impl Log {
             state: Arc::default(),
             capabilities,
             stuck: None,
+            browse: BrowseSettings::default(),
+        }
+    }
+
+    /// The browser reads these sources.
+    pub fn browsing(self, sources: &[&str]) -> Log {
+        Log {
+            browse: BrowseSettings {
+                sources: sources.iter().map(|s| s.to_string()).collect(),
+                ..self.browse
+            },
+            ..self
         }
     }
 
@@ -215,6 +252,11 @@ impl EventStore for Log {
 
     fn compare(&self, a: &str, b: &str) -> Ordering {
         position(a).cmp(&position(b))
+    }
+
+    fn browser(&self) -> Option<Arc<dyn EventBrowser>> {
+        self.supports(Capability::Browse)
+            .then(|| Arc::new(LogBrowser { log: self.clone() }) as Arc<dyn EventBrowser>)
     }
 }
 
@@ -425,5 +467,275 @@ impl SubscriptionAdmin for Admin {
                 .insert(segment(&r.segment)?, position(&r.from));
         }
         Ok(())
+    }
+}
+
+// ---- the browser -------------------------------------------------------------------------------
+
+/// The double's browser: reads the shared state, never changes it.
+struct LogBrowser {
+    log: Log,
+}
+
+/// A source's segments read by a search.
+struct Slices<'a> {
+    source: &'a str,
+    segments: &'a [Vec<Record>],
+    filters: &'a Filters,
+}
+
+impl Chunks for Slices<'_> {
+    type Error = BrowseError;
+
+    fn read(
+        &mut self,
+        wants: &[Want],
+        _deadline: Instant,
+    ) -> Result<Vec<Option<Vec<Examined>>>, BrowseError> {
+        Ok(wants
+            .iter()
+            .map(|w| {
+                let records = &self.segments[segment(&w.segment).expect("a segment it listed")];
+                let read = (w.start.max(0)..w.end.min(records.len() as i64))
+                    .map(|at| {
+                        let r = &records[at as usize];
+                        Examined {
+                            position: at,
+                            timestamp: r.timestamp_ms,
+                            hit: r.view(|v| {
+                                self.filters.matches(v).then(|| {
+                                    EventSummary::of(self.source, &w.segment, &at.to_string(), v)
+                                })
+                            }),
+                        }
+                    })
+                    .collect();
+                Some(read)
+            })
+            .collect())
+    }
+}
+
+fn not_found(what: String) -> BrowseError {
+    BrowseError::NotFound(what)
+}
+
+impl LogBrowser {
+    fn settings(&self) -> &BrowseSettings {
+        &self.log.browse
+    }
+
+    fn search_now(&self, request: &SearchRequest) -> Result<SearchPage, BrowseError> {
+        let plan = SearchPlan::new(request, self.settings())?;
+        let started = Instant::now();
+        let state = self.log.state();
+        let Some(segments) = state.sources.get(&plan.source) else {
+            return Ok(plan.missing());
+        };
+        let ranges: Vec<Range> = (0..SEGMENTS)
+            .map(|s| {
+                let name = s.to_string();
+                let upper = plan.upper(&name, 0, segments[s].len() as i64);
+                Range {
+                    segment: name,
+                    lower: 0,
+                    upper,
+                }
+            })
+            .collect();
+        let mut reader = Slices {
+            source: &plan.source,
+            segments,
+            filters: &plan.filters,
+        };
+        Ok(plan.answer(merge(&mut reader, &ranges, plan.budget(started))?))
+    }
+
+    fn get_now(&self, request: &GetRequest) -> Result<EventRecord, BrowseError> {
+        let source = self.settings().source(request.source.as_deref())?;
+        let s = segment(&request.segment).map_err(|e| BrowseError::Invalid(e.to_string()))?;
+        let at: usize = request
+            .position
+            .parse()
+            .map_err(|_| BrowseError::Invalid(format!("no position {:?}", request.position)))?;
+        let state = self.log.state();
+        let record = state
+            .sources
+            .get(&source)
+            .and_then(|segments| segments[s].get(at))
+            .ok_or_else(|| not_found(format!("no event at {at} of segment {s}")))?;
+        let payload = request.payload.then_some(self.settings().max_payload);
+        Ok(record
+            .view(|v| EventRecord::of(&source, &request.segment, &request.position, v, payload)))
+    }
+
+    fn sources_now(&self) -> SourcesView {
+        let state = self.log.state();
+        let sources = self
+            .settings()
+            .sources
+            .iter()
+            .map(|source| match state.sources.get(source) {
+                None => SourceView {
+                    source: source.clone(),
+                    missing: true,
+                    segments: Vec::new(),
+                },
+                Some(segments) => SourceView {
+                    source: source.clone(),
+                    missing: false,
+                    segments: segments
+                        .iter()
+                        .enumerate()
+                        .map(|(s, records)| SegmentBounds {
+                            segment: s.to_string(),
+                            first: "0".to_string(),
+                            head: records.len().to_string(),
+                        })
+                        .collect(),
+                },
+            })
+            .collect();
+        SourcesView { sources }
+    }
+
+    fn lag_now(&self, request: &LagRequest) -> Result<LagView, BrowseError> {
+        let source = self.settings().source(request.source.as_deref())?;
+        let state = self.log.state();
+        if !state.sources.contains_key(&source) {
+            return Ok(LagView {
+                source,
+                missing: true,
+                subscriptions: Vec::new(),
+                truncated: false,
+            });
+        }
+        let mut subscriptions: Vec<SubscriptionLag> = state
+            .groups
+            .iter()
+            .filter(|(spec, group)| spec.source == source && !group.committed.is_empty())
+            .map(|(spec, group)| {
+                let segments: Vec<SegmentLag> = (0..SEGMENTS)
+                    .map(|s| {
+                        let head = state.head(&source, s);
+                        let committed = group.committed.get(&s).copied();
+                        SegmentLag {
+                            segment: s.to_string(),
+                            committed: committed.map(|c| c.to_string()),
+                            head: head.to_string(),
+                            lag: committed.map(|c| head.saturating_sub(c)),
+                        }
+                    })
+                    .collect();
+                SubscriptionLag {
+                    subscription: spec.name.clone(),
+                    state: if group.members.is_empty() {
+                        "Empty"
+                    } else {
+                        "Stable"
+                    }
+                    .to_string(),
+                    members: group.members.len() as u64,
+                    lag: segments.iter().filter_map(|s| s.lag).sum(),
+                    segments,
+                }
+            })
+            .collect();
+        subscriptions.sort_by(|a, b| {
+            b.lag
+                .cmp(&a.lag)
+                .then_with(|| a.subscription.cmp(&b.subscription))
+        });
+        Ok(LagView {
+            source,
+            missing: false,
+            subscriptions,
+            truncated: false,
+        })
+    }
+
+    fn tail_now(&self, request: &TailRequest) -> Result<TailStream, BrowseError> {
+        let settings = self.settings();
+        let source = settings.source(request.source.as_deref())?;
+        let filters = Filters::parse(&request.filters, true)?;
+        let duration = settings.tail_duration(request.max_duration_ms)?;
+        let mut heads: Vec<usize> = {
+            let state = self.log.state();
+            let segments = state
+                .sources
+                .get(&source)
+                .ok_or_else(|| not_found(format!("source {source} does not exist")))?;
+            segments.iter().map(Vec::len).collect()
+        };
+        let ends = std::time::SystemTime::now() + duration;
+        let start = TailStart {
+            source: source.clone(),
+            segments: SEGMENTS as u64,
+            ends_at_ms: ends
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as i64),
+        };
+        let (mut feed, stream) =
+            tail_channel(settings.tail_buffer, heartbeat(request.heartbeat_ms));
+        feed.start(start);
+        let log = self.log.clone();
+        tokio::spawn(async move {
+            let deadline = Instant::now() + duration;
+            loop {
+                if feed.is_closed() {
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    feed.end(EndReason::MaxDuration);
+                    return;
+                }
+                let mut new = Vec::new();
+                {
+                    let state = log.state();
+                    let segments = &state.sources[&source];
+                    for (s, head) in heads.iter_mut().enumerate() {
+                        for (at, record) in segments[s].iter().enumerate().skip(*head) {
+                            if let Some(summary) = record.view(|v| {
+                                filters.matches(v).then(|| {
+                                    EventSummary::of(&source, &s.to_string(), &at.to_string(), v)
+                                })
+                            }) {
+                                new.push(summary);
+                            }
+                        }
+                        *head = segments[s].len();
+                    }
+                }
+                for summary in new {
+                    if !feed.record(summary) {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        Ok(stream)
+    }
+}
+
+impl EventBrowser for LogBrowser {
+    fn search(&self, request: SearchRequest) -> BoxFuture<'_, Result<SearchPage, BrowseError>> {
+        Box::pin(std::future::ready(self.search_now(&request)))
+    }
+
+    fn get(&self, request: GetRequest) -> BoxFuture<'_, Result<EventRecord, BrowseError>> {
+        Box::pin(std::future::ready(self.get_now(&request)))
+    }
+
+    fn sources(&self, _request: SourcesRequest) -> BoxFuture<'_, Result<SourcesView, BrowseError>> {
+        Box::pin(std::future::ready(Ok(self.sources_now())))
+    }
+
+    fn lag(&self, request: LagRequest) -> BoxFuture<'_, Result<LagView, BrowseError>> {
+        Box::pin(std::future::ready(self.lag_now(&request)))
+    }
+
+    fn tail(&self, request: TailRequest) -> BoxFuture<'_, Result<TailStream, BrowseError>> {
+        Box::pin(async move { self.tail_now(&request) })
     }
 }

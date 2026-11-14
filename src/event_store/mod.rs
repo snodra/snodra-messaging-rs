@@ -19,7 +19,8 @@
 //! - **Pause and resume**: a subscription stops delivering without losing its place.
 //! - **The headers**: the seven [`headers`] travel as the event store's native metadata.
 //!
-//! and declares the [`Capability`]s it offers (`replay`, `browse`, `lag`, `native-dead-letter`).
+//! and declares the [`Capability`]s it offers (`replay`, `browse`, `lag`, `native-dead-letter`);
+//! with `browse` it gives an [`EventBrowser`] ([`browse`]).
 //!
 //! Segments and positions are opaque strings that only the event store reads, at most
 //! [`MAX_SEGMENT_BYTES`] and [`MAX_POSITION_BYTES`] bytes; [`EventStore::compare`] orders two
@@ -28,10 +29,12 @@
 //! A new subscription name starts at the earliest position of every segment.
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use futures::future::BoxFuture;
 
 mod admin;
+pub mod browse;
 mod subscription;
 mod types;
 
@@ -39,6 +42,7 @@ mod types;
 pub mod conformance;
 
 pub use admin::{ReplayRange, ResetTarget, SubscriptionAdmin};
+pub use browse::EventBrowser;
 pub use subscription::Subscription;
 pub use types::{
     Capability, Delivery, EventStoreError, MAX_POSITION_BYTES, MAX_SEGMENT_BYTES, OutgoingEvent,
@@ -82,4 +86,10 @@ pub trait EventStore: Send + Sync {
 
     /// The order of two positions `a` and `b` of one segment.
     fn compare(&self, a: &str, b: &str) -> Ordering;
+
+    /// Its event browser: `Some` exactly when it declares [`Capability::Browse`]. Never
+    /// blocking, never connecting (the browser connects on its first call).
+    fn browser(&self) -> Option<Arc<dyn EventBrowser>> {
+        None
+    }
 }

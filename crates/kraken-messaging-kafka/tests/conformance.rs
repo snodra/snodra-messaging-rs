@@ -1,9 +1,11 @@
 //! The Kafka event store passes the event-store conformance kit on a real broker, with the
-//! MongoDB message store beside it (the at-least-once check records processed events).
+//! MongoDB message store beside it (the at-least-once check records processed events), its
+//! browser reading the kit's topic.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use kraken_messaging::event_store::browse::BrowseSettings;
 use kraken_messaging::event_store::conformance::run_event_store_conformance;
 use kraken_messaging::event_store::{Capability, EventStore, dead_letter_source};
 use kraken_messaging::store::MessageStore;
@@ -68,8 +70,12 @@ async fn kafka_event_store_passes_conformance() {
         .expect("indexes");
     let messages: Arc<dyn MessageStore> = Arc::new(messages);
 
+    let config = KafkaConfig::new(&bootstrap).browse(BrowseSettings {
+        sources: vec![source.to_string()],
+        ..BrowseSettings::default()
+    });
     let make = || -> Arc<dyn EventStore> {
-        Arc::new(KafkaEventStore::new(KafkaConfig::new(&bootstrap)).expect("kafka event store"))
+        Arc::new(KafkaEventStore::new(config.clone()).expect("kafka event store"))
     };
     assert_eq!(make().capabilities(), Capability::ALL);
     run_event_store_conformance(source, make, messages).await;

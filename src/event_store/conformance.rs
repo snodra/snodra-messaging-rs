@@ -19,6 +19,9 @@
 //!   reads the whole source).
 //! - **Each call of `make_events`** is one service instance: a store reading the same event store
 //!   (an in-process store returns the same one each time).
+//! - **When the event store declares [`Browse`](Capability::Browse)**, its browser
+//!   ([`EventStore::browser`]) reads `source` (one of its [`BrowseSettings::sources`](super::browse::BrowseSettings::sources)),
+//!   with bounds no lower than the defaults' results (the kit asks for 50 at most).
 //! - The checks run one after the other, each on subscription names of its own; a new name starts
 //!   at the earliest position, so each check reads what the earlier ones appended and looks only
 //!   at its own events (by their `id` header). Every check is public, so a failing one can be run
@@ -38,10 +41,17 @@ use std::time::Duration;
 use futures::FutureExt;
 use tokio::time::Instant;
 
+use futures::StreamExt;
+
+use super::browse::{
+    BrowseError, EndReason, EventBrowser, EventFilter, EventSummary, GetRequest, LagRequest,
+    LagView, SearchPage, SearchRequest, SegmentLag, SourcesRequest, StoppedBy, TailEvent,
+    TailRequest, TailStream, TimeArg,
+};
 use super::{
     Capability, Delivery, EventStore, EventStoreError, MAX_POSITION_BYTES, MAX_SEGMENT_BYTES,
     OutgoingEvent, ReplayRange, ResetTarget, Subscription, SubscriptionAdmin, SubscriptionEvent,
-    SubscriptionSpec, dead_letter_source, headers,
+    SubscriptionSpec, dead_letter_source, headers, segment_order,
 };
 use crate::store::{MessageStore, ProcessedMarker};
 use crate::time::{now_ms, rfc3339};
@@ -55,8 +65,8 @@ const SLICE: Duration = Duration::from_millis(250);
 /// The type of the kit's events.
 const EVENT_TYPE: &str = "conformance.Event";
 
-/// Runs every check, and each one of a capability the event store declares (without `replay`
-/// or `lag`, the check that it says so), by name; the first failing check panics naming itself
+/// Runs every check, and each one of a capability the event store declares (without `replay`,
+/// `lag` or `browse`, the check that it says so), by name; the first failing check panics naming itself
 /// and the event store. See the module docs for `source`,
 /// `make_events` and `store`.
 pub async fn run_event_store_conformance(
@@ -97,6 +107,16 @@ pub async fn run_event_store_conformance(
     }
     if events.supports(Capability::NativeDeadLetter) {
         run!(dead_letter_source_receives);
+    }
+    if events.supports(Capability::Browse) {
+        run!(
+            search_finds_by_type_key_and_correlation,
+            search_stops_at_bounds,
+            tail_streams_new_events,
+            browser_never_commits_a_position,
+        );
+    } else {
+        run!(no_browser_without_capability);
     }
 }
 
@@ -757,6 +777,627 @@ pub async fn dead_letter_source_receives(kit: &EventStoreKit<'_>) {
     reader.close().await;
 }
 
+// ---- the browser -------------------------------------------------------------------------------
+
+/// `browse`: a search finds events by type (exact and prefix), key, correlation id and event id,
+/// newest first; a summary carries the event's place, key and library headers but no payload; a
+/// record (`get`) carries every header and the payload only when asked; the sources list the
+/// source's segments.
+pub async fn search_finds_by_type_key_and_correlation(kit: &EventStoreKit<'_>) {
+    let events = kit.instance();
+    let browser = browser_of(&*events);
+    let tag = fresh("browse");
+    let ty = |name: &str| format!("conformance.{tag}.{name}");
+    let (k1, k2) = (fresh("key"), fresh("key"));
+    let (c1, c2) = (fresh("correlation"), fresh("correlation"));
+    let a = typed(kit.source, &k1, &ty("Placed"), &c1);
+    let b = typed(kit.source, &k2, &ty("Placed"), &c2);
+    let c = typed(kit.source, &k1, &ty("Shipped"), &c1);
+    publish_spaced(&*events, &[a.clone(), b.clone(), c.clone()]).await;
+
+    let filter = |f: fn(&mut EventFilter, String), value: String| {
+        let mut filter = EventFilter::default();
+        f(&mut filter, value);
+        filter
+    };
+    let all = found(
+        &*browser,
+        kit,
+        filter(|f, v| f.type_name = Some(v), format!("conformance.{tag}.*")),
+        &[&c, &b, &a],
+        "a type prefix",
+    )
+    .await;
+    for (filters, want, what) in [
+        (
+            filter(|f, v| f.type_name = Some(v), ty("Placed")),
+            vec![&b, &a],
+            "an exact type",
+        ),
+        (
+            filter(|f, v| f.key = Some(v), k1.clone()),
+            vec![&c, &a],
+            "a key",
+        ),
+        (
+            filter(|f, v| f.correlation_id = Some(v), c1.clone()),
+            vec![&c, &a],
+            "a correlation id",
+        ),
+        (
+            filter(|f, v| f.event_id = Some(v), a.id.clone()),
+            vec![&a],
+            "an event id",
+        ),
+        (
+            EventFilter {
+                type_name: Some(ty("Placed")),
+                key: Some(k1.clone()),
+                ..EventFilter::default()
+            },
+            vec![&a],
+            "a type and a key",
+        ),
+    ] {
+        found(&*browser, kit, filters, &want, what).await;
+    }
+
+    for (summary, sent) in all.iter().zip([&c, &b, &a]) {
+        assert_eq!(summary.source, kit.source, "a summary names its source");
+        assert!(
+            !summary.segment.is_empty() && summary.segment.len() <= MAX_SEGMENT_BYTES,
+            "a segment of 1 to {MAX_SEGMENT_BYTES} bytes: {:?}",
+            summary.segment
+        );
+        assert!(
+            !summary.position.is_empty() && summary.position.len() <= MAX_POSITION_BYTES,
+            "a position of 1 to {MAX_POSITION_BYTES} bytes: {:?}",
+            summary.position
+        );
+        assert_eq!(summary.key, sent.key, "the key");
+        for name in headers::ALL {
+            assert_eq!(
+                summary.headers.get(name),
+                sent.headers.get(name),
+                "summary header {name}"
+            );
+        }
+        assert_eq!(
+            summary.size,
+            sent.payload.len() as u64,
+            "the payload's size"
+        );
+        assert!(summary.timestamp.is_some_and(|t| t > 0), "a time");
+
+        let get = |payload: bool| GetRequest {
+            source: Some(kit.source.to_string()),
+            segment: summary.segment.clone(),
+            position: summary.position.clone(),
+            payload,
+        };
+        let record = bounded("get", browser.get(get(true)))
+            .await
+            .unwrap_or_else(|e| panic!("get {}: {e}", sent.id));
+        assert_eq!(
+            &record.summary, summary,
+            "a record's summary is the search's"
+        );
+        assert_eq!(
+            record.payload,
+            Some(Some(String::from_utf8(sent.payload.clone()).expect("JSON"))),
+            "the payload, asked for"
+        );
+        for (name, value) in &sent.headers {
+            assert!(
+                record
+                    .all_headers
+                    .iter()
+                    .any(|h| &h.name == name && h.value.as_ref() == Some(value)),
+                "record header {name}: {:?}",
+                record.all_headers
+            );
+        }
+        let unasked = bounded("get", browser.get(get(false)))
+            .await
+            .unwrap_or_else(|e| panic!("get {}: {e}", sent.id));
+        assert!(
+            unasked.payload.is_none() && unasked.payload_base64.is_none(),
+            "no payload unless asked: {unasked:?}"
+        );
+    }
+
+    let first = &all[2];
+    for (segment, position) in [
+        ("conformance-no-such-segment", first.position.as_str()),
+        (first.segment.as_str(), "9223372036854775807"),
+    ] {
+        let missing = bounded(
+            "get",
+            browser.get(GetRequest {
+                source: Some(kit.source.to_string()),
+                segment: segment.to_string(),
+                position: position.to_string(),
+                payload: false,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(
+                missing,
+                Err(BrowseError::NotFound(_) | BrowseError::Invalid(_))
+            ),
+            "no event at {position} of segment {segment}: {missing:?}"
+        );
+    }
+
+    let sources = bounded("sources", browser.sources(SourcesRequest {}))
+        .await
+        .unwrap_or_else(|e| panic!("sources: {e}"));
+    let mine = sources
+        .sources
+        .iter()
+        .find(|s| s.source == kit.source)
+        .unwrap_or_else(|| panic!("the sources list {}: {sources:?}", kit.source));
+    assert!(!mine.missing, "the source exists");
+    assert!(
+        mine.segments.len() >= 2,
+        "its segments: {:?}",
+        mine.segments
+    );
+    let listed: Vec<&str> = mine.segments.iter().map(|s| s.segment.as_str()).collect();
+    let mut ordered = listed.clone();
+    ordered.sort_by(|a, b| segment_order(a, b));
+    assert_eq!(listed, ordered, "segments in segment order");
+    let bounds = mine
+        .segments
+        .iter()
+        .find(|s| s.segment == first.segment)
+        .unwrap_or_else(|| panic!("segment {} listed: {:?}", first.segment, mine.segments));
+    assert!(
+        events.compare(&bounds.first, &first.position) != std::cmp::Ordering::Greater
+            && events.compare(&first.position, &bounds.head) == std::cmp::Ordering::Less,
+        "segment {} holds {} ({bounds:?})",
+        first.segment,
+        first.position
+    );
+
+    let elsewhere = bounded(
+        "search",
+        browser.search(SearchRequest {
+            source: Some(fresh("conformance-not-browsable")),
+            ..SearchRequest::default()
+        }),
+    )
+    .await;
+    assert!(
+        matches!(elsewhere, Err(BrowseError::Invalid(_))),
+        "a source the browser does not read: {elsewhere:?}"
+    );
+}
+
+/// `browse`: a search page stops at its `limit` and continues from its cursor (the pages
+/// together are every match, newest first, none twice), and stops at its scan budget having
+/// read no more; a cursor only continues its own search, and bounds it cannot honour are refused.
+pub async fn search_stops_at_bounds(kit: &EventStoreKit<'_>) {
+    let events = kit.instance();
+    let browser = browser_of(&*events);
+    let ty = format!("conformance.{}.Paged", fresh("browse"));
+    let sent: Vec<OutgoingEvent> = (0..5)
+        .map(|_| typed(kit.source, &fresh("key"), &ty, &fresh("correlation")))
+        .collect();
+    publish_spaced(&*events, &sent).await;
+    let newest_first: Vec<&OutgoingEvent> = sent.iter().rev().collect();
+    let by_type = EventFilter {
+        type_name: Some(ty.clone()),
+        ..EventFilter::default()
+    };
+    found(&*browser, kit, by_type.clone(), &newest_first, "the five").await;
+
+    let request = |filters: EventFilter, cursor: Option<String>| SearchRequest {
+        source: Some(kit.source.to_string()),
+        filters,
+        limit: Some(2),
+        cursor,
+        ..SearchRequest::default()
+    };
+    let mut pages: Vec<Vec<String>> = Vec::new();
+    let mut cursor = None;
+    let first_cursor = loop {
+        let page = search(&*browser, request(by_type.clone(), cursor.clone())).await;
+        pages.push(page.results.iter().map(summary_id).collect());
+        assert!(pages.len() <= 3, "three pages of two at most: {pages:?}");
+        if page.exhausted {
+            assert_eq!(
+                (page.stopped_by, page.cursor.as_deref()),
+                (None, None),
+                "an exhausted page has no cursor"
+            );
+            break pages.len();
+        }
+        assert_eq!(page.stopped_by, Some(StoppedBy::Limit), "{page:?}");
+        cursor = Some(
+            page.cursor
+                .expect("a page that is not exhausted has a cursor"),
+        );
+    };
+    let ids: Vec<String> = newest_first.iter().map(|e| e.id.clone()).collect();
+    assert_eq!(first_cursor, 3, "three pages: {pages:?}");
+    assert_eq!(
+        pages,
+        [&ids[0..2], &ids[2..4], &ids[4..5]],
+        "pages of two, in order"
+    );
+
+    let page = search(&*browser, request(by_type.clone(), None)).await;
+    let other = EventFilter {
+        type_name: Some(format!("{ty}.Other")),
+        ..EventFilter::default()
+    };
+    for (filters, cursor) in [
+        (other, page.cursor.clone()),
+        (by_type.clone(), Some("%%%".to_string())),
+    ] {
+        let refused = bounded("search", browser.search(request(filters, cursor))).await;
+        assert!(
+            matches!(refused, Err(BrowseError::Invalid(_))),
+            "a cursor of another search, or none: {refused:?}"
+        );
+    }
+
+    let nothing = EventFilter {
+        type_name: Some(format!("conformance.{}.Nothing", fresh("browse"))),
+        ..EventFilter::default()
+    };
+    let budget = |cursor: Option<String>| SearchRequest {
+        source: Some(kit.source.to_string()),
+        filters: nothing.clone(),
+        cursor,
+        max_scanned: Some(3),
+        ..SearchRequest::default()
+    };
+    let first = search(&*browser, budget(None)).await;
+    assert!(
+        first.results.is_empty() && first.scanned <= 3,
+        "no match, at most 3 records read: {first:?}"
+    );
+    assert_eq!(first.stopped_by, Some(StoppedBy::ScanBudget), "{first:?}");
+    assert!(!first.exhausted && first.cursor.is_some(), "{first:?}");
+    let next = search(&*browser, budget(first.cursor.clone())).await;
+    assert!(next.scanned <= 3, "at most 3 records read: {next:?}");
+    assert!(
+        next.exhausted || next.cursor != first.cursor,
+        "the next page moved on: {next:?}"
+    );
+
+    for (what, bad) in [
+        (
+            "limit 0",
+            SearchRequest {
+                limit: Some(0),
+                ..request(by_type.clone(), None)
+            },
+        ),
+        (
+            "a limit above every bound",
+            SearchRequest {
+                limit: Some(usize::MAX),
+                ..request(by_type.clone(), None)
+            },
+        ),
+        (
+            "maxScanned 0",
+            SearchRequest {
+                max_scanned: Some(0),
+                ..request(by_type.clone(), None)
+            },
+        ),
+        (
+            "from after to",
+            request(
+                EventFilter {
+                    from: Some(TimeArg::Millis(2)),
+                    to: Some(TimeArg::Millis(1)),
+                    ..EventFilter::default()
+                },
+                None,
+            ),
+        ),
+    ] {
+        let refused = bounded("search", browser.search(bad)).await;
+        assert!(
+            matches!(refused, Err(BrowseError::Invalid(_))),
+            "{what} is refused: {refused:?}"
+        );
+    }
+}
+
+/// `browse`: a tail starts at the end of every segment (an event appended before it does not
+/// come), then delivers the matching events appended after its `start` (each key in order,
+/// summaries only), heartbeats while nothing comes, and ends at its maximum duration with `end`.
+pub async fn tail_streams_new_events(kit: &EventStoreKit<'_>) {
+    let events = kit.instance();
+    let browser = browser_of(&*events);
+    let ty = format!("conformance.{}.Tailed", fresh("browse"));
+    let (k1, k2) = (fresh("key"), fresh("key"));
+    let before = typed(kit.source, &k1, &ty, &fresh("correlation"));
+    publish_all(&*events, std::slice::from_ref(&before)).await;
+    let request = TailRequest {
+        source: Some(kit.source.to_string()),
+        filters: EventFilter {
+            type_name: Some(ty.clone()),
+            ..EventFilter::default()
+        },
+        heartbeat_ms: Some(200),
+        max_duration_ms: None,
+    };
+    let mut tail = open_tail(&*browser, request.clone()).await;
+    let mut parts = Parts::default();
+    match parts.next(&mut tail, "the start").await {
+        TailEvent::Start(start) => {
+            assert_eq!(start.source, kit.source, "{start:?}");
+            assert!(start.segments >= 2, "{start:?}");
+        }
+        other => panic!("the first part is the start: {other:?}"),
+    }
+    let after = [
+        typed(kit.source, &k1, &ty, &fresh("correlation")),
+        typed(kit.source, &k2, &ty, &fresh("correlation")),
+        typed(kit.source, &k1, &ty, &fresh("correlation")),
+    ];
+    let unmatched = typed(
+        kit.source,
+        &k2,
+        &format!("{ty}.Other"),
+        &fresh("correlation"),
+    );
+    publish_all(&*events, &[after[0].clone(), unmatched.clone()]).await;
+    publish_all(&*events, &after[1..]).await;
+    let want: Vec<String> = ids(&after);
+    let deadline = Instant::now() + WAIT;
+    while !want
+        .iter()
+        .all(|id| parts.records.iter().any(|r| summary_id(r) == *id))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the three events within {WAIT:?}: {:?}",
+            parts.records
+        );
+        if let TailEvent::End(end) = parts.next(&mut tail, "the events").await {
+            panic!("the tail ended early: {end:?}");
+        }
+    }
+    let seen: Vec<String> = parts.records.iter().map(summary_id).collect();
+    assert!(!seen.contains(&before.id), "not the event before the start");
+    assert!(
+        !seen.contains(&unmatched.id),
+        "not an event of another type"
+    );
+    let of_k1: Vec<&String> = seen
+        .iter()
+        .filter(|id| **id == after[0].id || **id == after[2].id)
+        .collect();
+    assert_eq!(of_k1, [&after[0].id, &after[2].id], "one key in order");
+    for r in &parts.records {
+        assert_eq!(r.source, kit.source, "{r:?}");
+    }
+    let deadline = Instant::now() + WAIT;
+    while parts.heartbeats == 0 {
+        assert!(Instant::now() < deadline, "a heartbeat within {WAIT:?}");
+        if let TailEvent::End(end) = parts.next(&mut tail, "a heartbeat").await {
+            panic!("the tail ended early: {end:?}");
+        }
+    }
+    drop(tail);
+
+    let mut short = open_tail(
+        &*browser,
+        TailRequest {
+            max_duration_ms: Some(1_000),
+            ..request.clone()
+        },
+    )
+    .await;
+    let mut parts = Parts::default();
+    let started = Instant::now();
+    let reason = loop {
+        assert!(
+            started.elapsed() < WAIT,
+            "a tail of 1 s ends within {WAIT:?}"
+        );
+        if let TailEvent::End(end) = parts.next(&mut short, "the end").await {
+            break end.reason;
+        }
+    };
+    assert_eq!(reason, EndReason::MaxDuration);
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "it lasted its duration: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        bounded("the stream after the end", short.next())
+            .await
+            .is_none(),
+        "nothing after the end"
+    );
+
+    let refused = bounded(
+        "tail",
+        browser.tail(TailRequest {
+            filters: EventFilter {
+                from: Some(TimeArg::Millis(1)),
+                ..EventFilter::default()
+            },
+            ..request
+        }),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(BrowseError::Invalid(_))),
+        "a tail takes no from: {:?}",
+        refused.err()
+    );
+}
+
+/// `browse`: browsing never moves a position and never joins a subscription. After a search, a
+/// record read, the sources, the lag and a tail, with no instance reading a subscription and then
+/// with one: its committed positions are the same, the reading instance keeps its segments (and
+/// is the only member), what it had not acknowledged comes again, and the lag lists no
+/// subscription that was not there before.
+pub async fn browser_never_commits_a_position(kit: &EventStoreKit<'_>) {
+    let events = kit.instance();
+    let browser = browser_of(&*events);
+    let spec = kit.spec();
+    let ty = format!("conformance.{}.Held", fresh("browse"));
+    let key = fresh("key");
+    let sent: Vec<OutgoingEvent> = (0..4)
+        .map(|_| typed(kit.source, &key, &ty, &fresh("correlation")))
+        .collect();
+    let all = ids(&sent);
+    let unacked = all[2..].to_vec();
+    publish_all(&*events, &sent).await;
+    let mut first = Reader::join(&*events, &spec).await;
+    first.hold(&unacked);
+    first
+        .until("the four events delivered", |r| r.has_all(&all))
+        .await;
+    first.close().await;
+
+    let deadline = Instant::now() + WAIT;
+    let before = loop {
+        let view = lag(&*browser, kit).await;
+        if committed(&view, &spec.name).is_some_and(|c| c.iter().any(|s| s.committed.is_some())) {
+            break view;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the lag lists {} with its committed positions within {WAIT:?}: {view:?}",
+            spec.name
+        );
+        tokio::time::sleep(SLICE).await;
+    };
+    let names = |view: &LagView| -> BTreeSet<String> {
+        view.subscriptions
+            .iter()
+            .map(|s| s.subscription.clone())
+            .collect()
+    };
+
+    browse_everything(&*events, &*browser, kit, &ty).await;
+
+    // It acknowledges nothing (the tails publish after the held events): its close commits
+    // nothing.
+    let mut second = Reader::join(&*events, &spec).await;
+    second.hold_everything();
+    second
+        .until("the unacknowledged events again", |r| r.has_all(&unacked))
+        .await;
+    assert_eq!(
+        second.ids_in_order(&all),
+        unacked,
+        "from where the subscription was: the unacknowledged events only"
+    );
+    let (assigned, revoked) = (second.assigned.clone(), second.revoked);
+    browse_everything(&*events, &*browser, kit, &ty).await;
+    second.pump(QUIET).await;
+    assert_eq!(
+        (&second.assigned, second.revoked),
+        (&assigned, revoked),
+        "the reading instance keeps its segments while the browser reads"
+    );
+    if events.supports(Capability::Replay) {
+        let admin = Admin::new(events.admin(&spec).expect("admin"));
+        let members = admin
+            .call("members", |a| a.members())
+            .await
+            .expect("members");
+        assert_eq!(members.len(), 1, "only the reading instance: {members:?}");
+    }
+    second.close().await;
+
+    let after = lag(&*browser, kit).await;
+    assert_eq!(
+        committed(&after, &spec.name),
+        committed(&before, &spec.name),
+        "the committed positions did not move"
+    );
+    let new: Vec<String> = names(&after).difference(&names(&before)).cloned().collect();
+    assert!(
+        new.is_empty(),
+        "no subscription of the browser's own: {new:?}"
+    );
+}
+
+/// Without `browse`: no browser.
+pub async fn no_browser_without_capability(kit: &EventStoreKit<'_>) {
+    assert!(
+        kit.instance().browser().is_none(),
+        "a browser without the capability"
+    );
+}
+
+/// Every call of the browser once: the sources, a search and a record read of `ty`, the lag, and
+/// a tail that delivers one new event of `ty`.
+async fn browse_everything(
+    events: &dyn EventStore,
+    browser: &dyn EventBrowser,
+    kit: &EventStoreKit<'_>,
+    ty: &str,
+) {
+    bounded("sources", browser.sources(SourcesRequest {}))
+        .await
+        .unwrap_or_else(|e| panic!("sources: {e}"));
+    let page = search(
+        browser,
+        SearchRequest {
+            source: Some(kit.source.to_string()),
+            filters: EventFilter {
+                type_name: Some(ty.to_string()),
+                ..EventFilter::default()
+            },
+            ..SearchRequest::default()
+        },
+    )
+    .await;
+    for r in &page.results {
+        bounded(
+            "get",
+            browser.get(GetRequest {
+                source: Some(kit.source.to_string()),
+                segment: r.segment.clone(),
+                position: r.position.clone(),
+                payload: true,
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("get: {e}"));
+    }
+    lag(browser, kit).await;
+    let tailed = format!("{ty}.Tailed");
+    let mut tail = open_tail(
+        browser,
+        TailRequest {
+            source: Some(kit.source.to_string()),
+            filters: EventFilter {
+                type_name: Some(tailed.clone()),
+                ..EventFilter::default()
+            },
+            ..TailRequest::default()
+        },
+    )
+    .await;
+    let mut parts = Parts::default();
+    parts.next(&mut tail, "the start").await;
+    let new = typed(kit.source, &fresh("key"), &tailed, &fresh("correlation"));
+    publish_all(events, std::slice::from_ref(&new)).await;
+    while !parts.records.iter().any(|r| summary_id(r) == new.id) {
+        if let TailEvent::End(end) = parts.next(&mut tail, "the tailed event").await {
+            panic!("the tail ended early: {end:?}");
+        }
+    }
+}
+
 // ---- helpers -----------------------------------------------------------------------------------
 
 /// One subscription and what it gave: its assignment and its deliveries, in order. Every
@@ -767,6 +1408,10 @@ struct Reader {
     assigned: BTreeSet<String>,
     seen: Vec<Delivery>,
     held: HashSet<String>,
+    /// No delivery is acknowledged as it comes.
+    hold_everything: bool,
+    /// `Revoked` changes seen.
+    revoked: usize,
 }
 
 impl Reader {
@@ -783,6 +1428,8 @@ impl Reader {
             assigned: BTreeSet::new(),
             seen: Vec::new(),
             held: HashSet::new(),
+            hold_everything: false,
+            revoked: 0,
         }
     }
 
@@ -793,6 +1440,11 @@ impl Reader {
     /// The events with these ids are not acknowledged as they come.
     fn hold(&mut self, ids: &[String]) {
         self.held.extend(ids.iter().cloned());
+    }
+
+    /// No delivery is acknowledged as it comes.
+    fn hold_everything(&mut self) {
+        self.hold_everything = true;
     }
 
     fn pause(&mut self) {
@@ -846,6 +1498,7 @@ impl Reader {
                 }
             }
             SubscriptionEvent::Revoked(segments) => {
+                self.revoked += 1;
                 for segment in segments {
                     self.assigned.remove(&segment);
                 }
@@ -864,7 +1517,7 @@ impl Reader {
                     self.name,
                     d.position
                 );
-                if !self.held.contains(id_of(&d)) {
+                if !self.hold_everything && !self.held.contains(id_of(&d)) {
                     self.ack(&d);
                 }
                 self.seen.push(d);
@@ -1050,4 +1703,139 @@ fn id_of(d: &Delivery) -> &str {
 
 fn fresh(what: &str) -> String {
     format!("{what}-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// The browser of an event store that declares `browse`.
+fn browser_of(events: &dyn EventStore) -> Arc<dyn EventBrowser> {
+    events
+        .browser()
+        .expect("an event store declaring browse gives a browser")
+}
+
+/// An event of the kit to `source` with this key, type and correlation id.
+fn typed(source: &str, key: &str, type_name: &str, correlation: &str) -> OutgoingEvent {
+    let mut e = event(source, Some(key));
+    e.type_name = type_name.to_string();
+    e.headers
+        .insert(headers::TYPE.to_string(), type_name.to_string());
+    e.headers
+        .insert(headers::CORRELATION_ID.to_string(), correlation.to_string());
+    e
+}
+
+/// Publishes `sent` in order, a little apart, so each is newer than the one before.
+async fn publish_spaced(events: &dyn EventStore, sent: &[OutgoingEvent]) {
+    for e in sent {
+        publish_all(events, std::slice::from_ref(e)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn summary_id(s: &EventSummary) -> String {
+    s.headers.get(headers::ID).cloned().unwrap_or_default()
+}
+
+async fn search(browser: &dyn EventBrowser, request: SearchRequest) -> SearchPage {
+    let what = format!("search {:?}", request.filters);
+    bounded(&what, browser.search(request))
+        .await
+        .unwrap_or_else(|e| panic!("{what}: {e}"))
+}
+
+/// Searches the kit's source with `filters` until it finds exactly `want` (newest first), at
+/// most [`WAIT`]; the summaries.
+async fn found(
+    browser: &dyn EventBrowser,
+    kit: &EventStoreKit<'_>,
+    filters: EventFilter,
+    want: &[&OutgoingEvent],
+    what: &str,
+) -> Vec<EventSummary> {
+    let want: Vec<&str> = want.iter().map(|e| e.id.as_str()).collect();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let page = search(
+            browser,
+            SearchRequest {
+                source: Some(kit.source.to_string()),
+                filters: filters.clone(),
+                ..SearchRequest::default()
+            },
+        )
+        .await;
+        let got: Vec<String> = page.results.iter().map(summary_id).collect();
+        if got == want {
+            return page.results;
+        }
+        let same_set = got.len() == want.len() && want.iter().all(|id| got.iter().any(|g| g == id));
+        assert!(
+            !same_set,
+            "{what}: newest first, want {want:?}, got {got:?}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "{what}: {want:?} found within {WAIT:?}, got {got:?}"
+        );
+        tokio::time::sleep(SLICE).await;
+    }
+}
+
+async fn open_tail(browser: &dyn EventBrowser, request: TailRequest) -> TailStream {
+    bounded("tail", browser.tail(request))
+        .await
+        .unwrap_or_else(|e| panic!("tail: {e}"))
+}
+
+/// What a tail gave.
+#[derive(Default)]
+struct Parts {
+    records: Vec<EventSummary>,
+    heartbeats: usize,
+    ended: bool,
+}
+
+impl Parts {
+    /// The next part, at most [`WAIT`] away; no part may follow the `end`, and the stream may not
+    /// close before one.
+    async fn next(&mut self, tail: &mut TailStream, what: &str) -> TailEvent {
+        let part = bounded(&format!("tail: {what}"), tail.next())
+            .await
+            .unwrap_or_else(|| panic!("tail: {what}: the stream closed without an end"));
+        assert!(!self.ended, "tail: a part after the end: {part:?}");
+        match &part {
+            TailEvent::Record(r) => self.records.push(r.clone()),
+            TailEvent::Heartbeat(_) => self.heartbeats += 1,
+            TailEvent::End(_) => self.ended = true,
+            TailEvent::Start(_) => {}
+        }
+        part
+    }
+}
+
+async fn lag(browser: &dyn EventBrowser, kit: &EventStoreKit<'_>) -> LagView {
+    bounded(
+        "lag",
+        browser.lag(LagRequest {
+            source: Some(kit.source.to_string()),
+        }),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("lag: {e}"))
+}
+
+/// The segments of `subscription` in `view`, with their committed positions only.
+fn committed(view: &LagView, subscription: &str) -> Option<Vec<SegmentLag>> {
+    view.subscriptions
+        .iter()
+        .find(|s| s.subscription == subscription)
+        .map(|s| {
+            s.segments
+                .iter()
+                .map(|segment| SegmentLag {
+                    head: String::new(),
+                    lag: None,
+                    ..segment.clone()
+                })
+                .collect()
+        })
 }
