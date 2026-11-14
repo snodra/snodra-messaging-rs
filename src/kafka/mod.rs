@@ -1,6 +1,8 @@
 //! Events on Kafka (`kraken.events`) with the message store's outbox and the idempotent consumer,
 //! byte-compatible with the Kotlin starter (`OutboxEventBus`, `OutboxPublisher`, `EventConsumer`).
 
+use crate::event_store::ReplayRange;
+
 mod consumer;
 pub mod dispatch;
 mod outbox;
@@ -17,8 +19,6 @@ pub(crate) use outbox::{check_payload, check_payload_text};
 pub use publisher::{OUTBOX_SEND_TIMEOUT, OutboxPublisher, OutboxPublisherSettings};
 
 pub const EVENTS_TOPIC: &str = "kraken.events";
-
-use crate::event_store::ReplayRange;
 
 /// A Kafka replay range of `topic`: the partition as its segment and the offsets as its
 /// positions, in decimal.

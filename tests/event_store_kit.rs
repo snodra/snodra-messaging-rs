@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use kraken_messaging::Config;
-use kraken_messaging::event_store::conformance::run_event_store_conformance;
+use kraken_messaging::event_store::conformance::{
+    EventStoreKit, lag_counts_unacked, run_event_store_conformance,
+};
 use kraken_messaging::event_store::{
     Capability, Delivery, EventStore, EventStoreError, OutgoingEvent, ReplayRange, ResetTarget,
     SegmentStatus, Subscription, SubscriptionAdmin, SubscriptionEvent, SubscriptionSpec,
@@ -26,13 +28,73 @@ use kraken_messaging::store::{
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_kit_passes_on_a_minimal_in_process_event_store() {
-    let events = Log::default();
+    run_kit(Log::new(Capability::ALL.to_vec())).await;
+}
+
+/// Without the optional capabilities, the kit checks that the store says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_kit_passes_without_the_optional_capabilities() {
+    run_kit(Log::new(Vec::new())).await;
+}
+
+/// A call that never answers fails the check naming the step, after the kit's wait (on paused
+/// time: at once), instead of hanging the kit.
+#[tokio::test(start_paused = true)]
+async fn a_publish_that_never_answers_fails_the_check_naming_it() {
+    let failure = kit_failure(Log::new(Capability::ALL.to_vec()).stuck(Stuck::Publish)).await;
+    assert!(
+        failure.contains("check `headers_round_trip`")
+            && failure.contains("publish ")
+            && failure.contains("no answer within 60s"),
+        "{failure}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_close_that_never_answers_fails_the_check_naming_it() {
+    let failure = kit_failure(Log::new(Capability::ALL.to_vec()).stuck(Stuck::Close)).await;
+    assert!(
+        failure.contains("check `headers_round_trip`")
+            && failure.contains("close conformance.")
+            && failure.contains("no answer within 60s"),
+        "{failure}"
+    );
+}
+
+/// The lag check alone, on a source nothing was ever published to.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_lag_check_passes_alone_on_an_empty_source() {
+    let events = Log::new(Capability::ALL.to_vec());
+    let make = move || Arc::new(events.clone()) as Arc<dyn EventStore>;
+    let markers = Markers::default();
+    let kit = EventStoreKit {
+        source: "conformance.empty",
+        make_events: &make,
+        store: &markers,
+    };
+    lag_counts_unacked(&kit).await;
+}
+
+async fn run_kit(events: Log) {
     run_event_store_conformance(
         "conformance.events",
         move || Arc::new(events.clone()) as Arc<dyn EventStore>,
         Arc::new(Markers::default()),
     )
     .await;
+}
+
+/// The message the kit fails with on `events`.
+async fn kit_failure(events: Log) -> String {
+    use futures::FutureExt;
+    let panic = std::panic::AssertUnwindSafe(run_kit(events))
+        .catch_unwind()
+        .await
+        .expect_err("the kit fails");
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_else(|| "(no message)".into())
 }
 
 // ---- the event store ---------------------------------------------------------------------------
@@ -89,13 +151,39 @@ impl State {
     }
 }
 
+/// A call of the double that never answers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stuck {
+    Publish,
+    Close,
+}
+
 /// The event store: one shared state for every "instance".
-#[derive(Clone, Default)]
-struct Log(Arc<Mutex<State>>);
+#[derive(Clone)]
+struct Log {
+    state: Arc<Mutex<State>>,
+    capabilities: Vec<Capability>,
+    stuck: Option<Stuck>,
+}
 
 impl Log {
+    fn new(capabilities: Vec<Capability>) -> Log {
+        Log {
+            state: Arc::default(),
+            capabilities,
+            stuck: None,
+        }
+    }
+
+    fn stuck(self, stuck: Stuck) -> Log {
+        Log {
+            stuck: Some(stuck),
+            ..self
+        }
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
-        self.0.lock().unwrap()
+        self.state.lock().unwrap()
     }
 }
 
@@ -116,13 +204,16 @@ impl EventStore for Log {
     }
 
     fn capabilities(&self) -> &[Capability] {
-        &Capability::ALL
+        &self.capabilities
     }
 
     fn publish<'a>(
         &'a self,
         event: &'a OutgoingEvent,
     ) -> BoxFuture<'a, Result<(), EventStoreError>> {
+        if self.stuck == Some(Stuck::Publish) {
+            return Box::pin(std::future::pending());
+        }
         let mut state = self.state();
         let at = match &event.key {
             Some(key) => {
@@ -172,6 +263,9 @@ impl EventStore for Log {
         &self,
         spec: &SubscriptionSpec,
     ) -> Result<Box<dyn SubscriptionAdmin>, EventStoreError> {
+        if !self.supports(Capability::Replay) {
+            return Err(EventStoreError::Unsupported(Capability::Replay));
+        }
         Ok(Box::new(Admin {
             log: self.clone(),
             spec: spec.clone(),
@@ -290,13 +384,19 @@ impl Subscription for Member {
                     position: Some(cursor.to_string()),
                     committed: done.map(|c| c.to_string()),
                     head: Some(head.to_string()),
-                    lag: Some(head - done.unwrap_or(cursor)),
+                    // Known from a committed position only, as a store may report it.
+                    lag: done
+                        .filter(|_| self.log.supports(Capability::Lag))
+                        .map(|committed| head - committed),
                 }
             })
             .collect()
     }
 
     fn close(self: Box<Self>) -> BoxFuture<'static, ()> {
+        if self.log.stuck == Some(Stuck::Close) {
+            return Box::pin(std::future::pending());
+        }
         let mut state = self.log.state();
         if let Some(group) = state.groups.get_mut(&self.spec) {
             group.members.retain(|m| *m != self.member);

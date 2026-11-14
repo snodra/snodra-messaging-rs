@@ -3,8 +3,7 @@
 
 use std::collections::HashMap;
 
-/// The headers every event carries (ADR 0027), as the event store's native metadata (Kafka record
-/// headers, AMQP application properties, a map in memory).
+/// The headers every event carries (ADR 0027), as the event store's native metadata.
 pub mod headers {
     /// The event's type name.
     pub const TYPE: &str = "type";
@@ -78,11 +77,6 @@ impl Capability {
             Capability::NativeDeadLetter => "native-dead-letter",
         }
     }
-
-    /// The capability named `name` ([`as_str`](Self::as_str)); `None` for any other name.
-    pub fn parse(name: &str) -> Option<Capability> {
-        Capability::ALL.into_iter().find(|c| c.as_str() == name)
-    }
 }
 
 impl std::fmt::Display for Capability {
@@ -94,8 +88,8 @@ impl std::fmt::Display for Capability {
 /// One event the outbox relay hands the event store ([`EventStore::publish`](super::EventStore::publish)).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutgoingEvent {
-    /// The source (topic, stream) it goes to: the service's events source, or its dead-letter
-    /// source ([`dead_letter_source`]).
+    /// The source it goes to: the service's events source, or its dead-letter source
+    /// ([`dead_letter_source`]).
     pub source: String,
     /// The event's id, also in header [`headers::ID`].
     pub id: String,
@@ -114,12 +108,12 @@ pub struct OutgoingEvent {
 /// One event a subscription delivers.
 ///
 /// `segment` and `position` are opaque strings of at most [`MAX_SEGMENT_BYTES`] and
-/// [`MAX_POSITION_BYTES`] bytes that only the event store reads (a partition and an offset in
-/// decimal for the first-wave stores); the core orders two positions of one segment only through
+/// [`MAX_POSITION_BYTES`] bytes that only the event store reads (decimal numbers for the
+/// first-wave stores); the core orders two positions of one segment only through
 /// [`EventStore::compare`](super::EventStore::compare).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Delivery {
-    /// The segment (partition, partition stream) it was read from: a unit of order per key.
+    /// The segment of the source it was read from: a unit of order per key.
     pub segment: String,
     /// Its position in `segment`, which [`Subscription::ack`](super::Subscription::ack) takes.
     pub position: String,
@@ -148,9 +142,9 @@ pub enum SubscriptionEvent {
 /// (competing instances), and each name receives every event (one per processor).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SubscriptionSpec {
-    /// `<service>.<processor>`: the consumer group, the stream consumer name.
+    /// `<service>.<processor>`: the name the event store knows the subscription by.
     pub name: String,
-    /// The source read: the topic, the super stream.
+    /// The source read.
     pub source: String,
 }
 
@@ -212,10 +206,8 @@ mod tests {
         let names: Vec<&str> = Capability::ALL.iter().map(|c| c.as_str()).collect();
         assert_eq!(names, ["replay", "browse", "lag", "native-dead-letter"]);
         for c in Capability::ALL {
-            assert_eq!(Capability::parse(c.as_str()), Some(c));
             assert_eq!(c.to_string(), c.as_str());
         }
-        assert_eq!(Capability::parse("topic"), None);
     }
 
     #[test]

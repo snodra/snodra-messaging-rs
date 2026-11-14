@@ -8,8 +8,8 @@ use super::{EventStoreError, SegmentStatus, SubscriptionEvent};
 /// the segments the event store assigns it and their events, one at a time.
 ///
 /// - **Driven by [`next`](Self::next).** Nothing is delivered until `next` is called, and the core
-///   keeps calling it while paused: that keeps the subscription alive (a consumer group's
-///   membership) and reports assignment changes.
+///   keeps calling it while paused: that keeps the subscription's membership alive and reports
+///   assignment changes.
 /// - **Order per segment.** A segment's events come in their order, each after the
 ///   [`SubscriptionEvent::Assigned`] naming its segment and before any `Revoked` of it.
 /// - **At-least-once.** An event is acknowledged with [`ack`](Self::ack) after its handling

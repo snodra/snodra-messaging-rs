@@ -65,8 +65,7 @@ pub struct ResetView {
     pub ranges: Vec<RangeView>,
 }
 
-/// A range on Kafka, where a segment is a partition and a position an offset (decimal); -1 for
-/// what is not decimal.
+/// A range on Kafka, where a segment is a partition and a position an offset, both decimal.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct RangeView {
     pub partition: i32,
@@ -95,9 +94,9 @@ impl From<&ResetContext> for ResetView {
                 .ranges
                 .iter()
                 .map(|r| RangeView {
-                    partition: r.segment.parse().unwrap_or(-1),
-                    from: r.from.parse().unwrap_or(-1),
-                    until: r.until.parse().unwrap_or(-1),
+                    partition: r.segment.parse().expect("a Kafka partition"),
+                    from: r.from.parse().expect("a Kafka offset"),
+                    until: r.until.parse().expect("a Kafka offset"),
                 })
                 .collect(),
         }

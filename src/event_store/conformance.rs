@@ -23,14 +23,16 @@
 //!   at the earliest position, so each check reads what the earlier ones appended and looks only
 //!   at its own events (by their `id` header). Every check is public, so a failing one can be run
 //!   by itself on an [`EventStoreKit`].
-//! - The kit must run on a multi-thread runtime (`#[tokio::test(flavor = "multi_thread")]`): it
-//!   calls the blocking [`SubscriptionAdmin`](super::SubscriptionAdmin) in place. It waits at most a minute for what the
-//!   event store does in the background (an assignment, a lag refresh).
+//! - The kit waits at most a minute for what the event store does in the background (an
+//!   assignment, a lag refresh), and for every call it awaits: a publish, a subscribe or a close
+//!   that does not answer fails the check naming the step, and so does a
+//!   [`SubscriptionAdmin`] call (each runs on a thread of its own, so a blocked one is left
+//!   behind rather than holding the runtime).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::FutureExt;
@@ -38,8 +40,8 @@ use tokio::time::Instant;
 
 use super::{
     Capability, Delivery, EventStore, EventStoreError, MAX_POSITION_BYTES, MAX_SEGMENT_BYTES,
-    OutgoingEvent, ResetTarget, Subscription, SubscriptionEvent, SubscriptionSpec,
-    dead_letter_source, headers,
+    OutgoingEvent, ReplayRange, ResetTarget, Subscription, SubscriptionAdmin, SubscriptionEvent,
+    SubscriptionSpec, dead_letter_source, headers,
 };
 use crate::store::{MessageStore, ProcessedMarker};
 use crate::time::{now_ms, rfc3339};
@@ -53,8 +55,9 @@ const SLICE: Duration = Duration::from_millis(250);
 /// The type of the kit's events.
 const EVENT_TYPE: &str = "conformance.Event";
 
-/// Runs every check, and each one of a capability the event store declares, by name; the first
-/// failing check panics naming itself and the event store. See the module docs for `source`,
+/// Runs every check, and each one of a capability the event store declares (without `replay`
+/// or `lag`, the check that it says so), by name; the first failing check panics naming itself
+/// and the event store. See the module docs for `source`,
 /// `make_events` and `store`.
 pub async fn run_event_store_conformance(
     source: &str,
@@ -84,9 +87,13 @@ pub async fn run_event_store_conformance(
     );
     if events.supports(Capability::Replay) {
         run!(replay_from_earliest_redelivers_history);
+    } else {
+        run!(admin_without_replay_is_unsupported);
     }
     if events.supports(Capability::Lag) {
         run!(lag_counts_unacked);
+    } else {
+        run!(lag_unknown_without_capability);
     }
     if events.supports(Capability::NativeDeadLetter) {
         run!(dead_letter_source_receives);
@@ -331,8 +338,10 @@ pub async fn unacked_delivery_is_redelivered(kit: &EventStoreKit<'_>) {
 }
 
 /// A crash after the handler's transaction committed and before the acknowledgement: the event
-/// comes again, its processed-event marker (recorded in that transaction) makes it a duplicate,
-/// and once acknowledged it does not come again.
+/// comes again, its processed-event marker (recorded in that transaction, its id built from the
+/// delivered `id` header as the core builds it) makes it a duplicate, and once acknowledged it
+/// does not come again. The core's own marker path over an event store is proven by the add-on's
+/// and the core's suites (E0-R2, E0-R3); this check pins what the event store owes it.
 pub async fn redelivered_after_commit_is_skipped(kit: &EventStoreKit<'_>) {
     let events = kit.instance();
     let spec = kit.spec();
@@ -340,8 +349,8 @@ pub async fn redelivered_after_commit_is_skipped(kit: &EventStoreKit<'_>) {
     let handled = event(kit.source, Some(key.as_str()));
     publish_all(&*events, std::slice::from_ref(&handled)).await;
     let only = ids(std::slice::from_ref(&handled));
-    let marker = ProcessedMarker {
-        id: format!("processor:{}:{}", spec.name, handled.id),
+    let marker = |d: &Delivery| ProcessedMarker {
+        id: format!("processor:{}:{}", spec.name, id_of(d)),
         type_name: EVENT_TYPE.into(),
         processed_at_ms: now_ms(),
         processor: Some(spec.name.clone()),
@@ -358,8 +367,12 @@ pub async fn redelivered_after_commit_is_skipped(kit: &EventStoreKit<'_>) {
         .until("the event delivered", |r| r.has_all(&only))
         .await;
     let mut tx = txs.begin().await.expect("begin");
+    let first_marker = marker(first.first(&handled.id));
     assert!(
-        processed.record(&mut tx, &marker).await.expect("record"),
+        processed
+            .record(&mut tx, &first_marker)
+            .await
+            .expect("record"),
         "the first handling records its marker"
     );
     txs.commit(&mut tx).await.expect("commit");
@@ -371,11 +384,14 @@ pub async fn redelivered_after_commit_is_skipped(kit: &EventStoreKit<'_>) {
     second
         .until("the event again after the crash", |r| r.has_all(&only))
         .await;
+    let again = second.first(&handled.id).clone();
     let mut tx = txs.begin().await.expect("begin");
-    let recorded = processed.record(&mut tx, &marker).await.expect("record");
+    let recorded = processed
+        .record(&mut tx, &marker(&again))
+        .await
+        .expect("record");
     txs.abort(&mut tx).await;
     assert!(!recorded, "the redelivered event is a duplicate");
-    let again = second.first(&handled.id).clone();
     second.ack(&again);
     second.close().await;
 
@@ -459,17 +475,25 @@ pub async fn replay_from_earliest_redelivers_history(kit: &EventStoreKit<'_>) {
         .until("the events delivered", |r| r.has_all(&all))
         .await;
     let delivered: Vec<Delivery> = first.mine(&all).into_iter().cloned().collect();
-    let admin = events.admin(&spec).expect("admin");
+    let admin = Admin::new(events.admin(&spec).expect("admin"));
     let deadline = Instant::now() + WAIT;
-    while blocking(|| admin.members()).expect("members").is_empty() {
+    while admin
+        .call("members", |a| a.members())
+        .await
+        .expect("members")
+        .is_empty()
+    {
         assert!(
             Instant::now() < deadline,
             "the reading instance is a member"
         );
         first.pump(SLICE).await;
     }
-    let earliest = blocking(|| admin.plan(&ResetTarget::Earliest)).expect("plan earliest");
-    let refused = blocking(|| admin.apply(&earliest));
+    let earliest = admin
+        .plan(ResetTarget::Earliest)
+        .await
+        .expect("plan earliest");
+    let refused = admin.apply(&earliest).await;
     assert!(
         matches!(refused, Err(EventStoreError::SubscribersActive(_))),
         "no move while an instance reads: {refused:?}"
@@ -477,7 +501,10 @@ pub async fn replay_from_earliest_redelivers_history(kit: &EventStoreKit<'_>) {
     first.close().await;
     let deadline = Instant::now() + WAIT;
     loop {
-        let members = blocking(|| admin.members()).expect("members");
+        let members = admin
+            .call("members", |a| a.members())
+            .await
+            .expect("members");
         if members.is_empty() {
             break;
         }
@@ -489,7 +516,10 @@ pub async fn replay_from_earliest_redelivers_history(kit: &EventStoreKit<'_>) {
     }
 
     let before = |a: &str, b: &str| events.compare(a, b) == std::cmp::Ordering::Less;
-    let earliest = blocking(|| admin.plan(&ResetTarget::Earliest)).expect("plan earliest");
+    let earliest = admin
+        .plan(ResetTarget::Earliest)
+        .await
+        .expect("plan earliest");
     for d in &delivered {
         assert!(
             earliest.iter().any(|r| r.segment == d.segment
@@ -502,7 +532,7 @@ pub async fn replay_from_earliest_redelivers_history(kit: &EventStoreKit<'_>) {
             d.segment
         );
     }
-    let latest = blocking(|| admin.plan(&ResetTarget::Latest)).expect("plan latest");
+    let latest = admin.plan(ResetTarget::Latest).await.expect("plan latest");
     for d in &delivered {
         assert!(
             latest.iter().any(|r| r.segment == d.segment),
@@ -517,14 +547,35 @@ pub async fn replay_from_earliest_redelivers_history(kit: &EventStoreKit<'_>) {
         "latest replays nothing: {latest:?}"
     );
     let oldest = &delivered[0];
-    let at = blocking(|| admin.plan(&ResetTarget::Timestamp(oldest.timestamp_ms))).expect("plan");
+    let at = admin
+        .plan(ResetTarget::Timestamp(oldest.timestamp_ms))
+        .await
+        .expect("plan timestamp");
     assert!(
         at.iter()
             .any(|r| r.segment == oldest.segment && !before(&oldest.position, &r.from)),
         "a time moves to the first position at or after it: {at:?}"
     );
+    let newest = delivered
+        .iter()
+        .map(|d| d.timestamp_ms)
+        .max()
+        .expect("delivered");
+    let past = admin
+        .plan(ResetTarget::Timestamp(newest + 1))
+        .await
+        .expect("plan timestamp");
+    for d in &delivered {
+        assert!(
+            past.iter()
+                .any(|r| r.segment == d.segment && before(&d.position, &r.from)),
+            "a time after every event of segment {} moves past {}: {past:?}",
+            d.segment,
+            d.position
+        );
+    }
     let target = ResetTarget::Positions(vec![(oldest.segment.clone(), oldest.position.clone())]);
-    let positions = blocking(|| admin.plan(&target)).expect("plan positions");
+    let positions = admin.plan(target).await.expect("plan positions");
     assert_eq!(
         positions
             .iter()
@@ -533,8 +584,23 @@ pub async fn replay_from_earliest_redelivers_history(kit: &EventStoreKit<'_>) {
         [(oldest.segment.as_str(), oldest.position.as_str())],
         "positions move the listed segments only"
     );
+    // A segment the source lacks, and a position the segment does not have (far past any head of
+    // a store with decimal positions, not a position at all for the others).
+    for target in [
+        ResetTarget::Positions(vec![(
+            "conformance-no-such-segment".into(),
+            oldest.position.clone(),
+        )]),
+        ResetTarget::Positions(vec![(oldest.segment.clone(), "9223372036854775807".into())]),
+    ] {
+        let refused = admin.plan(target.clone()).await;
+        assert!(
+            matches!(refused, Err(EventStoreError::Invalid(_))),
+            "{target:?} is invalid: {refused:?}"
+        );
+    }
 
-    blocking(|| admin.apply(&earliest)).expect("apply earliest");
+    admin.apply(&earliest).await.expect("apply earliest");
     let restarted = kit.instance();
     let mut second = Reader::join(&*restarted, &spec).await;
     second
@@ -543,20 +609,71 @@ pub async fn replay_from_earliest_redelivers_history(kit: &EventStoreKit<'_>) {
     second.close().await;
 }
 
-/// `lag`: each segment's lag counts what the subscription has not acknowledged.
+/// Without `replay`: the reset side of a subscription is refused as unsupported.
+pub async fn admin_without_replay_is_unsupported(kit: &EventStoreKit<'_>) {
+    let events = kit.instance();
+    let admin = events.admin(&kit.spec());
+    assert!(
+        matches!(admin, Err(EventStoreError::Unsupported(Capability::Replay))),
+        "admin without replay: {:?}",
+        admin.err()
+    );
+}
+
+/// Without `lag`: no segment reports a lag.
+pub async fn lag_unknown_without_capability(kit: &EventStoreKit<'_>) {
+    let events = kit.instance();
+    let sent = event(kit.source, Some(fresh("key").as_str()));
+    publish_all(&*events, std::slice::from_ref(&sent)).await;
+    let mut reader = Reader::join(&*events, &kit.spec()).await;
+    reader
+        .until("the event delivered", |r| r.has(&sent.id))
+        .await;
+    let segments = reader.subscription().segments();
+    assert!(!segments.is_empty(), "segments() lists the assignment");
+    assert!(
+        segments.iter().all(|s| s.lag.is_none()),
+        "no lag without the capability: {segments:?}"
+    );
+    reader.close().await;
+}
+
+/// `lag`: each segment's lag counts what the subscription has not acknowledged. Passes on its
+/// own on an empty source: it first gives every assigned segment an acknowledged event.
 pub async fn lag_counts_unacked(kit: &EventStoreKit<'_>) {
     let events = kit.instance();
     let mut reader = Reader::join(&*events, &kit.spec()).await;
+    reader
+        .until("segments assigned", |r| !r.assigned.is_empty())
+        .await;
+    // An acknowledged event on every assigned segment, so each lag counts from a committed
+    // position even on a source that was empty (a segment without one may report no lag).
+    let deadline = Instant::now() + WAIT;
+    let mut primed: BTreeSet<String> = BTreeSet::new();
+    while !reader.assigned.is_subset(&primed) {
+        assert!(
+            Instant::now() < deadline,
+            "an acknowledged event on every segment within {WAIT:?} (on {primed:?} of {:?})",
+            reader.assigned
+        );
+        let prime = event(kit.source, Some(fresh("key").as_str()));
+        publish_all(&*events, std::slice::from_ref(&prime)).await;
+        reader
+            .until("the priming event delivered", |r| r.has(&prime.id))
+            .await;
+        primed.insert(reader.first(&prime.id).segment.clone());
+    }
+    let every = |r: &Reader| r.assigned.iter().cloned().collect::<Vec<_>>();
     let deadline = Instant::now() + WAIT;
     loop {
         reader
             .until("everything acknowledged, lag 0", |r| {
-                !r.assigned.is_empty() && r.known_lag(&[]) == Some(0)
+                r.known_lag(&every(r)) == Some(0)
             })
             .await;
         let delivered = reader.seen.len();
         reader.pump(QUIET).await;
-        if reader.seen.len() == delivered && reader.known_lag(&[]) == Some(0) {
+        if reader.seen.len() == delivered && reader.known_lag(&every(&reader)) == Some(0) {
             break;
         }
         assert!(
@@ -650,10 +767,12 @@ struct Reader {
 
 impl Reader {
     async fn join(events: &dyn EventStore, spec: &SubscriptionSpec) -> Reader {
-        let subscription = events
-            .subscribe(spec.clone())
-            .await
-            .unwrap_or_else(|e| panic!("subscribe {}: {e}", spec.name));
+        let subscription = bounded(
+            &format!("subscribe {}", spec.name),
+            events.subscribe(spec.clone()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("subscribe {}: {e}", spec.name));
         Reader {
             name: spec.name.clone(),
             subscription: Some(subscription),
@@ -812,7 +931,7 @@ impl Reader {
 
     async fn close(mut self) {
         if let Some(subscription) = self.subscription.take() {
-            subscription.close().await;
+            bounded(&format!("close {}", self.name), subscription.close()).await;
         }
     }
 }
@@ -838,9 +957,48 @@ async fn both_until(
     }
 }
 
-/// A blocking [`SubscriptionAdmin`](super::SubscriptionAdmin) call, in place.
-fn blocking<T>(call: impl FnOnce() -> T) -> T {
-    tokio::task::block_in_place(call)
+/// `call`'s outcome; panics naming `step` when it does not answer within [`WAIT`].
+async fn bounded<T>(step: &str, call: impl Future<Output = T>) -> T {
+    tokio::time::timeout(WAIT, call)
+        .await
+        .unwrap_or_else(|_| panic!("{step}: no answer within {WAIT:?}"))
+}
+
+/// A [`SubscriptionAdmin`] whose blocking calls each run on a thread of their own, bounded by
+/// [`WAIT`]: a call that never returns fails the check and leaves its thread behind (a
+/// `spawn_blocking` task would hold the runtime's shutdown instead).
+struct Admin(Arc<Mutex<Box<dyn SubscriptionAdmin>>>);
+
+impl Admin {
+    fn new(admin: Box<dyn SubscriptionAdmin>) -> Admin {
+        Admin(Arc::new(Mutex::new(admin)))
+    }
+
+    async fn call<T: Send + 'static>(
+        &self,
+        step: &str,
+        call: impl FnOnce(&dyn SubscriptionAdmin) -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let admin = Arc::clone(&self.0);
+        std::thread::spawn(move || {
+            let admin = admin.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = tx.send(call(&**admin));
+        });
+        bounded(&format!("admin {step}"), rx)
+            .await
+            .unwrap_or_else(|_| panic!("admin {step}: the call panicked"))
+    }
+
+    async fn plan(&self, target: ResetTarget) -> Result<Vec<ReplayRange>, EventStoreError> {
+        let step = format!("plan {target:?}");
+        self.call(&step, move |a| a.plan(&target)).await
+    }
+
+    async fn apply(&self, ranges: &[ReplayRange]) -> Result<(), EventStoreError> {
+        let ranges = ranges.to_vec();
+        self.call("apply", move |a| a.apply(&ranges)).await
+    }
 }
 
 /// An event of the kit to `source`: the seven headers, a fresh id, a JSON object payload.
@@ -872,8 +1030,7 @@ fn event(source: &str, key: Option<&str>) -> OutgoingEvent {
 
 async fn publish_all(events: &dyn EventStore, sent: &[OutgoingEvent]) {
     for e in sent {
-        events
-            .publish(e)
+        bounded(&format!("publish {}", e.id), events.publish(e))
             .await
             .unwrap_or_else(|err| panic!("publish {}: {err}", e.id));
     }

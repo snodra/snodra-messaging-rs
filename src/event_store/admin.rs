@@ -34,7 +34,7 @@ pub enum ResetTarget {
 /// positions of one segment.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReplayRange {
-    /// The source (topic, stream) of `segment`.
+    /// The source of `segment`.
     pub source: String,
     pub segment: String,
     pub from: String,
@@ -44,7 +44,7 @@ pub struct ReplayRange {
 /// The reset side of one subscription ([`EventStore::admin`](super::EventStore::admin)). Every
 /// call blocks (it talks to the event store): run them on a blocking thread.
 pub trait SubscriptionAdmin: Send {
-    /// The instances reading the subscription now (their client or consumer ids); empty when
+    /// The members reading the subscription now (the event store's ids for them); empty when
     /// none does.
     fn members(&self) -> Result<Vec<String>, EventStoreError>;
 
