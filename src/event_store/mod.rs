@@ -73,7 +73,8 @@ pub trait EventStore: Send + Sync {
     ) -> BoxFuture<'_, Result<Box<dyn Subscription>, EventStoreError>>;
 
     /// The reset side of the subscription `spec`, for a reset run while no instance reads it;
-    /// [`EventStoreError::Unsupported`] without [`Capability::Replay`].
+    /// [`EventStoreError::Unsupported`] without [`Capability::Replay`]. Never blocking; the calls
+    /// of the returned admin block.
     fn admin(&self, spec: &SubscriptionSpec)
     -> Result<Box<dyn SubscriptionAdmin>, EventStoreError>;
 

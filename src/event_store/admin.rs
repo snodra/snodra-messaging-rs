@@ -20,8 +20,9 @@ pub enum ResetTarget {
 
 /// Events of `segment` of `source` at a position `from <= position < until` are a replay.
 ///
-/// What [`SubscriptionAdmin::plan`] gives is one per segment a reset moves: `from` is the position
-/// it moves to, `until` the subscription's committed position before (empty when it had none).
+/// What [`SubscriptionAdmin::plan`] gives is one per segment the target addresses: `from` is the
+/// position it moves to, `until` the subscription's committed position before (empty when it had
+/// none).
 /// Only a range with `until` set and `from` before it (by
 /// [`EventStore::compare`](super::EventStore::compare)) replays anything; the others are moves
 /// without a replay (`latest`, a segment never committed). The processor control store keeps the

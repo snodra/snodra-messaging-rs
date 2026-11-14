@@ -1889,6 +1889,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kraken-messaging-kafka"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "kraken-messaging-mongo",
+ "kraken-messaging-rs",
+ "mongodb",
+ "rdkafka",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "kraken-messaging-mongo"
 version = "0.1.0"
 dependencies = [

@@ -4,7 +4,7 @@
 //! store (for the at-least-once check):
 //!
 //! ```ignore
-//! #[tokio::test(flavor = "multi_thread")]
+//! #[tokio::test]
 //! async fn my_event_store_passes_conformance() {
 //!     let store: Arc<dyn MessageStore> = ..; // any message store add-on, its schema in place
 //!     run_event_store_conformance("kraken.conformance", || Arc::new(MyEventStore::new(..)), store)
