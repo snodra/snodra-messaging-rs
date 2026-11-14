@@ -37,7 +37,7 @@ use crate::codec;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
 use crate::event_store::{Delivery, EventStoreError, Subscription, SubscriptionEvent, headers};
-use crate::events::{LocalEventDispatcher, RESUBSCRIBE_MAX, RESUBSCRIBE_MIN};
+use crate::events::{Ended, LocalEventDispatcher, Resubscribing, keep_subscribed};
 use crate::types::Event;
 
 /// One record of a partner source, as a translator reads it.
@@ -144,6 +144,30 @@ pub fn validate_source(name: &str) -> Result<(), MessagingError> {
     Ok(())
 }
 
+/// One source's reader, kept subscribed.
+struct SourceReader<'s> {
+    sources: &'s ExternalSources,
+    source: &'s SourceRegistration,
+}
+
+impl Resubscribing for SourceReader<'_> {
+    fn subscribe(&self) -> BoxFuture<'_, Result<Box<dyn Subscription>, EventStoreError>> {
+        self.source.provider.subscribe()
+    }
+
+    fn read<'a>(
+        &'a self,
+        subscription: &'a mut dyn Subscription,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Ended> {
+        Box::pin(self.sources.read(self.source, subscription, cancel))
+    }
+
+    fn failed(&self, failure: &EventStoreError, backoff: Duration) {
+        tracing::warn!(source = %self.source.name, subscription = %self.source.provider.subscription(), "the external source's subscription failed, subscribing again in {backoff:?}: {failure}");
+    }
+}
+
 /// The registered partner sources' readers; see the module docs.
 pub struct ExternalSources {
     sources: Vec<SourceRegistration>,
@@ -211,60 +235,33 @@ impl ExternalSources {
 
     /// Subscribes, reads until `cancel`, and subscribes again after a failure.
     async fn run(&self, index: usize, cancel: CancellationToken) {
-        let source = &self.sources[index];
-        let mut backoff = RESUBSCRIBE_MIN;
-        loop {
-            let subscribed = tokio::select! {
-                _ = cancel.cancelled() => return,
-                subscribed = source.provider.subscribe() => subscribed,
-            };
-            let failure = match subscribed {
-                Err(e) => e,
-                Ok(mut subscription) => {
-                    let ended = self.read(source, &mut *subscription, &cancel).await;
-                    subscription.close().await;
-                    match ended {
-                        None => return,
-                        Some((error, delivered)) => {
-                            if delivered {
-                                backoff = RESUBSCRIBE_MIN;
-                            }
-                            error
-                        }
-                    }
-                }
-            };
-            tracing::warn!(source = %source.name, subscription = %source.provider.subscription(), "the external source's subscription failed, subscribing again in {backoff:?}: {failure}");
-            tokio::select! {
-                _ = cancel.cancelled() => return,
-                _ = tokio::time::sleep(backoff) => {}
-            }
-            backoff = (backoff * 2).min(RESUBSCRIBE_MAX);
-        }
+        let reader = SourceReader {
+            sources: self,
+            source: &self.sources[index],
+        };
+        keep_subscribed(&reader, &cancel).await;
     }
 
-    /// Reads `subscription` until `cancel` (`None`) or its failure (the error, and whether it
-    /// handed out anything first).
+    /// Reads `subscription` until `cancel` or a shutdown mid-retry, or its failure.
     async fn read(
         &self,
         source: &SourceRegistration,
         subscription: &mut dyn Subscription,
         cancel: &CancellationToken,
-    ) -> Option<(EventStoreError, bool)> {
+    ) -> Ended {
         let mut delivered = false;
         loop {
             let next = tokio::select! {
-                _ = cancel.cancelled() => return None,
+                _ = cancel.cancelled() => return Ended::Stopped,
                 next = subscription.next() => next,
             };
             if let Some(e) = subscription.take_error() {
                 tracing::warn!(source = %source.name, "external source: {e}");
             }
             let delivery = match next {
-                Err(e) => return Some((e, delivered)),
+                Err(error) => return Ended::Failed { error, delivered },
                 Ok(SubscriptionEvent::Delivery(d)) => d,
                 Ok(change) => {
-                    delivered = true;
                     tracing::debug!(source = %source.name, "external source: {change:?}");
                     continue;
                 }
@@ -273,7 +270,7 @@ impl ExternalSources {
             let record = ExternalRecord::of(source.provider.source(), delivery);
             if !self.handle_record(source, &record, cancel).await {
                 // Shutting down mid-retry: the record is delivered again after a restart.
-                return None;
+                return Ended::Stopped;
             }
             if let Err(e) = subscription.ack(&record.segment, &record.position) {
                 tracing::warn!(source = %source.name, segment = %record.segment, position = %record.position, "acknowledgement failed: {e}");

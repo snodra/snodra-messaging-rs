@@ -32,10 +32,10 @@ use crate::config::Config;
 use crate::config::DeadLetterMode;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
-use crate::event_store::{Capability, EventStore, SubscriptionSpec};
+use crate::event_store::{EventStore, SubscriptionSpec};
 use crate::events::{
     EventBus, LocalEventDispatcher, NoSagas, OutboxPublisher, OutboxPublisherSettings,
-    ProcessorSettings, SagaStage,
+    ProcessorSettings, SagaStage, check_dead_letter_mode,
 };
 use crate::external::sources::{SourceRegistration, validate_source};
 use crate::external::{
@@ -798,17 +798,7 @@ impl KrakenMessagingBuilder {
                 // Nothing would relay the outbox: publishing fails, naming the missing add-on.
                 events.without_event_store();
             }
-            Some(events)
-                if config.dead_letter_mode == DeadLetterMode::EventStore
-                    && !events.supports(Capability::NativeDeadLetter) =>
-            {
-                return Err(MessagingError::InvalidMessage(format!(
-                    "dead-letter mode event-store needs an event store with the capability {}: {} lacks it",
-                    Capability::NativeDeadLetter,
-                    events.name()
-                )));
-            }
-            Some(_) => {}
+            Some(events) => check_dead_letter_mode(config.dead_letter_mode, &**events)?,
         }
         if !config.sagas_enabled && !saga_types.is_empty() {
             tracing::warn!(sagas = ?saga_types.iter().map(SagaType::name).collect::<Vec<_>>(), "sagas are registered but KRAKEN_SAGAS_ENABLED=false: they do not run");

@@ -626,12 +626,12 @@ impl ProcessorRunner {
         let operation = held.id.as_str();
         let name = self.name().to_string();
         let subscription = &self.settings.subscription;
-        let admin: Box<dyn SubscriptionAdmin> = self.settings.events.admin(subscription)?;
+        let admin = OffThread(Some(self.settings.events.admin(subscription)?));
         let (admin, plan, members) = {
             let target = target.clone();
             blocking(move || {
-                let plan = admin.plan(&target)?;
-                let members = admin.members()?;
+                let plan = admin.get().plan(&target)?;
+                let members = admin.get().members()?;
                 Ok((admin, plan, members))
             })
             .await?
@@ -701,7 +701,7 @@ impl ProcessorRunner {
                 .map_err(|e| Refusal::failed(&e))?;
             done.ranges_written = !ranges.is_empty();
             self.keep_lease(held, started).await?;
-            blocking(move || admin.apply(&plan)).await
+            blocking(move || admin.get().apply(&plan)).await
         }
         .await;
         if let Err(refusal) = finished {
@@ -783,6 +783,30 @@ impl Changed {
                 self.reset_handlers
             ),
             ..refusal
+        }
+    }
+}
+
+/// An admin dropped on a blocking thread, whatever path the execute takes (an event store's
+/// client may block while it shuts down, librdkafka's does).
+struct OffThread(Option<Box<dyn SubscriptionAdmin>>);
+
+impl OffThread {
+    fn get(&self) -> &dyn SubscriptionAdmin {
+        self.0.as_deref().expect("dropped only once")
+    }
+}
+
+impl Drop for OffThread {
+    fn drop(&mut self) {
+        let Some(admin) = self.0.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(move || drop(admin));
+            }
+            Err(_) => drop(admin),
         }
     }
 }

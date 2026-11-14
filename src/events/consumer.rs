@@ -8,8 +8,7 @@
 //! flowing.
 //!
 //! A subscription whose `next` fails is broken: it is closed and the processor subscribes again
-//! after a backoff ([`RESUBSCRIBE_MIN`] doubling to [`RESUBSCRIBE_MAX`]), showing the error on its
-//! status. What the subscription recovered from by itself ([`Subscription::take_error`]) shows
+//! after a backoff ([`keep_subscribed`](super::resubscribe)), showing the error on its status. What the subscription recovered from by itself ([`Subscription::take_error`]) shows
 //! there too.
 //!
 //! Processor control (ADR 0023) reaches it through its [`ConsumerControl`]: paused, it pauses its
@@ -22,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use opentelemetry::Value;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -29,13 +29,14 @@ use tokio_util::sync::CancellationToken;
 
 use super::dispatch::{LocalEventDispatcher, MarkerPosition, RecordDispatch, StageOneDone};
 use super::publisher::OUTBOX_SEND_TIMEOUT;
+use super::resubscribe::{Ended, Resubscribing, keep_subscribed};
 use crate::codec;
 use crate::config::DeadLetterMode;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
 use crate::event_store::{
     Capability, Delivery, EventStore, EventStoreError, OutgoingEvent, ReplayRange, Subscription,
-    SubscriptionEvent, SubscriptionSpec, dead_letter_source, headers,
+    SubscriptionEvent, SubscriptionSpec, dead_letter_source, headers, segment_order,
 };
 use crate::metrics::{Consumed, Metrics, OTHER, TypeLabels};
 use crate::processors::ProcessorMonitor;
@@ -111,11 +112,6 @@ const STATUS_REFRESH: Duration = Duration::from_secs(1);
 /// Between a record the dead letters could not take (a park, a dead-letter publish or a
 /// sequencing read failed) and its redelivery.
 const PARK_RETRY: Duration = Duration::from_secs(1);
-/// The first wait before subscribing again after a subscription failed; it doubles up to
-/// [`RESUBSCRIBE_MAX`] while the next ones fail before delivering anything.
-pub const RESUBSCRIBE_MIN: Duration = Duration::from_secs(1);
-pub const RESUBSCRIBE_MAX: Duration = Duration::from_secs(30);
-
 /// What a processor's consumer is (ADR 0022): its name, its subscription on the event store,
 /// its dead-letter mode and where its letters go.
 #[derive(Clone)]
@@ -257,17 +253,6 @@ enum Step {
     Next(Result<SubscriptionEvent, EventStoreError>),
 }
 
-/// How a subscription ended.
-enum Ended {
-    /// The processor stops (its cancel, or a shutdown in the middle of a record).
-    Stopped,
-    /// The subscription failed: subscribe again. `delivered`: it handed out anything first.
-    Failed {
-        error: EventStoreError,
-        delivered: bool,
-    },
-}
-
 impl EventConsumer {
     /// The consumer of one event processor (ADR 0022): its subscription, its dispatcher (whose
     /// marker prefix and handlers are the processor's) and its dead letters.
@@ -297,13 +282,7 @@ impl EventConsumer {
         let sink = match settings.dead_letter_mode {
             DeadLetterMode::Log => Sink::Log,
             DeadLetterMode::EventStore => {
-                if !settings.events.supports(Capability::NativeDeadLetter) {
-                    return Err(MessagingError::InvalidMessage(format!(
-                        "dead-letter mode event-store needs an event store with the capability {}: {} lacks it",
-                        Capability::NativeDeadLetter,
-                        settings.events.name()
-                    )));
-                }
+                check_dead_letter_mode(DeadLetterMode::EventStore, &*settings.events)?;
                 Sink::EventStore {
                     events: Arc::clone(&settings.events),
                     source: dead_letter_source(&settings.subscription.source),
@@ -364,39 +343,7 @@ impl EventConsumer {
 
     /// Subscribes, reads until `cancel` or a failure, and subscribes again after a failure.
     async fn consume(&self, cancel: &CancellationToken) {
-        let mut backoff = RESUBSCRIBE_MIN;
-        loop {
-            let subscribed = tokio::select! {
-                _ = cancel.cancelled() => break,
-                subscribed = self.events.subscribe(self.subscription.clone()) => subscribed,
-            };
-            let failure = match subscribed {
-                Err(e) => e,
-                Ok(mut subscription) => {
-                    let ended = self.read(&mut *subscription, cancel).await;
-                    subscription.close().await;
-                    // Its segments are gone with it: STARTING until the next one's assignment.
-                    let assigned = self.monitor.assigned_segments();
-                    self.monitor.revoked(&assigned);
-                    match ended {
-                        Ended::Stopped => break,
-                        Ended::Failed { error, delivered } => {
-                            if delivered {
-                                backoff = RESUBSCRIBE_MIN;
-                            }
-                            error
-                        }
-                    }
-                }
-            };
-            tracing::warn!(processor = %self.name, subscription = %self.subscription.name, "the subscription failed, subscribing again in {backoff:?}: {failure}");
-            self.monitor.error(&format!("subscription: {failure}"));
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep(backoff) => {}
-            }
-            backoff = (backoff * 2).min(RESUBSCRIBE_MAX);
-        }
+        keep_subscribed(self, cancel).await;
         self.monitor.stopped();
     }
 
@@ -425,14 +372,12 @@ impl EventConsumer {
                     return Ended::Failed { error, delivered };
                 }
                 Step::Next(Ok(SubscriptionEvent::Assigned(segments))) => {
-                    delivered = true;
-                    tracing::info!(processor = %self.name, segments = ?segments, "segments assigned");
+                    tracing::info!(processor = %self.name, segments = ?in_order(&segments), "segments assigned");
                     self.monitor.assigned(&segments);
                     self.monitor.segments(subscription.segments());
                 }
                 Step::Next(Ok(SubscriptionEvent::Revoked(segments))) => {
-                    delivered = true;
-                    tracing::info!(processor = %self.name, segments = ?segments, "segments revoked");
+                    tracing::info!(processor = %self.name, segments = ?in_order(&segments), "segments revoked");
                     self.monitor.revoked(&segments);
                 }
                 Step::Next(Ok(SubscriptionEvent::Delivery(record))) => {
@@ -921,6 +866,51 @@ impl EventConsumer {
             }
         }
     }
+}
+
+impl Resubscribing for EventConsumer {
+    fn subscribe(&self) -> BoxFuture<'_, Result<Box<dyn Subscription>, EventStoreError>> {
+        self.events.subscribe(self.subscription.clone())
+    }
+
+    fn read<'a>(
+        &'a self,
+        subscription: &'a mut dyn Subscription,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Ended> {
+        Box::pin(EventConsumer::read(self, subscription, cancel))
+    }
+
+    fn failed(&self, failure: &EventStoreError, backoff: Duration) {
+        // Its segments are gone with it: STARTING until the next one's assignment.
+        let assigned = self.monitor.assigned_segments();
+        self.monitor.revoked(&assigned);
+        tracing::warn!(processor = %self.name, subscription = %self.subscription.name, "the subscription failed, subscribing again in {backoff:?}: {failure}");
+        self.monitor.error(&format!("subscription: {failure}"));
+    }
+}
+
+/// `segments` in [`segment_order`], for the logs.
+fn in_order(segments: &[String]) -> Vec<&str> {
+    let mut all: Vec<&str> = segments.iter().map(String::as_str).collect();
+    all.sort_by(|a, b| segment_order(a, b));
+    all
+}
+
+/// Whether `events` can take dead-letter `mode`: `event-store` needs the capability
+/// `native-dead-letter`; `InvalidMessage` naming it otherwise.
+pub(crate) fn check_dead_letter_mode(
+    mode: DeadLetterMode,
+    events: &dyn EventStore,
+) -> Result<(), MessagingError> {
+    if mode == DeadLetterMode::EventStore && !events.supports(Capability::NativeDeadLetter) {
+        return Err(MessagingError::InvalidMessage(format!(
+            "dead-letter mode event-store needs an event store with the capability {}: {} lacks it",
+            Capability::NativeDeadLetter,
+            events.name()
+        )));
+    }
+    Ok(())
 }
 
 /// Hands `record` out again (its segment's later records wait behind it).

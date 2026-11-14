@@ -17,7 +17,7 @@
 //!   it last found, plus the acknowledgements made since.
 //! - **Errors** librdkafka recovers from (a client error, a failed rebalance, a receive error of a
 //!   partition) are logged and kept for [`take_error`]; only a fatal consumer error ends the
-//!   subscription (`next` fails, the caller subscribes again).
+//!   subscription: `next` fails, at once and on every later call (the caller subscribes again).
 //!
 //! [`segments`]: Subscription::segments
 //! [`take_error`]: Subscription::take_error
@@ -247,6 +247,8 @@ pub struct KafkaSubscription {
     cancel: CancellationToken,
     refresher: Option<JoinHandle<()>>,
     _stop: DropGuard,
+    /// The fatal error that ended the subscription: every later `next` returns it.
+    broken: Option<EventStoreError>,
 }
 
 /// What became of a received record.
@@ -296,6 +298,7 @@ impl KafkaSubscription {
             _stop: cancel.clone().drop_guard(),
             cancel,
             refresher: Some(refresher),
+            broken: None,
         })
     }
 
@@ -411,6 +414,9 @@ impl Subscription for KafkaSubscription {
     fn next(&mut self) -> BoxFuture<'_, Result<SubscriptionEvent, EventStoreError>> {
         Box::pin(async move {
             loop {
+                if let Some(broken) = &self.broken {
+                    return Err(broken.clone());
+                }
                 if let Some(change) = self.shared.pop() {
                     return Ok(change);
                 }
@@ -453,11 +459,13 @@ impl Subscription for KafkaSubscription {
                                 tokio::time::sleep(ERROR_BACKOFF).await;
                                 continue;
                             }
-                            // The consumer cannot go on: the caller subscribes again.
+                            // The consumer cannot go on: the caller subscribes again (after its own
+                            // backoff). Kept before anything else, with no wait in between, so a
+                            // cancelled `next` cannot lose it.
                             Err(e) => {
                                 tracing::warn!(topic = %self.shared.topic, "kafka receive error, the subscription ends: {e}");
-                                tokio::time::sleep(ERROR_BACKOFF).await;
-                                return Err(failed(e));
+                                self.broken = Some(failed(e));
+                                continue;
                             }
                         }
                     }
@@ -682,6 +690,23 @@ mod tests {
     use kraken_messaging::event_store::segment_order;
 
     use super::*;
+
+    /// A broken subscription stays broken: a `next` dropped right after the error was kept (the
+    /// core races `next` with its timers) gives the error to the next call, and every call after.
+    #[tokio::test]
+    async fn a_fatal_error_is_returned_by_every_next_even_after_a_dropped_one() {
+        let mut sub =
+            KafkaSubscription::join("127.0.0.1:1", "g", "t", &HashMap::new(), true).unwrap();
+        sub.broken = Some(EventStoreError::Failed("kafka: fatal".into()));
+        for _ in 0..2 {
+            let next = tokio::time::timeout(Duration::from_secs(5), sub.next()).await;
+            assert_eq!(
+                next.expect("at once"),
+                Err(EventStoreError::Failed("kafka: fatal".into()))
+            );
+        }
+        Box::new(sub).close().await;
+    }
 
     #[test]
     fn partition_names_by_number_are_in_segment_order() {

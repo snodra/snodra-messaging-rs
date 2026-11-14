@@ -119,7 +119,7 @@ pub struct OutgoingEvent {
     /// them as the event store does.
     pub key: Option<String>,
     /// Carried as given, as the event store's native metadata: the seven [`headers`] and any
-    /// other (a dead letter's `kraken-dlt-*`).
+    /// other (a dead letter's `kraken-dlt-*`). Headers are UTF-8 text, one value per name.
     pub headers: HashMap<String, String>,
     /// JSON bytes, carried as given.
     pub payload: Vec<u8>,
@@ -138,7 +138,9 @@ pub struct Delivery {
     /// Its position in `segment`, which [`Subscription::ack`](super::Subscription::ack) takes.
     pub position: String,
     pub key: Option<String>,
-    /// The headers as published.
+    /// The headers as published, as UTF-8 text with one value per name: a record that carries a
+    /// value that is not UTF-8 (read lossily) or a name twice (the last value wins), which the
+    /// library never publishes, is not preserved byte for byte, nor is its dead letter.
     pub headers: HashMap<String, String>,
     /// The payload as published.
     pub payload: Vec<u8>,

@@ -8,11 +8,13 @@ mod consumer;
 pub mod dispatch;
 mod outbox;
 mod publisher;
+mod resubscribe;
 
+pub(crate) use consumer::check_dead_letter_mode;
 pub(crate) use consumer::message_context;
 pub use consumer::{
-    ConsumerControl, DLT_HEADERS, EventConsumer, ProcessorSettings, RESUBSCRIBE_MAX,
-    RESUBSCRIBE_MIN, RecordDisposition, classify, classify_with,
+    ConsumerControl, DLT_HEADERS, EventConsumer, ProcessorSettings, RecordDisposition, classify,
+    classify_with,
 };
 pub use dispatch::{LocalEventDispatcher, NoSagas, SagaStage};
 pub(crate) use outbox::check_payload;
@@ -20,6 +22,8 @@ pub(crate) use outbox::check_payload;
 pub(crate) use outbox::check_payload_text;
 pub use outbox::{EventBus, new_outbox_entry};
 pub use publisher::{OUTBOX_SEND_TIMEOUT, OutboxPublisher, OutboxPublisherSettings};
+pub(crate) use resubscribe::{Ended, Resubscribing, keep_subscribed};
+pub use resubscribe::{RESUBSCRIBE_MAX, RESUBSCRIBE_MIN};
 
 /// The source a service's events go to unless `KRAKEN_EVENTS_SOURCE` names another (on Kafka,
 /// the topic of ADR 0003).
