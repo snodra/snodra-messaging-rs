@@ -62,6 +62,7 @@ own database through a message store add-on (ADR 0028): `.store(...)` on the bui
 - [Dead letters](#dead-letters)
 - [Processor control](#processor-control)
 - [In-memory stores](#in-memory-stores)
+- [The RabbitMQ Streams event store](#the-rabbitmq-streams-event-store)
 - [Security](#security)
 - [Metrics](#metrics)
 - [Build and test](#build-and-test)
@@ -1189,6 +1190,91 @@ so a test on paused time (`#[tokio::test(start_paused = true)]`) moves the lease
 deadlines (a later `.clock(..)` replaces it). `MemoryEventStore::events(source)` and
 `MemoryStore::contents()` show what each store holds. `examples/service-c` tests its `audit`
 processor this way (`src/audit.rs`).
+
+## The RabbitMQ Streams event store
+
+The crate `kraken-messaging-rabbitmq` (`crates/`) is the event store on **RabbitMQ 3.13 or later
+with the stream plugin** (`rabbitmq_stream`), through the stream protocol (port 5552, 5551 with
+TLS). It reads and writes the same streams as the Kotlin module `kraken-messaging-rabbitmq`; its
+crate docs give the whole layout on the wire.
+
+```rust,ignore
+use kraken_messaging_rabbitmq::{RabbitConfig, RabbitEventStore};
+
+let events = RabbitEventStore::new(RabbitConfig::from_env()?)?;
+let app = KrakenMessaging::builder(config).await?
+    .event_store(Arc::new(events))
+    .store(store)
+    /* handlers */
+    .start()
+    .await?;
+```
+
+**Create the streams first** (the library never creates them): the source as a super stream,
+with as many partitions as the instances should share (six by default, as Kafka's topic), and
+its dead-letter stream when the dead-letter mode is `event-store`:
+
+```bash
+rabbitmq-streams add_super_stream kraken.events --partitions 6
+rabbitmq-streams add_stream kraken.events.dlt
+```
+
+A missing super stream fails the publish (retried by the outbox relay) and the processors'
+subscriptions (retried after a backoff), naming the command above.
+
+**What it covers.** Events go to the super stream's partitions by key (the stream clients' hash
+routing: the same partition as the Java client's), unkeyed events by their id; a processor
+`<service>.<processor>` is a single active consumer of that name on every partition, so the
+broker spreads the partitions over the instances; offsets are tracked on the server under that
+name; headers are AMQP application properties; dead letters go to the stream `<source>.dlt`.
+`browse`, `lag` and `native-dead-letter` are always declared; **`replay` only with the
+management API** (`KRAKEN_RABBITMQ_MANAGEMENT_URL`, plugin `rabbitmq_stream_management`): a reset
+is refused while an instance reads the processor, and only the management API can tell. Without
+it, a reset is answered `UNSUPPORTED`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `KRAKEN_RABBITMQ_HOSTS` | `rabbitmq` | nodes to connect to first, `host` or `host:port`, comma-separated, tried in order (then each stream's leader as the broker advertises it) |
+| `KRAKEN_RABBITMQ_PORT` | 5552 (5551 with TLS) | the port of a host given without one |
+| `KRAKEN_RABBITMQ_VIRTUAL_HOST` | `/` | |
+| `KRAKEN_RABBITMQ_USERNAME` | `guest` | |
+| `KRAKEN_RABBITMQ_PASSWORD` / `_PASSWORD_FILE` | `guest` | the password, or a file holding it (the variable wins); never logged |
+| `KRAKEN_RABBITMQ_TLS` | false | TLS (rustls, no OpenSSL) to every node |
+| `KRAKEN_RABBITMQ_TLS_CA_FILE` | none | PEM CA certificates the nodes are verified against; required with TLS (the store never connects unverified) |
+| `KRAKEN_RABBITMQ_LOAD_BALANCER` | false | the hosts are a load balancer: connect through it until it lands on the node needed |
+| `KRAKEN_RABBITMQ_MANAGEMENT_URL` | none | the management API (`http://rabbitmq:15672`): declares `replay`, shows live subscriptions |
+| `KRAKEN_RABBITMQ_MANAGEMENT_USERNAME` / `_PASSWORD` / `_PASSWORD_FILE` | the stream user's | |
+| `KRAKEN_RABBITMQ_KNOWN_SUBSCRIPTIONS` | none | subscription names the event browser's lag view always lists |
+
+The source and its dead-letter source are the core's settings (`KRAKEN_EVENTS_SOURCE`,
+`<source>.dlt`), as for every event store.
+
+**Limits, and what differs from Kafka:**
+
+- A processor's redelivery (an event it could not finish) cannot seek a single active consumer in
+  place: the subscription keeps what it handed out and has not acknowledged, and hands it out
+  again.
+- A stream's offsets also number its offset-tracking entries (every stored offset takes one), so
+  positions have gaps, and a lag counts offsets for what a processor has not received yet: it may
+  overstate a lag that is not received yet (what was received and not acknowledged is counted one
+  by one).
+- The stream's first offset and head are read from its first and last chunk (the Rust client has
+  no `StreamStats`); a stream that sends nothing for 1.5 s is taken as empty.
+- Partitions are read when a processor subscribes: a partition added later is read once the
+  instances subscribe again (a restart).
+- No producer deduplication: an event the outbox publishes again after a crash is a duplicate,
+  which the processed-event markers skip. Each publish waits for the broker's confirm. An event
+  over the 1 MiB frame, or refused for access, is given up at once.
+- The event browser's lag view lists the subscriptions this process subscribed, the ones the
+  management API shows reading, and `KRAKEN_RABBITMQ_KNOWN_SUBSCRIPTIONS` (the stream protocol
+  cannot list the names with a stored offset).
+- The client's TLS uses the process's rustls provider: the add-on installs `ring` when none is
+  installed.
+
+Tests: `crates/kraken-messaging-rabbitmq/tests/conformance.rs` runs the event-store conformance kit
+on `rabbitmq:4.4.0-management` (stream and management plugins), `tests/e2e.rs` a service of two
+instances against the hub image (outbox, competing instances, pause and resume, a reset through
+the hub, a dead letter in the dead-letter stream).
 
 ## Security
 
