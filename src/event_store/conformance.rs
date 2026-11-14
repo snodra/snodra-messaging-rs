@@ -1010,15 +1010,19 @@ pub async fn search_stops_at_bounds(kit: &EventStoreKit<'_>) {
     let sent: Vec<OutgoingEvent> = (0..5)
         .map(|_| typed(kit.source, &fresh("key"), &ty, &fresh("correlation")))
         .collect();
-    // Every event of this check is stamped at or after this (module docs: the clocks agree).
-    let since = now_ms();
     publish_spaced(&*events, &sent).await;
     let newest_first: Vec<&OutgoingEvent> = sent.iter().rev().collect();
     let by_type = EventFilter {
         type_name: Some(ty.clone()),
         ..EventFilter::default()
     };
-    found(&*browser, kit, by_type.clone(), &newest_first, "the five").await;
+    let five = found(&*browser, kit, by_type.clone(), &newest_first, "the five").await;
+    // The store's own stamp of the oldest of the five (on its clock, not the kit's): no event of
+    // this check is older.
+    let since = five
+        .last()
+        .and_then(|s| s.timestamp)
+        .expect("the five carry their times");
 
     let request = |filters: EventFilter, cursor: Option<String>| SearchRequest {
         source: Some(kit.source.to_string()),

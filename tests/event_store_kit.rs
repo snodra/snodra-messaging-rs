@@ -102,6 +102,24 @@ async fn the_scan_budget_check_passes_on_a_pre_filled_source() {
     search_stops_at_bounds(&kit).await;
 }
 
+/// The scan-budget check on a store whose clock is 5 s behind the kit's: its paging takes its
+/// times from the store's own stamps.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_scan_budget_check_passes_on_a_store_with_a_lagging_clock() {
+    let source = "conformance.lagging";
+    let events = Log::new(Capability::ALL.to_vec())
+        .browsing(&[source])
+        .lagging(5_000);
+    let make = move || Arc::new(events.clone()) as Arc<dyn EventStore>;
+    let markers = Markers::default();
+    let kit = EventStoreKit {
+        source,
+        make_events: &make,
+        store: &markers,
+    };
+    search_stops_at_bounds(&kit).await;
+}
+
 async fn run_kit(events: Log) {
     let events = events.browsing(&["conformance.events"]);
     run_event_store_conformance(

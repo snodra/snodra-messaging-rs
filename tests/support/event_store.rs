@@ -111,6 +111,8 @@ pub struct Log {
     capabilities: Vec<Capability>,
     stuck: Option<Stuck>,
     browse: BrowseSettings,
+    /// How far behind the caller's clock the double stamps its events, in ms.
+    lag_ms: i64,
 }
 
 impl Log {
@@ -120,7 +122,14 @@ impl Log {
             capabilities,
             stuck: None,
             browse: BrowseSettings::default(),
+            lag_ms: 0,
         }
+    }
+
+    /// The double stamps its events `lag_ms` behind the caller's clock (a store on a clock of
+    /// its own).
+    pub fn lagging(self, lag_ms: i64) -> Log {
+        Log { lag_ms, ..self }
     }
 
     /// The browser reads these sources.
@@ -204,11 +213,16 @@ impl EventStore for Log {
                 state.spread % SEGMENTS
             }
         };
-        state.source(&event.source)[at].push(Record {
+        let segment = &mut state.source(&event.source)[at];
+        // Times rise within a segment (the browser's ranges rely on it), even if the wall clock
+        // steps back.
+        let now = kraken_messaging::time::now_ms() - self.lag_ms;
+        let timestamp_ms = segment.last().map_or(now, |r| r.timestamp_ms.max(now));
+        segment.push(Record {
             key: event.key.clone(),
             headers: event.headers.clone(),
             payload: event.payload.clone(),
-            timestamp_ms: kraken_messaging::time::now_ms(),
+            timestamp_ms,
         });
         Box::pin(std::future::ready(Ok(())))
     }
