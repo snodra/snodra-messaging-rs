@@ -187,6 +187,11 @@ impl DeadlineStore for MemorySagas {
                     deadline.id
                 )));
             }
+            // An empty correlation id is none (as the SQL store keeps it).
+            let deadline = DeadlineDocument {
+                correlation_id: deadline.correlation_id.clone().filter(|c| !c.is_empty()),
+                ..deadline.clone()
+            };
             data.deadlines.set(
                 overlay,
                 &mut data.version,

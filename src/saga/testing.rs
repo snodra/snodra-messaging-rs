@@ -902,7 +902,11 @@ impl DeadlineStore for InMemorySagaStore {
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         let mut data = self.data();
         data.deadlines.retain(|d| d.id != deadline.id);
-        data.deadlines.push(deadline.clone());
+        // An empty correlation id is none, as in every store.
+        data.deadlines.push(DeadlineDocument {
+            correlation_id: deadline.correlation_id.clone().filter(|c| !c.is_empty()),
+            ..deadline.clone()
+        });
         ready(Ok(()))
     }
 

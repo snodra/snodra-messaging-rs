@@ -228,7 +228,8 @@ impl From<&DeadlineDocument> for DeadlineDoc {
             claimed_by: d.claimed_by.clone(),
             claimed_until: d.claimed_until_ms.map(date),
             finished_at: d.finished_at_ms.map(date),
-            correlation_id: d.correlation_id.clone(),
+            // An empty correlation id is none: left out, as the SQL store keeps it empty.
+            correlation_id: d.correlation_id.clone().filter(|c| !c.is_empty()),
         }
     }
 }
@@ -247,7 +248,7 @@ impl From<DeadlineDoc> for DeadlineDocument {
             claimed_by: d.claimed_by,
             claimed_until_ms: d.claimed_until.map(ms),
             finished_at_ms: d.finished_at.map(ms),
-            correlation_id: d.correlation_id,
+            correlation_id: d.correlation_id.filter(|c| !c.is_empty()),
         }
     }
 }

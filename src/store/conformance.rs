@@ -58,6 +58,7 @@
 //! | [`two_transactions_updating_one_saga_version_commit_once`] | **`concurrentUpdatesOfOneSagaLetOneWin`** |
 //! | [`saga_dispatch_store_refuses_an_event_the_outbox_would_refuse`] | **`sagaEventTheOutboxWouldRefuseIsNotRecorded`** |
 //! | [`due_deadline_is_claimed_once_until_its_lease_passes`] | **`dueDeadlinesAreClaimedOnceUntilTheirLeaseExpires`** |
+//! | [`an_empty_deadline_correlation_id_reads_as_absent`] | **none yet** |
 //! | [`two_schedulers_claim_each_due_deadline_once`] | **`concurrentDeadlineClaimsReturnEachDeadlineOnce`** |
 //! | [`dispatch_hands_out_each_saga_in_seq_order`] | **`sagaDispatchEntriesAreRelayedInOrderPerSaga`** and **`sagaDispatchLeaseIsExclusiveUntilItExpires`** (one check here) |
 //! | [`two_relays_never_hold_one_saga_lease`] | **`concurrentLeaseClaimsGrantOneOwner`** |
@@ -127,6 +128,7 @@ pub async fn run_store_conformance(store: Arc<dyn MessageStore>) {
         two_transactions_updating_one_saga_version_commit_once,
         saga_dispatch_store_refuses_an_event_the_outbox_would_refuse,
         due_deadline_is_claimed_once_until_its_lease_passes,
+        an_empty_deadline_correlation_id_reads_as_absent,
         two_schedulers_claim_each_due_deadline_once,
         dispatch_hands_out_each_saga_in_seq_order,
         two_relays_never_hold_one_saga_lease,
@@ -2369,6 +2371,63 @@ pub async fn due_deadline_is_claimed_once_until_its_lease_passes(store: &dyn Mes
     sagas
         .deadlines
         .cancel_all(&mut tx, &saga_id, far)
+        .await
+        .expect("cancel_all");
+    txs.commit(&mut tx).await.expect("commit");
+}
+
+/// A deadline written with an empty correlation id reads back without one (as with none), from
+/// `find_scheduled` and from `claim_due`: every store keeps the two the same, as the SQL schema
+/// (a non-null column, empty for none) must.
+pub async fn an_empty_deadline_correlation_id_reads_as_absent(store: &dyn MessageStore) {
+    let sagas = store.sagas();
+    let txs = store.tx();
+    let now = now_ms();
+    let saga_id = uuid::Uuid::new_v4().to_string();
+    let deadline = DeadlineDocument {
+        id: uuid::Uuid::new_v4().to_string(),
+        saga_type: "conformance.Deadlines".into(),
+        saga_id: saga_id.clone(),
+        name: format!("empty-{}", uuid::Uuid::new_v4().simple()),
+        payload: None,
+        payload_type: None,
+        due_at_ms: now - 1_000,
+        status: DeadlineStatus::Scheduled,
+        claimed_by: None,
+        claimed_until_ms: None,
+        finished_at_ms: None,
+        correlation_id: Some(String::new()),
+    };
+    let mut tx = txs.begin().await.expect("begin");
+    sagas
+        .deadlines
+        .insert(&mut tx, &deadline)
+        .await
+        .expect("insert");
+    txs.commit(&mut tx).await.expect("commit");
+    let mut tx = txs.begin().await.expect("begin");
+    let found = sagas
+        .deadlines
+        .find_scheduled(&mut tx, &deadline.id)
+        .await
+        .expect("find_scheduled")
+        .expect("the deadline is scheduled");
+    txs.commit(&mut tx).await.expect("commit");
+    assert_eq!(found.correlation_id, None, "find_scheduled: {found:?}");
+    let claimed = claim_mine(
+        &*sagas.deadlines,
+        "scheduler-empty",
+        now,
+        now + 30_000,
+        &saga_id,
+    )
+    .await
+    .expect("the deadline is due");
+    assert_eq!(claimed.correlation_id, None, "claim_due: {claimed:?}");
+    let mut tx = txs.begin().await.expect("begin");
+    sagas
+        .deadlines
+        .cancel_all(&mut tx, &saga_id, now)
         .await
         .expect("cancel_all");
     txs.commit(&mut tx).await.expect("commit");
