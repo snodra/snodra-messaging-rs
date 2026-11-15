@@ -9,7 +9,9 @@ use super::{EventStoreError, SegmentStatus, SubscriptionEvent};
 pub const FIRST_ASSIGNMENT_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// One instance's subscription of a processor ([`EventStore::subscribe`](super::EventStore::subscribe)):
-/// the segments the event store assigns it and their events, one at a time.
+/// the segments the event store assigns it and their events, one at a time. Not the
+/// [`kraken_messaging::Subscription`](crate::Subscription) at the crate root, which is an open
+/// subscription query to the hub.
 ///
 /// - **Driven by [`next`](Self::next).** Nothing is delivered until `next` is called, and the core
 ///   keeps calling it while paused: that keeps the subscription's membership alive and reports

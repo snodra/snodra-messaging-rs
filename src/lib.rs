@@ -1,8 +1,10 @@
 //! kraken messaging client for Rust: the counterpart of the Kotlin `kraken-messaging` starter.
 //!
 //! Wire- and storage-compatible with it: same hub protocol (`proto/hub.proto`), same events on the
-//! event store (an add-on, ADR 0027: `kraken-messaging-kafka`), same documents in the message store
-//! (an add-on, ADR 0028: `kraken-messaging-mongo`). See README.md.
+//! event store (an add-on, ADR 0027: `kraken-messaging-kafka` or `kraken-messaging-rabbitmq`; the
+//! in-memory [`event_store::memory`] for tests), same records in the message store (an add-on,
+//! ADR 0028: `kraken-messaging-mongo` or `kraken-messaging-sqlx` for PostgreSQL and MySQL; the
+//! in-memory [`store::memory`] for tests). See README.md.
 pub mod app;
 pub mod codec;
 pub mod config;
@@ -29,9 +31,10 @@ pub use app::{KrakenMessaging, KrakenMessagingBuilder};
 pub use config::Config;
 pub use context::MessageContext;
 pub use error::MessagingError;
-pub use hub::{
-    EventContext, QueryUpdateEmitter, SendOptions, StreamOptions, Subscription, SubscriptionOptions,
-};
+/// [`Subscription`] here is an open subscription query to the hub ([`hub::Subscription`]); a
+/// processor's subscription on the event store is [`event_store::Subscription`].
+pub use hub::Subscription;
+pub use hub::{EventContext, QueryUpdateEmitter, SendOptions, StreamOptions, SubscriptionOptions};
 pub use identity::{Guard, Identity};
 pub use retry::RetryPolicy;
 pub use saga::{FailureReason, SagaCommandFailed, SagaContext, SagaDefinition};
