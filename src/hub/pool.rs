@@ -86,7 +86,8 @@ use crate::security::HubTls;
 
 use super::auth::{AuthKind, AuthStatus};
 use super::connection::{
-    Hooks, HubConnection, HubRejection, HubSettings, Inbound, RegisteredTypes, StreamId, hub_id,
+    Hooks, HubConnection, HubRejection, HubSettings, Inbound, RegisteredTypes, Sequenced, StreamId,
+    hub_id,
 };
 use super::mtls::{self, ClientIdentity};
 use super::targets::{HubTargets, permit_share, rank_keyed, rank_round_robin, resolved_targets};
@@ -214,7 +215,7 @@ pub struct HubPool {
     /// Credential refreshes written to any hub (monotonic: members come and go).
     refreshes_sent: Arc<AtomicU64>,
     /// The newest refusal by any hub (kept: members come and go).
-    latest_rejection: Arc<Mutex<Option<HubRejection>>>,
+    latest_rejection: Arc<Mutex<Option<Sequenced>>>,
     changes: watch::Sender<u64>,
     /// The client certificate watch (mTLS only).
     certificate: Mutex<CertificateWatch>,
@@ -604,10 +605,15 @@ impl HubPool {
             return self
                 .members()
                 .iter()
-                .filter_map(|m| m.conn.latest_rejection())
-                .max_by_key(|r| r.at);
+                .filter_map(|m| m.conn.latest_rejection_sequenced())
+                .max_by_key(|(seq, _)| *seq)
+                .map(|(_, r)| r);
         }
-        self.latest_rejection.lock().unwrap().clone()
+        self.latest_rejection
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|(_, r)| r)
     }
 
     /// Requests that arrived on any hub and whose handler has not finished.

@@ -528,10 +528,17 @@ fn code_name(code: Code) -> String {
     }
 }
 
-/// Keeps `rejection` in `latest` unless `latest` holds a newer one.
-pub(crate) fn keep_newer(latest: &Mutex<Option<HubRejection>>, rejection: &HubRejection) {
+/// The order refusals happened in, over every connection of the process: monotonic, whatever the
+/// wall clock does (`HubRejection::at` is for display only).
+static REJECTION_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A refusal with its place in [`REJECTION_SEQ`].
+pub(crate) type Sequenced = (u64, HubRejection);
+
+/// Keeps `rejection` in `latest` unless `latest` holds a later one (by sequence).
+pub(crate) fn keep_newer(latest: &Mutex<Option<Sequenced>>, rejection: &Sequenced) {
     let mut latest = latest.lock().unwrap();
-    if latest.as_ref().is_none_or(|l| l.at <= rejection.at) {
+    if latest.as_ref().is_none_or(|(seq, _)| *seq < rejection.0) {
         *latest = Some(rejection.clone());
     }
 }
@@ -558,7 +565,7 @@ pub struct HubConnection {
     later_registers: watch::Sender<(StreamId, u64, u64)>,
     last_rejection: Mutex<Option<String>>,
     /// The newest refusal by the hub, kept after a later acceptance.
-    latest_rejection: Mutex<Option<HubRejection>>,
+    latest_rejection: Mutex<Option<Sequenced>>,
     /// The id of the hub the last handshaken stream registered with, kept once that stream ended.
     last_hub_id: Mutex<Option<String>>,
     /// The token resolved for the stream being opened (the last one read from `token_file`); what
@@ -668,7 +675,7 @@ pub(crate) struct Hooks {
     /// Also counts the credential refreshes written (all connections of the pool).
     pub refreshes_sent: Arc<AtomicU64>,
     /// Also keeps the newest refusal (all connections of the pool).
-    pub latest_rejection: Arc<Mutex<Option<HubRejection>>>,
+    pub latest_rejection: Arc<Mutex<Option<Sequenced>>>,
 }
 
 impl HubConnection {
@@ -835,6 +842,10 @@ impl HubConnection {
     /// newer refusal only); `None` while it never refused. A failure to get an access token is
     /// not a hub's refusal and is not kept here.
     pub fn latest_rejection(&self) -> Option<HubRejection> {
+        self.latest_rejection_sequenced().map(|(_, r)| r)
+    }
+
+    pub(crate) fn latest_rejection_sequenced(&self) -> Option<Sequenced> {
         self.latest_rejection.lock().unwrap().clone()
     }
 
@@ -847,7 +858,9 @@ impl HubConnection {
             description: Some(status.message().to_string()).filter(|m| !m.is_empty()),
             at: SystemTime::now(),
         };
-        keep_newer(&self.latest_rejection, &rejection);
+        let rejection = (REJECTION_SEQ.fetch_add(1, Ordering::SeqCst) + 1, rejection);
+        // This connection's own slot: always the one just recorded.
+        *self.latest_rejection.lock().unwrap() = Some(rejection.clone());
         if let Some(h) = self.hooks.get() {
             keep_newer(&h.latest_rejection, &rejection);
         }
@@ -1960,6 +1973,27 @@ fn describe(status: &Status) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The latest refusal is the one recorded last, whatever the wall clock says: a clock stepped
+    /// back between two refusals must not keep the older one.
+    #[test]
+    fn the_latest_rejection_follows_the_order_of_refusals_not_the_wall_clock() {
+        let refusal = |hub: &str, at: SystemTime| HubRejection {
+            hub: hub.into(),
+            code: "PERMISSION_DENIED".into(),
+            description: None,
+            at,
+        };
+        let now = SystemTime::now();
+        let slot = Mutex::new(None);
+        keep_newer(&slot, &(1, refusal("a", now)));
+        // Recorded later, stamped earlier (the clock went back).
+        keep_newer(&slot, &(2, refusal("b", now - Duration::from_secs(3600))));
+        assert_eq!(slot.lock().unwrap().as_ref().unwrap().1.hub, "b");
+        // An older one arriving late (a lower sequence) does not replace it.
+        keep_newer(&slot, &(1, refusal("a", now + Duration::from_secs(3600))));
+        assert_eq!(slot.lock().unwrap().as_ref().unwrap().1.hub, "b");
+    }
 
     #[test]
     fn target_forms() {
