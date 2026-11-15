@@ -37,8 +37,8 @@ pub fn new_outbox_entry<E: Event>(
         headers::USER_ID.to_string(),
         ctx.and_then(|c| c.user_id()).unwrap_or("").to_string(),
     );
-    if let Some(tp) = ctx.and_then(|c| c.headers.get(headers::TRACEPARENT)) {
-        hdrs.insert(headers::TRACEPARENT.to_string(), tp.clone());
+    if let Some(tp) = ctx.and_then(MessageContext::traceparent) {
+        hdrs.insert(headers::TRACEPARENT.to_string(), tp.to_string());
     }
     Ok(OutboxEntry {
         id: uuid::Uuid::new_v4().to_string(),

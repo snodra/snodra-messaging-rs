@@ -137,7 +137,10 @@ and publishing without one fails the same way.
 Sending: `app.commands().send_command(&cmd, SendOptions::default()).await?` and
 `app.queries().send_query(&q, SendOptions { routing_key, timeout, ..Default::default() })`. Inside a handler
 the caller's `correlationId` and bearer token are forwarded automatically (task-local
-`MessageContext::current()`).
+`MessageContext::current()`). So is the handled message's `traceparent` (the trace floor), on the requests sent and the
+events published while handling it, when it is a valid W3C one (version `00`, lower-case hex, neither id all zeros;
+anything else is dropped): a command or an event a saga dispatches carries the `traceparent` of the event that caused
+it (kept in the dispatch entry's headers); one sent by a deadline handler carries none (a deadline keeps no headers).
 
 ## Configuration (`Config::from_env`)
 

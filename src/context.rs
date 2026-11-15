@@ -52,6 +52,41 @@ impl MessageContext {
     pub fn current() -> Option<MessageContext> {
         CURRENT.try_with(|c| c.clone()).ok()
     }
+
+    /// The handled message's `traceparent` when it is a valid W3C one ([`valid_traceparent`]):
+    /// what the trace floor forwards on the requests and events sent while handling it.
+    pub fn traceparent(&self) -> Option<&str> {
+        self.headers
+            .get(hub_headers::TRACEPARENT)
+            .and_then(|tp| valid_traceparent(tp))
+    }
+}
+
+/// `value` when it is a valid W3C `traceparent` of version `00`: `00-<32 hex>-<16 hex>-<2 hex>`,
+/// lower case, neither the trace id nor the parent id all zeros. The trace floor forwards no
+/// other value (kraken-messaging's `Traceparents.valid`).
+pub fn valid_traceparent(value: &str) -> Option<&str> {
+    let hex = |part: &str, len: usize| {
+        part.len() == len && part.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    let zeros = |part: &str| part.bytes().all(|b| b == b'0');
+    let mut parts = value.split('-');
+    let (Some(version), Some(trace), Some(parent), Some(flags), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return None;
+    };
+    (version == "00"
+        && hex(trace, 32)
+        && hex(parent, 16)
+        && hex(flags, 2)
+        && !zeros(trace)
+        && !zeros(parent))
+    .then_some(value)
 }
 
 impl std::fmt::Debug for MessageContext {

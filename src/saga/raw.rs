@@ -130,11 +130,11 @@ impl LocalRawCommandSender {
             hub_headers::CORRELATION_ID.to_string(),
             correlation_id.clone(),
         );
-        if let Some(traceparent) = current
-            .as_ref()
-            .and_then(|c| c.headers.get(hub_headers::TRACEPARENT))
-        {
-            headers.insert(hub_headers::TRACEPARENT.to_string(), traceparent.clone());
+        if let Some(traceparent) = current.as_ref().and_then(MessageContext::traceparent) {
+            headers.insert(
+                hub_headers::TRACEPARENT.to_string(),
+                traceparent.to_string(),
+            );
         }
         // No identity and no token on purpose, whoever's handler this runs in.
         let ctx = MessageContext {

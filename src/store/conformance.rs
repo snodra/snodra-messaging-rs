@@ -1741,7 +1741,14 @@ pub async fn saga_ports_round_trip(store: &dyn MessageStore) {
         kind: DispatchKind::Command,
         type_name: "conformance.Charge".into(),
         payload: "{\"amount\":42}".into(),
-        headers: HashMap::from([("correlation-id".to_string(), "c-1".to_string())]),
+        // The saga runtime keeps the cause's correlation id and traceparent with an entry.
+        headers: HashMap::from([
+            ("correlation-id".to_string(), "c-1".to_string()),
+            (
+                "traceparent".to_string(),
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
+            ),
+        ]),
         routing_key: Some("o-1".into()),
         ..dispatch_entry(&saga.id, 1000, DispatchKind::Command, now)
     };

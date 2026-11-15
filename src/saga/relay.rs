@@ -55,10 +55,11 @@ use super::failed::{FailureReason, SagaCommandFailed};
 use super::metrics::SagaMetrics;
 use super::ports::{DispatchFailure, SagaDispatchStore};
 use super::raw::{RawCommandSender, RawOutcome};
-use super::runtime::DISPATCH_CORRELATION_HEADER;
+use super::runtime::{DISPATCH_CORRELATION_HEADER, DISPATCH_TRACEPARENT_HEADER};
 use super::store::{DispatchKind, SagaDispatchDocument};
-use crate::context::{CURRENT, MessageContext};
+use crate::context::{CURRENT, MessageContext, valid_traceparent};
 use crate::error::MessagingError;
+use crate::event_store::headers;
 use crate::events::{EventBus, LocalEventDispatcher, dispatch::Outcome};
 use crate::hub::SendOptions;
 use crate::retry::RetryPolicy;
@@ -356,7 +357,19 @@ impl SagaDispatchRelay {
             &entry.payload,
             &correlation,
         ) {
-            Ok(outbox) => outbox,
+            // Published in the trace of the event that caused it.
+            Ok(mut outbox) => {
+                if let Some(tp) = entry
+                    .headers
+                    .get(DISPATCH_TRACEPARENT_HEADER)
+                    .and_then(|tp| valid_traceparent(tp))
+                {
+                    outbox
+                        .headers
+                        .insert(headers::TRACEPARENT.to_string(), tp.to_string());
+                }
+                outbox
+            }
             // The payload can never become an outbox entry: retrying would hold back the saga's
             // later entries forever, so the entry fails for good (ruling 69).
             Err(e) => return self.fail_event(entry, &e.to_string()).await,
@@ -447,7 +460,10 @@ impl SagaDispatchRelay {
         let mut headers: HashMap<String, String> = entry
             .headers
             .iter()
-            .filter(|(k, _)| k.as_str() != DISPATCH_CORRELATION_HEADER)
+            .filter(|(k, _)| {
+                k.as_str() != DISPATCH_CORRELATION_HEADER
+                    && k.as_str() != DISPATCH_TRACEPARENT_HEADER
+            })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         headers.insert("idempotency-key".into(), entry.id.clone());
@@ -458,10 +474,17 @@ impl SagaDispatchRelay {
             headers,
             ..Default::default()
         };
-        // The correlation id of the message that caused the entry is the request's correlation;
+        // The correlation id of the message that caused the entry is the request's correlation,
+        // and its traceparent the request's trace (never a header of the send's own: reserved);
         // nothing else of a caller (no identity, no token) is in scope.
         let ctx = MessageContext {
             correlation_id: correlation,
+            headers: entry
+                .headers
+                .get(DISPATCH_TRACEPARENT_HEADER)
+                .and_then(|tp| valid_traceparent(tp))
+                .map(|tp| HashMap::from([(headers::TRACEPARENT.to_string(), tp.to_string())]))
+                .unwrap_or_default(),
             ..Default::default()
         };
         let send = CURRENT.scope(

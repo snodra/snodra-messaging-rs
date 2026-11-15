@@ -1753,11 +1753,8 @@ impl Sender {
         if let Some(auth) = authorization {
             headers.insert(hub_headers::AUTHORIZATION.to_string(), auth);
         }
-        if let Some(tp) = current
-            .as_ref()
-            .and_then(|c| c.headers.get(hub_headers::TRACEPARENT))
-        {
-            headers.insert(hub_headers::TRACEPARENT.to_string(), tp.clone());
+        if let Some(tp) = current.as_ref().and_then(MessageContext::traceparent) {
+            headers.insert(hub_headers::TRACEPARENT.to_string(), tp.to_string());
         }
         headers
     }

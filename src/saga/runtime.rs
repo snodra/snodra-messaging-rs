@@ -51,6 +51,8 @@ use crate::types::MessageType;
 /// The header of a `saga_dispatch` entry that carries the correlation id of the message that
 /// caused it.
 pub(crate) const DISPATCH_CORRELATION_HEADER: &str = "correlation-id";
+/// The header of a dispatch entry that keeps the causing event's valid W3C `traceparent`.
+pub(crate) const DISPATCH_TRACEPARENT_HEADER: &str = "traceparent";
 
 const MAX_ERROR_LENGTH: usize = 2000;
 
@@ -989,10 +991,7 @@ fn plan(
                 kind: d.kind,
                 type_name: d.type_name.to_string(),
                 payload: d.payload,
-                headers: HashMap::from([(
-                    DISPATCH_CORRELATION_HEADER.to_string(),
-                    ctx.correlation_id.clone(),
-                )]),
+                headers: dispatch_headers(ctx),
                 routing_key: d.routing_key,
                 created_at_ms: now_ms,
                 dispatched_at_ms: None,
@@ -1042,6 +1041,20 @@ fn plan(
         deadlines,
         created: doc.is_none(),
     }
+}
+
+/// The headers of a dispatch entry: the correlation id of the message that caused it and, when
+/// that message carried a valid one, its `traceparent` (the trace floor: the relay sends the
+/// command, or publishes the event, in that trace).
+fn dispatch_headers(ctx: &MessageContext) -> HashMap<String, String> {
+    let mut headers = HashMap::from([(
+        DISPATCH_CORRELATION_HEADER.to_string(),
+        ctx.correlation_id.clone(),
+    )]);
+    if let Some(tp) = ctx.traceparent() {
+        headers.insert(DISPATCH_TRACEPARENT_HEADER.to_string(), tp.to_string());
+    }
+    headers
 }
 
 /// The headers kept with a parked event: enough to rebuild its message context.

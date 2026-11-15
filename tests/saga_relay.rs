@@ -270,6 +270,8 @@ struct Call {
     payload: String,
     headers: HashMap<String, String>,
     correlation_id: Option<String>,
+    /// The `traceparent` of the context the send ran in.
+    traceparent: Option<String>,
     retry: Option<RetryPolicy>,
     has_authorization: bool,
 }
@@ -324,6 +326,9 @@ impl RawCommandSender for ScriptedSender {
                 payload: String::from_utf8(payload).unwrap(),
                 headers: options.headers,
                 correlation_id: current.as_ref().map(|c| c.correlation_id.clone()),
+                traceparent: current
+                    .as_ref()
+                    .and_then(|c| c.headers.get("traceparent").cloned()),
                 retry: options.retry,
                 has_authorization: current.is_some_and(|c| c.authorization.is_some()),
             });
@@ -440,12 +445,17 @@ impl Rl {
     }
 
     async fn deliver<E: Event>(&self, event: &E, id: &str) {
+        self.deliver_with(event, id, &[]).await;
+    }
+
+    /// [`deliver`](Self::deliver) with these headers on the event besides `id` and `type`.
+    async fn deliver_with<E: Event>(&self, event: &E, id: &str, headers: &[(&str, &str)]) {
         use kraken_messaging::events::SagaStage;
         self.runtime
             .process(
                 E::TYPE,
                 &serde_json::to_vec(event).unwrap(),
-                &event_ctx(id, E::TYPE, &[]),
+                &event_ctx(id, E::TYPE, headers),
             )
             .await
             .unwrap();
@@ -942,6 +952,112 @@ async fn a_command_carries_the_idempotency_key_the_saga_id_and_the_correlation_i
         !call.has_authorization,
         "a saga command carries no caller identity"
     );
+}
+
+const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+/// The trace floor: a command a saga dispatches is sent in the trace of the event that caused it
+/// (its valid `traceparent`, kept in the dispatch entry's headers), never as a header of its own
+/// (`traceparent` is reserved); an invalid one is not kept.
+#[tokio::test]
+async fn a_saga_command_carries_the_traceparent_of_its_cause_a_valid_one_only() {
+    let rl = Rl::start().await;
+    rl.deliver_with(
+        &Start {
+            order_id: "o1".into(),
+        },
+        "cause-1",
+        &[("traceparent", TRACEPARENT)],
+    )
+    .await;
+    rl.deliver_with(
+        &Start {
+            order_id: "o2".into(),
+        },
+        "cause-2",
+        &[("traceparent", "not-a-traceparent")],
+    )
+    .await;
+    let entry = |order: &str| {
+        let rl = &rl;
+        let order = order.to_string();
+        async move {
+            let saga = rl.saga_of("rl.Order", &order).await;
+            rl.store.dispatch_of(&saga.id).await.remove(0)
+        }
+    };
+    assert_eq!(
+        entry("o1")
+            .await
+            .headers
+            .get("traceparent")
+            .map(String::as_str),
+        Some(TRACEPARENT),
+        "kept with the entry"
+    );
+    assert_eq!(entry("o2").await.headers.get("traceparent"), None);
+
+    rl.relay().poll_once().await.unwrap();
+    rl.relay().poll_once().await.unwrap();
+
+    let calls = rl.sender.calls();
+    assert_eq!(calls.len(), 2);
+    let of = |r: &str| {
+        calls
+            .iter()
+            .find(|c| c.payload.contains(r))
+            .unwrap_or_else(|| panic!("no call for {r}"))
+    };
+    assert_eq!(of("o1").traceparent.as_deref(), Some(TRACEPARENT));
+    assert_eq!(of("o2").traceparent, None);
+    assert!(
+        calls.iter().all(|c| !c.headers.contains_key("traceparent")),
+        "never a header of the send's own (reserved)"
+    );
+}
+
+/// An event a saga publishes carries the `traceparent` recorded with its dispatch entry.
+#[tokio::test]
+async fn a_saga_event_carries_the_traceparent_recorded_with_it() {
+    let rl = Rl::start().await;
+    rl.store.edit(|c| {
+        c.dispatch.push(SagaDispatchDocument {
+            id: "s1:1000".into(),
+            saga_id: "s1".into(),
+            seq: 1000,
+            kind: DispatchKind::Event,
+            type_name: "rl.Announced".into(),
+            payload: r#"{"orderId":"o1"}"#.into(),
+            headers: HashMap::from([
+                ("correlation-id".to_string(), "corr-s1".to_string()),
+                ("traceparent".to_string(), TRACEPARENT.to_string()),
+            ]),
+            routing_key: None,
+            created_at_ms: rl.store.clock.clock().now_ms(),
+            dispatched_at_ms: None,
+            attempts: 0,
+            next_attempt_at_ms: None,
+            failed_at_ms: None,
+            failure_reason: None,
+            failure_message: None,
+            notice_pending: None,
+            notice_attempts: None,
+            notice_next_at_ms: None,
+        })
+    });
+
+    rl.relay().poll_once().await.unwrap();
+
+    let outbox: Vec<OutboxDocument> = rl
+        .store
+        .outbox()
+        .await
+        .into_iter()
+        .map(outbox_document)
+        .collect();
+    assert_eq!(outbox.len(), 1);
+    assert_eq!(outbox[0].headers["traceparent"], TRACEPARENT);
+    assert_eq!(outbox[0].headers["correlationId"], "corr-s1");
 }
 
 #[tokio::test]

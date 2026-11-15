@@ -90,14 +90,41 @@ fn document_takes_correlation_and_user_from_context() {
             roles: vec![],
             verified: true,
         }),
-        headers: HashMap::from([("traceparent".to_string(), "00-abc-def-01".to_string())]),
+        headers: HashMap::from([("traceparent".to_string(), TRACEPARENT.to_string())]),
         ..Default::default()
     };
     let doc = new_outbox_entry(&event(), None, Some(&ctx), 1).unwrap();
     assert_eq!(doc.headers.get("correlationId").unwrap(), "c-7");
     assert_eq!(doc.headers.get("userId").unwrap(), "u-7");
-    assert_eq!(doc.headers.get("traceparent").unwrap(), "00-abc-def-01");
+    assert_eq!(doc.headers.get("traceparent").unwrap(), TRACEPARENT);
     assert_eq!(doc.key, None);
+}
+
+const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+/// The trace floor forwards only a valid W3C `traceparent` (version `00`, lower-case hex,
+/// neither id all zeros), as kraken-messaging does: anything else is dropped.
+#[test]
+fn only_a_valid_w3c_traceparent_is_forwarded() {
+    let invalid = [
+        "00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-01", // upper case
+        "00-00000000000000000000000000000000-00f067aa0ba902b7-01", // trace id all zeros
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01", // parent id all zeros
+        "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", // another version
+        "00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01",  // short trace id
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0g", // not hex
+        "garbage",
+        "",
+    ];
+    for value in invalid {
+        let ctx = MessageContext {
+            headers: HashMap::from([("traceparent".to_string(), value.to_string())]),
+            ..Default::default()
+        };
+        let doc = new_outbox_entry(&event(), None, Some(&ctx), 1).unwrap();
+        assert_eq!(doc.headers.get("traceparent"), None, "{value:?}");
+    }
 }
 
 fn registry_with_happened() -> HandlerRegistry {
