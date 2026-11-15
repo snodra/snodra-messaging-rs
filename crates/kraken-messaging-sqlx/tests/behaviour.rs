@@ -1,0 +1,691 @@
+//! The SQL store's behaviour beyond the kit, on both databases, as kraken-messaging-jdbc's tests
+//! pin it: the service's transaction, the bounds, the schema, the purge, and the concurrency the
+//! MySQL lock rules are there for.
+
+#![cfg(all(feature = "postgres", feature = "mysql"))]
+
+mod support;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use kraken_messaging::Config;
+use kraken_messaging::error::MessagingError;
+use kraken_messaging::saga::store::{Association, SagaDocument, SagaFailureDocument};
+use kraken_messaging::store::{
+    DeadLetter, DeadLetterError, DeadLetterReason, Locked, MessageStore, OutboxEntry,
+    ProcessedMarker, StoreError, Tx,
+};
+use kraken_messaging::time::now_ms;
+use kraken_messaging_sqlx::{SqlxSettings, SqlxStore, SqlxTxExt};
+use support::{Kind, Raw, Server};
+
+fn entry(id: &str) -> OutboxEntry {
+    OutboxEntry {
+        id: id.into(),
+        type_name: "t.Happened".into(),
+        key: None,
+        headers: HashMap::new(),
+        payload: br#"{"n":1}"#.to_vec(),
+        created_at_ms: now_ms(),
+        seq: 1,
+        attempts: 0,
+    }
+}
+
+fn marker(id: &str) -> ProcessedMarker {
+    ProcessedMarker {
+        id: id.into(),
+        type_name: "t.Happened".into(),
+        processed_at_ms: now_ms(),
+        processor: None,
+        source: None,
+        segment: None,
+        position: None,
+    }
+}
+
+fn saga(id: &str, key: &str) -> SagaDocument {
+    SagaDocument {
+        id: id.into(),
+        type_name: "t.Order".into(),
+        state: "{}".into(),
+        associations: vec![Association::new("orderId", key)],
+        start_key: Some(format!("t.Order|orderId={key}")),
+        ended: false,
+        ended_at_ms: None,
+        version: 0,
+        created_at_ms: now_ms(),
+        updated_at_ms: now_ms(),
+    }
+}
+
+fn is_invalid(r: &Result<impl std::fmt::Debug, StoreError>) -> bool {
+    matches!(
+        r,
+        Err(StoreError::Failed(MessagingError::InvalidMessage(_)))
+    )
+}
+
+/// A business row written in the handler's transaction (`SqlxTxExt`) and the outbox row commit
+/// together and roll back together; a dropped transaction leaves nothing; a write once the
+/// transaction ended commits on its own; another store's transaction is refused.
+async fn transactions_with_the_service(kind: Kind) {
+    let server = Server::of(kind).await;
+    let (store, raw) = server.store().await;
+    raw.exec("CREATE TABLE orders (id VARCHAR(64) NOT NULL PRIMARY KEY)")
+        .await;
+    let txs = store.tx();
+    let outbox = store.outbox();
+    let order = async |tx: &mut Tx, id: &str| match kind {
+        Kind::Postgres => {
+            sqlx::query("INSERT INTO orders (id) VALUES ($1)")
+                .bind(id)
+                .execute(&mut **tx.transaction::<sqlx::Postgres>())
+                .await
+                .unwrap();
+        }
+        Kind::MySql => {
+            sqlx::query("INSERT INTO orders (id) VALUES (?)")
+                .bind(id)
+                .execute(&mut **tx.transaction::<sqlx::MySql>())
+                .await
+                .unwrap();
+        }
+    };
+    let both = async |raw: &Raw, id: &str| {
+        (
+            raw.rows(&format!("SELECT id FROM orders WHERE id = '{id}'"))
+                .await
+                .len(),
+            raw.rows(&format!("SELECT id FROM kraken_outbox WHERE id = '{id}'"))
+                .await
+                .len(),
+        )
+    };
+
+    let mut tx = txs.begin().await.unwrap();
+    order(&mut tx, "o-commit").await;
+    outbox.append(&mut tx, entry("o-commit")).await.unwrap();
+    assert_eq!(
+        both(&raw, "o-commit").await,
+        (0, 0),
+        "nothing visible before the commit"
+    );
+    txs.commit(&mut tx).await.unwrap();
+    assert_eq!(both(&raw, "o-commit").await, (1, 1), "committed together");
+
+    let mut tx = txs.begin().await.unwrap();
+    order(&mut tx, "o-abort").await;
+    outbox.append(&mut tx, entry("o-abort")).await.unwrap();
+    txs.abort(&mut tx).await;
+    assert_eq!(both(&raw, "o-abort").await, (0, 0), "rolled back together");
+
+    {
+        let mut tx = txs.begin().await.unwrap();
+        order(&mut tx, "o-drop").await;
+        outbox.append(&mut tx, entry("o-drop")).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        both(&raw, "o-drop").await,
+        (0, 0),
+        "a dropped transaction leaves nothing"
+    );
+
+    let mut tx = txs.begin().await.unwrap();
+    txs.commit(&mut tx).await.unwrap();
+    outbox.append(&mut tx, entry("o-after")).await.unwrap();
+    assert_eq!(
+        both(&raw, "o-after").await,
+        (0, 1),
+        "after the commit: on its own"
+    );
+    assert!(
+        tx.try_transaction::<sqlx::Postgres>().is_none()
+            && tx.try_transaction::<sqlx::MySql>().is_none()
+    );
+
+    let mut foreign = Tx::new(String::from("another store's"));
+    let refused = outbox.append(&mut foreign, entry("o-foreign")).await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("not one of its own")),
+        "{refused:?}"
+    );
+}
+
+/// Each bound accepted at the bound (multi-byte characters) and refused one over it with nothing
+/// written; values without a bound (hashed) of 10 000 characters; U+0000 refused; free text cut
+/// to 16 KiB; trailing spaces matter (byte comparison).
+async fn bounds(kind: Kind) {
+    let server = Server::of(kind).await;
+    let (store, raw) = server.store().await;
+    let txs = store.tx();
+    let outbox = store.outbox();
+
+    for (field, ok, over) in [
+        ("an outbox id", "é".repeat(255), "é".repeat(256)),
+        ("an outbox id (4 bytes)", "😀".repeat(255), "😀".repeat(256)),
+    ] {
+        outbox
+            .append_now(entry(&ok))
+            .await
+            .unwrap_or_else(|e| panic!("{field}: {e}"));
+        assert!(
+            is_invalid(&outbox.append_now(entry(&over)).await),
+            "{field}"
+        );
+    }
+    let mut long_type = entry("e-type");
+    long_type.type_name = "t".repeat(256);
+    assert!(is_invalid(&outbox.append_now(long_type).await));
+    assert_eq!(
+        raw.count("kraken_outbox").await,
+        2,
+        "nothing written over a bound"
+    );
+
+    let control = store.processor_control();
+    control
+        .set_paused(&"😀".repeat(64), true, "local", now_ms())
+        .await
+        .unwrap();
+    assert!(is_invalid(
+        &control
+            .set_paused(&"😀".repeat(65), true, "local", now_ms())
+            .await
+    ));
+    assert_eq!(raw.count("kraken_processor_control").await, 1);
+
+    let letter = |processor: &str, source: &str, segment: &str, position: &str| DeadLetter {
+        id: kraken_messaging::store::letter_id(processor, source, segment, position),
+        processor: processor.into(),
+        source: source.into(),
+        segment: segment.into(),
+        position: position.into(),
+        key: Some("k".repeat(10_000)),
+        event_id: None,
+        event_type: None,
+        headers: Default::default(),
+        payload: b"{}".to_vec(),
+        reason: DeadLetterReason::HandlerFailed,
+        error: DeadLetterError::new("Storage", "down"),
+        blocked_by: None,
+        attempts: 1,
+        parked_at_ms: now_ms(),
+        last_attempt_at_ms: now_ms(),
+        expire_at_ms: now_ms() + 86_400_000,
+        replay: false,
+    };
+    let longest = letter(
+        &"p".repeat(64),
+        &"s".repeat(255),
+        &"1".repeat(128),
+        &"2".repeat(128),
+    );
+    assert_eq!(longest.id.chars().count(), 578);
+    store.dead_letters().park(&longest).await.unwrap();
+    assert!(is_invalid(
+        &store
+            .dead_letters()
+            .park(&letter("p", &"s".repeat(256), "1", "2"))
+            .await
+    ));
+    assert_eq!(
+        store
+            .dead_letters()
+            .head(&"p".repeat(64), &"k".repeat(10_000))
+            .await
+            .unwrap(),
+        Some(longest.id.clone()),
+        "a 10 000-character key, found by its hash"
+    );
+
+    // Unbounded values go through their hashes.
+    let long = "m".repeat(10_000);
+    let mut tx = txs.begin().await.unwrap();
+    assert!(
+        store
+            .processed_events()
+            .record(&mut tx, &marker(&long))
+            .await
+            .unwrap()
+    );
+    let mut started = saga("s-long", &"v".repeat(10_000));
+    started.start_key = Some(format!("t.Order|orderId={}", "v".repeat(10_000)));
+    store.sagas().sagas.insert(&mut tx, &started).await.unwrap();
+    txs.commit(&mut tx).await.unwrap();
+    assert!(store.processed_events().exists(&long).await.unwrap());
+    let mut tx = Tx::none();
+    assert_eq!(
+        store
+            .sagas()
+            .sagas
+            .find_live(&mut tx, "t.Order", "orderId", &"v".repeat(10_000))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let call = kraken_messaging::store::ExternalCall {
+        key: "i".repeat(10_000),
+        status: kraken_messaging::store::ExternalCallStatus::Succeeded,
+        reply: Some("{}".into()),
+        error: None,
+        attempts: 1,
+        updated_at_ms: now_ms(),
+        lease_until_ms: None,
+        owner: None,
+    };
+    assert!(store.external_calls().insert(&call).await.unwrap());
+    assert!(!store.external_calls().insert(&call).await.unwrap(), "once");
+
+    // U+0000.
+    assert!(is_invalid(&outbox.append_now(entry("e\0")).await));
+    let mut nul_header = entry("e-h");
+    nul_header.headers.insert("k".into(), "a\0".into());
+    assert!(is_invalid(&outbox.append_now(nul_header).await));
+    let mut nul_payload = entry("e-p");
+    nul_payload.payload = br#"{"s":"a\u0000"}"#.to_vec();
+    assert!(is_invalid(&outbox.append_now(nul_payload).await));
+    let mut tx = txs.begin().await.unwrap();
+    assert!(is_invalid(
+        &store
+            .processed_events()
+            .record(&mut tx, &marker("m\0"))
+            .await
+    ));
+    let mut nul_state = saga("s-nul", "n-1");
+    nul_state.state = "{\"a\":\"\0\"}".into();
+    assert!(is_invalid(
+        &store.sagas().sagas.insert(&mut tx, &nul_state).await
+    ));
+    let mut nul_assoc = saga("s-nul2", "n-2");
+    nul_assoc.associations = vec![Association::new("orderId", "a\0")];
+    assert!(is_invalid(
+        &store.sagas().sagas.insert(&mut tx, &nul_assoc).await
+    ));
+    txs.abort(&mut tx).await;
+
+    // Free text cut to 16 KiB of UTF-8.
+    outbox.append_now(entry("e-cut")).await.unwrap();
+    outbox
+        .mark_failed("e-cut", &"é".repeat(10_000))
+        .await
+        .unwrap();
+    let error = raw
+        .row("SELECT last_error FROM kraken_outbox WHERE id = 'e-cut'")
+        .await[0]
+        .clone()
+        .unwrap();
+    assert_eq!(error.len(), 16_384);
+
+    // Trailing spaces and case: different values.
+    for id in ["e-1", "e-1 ", "E-1"] {
+        outbox.append_now(entry(id)).await.unwrap();
+    }
+    let mut tx = txs.begin().await.unwrap();
+    for id in ["m-1", "m-1 "] {
+        assert!(
+            store
+                .processed_events()
+                .record(&mut tx, &marker(id))
+                .await
+                .unwrap(),
+            "{id:?}"
+        );
+    }
+    txs.commit(&mut tx).await.unwrap();
+    for p in ["p-1", "p-1 "] {
+        control
+            .set_paused(p, true, "local", now_ms())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        raw.rows("SELECT processor FROM kraken_processor_control WHERE processor LIKE 'p-1%'")
+            .await
+            .len(),
+        2
+    );
+}
+
+/// Instances starting together apply the schema once; a database at V1 is only read; the file
+/// re-runs over itself; a later version is accepted; with init off a missing schema fails the
+/// startup, naming the file; the server checks.
+async fn schema(kind: Kind) {
+    let server = Server::of(kind).await;
+    let url = server.database().await;
+    let (a, raw) = server.open(&url, SqlxSettings::default()).await;
+    let (b, _) = server.open(&url, SqlxSettings::default()).await;
+    let refused = a.require_schema().await.unwrap_err().to_string();
+    assert!(
+        refused.contains("schema is at version 0, it needs 1 or later")
+            && refused.contains(&format!(
+                "db/kraken/{}/V1__kraken.sql",
+                if kind == Kind::Postgres {
+                    "postgresql"
+                } else {
+                    "mysql"
+                }
+            )),
+        "{refused}"
+    );
+    let (ra, rb) = tokio::join!(a.apply_schema(), b.apply_schema());
+    ra.unwrap();
+    rb.unwrap();
+    assert_eq!(
+        raw.rows("SELECT CAST(version AS {text}) FROM kraken_schema")
+            .await
+            .len(),
+        1
+    );
+    a.apply_schema().await.unwrap();
+    a.require_schema().await.unwrap();
+    // The file runs again over itself.
+    let script = match kind {
+        Kind::Postgres => kraken_messaging_sqlx::schema::POSTGRESQL_V1,
+        Kind::MySql => kraken_messaging_sqlx::schema::MYSQL_V1,
+    };
+    raw.exec(script).await;
+    raw.exec("INSERT INTO kraken_schema (version) VALUES (2)")
+        .await;
+    a.require_schema()
+        .await
+        .expect("a later version is accepted");
+    a.apply_schema().await.expect("and only read");
+
+    // init off at startup: the core asks the store to check.
+    let empty = server.database().await;
+    let (fresh, _) = server.open(&empty, SqlxSettings::default()).await;
+    let mut config = Config::new("schema-check", "static://127.0.0.1:1");
+    config.hub_enabled = false;
+    config.outbox_enabled = false;
+    config.store_init_schema = false;
+    let started = kraken_messaging::KrakenMessaging::builder(config)
+        .await
+        .unwrap()
+        .store(Arc::new(fresh))
+        .start()
+        .await;
+    assert!(
+        started
+            .err()
+            .is_some_and(|e| e.to_string().contains("schema is at version 0")),
+        "a missing schema fails the startup"
+    );
+
+    // A pool of one connection is refused.
+    let single = match kind {
+        Kind::Postgres => SqlxStore::postgres(
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .unwrap(),
+        ),
+        Kind::MySql => SqlxStore::mysql(
+            sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .unwrap(),
+        ),
+    };
+    let refused = single.require_schema().await.unwrap_err().to_string();
+    assert!(refused.contains("at least 2"), "{refused}");
+
+    if kind == Kind::MySql {
+        let lax = SqlxStore::mysql(
+            sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(2)
+                .after_connect(|c, _| {
+                    Box::pin(async move {
+                        sqlx::raw_sql("SET SESSION sql_mode = 'NO_ENGINE_SUBSTITUTION'")
+                            .execute(c)
+                            .await
+                            .map(|_| ())
+                    })
+                })
+                .connect(&url)
+                .await
+                .unwrap(),
+        );
+        let refused = lax.apply_schema().await.unwrap_err().to_string();
+        assert!(refused.contains("strict sql_mode"), "{refused}");
+    }
+}
+
+/// Every table's retention, nothing pending or live purged.
+async fn purge(kind: Kind) {
+    let server = Server::of(kind).await;
+    let (store, raw) = server.store().await;
+    let old = raw.at("2020-01-01 00:00:00.000");
+    let fresh_text = chrono::Utc::now()
+        .format("%Y-%m-%d %H:%M:%S%.3f")
+        .to_string();
+    let fresh = raw.at(&fresh_text);
+    let future = raw.at("2100-01-01 00:00:00.000");
+    // Each old row goes; the pending, live, scheduled, fresh and held ones stay.
+    for sql in [
+        format!("INSERT INTO kraken_outbox (id, type, headers, payload, created_at, seq, attempts, sent_at) VALUES ('o-old', 't', CAST('{{}}' AS {{json}}), CAST('{{}}' AS {{json}}), {old}, 1, 0, {old})"),
+        format!("INSERT INTO kraken_outbox (id, type, headers, payload, created_at, seq, attempts) VALUES ('o-pending', 't', CAST('{{}}' AS {{json}}), CAST('{{}}' AS {{json}}), {old}, 1, 0)"),
+        format!("INSERT INTO kraken_outbox (id, type, headers, payload, created_at, seq, attempts, failed_at) VALUES ('o-failed', 't', CAST('{{}}' AS {{json}}), CAST('{{}}' AS {{json}}), {old}, 1, 0, {old})"),
+        format!("INSERT INTO kraken_processed_events (id_hash, id, type, processed_at) VALUES ('{}', 'm-old', 't', {old})", "a".repeat(64)),
+        format!("INSERT INTO kraken_processed_events (id_hash, id, type, processed_at) VALUES ('{}', 'm-new', 't', {fresh})", "b".repeat(64)),
+        format!("INSERT INTO kraken_external_calls (id_hash, id, status, attempts, updated_at) VALUES ('{}', 'c-old', 'SUCCEEDED', 1, {old})", "c".repeat(64)),
+        format!("INSERT INTO kraken_sagas (id, type, state, ended, ended_at, version, created_at, updated_at) VALUES ('s-ended', 't', '{{}}', TRUE, {old}, 1, {old}, {old})"),
+        format!("INSERT INTO kraken_sagas (id, type, state, ended, version, created_at, updated_at) VALUES ('s-live', 't', '{{}}', FALSE, 1, {old}, {old})"),
+        "INSERT INTO kraken_saga_associations (saga_id, idx, assoc_key, assoc_value, assoc_hash) VALUES ('s-ended', 0, 'k', 'v', 'h')".to_string(),
+        format!("INSERT INTO kraken_saga_dispatch (id, saga_id, seq, kind, type, payload, headers, created_at, attempts, dispatched_at) VALUES ('d-sent', 's', 1, 'EVENT', 't', '{{}}', CAST('{{}}' AS {{json}}), {old}, 0, {old})"),
+        format!("INSERT INTO kraken_saga_dispatch (id, saga_id, seq, kind, type, payload, headers, created_at, attempts, failed_at) VALUES ('d-failed', 's', 2, 'COMMAND', 't', '{{}}', CAST('{{}}' AS {{json}}), {old}, 0, {old})"),
+        format!("INSERT INTO kraken_saga_dispatch (id, saga_id, seq, kind, type, payload, headers, created_at, attempts) VALUES ('d-pending', 's', 3, 'COMMAND', 't', '{{}}', CAST('{{}}' AS {{json}}), {old}, 0)"),
+        format!("INSERT INTO kraken_saga_dispatch_leases (saga_id, owner, lease_until) VALUES ('s-gone', 'r', {old})"),
+        format!("INSERT INTO kraken_saga_dispatch_leases (saga_id, owner, lease_until) VALUES ('s-held', 'r', {future})"),
+        format!("INSERT INTO kraken_deadlines (id, saga_type, saga_id, name, due_at, correlation_id, status, finished_at) VALUES ('dl-fired', 't', 's', 'n', {old}, 'c', 'FIRED', {old})"),
+        format!("INSERT INTO kraken_deadlines (id, saga_type, saga_id, name, due_at, correlation_id, status) VALUES ('dl-scheduled', 't', 's', 'n', {old}, 'c', 'SCHEDULED')"),
+        format!("INSERT INTO kraken_saga_failures (id_hash, id, saga_type, event_id, event_type, payload, headers, error, attempts, first_failed_at, last_failed_at) VALUES ('{}', 'f', 't', 'e', 't', '{{}}', CAST('{{}}' AS {{json}}), 'x', 1, {old}, {old})", "f".repeat(64)),
+        format!("INSERT INTO kraken_dead_letters (id, processor, source, segment, position, headers, reason, error_type, error_message, attempts, parked_at, last_attempt_at, expire_at) VALUES ('l-expired', 'p', 's', '0', '1', CAST('{{}}' AS {{json}}), 'INVALID', 'x', 'x', 1, {old}, {old}, {old})"),
+        format!("INSERT INTO kraken_dead_letters (id, processor, source, segment, position, headers, reason, error_type, error_message, attempts, parked_at, last_attempt_at, expire_at) VALUES ('l-live', 'p', 's', '0', '2', CAST('{{}}' AS {{json}}), 'INVALID', 'x', 'x', 1, {old}, {old}, {future})"),
+    ] {
+        raw.exec(&sql).await;
+    }
+    let config = Config::new("purge", "static://127.0.0.1:1");
+    let purged = store.purge_expired(&config).await.unwrap();
+    assert_eq!(
+        purged, 10,
+        "outbox, marker, call, saga, 2 dispatch, lease, deadline, failure, letter"
+    );
+    for (table, left) in [
+        ("kraken_outbox", 2),
+        ("kraken_processed_events", 1),
+        ("kraken_external_calls", 0),
+        ("kraken_sagas", 1),
+        ("kraken_saga_associations", 0),
+        ("kraken_saga_dispatch", 1),
+        ("kraken_saga_dispatch_leases", 1),
+        ("kraken_deadlines", 1),
+        ("kraken_saga_failures", 0),
+        ("kraken_dead_letters", 1),
+    ] {
+        assert_eq!(raw.count(table).await, left, "{table}");
+    }
+    assert_eq!(store.purge_expired(&config).await.unwrap(), 0);
+}
+
+/// The MySQL lock rules (also run on PostgreSQL): an open claim does not hide another relay's
+/// entries; two locks of a new processor give one holder; starts of different keys held open
+/// together never conflict; takeovers of an expired lease give one owner; concurrent saves of
+/// one failure both succeed.
+async fn concurrency(kind: Kind) {
+    let server = Server::of(kind).await;
+    let (store, raw) = server.store().await;
+    let outbox = store.outbox();
+    for (i, id) in ["c-1", "c-2", "c-3"].into_iter().enumerate() {
+        let mut e = entry(id);
+        e.created_at_ms = now_ms() - 10_000 + i as i64;
+        outbox.append_now(e).await.unwrap();
+    }
+    // B holds c-1 (its send failed); another claimer's open transaction holds c-2.
+    let b = outbox
+        .claim("relay-b", Duration::from_secs(60), 1)
+        .await
+        .unwrap();
+    assert_eq!(b[0].id, "c-1");
+    let holder = match &raw {
+        Raw::Pg(p) => {
+            let mut t = p.begin().await.unwrap();
+            sqlx::raw_sql("SELECT id FROM kraken_outbox WHERE id = 'c-2' FOR UPDATE")
+                .execute(&mut *t)
+                .await
+                .unwrap();
+            Box::new(t) as Box<dyn std::any::Any + Send>
+        }
+        Raw::My(p) => {
+            let mut t = p.begin().await.unwrap();
+            sqlx::raw_sql("SELECT id FROM kraken_outbox WHERE id = 'c-2' FOR UPDATE")
+                .execute(&mut *t)
+                .await
+                .unwrap();
+            Box::new(t) as Box<dyn std::any::Any + Send>
+        }
+    };
+    let again = outbox
+        .claim("relay-b", Duration::from_secs(60), 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        again.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+        ["c-1", "c-3"],
+        "its own entry and the free one; the locked one skipped"
+    );
+    drop(holder);
+
+    let control = store.processor_control();
+    for round in 0..10 {
+        let p = format!("new-{round}");
+        let (x, y) = tokio::join!(
+            control.lock(&p, "op-x", now_ms() + 60_000, now_ms()),
+            control.lock(&p, "op-y", now_ms() + 60_000, now_ms())
+        );
+        let taken = [x.unwrap(), y.unwrap()]
+            .iter()
+            .filter(|l| **l == Locked::Taken)
+            .count();
+        assert_eq!(taken, 1, "round {round}: one holder");
+    }
+
+    let txs = store.tx();
+    let mut open = Vec::new();
+    for i in 0..16 {
+        let mut tx = txs.begin().await.unwrap();
+        store
+            .sagas()
+            .sagas
+            .insert(&mut tx, &saga(&format!("start-{i}"), &format!("key-{i}")))
+            .await
+            .unwrap_or_else(|e| panic!("start {i}: {e}"));
+        open.push(tx);
+    }
+    for mut tx in open {
+        txs.commit(&mut tx).await.unwrap();
+    }
+
+    let dispatch = store.sagas().dispatch;
+    for round in 0..40 {
+        let saga_id = format!("lease-{round}");
+        let now = now_ms();
+        if round < 20 {
+            assert!(
+                dispatch
+                    .claim_lease(&saga_id, "old", now - 120_000, now - 60_000)
+                    .await
+                    .unwrap()
+            );
+        }
+        let (x, y) = tokio::join!(
+            dispatch.claim_lease(&saga_id, "x", now, now + 60_000),
+            dispatch.claim_lease(&saga_id, "y", now, now + 60_000)
+        );
+        let owners = [x.unwrap(), y.unwrap()].iter().filter(|t| **t).count();
+        assert_eq!(owners, 1, "round {round}: one owner");
+    }
+
+    let failures = store.sagas().failures;
+    let failure = |attempts| SagaFailureDocument {
+        id: "t.Order:e-race".into(),
+        saga_type: "t.Order".into(),
+        event_id: "e-race".into(),
+        event_type: "t.E".into(),
+        payload: "{}".into(),
+        headers: HashMap::new(),
+        error: "x".into(),
+        attempts,
+        first_failed_at_ms: now_ms(),
+        last_failed_at_ms: now_ms(),
+    };
+    for round in 0..10 {
+        let id = format!("t.Order:e-race-{round}");
+        let one = SagaFailureDocument {
+            id: id.clone(),
+            ..failure(1)
+        };
+        let two = SagaFailureDocument {
+            id: id.clone(),
+            ..failure(2)
+        };
+        let save = async |doc: &SagaFailureDocument| {
+            let mut tx = txs.begin().await?;
+            failures.save(&mut tx, doc).await?;
+            txs.commit(&mut tx).await
+        };
+        let (x, y) = tokio::join!(save(&one), save(&two));
+        x.unwrap_or_else(|e| panic!("round {round}: {e}"));
+        y.unwrap_or_else(|e| panic!("round {round}: {e}"));
+        let (x, y) = tokio::join!(save(&two), save(&one));
+        x.unwrap_or_else(|e| panic!("re-save round {round}: {e}"));
+        y.unwrap_or_else(|e| panic!("re-save round {round}: {e}"));
+    }
+}
+
+macro_rules! both {
+    ($check:ident, $pg:ident, $my:ident) => {
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn $pg() {
+            $check(Kind::Postgres).await;
+        }
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn $my() {
+            $check(Kind::MySql).await;
+        }
+    };
+}
+
+both!(
+    transactions_with_the_service,
+    postgres_business_rows_and_the_outbox_commit_together,
+    mysql_business_rows_and_the_outbox_commit_together
+);
+both!(
+    bounds,
+    postgres_bounds_hashes_and_nul,
+    mysql_bounds_hashes_and_nul
+);
+both!(
+    schema,
+    postgres_schema_init_and_check,
+    mysql_schema_init_and_check
+);
+both!(
+    purge,
+    postgres_purge_keeps_what_is_pending_or_live,
+    mysql_purge_keeps_what_is_pending_or_live
+);
+both!(
+    concurrency,
+    postgres_concurrent_claims_and_starts,
+    mysql_concurrent_claims_and_starts
+);
