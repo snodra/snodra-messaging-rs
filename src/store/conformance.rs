@@ -102,7 +102,10 @@ pub async fn run_store_conformance(store: Arc<dyn MessageStore>) {
     let store = &*store;
     macro_rules! run {
         ($($check:ident),* $(,)?) => {
-            $( run_check(store.name(), stringify!($check), $check(store)).await; )*
+            // Each check on the heap: one state machine of every check, pinned on the caller's
+            // stack, leaves too little of it to a store whose driver recurses over a payload
+            // [`MAX_PAYLOAD_DEPTH`] deep (the MongoDB add-on in a debug build overflowed).
+            $( run_check(store.name(), stringify!($check), Box::pin($check(store))).await; )*
         };
     }
     run!(
