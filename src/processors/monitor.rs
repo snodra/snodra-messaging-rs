@@ -530,6 +530,20 @@ pub(crate) mod tests {
         ProcessorState::try_from(m.status_at(now).state).unwrap()
     }
 
+    /// An instance that loses every segment is running, idle, once the revocation is closed
+    /// by an empty assignment (the event-store contract), not starting.
+    #[test]
+    fn an_instance_left_without_segments_is_running_after_the_empty_assignment() {
+        let m = monitor();
+        let t0 = Instant::now();
+        m.assigned(&names(&["0", "1"]));
+        m.revoked(&names(&["0", "1"]));
+        assert_eq!(state(&m, t0), ProcessorState::ProcessorStarting);
+        m.assigned(&[]);
+        assert_eq!(state(&m, t0), ProcessorState::ProcessorRunning);
+        assert!(m.status_at(t0).segments.is_empty());
+    }
+
     #[test]
     fn the_gauges_read_the_status_one_state_at_one_and_only_known_lags() {
         use crate::metrics::test_meter::TestMeter;

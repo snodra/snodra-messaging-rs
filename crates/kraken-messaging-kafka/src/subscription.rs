@@ -200,11 +200,11 @@ impl ConsumerContext for SubscriptionContext {
                     tracing::warn!(topic = %shared.topic, "cannot pause the assigned partitions: {e}");
                 }
                 lock(&shared.assigned).extend(assigned.iter().copied());
-                if !assigned.is_empty() {
-                    shared.push(SubscriptionEvent::Assigned(
-                        assigned.iter().map(i32::to_string).collect(),
-                    ));
-                }
+                // Every assignment, an empty one included: it closes the rebalance (the
+                // event-store contract: a `Revoked` is always followed by an `Assigned`).
+                shared.push(SubscriptionEvent::Assigned(
+                    assigned.iter().map(i32::to_string).collect(),
+                ));
             }
             Rebalance::Revoke(tpl) => {
                 let revoked = partitions(tpl);

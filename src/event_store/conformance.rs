@@ -65,6 +65,8 @@ const WAIT: Duration = Duration::from_secs(60);
 const QUIET: Duration = Duration::from_secs(3);
 /// One turn of reading a subscription.
 const SLICE: Duration = Duration::from_millis(250);
+/// How long a check waits for the assignment change a joining instance may cause.
+const JOIN_WINDOW: Duration = Duration::from_secs(6);
 /// The type of the kit's events.
 const EVENT_TYPE: &str = "conformance.Event";
 
@@ -93,6 +95,7 @@ pub async fn run_event_store_conformance(
         same_key_arrives_in_publish_order,
         every_processor_gets_every_event,
         instances_share_a_processor,
+        an_instance_left_without_segments_closes_its_change,
         unacked_delivery_is_redelivered,
         redelivered_after_commit_is_skipped,
         paused_subscription_receives_nothing_and_resumes_in_place,
@@ -314,6 +317,71 @@ pub async fn instances_share_a_processor(kit: &EventStoreKit<'_>) {
     assert!(twice.is_empty(), "delivered to both instances: {twice:?}");
     a.close().await;
     b.close().await;
+}
+
+/// More instances than segments: instances join one at a time; after each join the segments
+/// are spread (none held twice, none by an instance holding more than its share, rounded up)
+/// and every instance's last assignment change closed (a
+/// `Revoked` followed by an `Assigned`, an empty one for an instance left without segments).
+/// The instances join until one that held segments holds none (or there are twice as many
+/// instances as segments, two more): that instance saw its revocation closed by `Assigned([])`,
+/// so the core reports it running, idle, never starting.
+pub async fn an_instance_left_without_segments_closes_its_change(kit: &EventStoreKit<'_>) {
+    let spec = kit.spec();
+    let first = kit.instance();
+    let mut readers = vec![Reader::join(&*first, &spec).await];
+    readers[0]
+        .until("the first instance holds segments", |r| {
+            !r.assigned.is_empty()
+        })
+        .await;
+    // Alone, it holds every segment (in time: an assignment may come in parts).
+    readers[0].pump(QUIET).await;
+    let all: BTreeSet<String> = readers[0].assigned.clone();
+    let mut stores = vec![first];
+    // Spread: every segment held once, none by an instance holding more than its share
+    // (rounded up), every change closed.
+    let settled = |readers: &[Reader]| {
+        let held: Vec<&String> = readers.iter().flat_map(|r| &r.assigned).collect();
+        let unique: BTreeSet<&String> = held.iter().copied().collect();
+        let share = all.len().div_ceil(readers.len());
+        held.len() == unique.len()
+            && unique.len() == all.len()
+            && readers
+                .iter()
+                .all(|r| r.assigned.len() <= share && !r.changing)
+    };
+    let mut emptied = false;
+    while !emptied && readers.len() < 2 * all.len() + 2 {
+        let store = kit.instance();
+        let revoked_before: usize = readers.iter().map(|r| r.revoked).sum();
+        readers.push(Reader::join(&*store, &spec).await);
+        stores.push(store);
+        // The join may move segments (a revocation somewhere) or leave the newcomer idle: wait
+        // for a revocation, at most a window, before checking the spread.
+        let deadline = Instant::now() + JOIN_WINDOW;
+        while readers.iter().map(|r| r.revoked).sum::<usize>() == revoked_before
+            && Instant::now() < deadline
+        {
+            futures::future::join_all(readers.iter_mut().map(|r| r.pump(SLICE))).await;
+        }
+        all_until(
+            &mut readers,
+            "the segments spread, every revocation closed by an assignment",
+            settled,
+        )
+        .await;
+        emptied = readers
+            .iter()
+            .any(|r| r.assigned.is_empty() && r.revoked > 0);
+    }
+    assert!(
+        readers.iter().any(|r| r.assigned.is_empty()),
+        "more instances than segments leave one without segments"
+    );
+    for r in readers {
+        r.close().await;
+    }
 }
 
 /// What a subscription did not acknowledge comes again: to the next subscription of the name after
@@ -1662,6 +1730,20 @@ impl Reader {
         if let Some(subscription) = self.subscription.take() {
             bounded(&format!("close {}", self.name), subscription.close()).await;
         }
+    }
+}
+
+/// Reads all of `readers` until `done`, at most [`WAIT`].
+async fn all_until(readers: &mut [Reader], what: &str, done: impl Fn(&[Reader]) -> bool) {
+    let deadline = Instant::now() + WAIT;
+    while !done(readers) {
+        assert!(
+            Instant::now() < deadline,
+            "{what} within {WAIT:?} (assigned {:?}, revocations {:?})",
+            readers.iter().map(|r| &r.assigned).collect::<Vec<_>>(),
+            readers.iter().map(|r| r.revoked).collect::<Vec<_>>()
+        );
+        futures::future::join_all(readers.iter_mut().map(|r| r.pump(SLICE))).await;
     }
 }
 
