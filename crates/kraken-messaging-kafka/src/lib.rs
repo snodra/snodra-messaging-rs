@@ -34,6 +34,11 @@
 //! replaces the earlier one, the environment's included. The fixed keys are set last, by the
 //! store itself.
 //!
+//! **Partitions**: the producer partitions keys as the Java client's default partitioner does
+//! (librdkafka `partitioner=murmur2_random`, [`DEFAULT_PARTITIONER`]), so one key from a Kotlin and
+//! a Rust publisher lands on one partition and keeps its order; a `partitioner` property
+//! (`KRAKEN_KAFKA_PROPERTY_PARTITIONER`) chooses another.
+//!
 //! **TLS** (`security.protocol=SSL` or `SASL_SSL`) needs the cargo feature `ssl` of this crate,
 //! which builds librdkafka with a vendored, statically linked OpenSSL (no system OpenSSL at run
 //! time, so a distroless image works). Without it, a configuration asking for TLS is refused when
@@ -61,7 +66,7 @@ mod subscription;
 pub use admin::KafkaAdmin;
 pub use browser::{BROWSER_GROUP_PREFIX, CLOSE_GRACE, KafkaBrowser, MAX_GROUPS, TO_SKEW};
 pub use external::{ExternalSource, FIXED_KEYS, KafkaExternalSource};
-pub use publish::SEND_TIMEOUT;
+pub use publish::{DEFAULT_PARTITIONER, SEND_TIMEOUT};
 pub use subscription::{KafkaSubscription, OFFSETS_REFRESH};
 
 /// The name this add-on reports as the processors' event store.

@@ -14,10 +14,18 @@ use crate::{KafkaConfig, failed};
 /// `delivery.timeout.ms` 30 s). A relay's lease must be longer.
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(40);
 
+/// The partitioner the producer uses unless a `partitioner` property names another: the Java
+/// client's default (murmur2 of the key, positive, modulo the partitions; a record without a key
+/// on a random partition), so a key lands on the partition a Kotlin publisher writes it to.
+/// librdkafka's own default (`consistent_random`) would put it elsewhere.
+pub const DEFAULT_PARTITIONER: &str = "murmur2_random";
+
 /// The idempotent producer, with the budget above: a broker restart must not exhaust a relay's
-/// attempts.
+/// attempts. Partitions keys as the Java client does ([`DEFAULT_PARTITIONER`]) unless the
+/// configuration sets `partitioner`.
 pub(crate) fn producer(config: &KafkaConfig) -> Result<FutureProducer, EventStoreError> {
     let mut client = rdkafka::config::ClientConfig::new();
+    client.set("partitioner", DEFAULT_PARTITIONER);
     for (k, v) in &config.producer() {
         client.set(k, v);
     }
