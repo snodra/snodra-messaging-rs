@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/*", "examples/service-c"]
+members = [".", "crates/*", "examples/service-c", "examples/orders-sql"]
 resolver = "3"
 
 [package]
