@@ -567,7 +567,8 @@ message Request {
   // Streaming and subscriptions: credits the sender grants before its first Flow.
   uint32 initial_credit = 11;
   // Scatter-gather: end after this many successful parts (0 = no limit). The answers of the
-  // remaining targets are dropped; the targets are not cancelled.
+  // remaining targets are dropped; a target already forwarded is sent a Cancel, one still queued
+  // leaves its queue.
   uint32 max_results = 12;
 }
 
@@ -639,7 +640,10 @@ message ReplyPart {
   // The service and instance that answered.
   string responder_service = 4;
   string responder_instance = 5;
-  // 0, 1, 2, ... in the order the hub sent the parts of this request.
+  // Scatter-gather: 0, 1, 2, ... in the order the hub sent the parts. Streaming: the handler's own
+  // number, 1, 2, 3, ... per request with no gap, relayed unchanged. Subscription: the hub's own,
+  // 1 for the initial result, then 2, 3, ... for the updates. A gap a sender sees in a stream or a
+  // subscription is a part the hub dropped.
   uint64 seq = 6;
 }
 
