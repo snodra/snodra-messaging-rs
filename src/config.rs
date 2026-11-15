@@ -938,7 +938,7 @@ const REMOVED_SETTINGS: [(&str, &str); 3] = [
     ("KRAKEN_KAFKA_TOPIC", "KRAKEN_EVENTS_SOURCE"),
     (
         "KRAKEN_KAFKA_DEAD_LETTER_MODE",
-        "KRAKEN_EVENTS_DEAD_LETTER_MODE (the value `topic` is now `event-store`)",
+        "KRAKEN_EVENTS_DEAD_LETTER_MODE, where `topic` is now `event-store`",
     ),
     (
         "KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS",
@@ -952,14 +952,14 @@ fn removed_settings(lookup: &impl Fn(&str) -> Option<String>) -> Result<(), Mess
     let set: Vec<String> = REMOVED_SETTINGS
         .iter()
         .filter(|(name, _)| lookup(name).is_some_and(|v| !v.trim().is_empty()))
-        .map(|(name, replacement)| format!("{name} (use {replacement})"))
+        .map(|(name, replacement)| format!("{name}: use {replacement}"))
         .collect();
     if set.is_empty() {
         return Ok(());
     }
     Err(MessagingError::InvalidMessage(format!(
-        "removed settings are set; they are no longer read, unset them: {}",
-        set.join(", ")
+        "removed settings are set; they are no longer read, unset them. {}",
+        set.join("; ")
     )))
 }
 
@@ -1982,6 +1982,13 @@ mod tests {
                 "{name} -> {replacement}: {message}"
             );
         }
+        assert_eq!(
+            message,
+            "removed settings are set; they are no longer read, unset them. \
+             KRAKEN_KAFKA_TOPIC: use KRAKEN_EVENTS_SOURCE; \
+             KRAKEN_KAFKA_DEAD_LETTER_MODE: use KRAKEN_EVENTS_DEAD_LETTER_MODE, where `topic` is now `event-store`; \
+             KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS: use KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS"
+        );
         // One alone is refused too; blank is unset.
         assert!(try_from(&[("KRAKEN_KAFKA_TOPIC", "t")]).is_err());
         assert!(try_from(&[("KRAKEN_KAFKA_TOPIC", " ")]).is_ok());
