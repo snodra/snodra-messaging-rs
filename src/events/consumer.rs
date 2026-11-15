@@ -983,7 +983,13 @@ fn dead_letter_event(
     let header = |name: &str| record.headers.get(name).cloned().unwrap_or_default();
     OutgoingEvent {
         source: dlt.to_string(),
-        id: header(headers::ID),
+        // No id (or a blank one): the record's position names it, as the Kotlin consumer does.
+        id: record
+            .headers
+            .get(headers::ID)
+            .filter(|id| !id.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| format!("{source}-{}-{}", record.segment, record.position)),
         type_name: header(headers::TYPE),
         key: record.key.clone(),
         headers: all,
@@ -1057,6 +1063,29 @@ mod tests {
         assert_eq!(h("kraken-dlt-original-topic"), "kraken.events");
         assert_eq!(h("kraken-dlt-original-partition"), "3");
         assert_eq!(h("kraken-dlt-original-offset"), "41");
+    }
+
+    /// A record without an `id` header (or a blank one) gets `<source>-<segment>-<position>` as
+    /// its dead-letter event's id, as the Kotlin consumer does; its headers stay as they were.
+    #[test]
+    fn a_dead_letter_event_of_a_record_without_an_id_is_named_by_its_position() {
+        for id in [None, Some(" ")] {
+            let mut record = delivery();
+            match id {
+                None => record.headers.remove("id"),
+                Some(blank) => record.headers.insert("id".into(), blank.into()),
+            };
+            let e = dead_letter_event(
+                "orders",
+                "kraken.events",
+                "kraken.events.dlt",
+                &record,
+                DeadLetterReason::Invalid,
+                &DeadLetterError::new("Invalid", "no id"),
+            );
+            assert_eq!(e.id, "kraken.events-3-41", "{id:?}");
+            assert_eq!(e.headers.get("id").map(String::as_str), id, "headers as they were");
+        }
     }
 
     /// What a scripted subscription does on each `next`.
