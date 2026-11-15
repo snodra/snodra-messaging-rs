@@ -502,6 +502,40 @@ impl std::fmt::Debug for Inbound {
     }
 }
 
+/// A hub's refusal of this instance's registration (a `Register` the hub closed the stream on
+/// with `ALREADY_EXISTS`, `INVALID_ARGUMENT`, `UNAUTHENTICATED` or `PERMISSION_DENIED`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HubRejection {
+    /// The hub's id when it registered this instance before, else the target dialled
+    /// (`host:port`): a refused `Register` carries no hub id.
+    pub hub: String,
+    /// The gRPC status code's name, e.g. `PERMISSION_DENIED`.
+    pub code: String,
+    /// The hub's message; `None` when it gave none.
+    pub description: Option<String>,
+    /// When it was refused.
+    pub at: SystemTime,
+}
+
+/// The name of a gRPC status code, as the protocol spells it.
+fn code_name(code: Code) -> String {
+    match code {
+        Code::AlreadyExists => "ALREADY_EXISTS".into(),
+        Code::InvalidArgument => "INVALID_ARGUMENT".into(),
+        Code::Unauthenticated => "UNAUTHENTICATED".into(),
+        Code::PermissionDenied => "PERMISSION_DENIED".into(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Keeps `rejection` in `latest` unless `latest` holds a newer one.
+pub(crate) fn keep_newer(latest: &Mutex<Option<HubRejection>>, rejection: &HubRejection) {
+    let mut latest = latest.lock().unwrap();
+    if latest.as_ref().is_none_or(|l| l.at <= rejection.at) {
+        *latest = Some(rejection.clone());
+    }
+}
+
 /// A handshaken stream that accepts outgoing messages.
 struct Live {
     stream: StreamId,
@@ -523,6 +557,8 @@ pub struct HubConnection {
     /// acknowledged). The hub acks them in order, so the n-th written is acked once n acks came.
     later_registers: watch::Sender<(StreamId, u64, u64)>,
     last_rejection: Mutex<Option<String>>,
+    /// The newest refusal by the hub, kept after a later acceptance.
+    latest_rejection: Mutex<Option<HubRejection>>,
     /// The id of the hub the last handshaken stream registered with, kept once that stream ended.
     last_hub_id: Mutex<Option<String>>,
     /// The token resolved for the stream being opened (the last one read from `token_file`); what
@@ -631,6 +667,8 @@ pub(crate) struct Hooks {
     pub in_flight: Arc<AtomicUsize>,
     /// Also counts the credential refreshes written (all connections of the pool).
     pub refreshes_sent: Arc<AtomicU64>,
+    /// Also keeps the newest refusal (all connections of the pool).
+    pub latest_rejection: Arc<Mutex<Option<HubRejection>>>,
 }
 
 impl HubConnection {
@@ -669,6 +707,7 @@ impl HubConnection {
             handshake,
             later_registers,
             last_rejection: Mutex::new(None),
+            latest_rejection: Mutex::new(None),
             last_hub_id: Mutex::new(None),
             token: Mutex::new(None),
             jwt: Mutex::new(None),
@@ -790,6 +829,28 @@ impl HubConnection {
     /// registration is accepted again.
     pub fn last_rejection(&self) -> Option<String> {
         self.last_rejection.lock().unwrap().clone()
+    }
+
+    /// The hub's newest refusal of a `Register`, kept after a later acceptance (replaced by a
+    /// newer refusal only); `None` while it never refused. A failure to get an access token is
+    /// not a hub's refusal and is not kept here.
+    pub fn latest_rejection(&self) -> Option<HubRejection> {
+        self.latest_rejection.lock().unwrap().clone()
+    }
+
+    fn record_rejection(&self, status: &Status) {
+        let rejection = HubRejection {
+            hub: self
+                .last_hub_id()
+                .unwrap_or_else(|| super::targets::target_id(&self.settings.address)),
+            code: code_name(status.code()),
+            description: Some(status.message().to_string()).filter(|m| !m.is_empty()),
+            at: SystemTime::now(),
+        };
+        keep_newer(&self.latest_rejection, &rejection);
+        if let Some(h) = self.hooks.get() {
+            keep_newer(&h.latest_rejection, &rejection);
+        }
     }
 
     /// The id of the hub this connection last registered with (as [`hub_id`](Self::hub_id)),
@@ -1175,6 +1236,7 @@ impl HubConnection {
                 wait
             } else if is_rejection(status.code()) {
                 *self.last_rejection.lock().unwrap() = Some(status.message().to_string());
+                self.record_rejection(&status);
                 let wait = jittered(max, max, random_unit());
                 let key = (status.code(), status.message().to_string());
                 if logged_rejection.as_ref() == Some(&key) {

@@ -1594,6 +1594,10 @@ rejections, not outages:
   hub id (by the target dialled, `host:port`, for a hub that never registered it: a refusal carries
   no hub id), empty while every hub accepts it. `await_hub` / `await_all_hubs` keep returning
   `false` while the hub refuses, as for the other rejections.
+- `app.latest_rejection()` is the newest refusal by any hub, kept after the hub accepts again:
+  `HubRejection { hub, code, description, at }` (`hub` the hub id, else the target dialled;
+  `code` the status name, e.g. `PERMISSION_DENIED`; `description` the hub's message). Only a newer
+  refusal replaces it; a failure to get an access token is not a hub's refusal and does not set it.
 - The reconnect waits the **backoff cap** (`reconnect_backoff_max`, 80-100 % of it), not the floor:
   no tight loop against a hub that will keep saying no.
 - The log line `hub rejected the registration` is at `error` once per distinct (code, message),

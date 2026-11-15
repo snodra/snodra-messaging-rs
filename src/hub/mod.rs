@@ -19,8 +19,8 @@ pub use auth::{
     TokenStats, WAKE_INTERVAL, WallClock, refresh_margin,
 };
 pub use connection::{
-    CLIENT_VERSION, HEARTBEAT_INTERVAL_BEFORE_ACK, HubConnection, HubSettings, Inbound,
-    PERMIT_BATCH, PERMIT_FLUSH_AFTER, RegisteredTypes, ReplyTo, StreamId,
+    CLIENT_VERSION, HEARTBEAT_INTERVAL_BEFORE_ACK, HubConnection, HubRejection, HubSettings,
+    Inbound, PERMIT_BATCH, PERMIT_FLUSH_AFTER, RegisteredTypes, ReplyTo, StreamId,
 };
 pub(crate) use dispatcher::{AbortOnDrop, invocation_error};
 pub use dispatcher::{AdmissionHook, Dispatcher};

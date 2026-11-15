@@ -307,6 +307,14 @@ impl KrakenMessaging {
         self.hubs.rejections()
     }
 
+    /// The newest refusal of this instance's registration by any hub (which hub, the status
+    /// code, the hub's message, when): replaced only by a newer refusal, never cleared by a later
+    /// acceptance, so it still says why after the hub accepted again. `None` while no hub ever
+    /// refused. [`hub_rejections`](Self::hub_rejections) is what refuses it now.
+    pub fn latest_rejection(&self) -> Option<crate::hub::HubRejection> {
+        self.hubs.latest_rejection()
+    }
+
     /// How this instance authenticates to the hubs: `none`, a static `token`, a `jwt`
     /// (Keycloak client credentials, ADR 0019) or a client `certificate` (mutual TLS, ADR 0020),
     /// the current access token's expiry, the last token fetch error and the token fetch counts by

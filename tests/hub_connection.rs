@@ -710,7 +710,8 @@ async fn wait_for_tcp_returns_once_the_port_accepts_and_gives_up_otherwise() {
 
 /// The application reads why a hub refuses the instance (`KrakenMessaging::hub_rejections`): by
 /// the target dialled while that hub never registered it, by its hub id once it did; gone once
-/// the hub accepts a registration again.
+/// the hub accepts a registration again. `KrakenMessaging::latest_rejection` is the newest refusal
+/// by any hub: replaced by a newer one only, never cleared by an acceptance.
 #[tokio::test]
 async fn the_application_reads_each_hubs_latest_rejection() {
     let hub = FakeHub::start().await;
@@ -740,8 +741,24 @@ async fn the_application_reads_each_hubs_latest_rejection() {
         refused[&target].contains("owned by other-service"),
         "{refused:?}"
     );
+    let first = app.latest_rejection().expect("the latest rejection");
+    assert_eq!(first.hub, target);
+    assert_eq!(first.code, "ALREADY_EXISTS");
+    assert!(
+        first
+            .description
+            .as_deref()
+            .is_some_and(|d| d.contains("owned by other-service")),
+        "{first:?}"
+    );
+    assert!(first.at <= std::time::SystemTime::now());
     assert!(app.await_hub(Duration::from_secs(5)).await);
     assert!(app.hub_rejections().is_empty(), "accepted again");
+    assert_eq!(
+        app.latest_rejection(),
+        Some(first.clone()),
+        "an acceptance does not clear the latest rejection"
+    );
 
     hub.reject_next_with_already_exists();
     hub.drop_streams();
@@ -755,6 +772,9 @@ async fn the_application_reads_each_hubs_latest_rejection() {
         ["fake-hub"],
         "by its hub id once it registered the instance"
     );
+    let second = app.latest_rejection().expect("the latest rejection");
+    assert_eq!(second.hub, "fake-hub", "{second:?}");
+    assert!(second.at >= first.at, "replaced by the newer refusal");
     app.shutdown().await;
     hub.stop();
 }

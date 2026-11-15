@@ -86,7 +86,7 @@ use crate::security::HubTls;
 
 use super::auth::{AuthKind, AuthStatus};
 use super::connection::{
-    Hooks, HubConnection, HubSettings, Inbound, RegisteredTypes, StreamId, hub_id,
+    Hooks, HubConnection, HubRejection, HubSettings, Inbound, RegisteredTypes, StreamId, hub_id,
 };
 use super::mtls::{self, ClientIdentity};
 use super::targets::{HubTargets, permit_share, rank_keyed, rank_round_robin, resolved_targets};
@@ -213,6 +213,8 @@ pub struct HubPool {
     in_flight: Arc<AtomicUsize>,
     /// Credential refreshes written to any hub (monotonic: members come and go).
     refreshes_sent: Arc<AtomicU64>,
+    /// The newest refusal by any hub (kept: members come and go).
+    latest_rejection: Arc<Mutex<Option<HubRejection>>>,
     changes: watch::Sender<u64>,
     /// The client certificate watch (mTLS only).
     certificate: Mutex<CertificateWatch>,
@@ -301,6 +303,7 @@ impl HubPool {
             turn: AtomicUsize::new(0),
             in_flight: Arc::new(AtomicUsize::new(0)),
             refreshes_sent: Arc::new(AtomicU64::new(0)),
+            latest_rejection: Arc::new(Mutex::new(None)),
             changes,
             certificate: Mutex::new(CertificateWatch::default()),
             probes: Mutex::new(vec![]),
@@ -593,6 +596,20 @@ impl HubPool {
             .collect()
     }
 
+    /// The newest refusal of this instance's registration by any hub
+    /// ([`HubConnection::latest_rejection`]): replaced by a newer refusal only, never cleared by a
+    /// later acceptance, kept when its hub leaves the pool.
+    pub fn latest_rejection(&self) -> Option<HubRejection> {
+        if self.external {
+            return self
+                .members()
+                .iter()
+                .filter_map(|m| m.conn.latest_rejection())
+                .max_by_key(|r| r.at);
+        }
+        self.latest_rejection.lock().unwrap().clone()
+    }
+
     /// Requests that arrived on any hub and whose handler has not finished.
     pub fn handlers_in_flight(&self) -> usize {
         if self.external {
@@ -845,6 +862,7 @@ impl HubPool {
             }),
             in_flight: Arc::clone(&self.in_flight),
             refreshes_sent: Arc::clone(&self.refreshes_sent),
+            latest_rejection: Arc::clone(&self.latest_rejection),
         });
         let member = Arc::new(Member {
             conn,
