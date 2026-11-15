@@ -22,7 +22,8 @@ use kraken_messaging::error::MessagingError;
 use kraken_messaging::saga::Clock;
 use kraken_messaging::store::{StoreError, Tx};
 use sqlx::pool::PoolConnection;
-use sqlx::{AssertSqlSafe, Row as _};
+use sqlx::{AssertSqlSafe, Row as _, SqlSafeStr};
+use sqlx_core::transaction::TransactionManager;
 
 #[cfg(feature = "mysql")]
 use sqlx::mysql::{MySql, MySqlConnection, MySqlDatabaseError, MySqlPool, MySqlRow};
@@ -62,14 +63,17 @@ pub(crate) enum Pool {
 }
 
 /// A transaction of the store's database (a [`Tx`] holds one, and so does [`OwnTx`]): its pooled
-/// connection while it is open, after a `BEGIN` of the store's own (not an `sqlx::Transaction`,
-/// which hands its connection back to the pool whatever state the session is in).
+/// connection while it is open. It begins and ends through sqlx's own transaction manager, so the
+/// connection knows it is in a transaction (depth 1): a nested transaction a handler opens on it
+/// through sqlx is a savepoint, never a `BEGIN` / `COMMIT` of its own.
 ///
 /// A connection goes back to the pool only once its transaction ended cleanly (`COMMIT` or
-/// `ROLLBACK` succeeded) with the session as it found it. Otherwise it is closed: a transaction
-/// dropped while open (a future dropped mid-way, a `Tx` never ended), a failed end, or a session
-/// variable changed for a statement and not yet put back ([`Conn::session_changed`]). The server
-/// rolls back what a closed connection left open; nothing reaches the next user of the pool.
+/// `ROLLBACK` succeeded at depth 1) with the session as it found it. Otherwise it is closed: a
+/// transaction dropped while open (a future dropped mid-way, a `Tx` never ended), a failed end, a
+/// nested transaction left open (the commit then fails), or a session variable changed for a
+/// statement and not yet put back ([`Conn::session_changed`]). The server rolls back what a closed
+/// connection left open; nothing reaches the next user of the pool. Not an `sqlx::Transaction`:
+/// that hands its connection back to the pool whatever its session holds.
 pub(crate) struct Held<DB: sqlx::Database> {
     conn: Option<PoolConnection<DB>>,
     session_changed: bool,
@@ -92,28 +96,81 @@ impl<DB: sqlx::Database> Held<DB> {
     pub(crate) fn is_open(&self) -> bool {
         self.conn.is_some()
     }
+
+    /// A connection of `pool` in a transaction begun by `statement` (through sqlx's transaction
+    /// manager, which checks that the session is in a transaction afterwards: a statement-mode
+    /// pooler fails here).
+    pub(crate) async fn begin(
+        pool: &sqlx::Pool<DB>,
+        statement: &'static str,
+    ) -> Result<Held<DB>, StoreError> {
+        let mut held = Held {
+            conn: Some(pool.acquire().await.map_err(store_error)?),
+            session_changed: false,
+        };
+        // Inside `held` already: dropped here (an error, or this future dropped), the connection
+        // is closed.
+        if let Some(conn) = held.conn.as_mut() {
+            DB::TransactionManager::begin(&mut **conn, Some(statement.into_sql_str()))
+                .await
+                .map_err(|e| match e {
+                    sqlx::Error::BeginFailed => storage(format!(
+                        "`{statement}` did not leave the session in a transaction (a pooler in \
+                         statement mode?): the message store needs a connection that keeps one"
+                    )),
+                    other => store_error(other),
+                })?;
+        }
+        Ok(held)
+    }
+
+    /// Commits (or rolls back) and lets go of the connection: back to the pool when that ended
+    /// cleanly with the session untouched, else closed. A commit with a nested transaction still
+    /// open (depth above 1) or with the transaction ended by someone else (depth 0) commits
+    /// nothing: the connection is closed (the server rolls it back) and the commit fails. Nothing
+    /// for an ended one.
+    pub(crate) async fn end(&mut self, commit: bool) -> Result<(), StoreError> {
+        let Some(conn) = self.conn.as_mut() else {
+            return Ok(());
+        };
+        let depth = DB::TransactionManager::get_transaction_depth(conn);
+        if depth != 1 {
+            if let Some(mut conn) = self.conn.take() {
+                conn.close_on_drop();
+            }
+            return if commit {
+                Err(storage(if depth == 0 {
+                    "the store's transaction was ended on its connection by someone else (a raw \
+                     COMMIT or ROLLBACK?): it is rolled back, nothing of it is committed"
+                        .to_string()
+                } else {
+                    format!(
+                        "a nested transaction was left open on the store's connection ({} \
+                         levels): the store's transaction is rolled back, nothing of it is committed",
+                        depth - 1
+                    )
+                }))
+            } else {
+                Ok(())
+            };
+        }
+        let ended = if commit {
+            DB::TransactionManager::commit(&mut **conn).await
+        } else {
+            DB::TransactionManager::rollback(&mut **conn).await
+        };
+        if let Some(mut conn) = self.conn.take()
+            && (ended.is_err() || self.session_changed)
+        {
+            conn.close_on_drop();
+        }
+        ended.map_err(store_error)
+    }
 }
 
 macro_rules! held {
     ($db:ty, $variant:ident) => {
         impl Held<$db> {
-            /// A connection of `pool` in a transaction begun by `statement`.
-            pub(crate) async fn begin(
-                pool: &sqlx::Pool<$db>,
-                statement: &'static str,
-            ) -> Result<Held<$db>, sqlx::Error> {
-                let mut held = Held {
-                    conn: Some(pool.acquire().await?),
-                    session_changed: false,
-                };
-                // Inside `held` already: dropped here (an error, or this future dropped), the
-                // connection is closed.
-                if let Some(conn) = held.conn.as_mut() {
-                    sqlx::raw_sql(statement).execute(&mut **conn).await?;
-                }
-                Ok(held)
-            }
-
             pub(crate) fn conn(&mut self) -> Option<Conn<'_>> {
                 let Held {
                     conn,
@@ -123,24 +180,6 @@ macro_rules! held {
                     c: ConnRef::$variant(&mut **c),
                     session_changed,
                 })
-            }
-
-            /// Commits (or rolls back) and lets go of the connection: back to the pool when that
-            /// ended cleanly with the session untouched, else closed. Nothing for an ended one.
-            pub(crate) async fn end(&mut self, commit: bool) -> Result<(), sqlx::Error> {
-                let Some(conn) = self.conn.as_mut() else {
-                    return Ok(());
-                };
-                let ended = sqlx::raw_sql(if commit { "COMMIT" } else { "ROLLBACK" })
-                    .execute(&mut **conn)
-                    .await
-                    .map(|_| ());
-                if let Some(mut conn) = self.conn.take()
-                    && (ended.is_err() || self.session_changed)
-                {
-                    conn.close_on_drop();
-                }
-                ended
             }
         }
     };
@@ -612,7 +651,7 @@ impl OwnTx {
             OwnTx::My(t) => t.end(commit).await,
         };
         match result {
-            Ok(value) => ended.map(|()| value).map_err(store_error),
+            Ok(value) => ended.map(|()| value),
             Err(e) => Err(e),
         }
     }
@@ -683,13 +722,9 @@ impl Db {
     pub(crate) async fn begin(&self) -> Result<OwnTx, StoreError> {
         Ok(match &self.pool {
             #[cfg(feature = "postgres")]
-            Pool::Pg(p) => OwnTx::Pg(
-                Held::<Postgres>::begin(p, BEGIN)
-                    .await
-                    .map_err(store_error)?,
-            ),
+            Pool::Pg(p) => OwnTx::Pg(Held::<Postgres>::begin(p, BEGIN).await?),
             #[cfg(feature = "mysql")]
-            Pool::My(p) => OwnTx::My(Held::<MySql>::begin(p, START).await.map_err(store_error)?),
+            Pool::My(p) => OwnTx::My(Held::<MySql>::begin(p, START).await?),
         })
     }
 
@@ -697,11 +732,9 @@ impl Db {
     pub(crate) async fn own(&self) -> Result<OwnTx, StoreError> {
         Ok(match &self.pool {
             #[cfg(feature = "postgres")]
-            Pool::Pg(p) => OwnTx::Pg(
-                Held::<Postgres>::begin(p, "BEGIN ISOLATION LEVEL READ COMMITTED")
-                    .await
-                    .map_err(store_error)?,
-            ),
+            Pool::Pg(p) => {
+                OwnTx::Pg(Held::<Postgres>::begin(p, "BEGIN ISOLATION LEVEL READ COMMITTED").await?)
+            }
             // SET TRANSACTION applies to the next transaction only: the one started right after.
             #[cfg(feature = "mysql")]
             Pool::My(p) => OwnTx::My(
@@ -709,8 +742,7 @@ impl Db {
                     p,
                     "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; START TRANSACTION",
                 )
-                .await
-                .map_err(store_error)?,
+                .await?,
             ),
         })
     }

@@ -16,6 +16,9 @@ mysql = ["sqlx/mysql"]
 kraken-messaging-rs = { path = "../.." }
 # Pure Rust TLS (rustls with ring and the platform roots, as the core's hub client): no OpenSSL.
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "chrono"] }
+# sqlx's transaction manager (not re-exported by sqlx): the store begins and ends its transactions
+# through it, so sqlx's own nested transactions on the handler's connection are savepoints.
+sqlx-core = { version = "=0.9.0", default-features = false }
 chrono = "0.4.45"
 futures = "0.3"
 serde = { version = "1.0.229", features = ["derive"] }

@@ -688,6 +688,130 @@ async fn concurrency(kind: Kind) {
     }
 }
 
+/// What a handler does with sqlx's own nested transactions on the connection it is given
+/// (`SqlxTxExt::connection`): savepoints inside the store's transaction, never a transaction of
+/// their own. (a) an inner transaction committed, then the handler fails: nothing remains; (b) an
+/// inner transaction rolled back, the handler succeeds: the outer rows commit, the inner ones
+/// not; (c) a nested transaction left open: the commit fails and nothing is committed; (d) the
+/// connection says it is in a transaction.
+macro_rules! nested_transactions {
+    ($name:ident, $db:ty, $kind:expr, $p:literal) => {
+        async fn $name() {
+            use sqlx::Connection;
+            let server = Server::of($kind).await;
+            let (store, raw) = server.store().await;
+            raw.exec("CREATE TABLE orders (id VARCHAR(64) NOT NULL PRIMARY KEY)")
+                .await;
+            let txs = store.tx();
+            let outbox = store.outbox();
+            let processed = store.processed_events();
+            let count = async |table: &str, column: &str, id: &str| {
+                raw.rows(&format!(
+                    "SELECT {column} FROM {table} WHERE {column} = '{id}'"
+                ))
+                .await
+                .len()
+            };
+            let insert = concat!("INSERT INTO orders (id) VALUES (", $p, ")");
+
+            // (d) and (a)
+            let mut tx = txs.begin().await.unwrap();
+            assert!(
+                tx.connection::<$db>().is_in_transaction(),
+                "(d) in a transaction"
+            );
+            outbox.append(&mut tx, entry("n-a")).await.unwrap();
+            assert!(processed.record(&mut tx, &marker("m-a")).await.unwrap());
+            let mut inner = tx.connection::<$db>().begin().await.unwrap();
+            sqlx::query(insert)
+                .bind("n-a")
+                .execute(&mut *inner)
+                .await
+                .unwrap();
+            inner.commit().await.unwrap();
+            assert!(
+                tx.connection::<$db>().is_in_transaction(),
+                "still in the store's transaction"
+            );
+            txs.abort(&mut tx).await; // the handler failed
+            assert_eq!(
+                (
+                    count("orders", "id", "n-a").await,
+                    count("kraken_outbox", "id", "n-a").await,
+                    count("kraken_processed_events", "id", "m-a").await
+                ),
+                (0, 0, 0),
+                "(a) an inner commit commits nothing of the outer transaction"
+            );
+
+            // (b)
+            let mut tx = txs.begin().await.unwrap();
+            outbox.append(&mut tx, entry("n-b")).await.unwrap();
+            let mut inner = tx.connection::<$db>().begin().await.unwrap();
+            sqlx::query(insert)
+                .bind("n-b-inner")
+                .execute(&mut *inner)
+                .await
+                .unwrap();
+            inner.rollback().await.unwrap();
+            sqlx::query(insert)
+                .bind("n-b-outer")
+                .execute(tx.connection::<$db>())
+                .await
+                .unwrap();
+            txs.commit(&mut tx).await.unwrap();
+            assert_eq!(
+                (
+                    count("orders", "id", "n-b-outer").await,
+                    count("kraken_outbox", "id", "n-b").await,
+                    count("orders", "id", "n-b-inner").await
+                ),
+                (1, 1, 0),
+                "(b) the inner rollback undoes the inner rows only"
+            );
+
+            // (c)
+            let mut tx = txs.begin().await.unwrap();
+            outbox.append(&mut tx, entry("n-c")).await.unwrap();
+            let mut inner = tx.connection::<$db>().begin().await.unwrap();
+            sqlx::query(insert)
+                .bind("n-c")
+                .execute(&mut *inner)
+                .await
+                .unwrap();
+            std::mem::forget(inner); // left open
+            let committed = txs.commit(&mut tx).await;
+            assert!(
+                committed
+                    .as_ref()
+                    .is_err_and(|e| e.to_string().contains("nested transaction")),
+                "(c) the commit fails: {committed:?}"
+            );
+            assert_eq!(
+                (
+                    count("orders", "id", "n-c").await,
+                    count("kraken_outbox", "id", "n-c").await
+                ),
+                (0, 0),
+                "(c) nothing committed"
+            );
+        }
+    };
+}
+
+nested_transactions!(nested_postgres, sqlx::Postgres, Kind::Postgres, "$1");
+nested_transactions!(nested_mysql, sqlx::MySql, Kind::MySql, "?");
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_nested_transactions_are_savepoints_of_the_stores() {
+    nested_postgres().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_nested_transactions_are_savepoints_of_the_stores() {
+    nested_mysql().await;
+}
+
 macro_rules! both {
     ($check:ident, $pg:ident, $my:ident) => {
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

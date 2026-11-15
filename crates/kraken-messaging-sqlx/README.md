@@ -37,7 +37,7 @@ let app = KrakenMessaging::builder(Config::from_env()?).await?
 
 | Database | Minimum | Checked at startup |
 |---|---|---|
-| PostgreSQL | 13.0 (`jsonb`, `GENERATED ... STORED`) | `server_version_num` |
+| PostgreSQL | 13.0 (`jsonb`, `GENERATED ... STORED`) | `version()` must name PostgreSQL itself (a server speaking its protocol, such as CockroachDB, is refused); `server_version_num` |
 | MySQL | 8.0.17, InnoDB (`utf8mb4_0900_bin`, functional `CAST(... AS JSON)`) | `VERSION()`; **MariaDB is refused** |
 | MySQL `sql_mode` | `STRICT_TRANS_TABLES` or `STRICT_ALL_TABLES` | `@@SESSION.sql_mode`: a value too long is refused, never truncated |
 | Pool | at least 2 connections (refused below); size it as below | `max_connections` of the pool |
@@ -136,10 +136,23 @@ dead letter's payload holding one is kept as `payload_binary`. Identifiers are c
 
 ## Transactions
 
-- `TxProvider::begin` is a `sqlx` transaction on the pool at the database's default isolation. A handler writes its own rows
-  in the transaction of the message it handles with `SqlxTxExt::connection::<DB>()` (the transaction's connection); its rows, the outbox appends and the
-  processed-event markers commit or roll back together. A command handler (which gets no transaction) begins one with
-  `store.tx().begin()` and passes it to `EventBus::publish_in` (see `examples/orders-sql`).
+- `TxProvider::begin` takes a connection from the pool and begins a transaction on it through sqlx's own transaction
+  manager, at the database's default isolation (the session is checked to be in a transaction: a statement-mode pooler
+  that cannot keep one fails here, clearly). A handler writes its own rows in the transaction of the message it handles
+  on that connection, `SqlxTxExt::connection::<DB>()`; its rows, the outbox appends and the processed-event markers commit
+  or roll back together. A command handler (which gets no transaction) begins one with `store.tx().begin()` and passes it
+  to `EventBus::publish_in` (see `examples/orders-sql`).
+- On that connection, never `BEGIN`, `COMMIT` or `ROLLBACK` by raw SQL: the store ends the transaction. A nested
+  transaction through sqlx (`connection.begin()`, `Connection::transaction`, `Acquire::begin`) is a **savepoint** of the
+  store's transaction: its commit releases the savepoint, its rollback undoes only what it did, and nothing commits before
+  the store's commit. A nested transaction left open fails the store's commit: nothing is committed.
+- A handler must not change the session of that connection either (`SET`, `LISTEN`, advisory locks, auto-commit): it goes
+  back to the pool for the next user.
+- The connection goes back to the pool only when its transaction ended cleanly; it is closed when the transaction was
+  dropped while open, its end failed, or the session was changed (the MySQL saga start's lock wait until it is put back).
+- A commit cancelled while it runs (its future dropped) and then aborted is reported as failed, although the server may have
+  committed it: its outcome is unknown, as with any commit whose answer is lost. The core's retries and the processed-event
+  markers make a repeated attempt harmless.
 - What commits on its own (dead letters but a retry's delete, processor control, the outbox, deadline, notice and lease
   claims, the purge) runs in a transaction of its own at **READ COMMITTED** (on MySQL a locking read at REPEATABLE READ would
   keep the rows it scanned locked, hiding one relay's rows from another's `SKIP LOCKED` claim). A store call outside any

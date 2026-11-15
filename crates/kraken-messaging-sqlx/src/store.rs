@@ -17,7 +17,7 @@ use sqlx::mysql::{MySql, MySqlPool};
 use sqlx::postgres::{PgPool, Postgres};
 
 use crate::SqlxSettings;
-use crate::db::{Db, Held, Pool, store_error};
+use crate::db::{Db, Held, Pool};
 
 /// The SQL message store: see the crate docs. Every clone is the same store.
 #[derive(Clone)]
@@ -238,8 +238,11 @@ impl MessageStore for SqlxStore {
 ///     .await?;
 /// ```
 ///
-/// The transaction is the store's (`TxProvider::begin`, `commit`, `abort`): do not run `BEGIN`,
-/// `COMMIT` or `ROLLBACK` on it yourself.
+/// The transaction is the store's (`TxProvider::begin`, `commit`, `abort`): never run `BEGIN`,
+/// `COMMIT` or `ROLLBACK` on the connection by raw SQL. A nested transaction through sqlx
+/// (`connection.begin()`, `Connection::transaction`) is a savepoint of the store's transaction:
+/// nothing commits before the store's commit, and one left open fails it. Do not change the
+/// session either (`SET`, `LISTEN`, advisory locks): the connection goes back to the pool.
 pub trait SqlxTxExt {
     /// The connection.
     ///
@@ -278,17 +281,9 @@ impl TxProvider for SqlTx {
         Box::pin(async move {
             Ok(match &self.db.pool {
                 #[cfg(feature = "postgres")]
-                Pool::Pg(p) => Tx::new(
-                    Held::<Postgres>::begin(p, crate::db::BEGIN)
-                        .await
-                        .map_err(store_error)?,
-                ),
+                Pool::Pg(p) => Tx::new(Held::<Postgres>::begin(p, crate::db::BEGIN).await?),
                 #[cfg(feature = "mysql")]
-                Pool::My(p) => Tx::new(
-                    Held::<MySql>::begin(p, crate::db::START)
-                        .await
-                        .map_err(store_error)?,
-                ),
+                Pool::My(p) => Tx::new(Held::<MySql>::begin(p, crate::db::START).await?),
             })
         })
     }
@@ -306,14 +301,14 @@ impl TxProvider for SqlTx {
                 if !held.is_open() {
                     return Err(ended());
                 }
-                return held.end(true).await.map_err(store_error);
+                return held.end(true).await;
             }
             #[cfg(feature = "mysql")]
             if let Some(held) = tx.get_mut::<Held<MySql>>() {
                 if !held.is_open() {
                     return Err(ended());
                 }
-                return held.end(true).await.map_err(store_error);
+                return held.end(true).await;
             }
             let _ = ended;
             // No transaction (`plain`, `Tx::none`): every write committed already.
