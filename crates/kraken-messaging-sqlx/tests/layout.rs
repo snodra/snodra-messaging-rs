@@ -362,6 +362,27 @@ async fn golden_values(kind: Kind) {
         ])
     );
 
+    // A dispatch lease: the saga, its holder, until when.
+    assert!(
+        sagas
+            .dispatch
+            .claim_lease("s-1", "relay-1", AT, AT + 30_000)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        raw.row(&format!(
+            "SELECT saga_id, owner, {} FROM kraken_saga_dispatch_leases",
+            ts("lease_until")
+        ))
+        .await,
+        texts(&[
+            Some("s-1"),
+            Some("relay-1"),
+            Some("2026-11-14T10:00:30.123")
+        ])
+    );
+
     // External call, dead letter, processor control.
     store
         .external_calls()
@@ -668,6 +689,111 @@ async fn rows_in_the_kotlin_layout_are_read(kind: Kind) {
     assert_eq!(
         (due.id.as_str(), due.correlation_id.as_deref()),
         ("k-d-9", Some("c-9"))
+    );
+
+    // The saga-side outbox as Kotlin writes it: a pending command (no notice: NULLs) carrying the
+    // trace of its cause, and a command given up on with its failure notice pending.
+    let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    raw.exec(&format!(
+        "INSERT INTO kraken_saga_dispatch (id, saga_id, seq, kind, type, payload, headers, routing_key, created_at, \
+         dispatched_at, attempts, next_attempt_at, failed_at, failure_reason, failure_message, notice_pending, \
+         notice_attempts, notice_next_at) VALUES \
+         ('k-saga-9:4000', 'k-saga-9', 4000, 'COMMAND', 'k.Ship', '{{\"order\":\"o-9\"}}', \
+         CAST('{{\"correlation-id\":\"c-9\",\"traceparent\":\"{traceparent}\"}}' AS {{json}}), 'o-9', {t0}, \
+         NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL), \
+         ('k-saga-8:3000', 'k-saga-8', 3000, 'COMMAND', 'k.Bill', '{{}}', CAST('{{}}' AS {{json}}), NULL, {t0}, \
+         NULL, 5, NULL, {t0}, 'NO_HANDLER', 'nobody handles k.Bill', TRUE, 0, NULL)"
+    ))
+    .await;
+    let pending = sagas
+        .dispatch
+        .next_pending("k-saga-9")
+        .await
+        .unwrap()
+        .expect("the Kotlin dispatch entry");
+    assert_eq!(
+        (
+            pending.kind,
+            pending.type_name.as_str(),
+            pending.seq,
+            pending.routing_key.as_deref()
+        ),
+        (DispatchKind::Command, "k.Ship", 4000, Some("o-9"))
+    );
+    assert_eq!(pending.payload, "{\"order\":\"o-9\"}");
+    assert_eq!(
+        pending.headers,
+        HashMap::from([
+            ("correlation-id".into(), "c-9".into()),
+            ("traceparent".into(), traceparent.into()),
+        ])
+    );
+    assert_eq!(
+        (
+            pending.notice_pending,
+            pending.notice_attempts,
+            pending.notice_next_at_ms
+        ),
+        (None, None, None),
+        "no notice: NULLs"
+    );
+    assert_eq!(pending.created_at_ms, AT);
+    let notice = sagas
+        .dispatch
+        .claim_due_notice(now, now + 30_000)
+        .await
+        .unwrap()
+        .expect("the Kotlin failure notice");
+    assert_eq!(notice.id, "k-saga-8:3000");
+    assert_eq!(
+        notice.failure_reason,
+        Some(kraken_messaging::saga::FailureReason::NoHandler)
+    );
+    assert_eq!(
+        notice.failure_message.as_deref(),
+        Some("nobody handles k.Bill")
+    );
+    assert_eq!(
+        (
+            notice.notice_pending,
+            notice.notice_attempts,
+            notice.failed_at_ms,
+            notice.attempts
+        ),
+        (Some(true), Some(0), Some(AT), 5)
+    );
+    assert_eq!(
+        sagas.dispatch.pending().await.unwrap(),
+        1,
+        "the given-up entry is not pending"
+    );
+
+    // Dispatch leases as Kotlin writes them: a running one holds, an expired one is taken over.
+    raw.exec(&format!(
+        "INSERT INTO kraken_saga_dispatch_leases (saga_id, owner, lease_until) VALUES \
+         ('k-saga-9', 'kotlin-relay', {later}), ('k-saga-8', 'kotlin-relay', {t0})"
+    ))
+    .await;
+    assert!(
+        !sagas
+            .dispatch
+            .claim_lease("k-saga-9", "rust-relay", now, now + 30_000)
+            .await
+            .unwrap(),
+        "held by the Kotlin relay"
+    );
+    assert!(
+        sagas
+            .dispatch
+            .claim_lease("k-saga-8", "rust-relay", now, now + 30_000)
+            .await
+            .unwrap(),
+        "the Kotlin relay's lease passed"
+    );
+    assert_eq!(
+        raw.row("SELECT owner FROM kraken_saga_dispatch_leases WHERE saga_id = 'k-saga-8'")
+            .await,
+        texts(&[Some("rust-relay")])
     );
 }
 

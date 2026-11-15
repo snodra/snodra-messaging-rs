@@ -1206,6 +1206,8 @@ The crate `kraken-messaging-sqlx` (`crates/`, on `sqlx`) keeps the message store
 later, feature `postgres`) or MySQL (8.0.17 or later, InnoDB, a STRICT `sql_mode`, feature `mysql`) database, in the tables
 the Kotlin module `kraken-messaging-jdbc` writes, with the same values and meanings: a Kotlin service and a Rust service can
 share one database. The schema files (`db/kraken/<dialect>/V1__kraken.sql`) are the Kotlin module's, byte for byte.
+One database (or schema) holds one logical service: its instances, Kotlin or Rust; two different services keep separate
+ones (markers, processor control, dead letters and claims carry no service name).
 
 ```rust
 let pool = sqlx::postgres::PgPoolOptions::new().max_connections(10).connect(&url).await?;
@@ -1213,7 +1215,7 @@ let app = KrakenMessaging::builder(config).await?
     .store(Arc::new(SqlxStore::postgres(pool).with_settings(SqlxSettings::from_env()?)))
     .event_store(events)
     // the service's handlers; a handler writes its rows in the transaction of the message it handles:
-    // sqlx::query(..).execute(&mut **ctx.tx.lock().await.transaction::<sqlx::Postgres>())
+    // sqlx::query(..).execute(ctx.tx.lock().await.connection::<sqlx::Postgres>())
     .start()
     .await?;
 ```

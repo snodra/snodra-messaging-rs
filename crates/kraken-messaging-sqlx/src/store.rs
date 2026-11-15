@@ -227,34 +227,35 @@ impl MessageStore for SqlxStore {
     }
 }
 
-/// The `sqlx` transaction of a [`Tx`] of the SQL store, for a handler's own writes in the
-/// transaction of the message it handles:
+/// The connection of a [`Tx`] of the SQL store, in its transaction, for a handler's own writes in
+/// the transaction of the message it handles:
 ///
 /// ```ignore
 /// let mut tx = ctx.tx.lock().await;
 /// sqlx::query("INSERT INTO orders (id) VALUES ($1)")
 ///     .bind(&order.id)
-///     .execute(&mut **tx.transaction::<sqlx::Postgres>())
+///     .execute(tx.connection::<sqlx::Postgres>())
 ///     .await?;
 /// ```
+///
+/// The transaction is the store's (`TxProvider::begin`, `commit`, `abort`): do not run `BEGIN`,
+/// `COMMIT` or `ROLLBACK` on it yourself.
 pub trait SqlxTxExt {
-    /// The transaction.
+    /// The connection.
     ///
     /// # Panics
     ///
     /// When the transaction is not an open one of the SQL store on `DB` (another store's,
     /// [`Tx::none`], one that ended, or one of the other database).
-    fn transaction<DB: sqlx::Database>(&mut self) -> &mut sqlx::Transaction<'static, DB>;
+    fn connection<DB: sqlx::Database>(&mut self) -> &mut DB::Connection;
 
-    /// The transaction; `None` where [`transaction`](Self::transaction) panics.
-    fn try_transaction<DB: sqlx::Database>(
-        &mut self,
-    ) -> Option<&mut sqlx::Transaction<'static, DB>>;
+    /// The connection; `None` where [`connection`](Self::connection) panics.
+    fn try_connection<DB: sqlx::Database>(&mut self) -> Option<&mut DB::Connection>;
 }
 
 impl SqlxTxExt for Tx {
-    fn transaction<DB: sqlx::Database>(&mut self) -> &mut sqlx::Transaction<'static, DB> {
-        self.try_transaction::<DB>().unwrap_or_else(|| {
+    fn connection<DB: sqlx::Database>(&mut self) -> &mut DB::Connection {
+        self.try_connection::<DB>().unwrap_or_else(|| {
             panic!(
                 "the transaction is not an open one of the SQL message store on {}",
                 DB::NAME
@@ -262,14 +263,12 @@ impl SqlxTxExt for Tx {
         })
     }
 
-    fn try_transaction<DB: sqlx::Database>(
-        &mut self,
-    ) -> Option<&mut sqlx::Transaction<'static, DB>> {
-        self.get_mut::<Held<DB>>().and_then(|held| held.0.as_mut())
+    fn try_connection<DB: sqlx::Database>(&mut self) -> Option<&mut DB::Connection> {
+        self.get_mut::<Held<DB>>().and_then(Held::connection)
     }
 }
 
-/// Transactions are `sqlx` transactions on the pool, at the database's default isolation.
+/// Transactions on connections of the pool, at the database's default isolation.
 struct SqlTx {
     db: Arc<Db>,
 }
@@ -279,11 +278,17 @@ impl TxProvider for SqlTx {
         Box::pin(async move {
             Ok(match &self.db.pool {
                 #[cfg(feature = "postgres")]
-                Pool::Pg(p) => Tx::new(Held::<Postgres>(Some(
-                    p.begin().await.map_err(store_error)?,
-                ))),
+                Pool::Pg(p) => Tx::new(
+                    Held::<Postgres>::begin(p, crate::db::BEGIN)
+                        .await
+                        .map_err(store_error)?,
+                ),
                 #[cfg(feature = "mysql")]
-                Pool::My(p) => Tx::new(Held::<MySql>(Some(p.begin().await.map_err(store_error)?))),
+                Pool::My(p) => Tx::new(
+                    Held::<MySql>::begin(p, crate::db::START)
+                        .await
+                        .map_err(store_error)?,
+                ),
             })
         })
     }
@@ -295,24 +300,22 @@ impl TxProvider for SqlTx {
 
     fn commit<'a>(&'a self, tx: &'a mut Tx) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
+            let ended = || crate::db::storage("the transaction has ended already".into());
             #[cfg(feature = "postgres")]
             if let Some(held) = tx.get_mut::<Held<Postgres>>() {
-                return match held.0.take() {
-                    Some(t) => t.commit().await.map_err(store_error),
-                    None => Err(crate::db::storage(
-                        "the transaction has ended already".into(),
-                    )),
-                };
+                if !held.is_open() {
+                    return Err(ended());
+                }
+                return held.end(true).await.map_err(store_error);
             }
             #[cfg(feature = "mysql")]
             if let Some(held) = tx.get_mut::<Held<MySql>>() {
-                return match held.0.take() {
-                    Some(t) => t.commit().await.map_err(store_error),
-                    None => Err(crate::db::storage(
-                        "the transaction has ended already".into(),
-                    )),
-                };
+                if !held.is_open() {
+                    return Err(ended());
+                }
+                return held.end(true).await.map_err(store_error);
             }
+            let _ = ended;
             // No transaction (`plain`, `Tx::none`): every write committed already.
             Ok(())
         })
@@ -321,12 +324,12 @@ impl TxProvider for SqlTx {
     fn abort<'a>(&'a self, tx: &'a mut Tx) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             #[cfg(feature = "postgres")]
-            if let Some(t) = tx.get_mut::<Held<Postgres>>().and_then(|h| h.0.take()) {
-                let _ = t.rollback().await;
+            if let Some(held) = tx.get_mut::<Held<Postgres>>() {
+                let _ = held.end(false).await;
             }
             #[cfg(feature = "mysql")]
-            if let Some(t) = tx.get_mut::<Held<MySql>>().and_then(|h| h.0.take()) {
-                let _ = t.rollback().await;
+            if let Some(held) = tx.get_mut::<Held<MySql>>() {
+                let _ = held.end(false).await;
             }
         })
     }

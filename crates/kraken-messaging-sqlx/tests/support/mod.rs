@@ -167,6 +167,18 @@ impl Server {
     }
 }
 
+/// `url` with the credentials `user:password` instead of the container's.
+pub fn as_user(url: &str, user: &str, password: &str) -> String {
+    let (scheme, rest) = url.split_once("://").expect("a URL");
+    let (_, host) = rest.split_once('@').expect("credentials in the URL");
+    format!("{scheme}://{user}:{password}@{host}")
+}
+
+/// The database name at the end of `url`.
+pub fn database_name(url: &str) -> &str {
+    url.rsplit('/').next().expect("a database")
+}
+
 /// Raw SQL on a test database: literal values only, every selected column cast to text in the
 /// statement (`{text}` is `TEXT` / `CHAR`).
 #[derive(Clone)]

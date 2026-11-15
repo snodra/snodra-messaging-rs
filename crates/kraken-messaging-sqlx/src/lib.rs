@@ -16,12 +16,13 @@
 //!   ([`MessageStore::init_schema`]: the server checked, then V1 under a database lock unless
 //!   `kraken_schema` holds version 1 or later) unless `KRAKEN_STORE_INIT_SCHEMA=false`; then it
 //!   checks that the database has version 1 or later ([`MessageStore::check_schema`]).
-//! - **Transactions**: the store's transactions are `sqlx` transactions on the pool. A handler
-//!   writes its own rows in the transaction of the message it handles with [`SqlxTxExt`]
-//!   (`ctx.tx.lock().await.transaction::<Postgres>()`): its rows, the outbox entries and the
+//! - **Transactions**: the store's transactions are transactions on connections of the pool. A
+//!   handler writes its own rows in the transaction of the message it handles with [`SqlxTxExt`]
+//!   (`ctx.tx.lock().await.connection::<Postgres>()`): its rows, the outbox entries and the
 //!   processed-event markers commit or roll back together. What commits on its own (dead letters,
 //!   processor control, the relays' and schedulers' claims, the purge) runs in a transaction of
-//!   its own at READ COMMITTED; a store call outside any transaction in a short one of its own.
+//!   its own at READ COMMITTED; a store call outside any transaction in a short one of its own. A
+//!   connection whose transaction did not end cleanly is closed, never returned to the pool.
 //! - **Wake-up** (PostgreSQL): every append runs `SELECT pg_notify('kraken_outbox', '')` in its
 //!   transaction, and the relay listens (`LISTEN kraken_outbox`) on a connection of its own while
 //!   it runs, so it publishes as soon as an append commits. MySQL: the relay polls.

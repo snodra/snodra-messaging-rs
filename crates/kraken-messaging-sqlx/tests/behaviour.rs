@@ -82,14 +82,14 @@ async fn transactions_with_the_service(kind: Kind) {
         Kind::Postgres => {
             sqlx::query("INSERT INTO orders (id) VALUES ($1)")
                 .bind(id)
-                .execute(&mut **tx.transaction::<sqlx::Postgres>())
+                .execute(tx.connection::<sqlx::Postgres>())
                 .await
                 .unwrap();
         }
         Kind::MySql => {
             sqlx::query("INSERT INTO orders (id) VALUES (?)")
                 .bind(id)
-                .execute(&mut **tx.transaction::<sqlx::MySql>())
+                .execute(tx.connection::<sqlx::MySql>())
                 .await
                 .unwrap();
         }
@@ -143,8 +143,8 @@ async fn transactions_with_the_service(kind: Kind) {
         "after the commit: on its own"
     );
     assert!(
-        tx.try_transaction::<sqlx::Postgres>().is_none()
-            && tx.try_transaction::<sqlx::MySql>().is_none()
+        tx.try_connection::<sqlx::Postgres>().is_none()
+            && tx.try_connection::<sqlx::MySql>().is_none()
     );
 
     let mut foreign = Tx::new(String::from("another store's"));
@@ -283,6 +283,15 @@ async fn bounds(kind: Kind) {
     assert!(store.external_calls().insert(&call).await.unwrap());
     assert!(!store.external_calls().insert(&call).await.unwrap(), "once");
 
+    // An instant no timestamp holds is refused, not stored as 1970.
+    let mut far = entry("e-far");
+    far.created_at_ms = i64::MAX;
+    let refused = outbox.append_now(far).await;
+    assert!(
+        is_invalid(&refused) && refused.unwrap_err().to_string().contains("out of range"),
+        "an out-of-range instant"
+    );
+
     // U+0000.
     assert!(is_invalid(&outbox.append_now(entry("e\0")).await));
     let mut nul_header = entry("e-h");
@@ -416,6 +425,34 @@ async fn schema(kind: Kind) {
             .err()
             .is_some_and(|e| e.to_string().contains("schema is at version 0")),
         "a missing schema fails the startup"
+    );
+
+    // A user who cannot read kraken_schema gets that error, not "version 0".
+    let db = support::database_name(&url).to_string();
+    match kind {
+        Kind::Postgres => {
+            raw.exec("CREATE ROLE kreader LOGIN PASSWORD 'kreader'")
+                .await;
+        }
+        Kind::MySql => {
+            raw.exec("CREATE USER 'kreader'@'%' IDENTIFIED BY 'kreader'")
+                .await;
+            raw.exec(&format!(
+                "GRANT SELECT ON {db}.kraken_outbox TO 'kreader'@'%'"
+            ))
+            .await;
+        }
+    }
+    let (reader, _) = server
+        .open(
+            &support::as_user(&url, "kreader", "kreader"),
+            SqlxSettings::default(),
+        )
+        .await;
+    let refused = reader.require_schema().await.unwrap_err().to_string();
+    assert!(
+        refused.contains("cannot read the schema version") && !refused.contains("version 0"),
+        "{refused}"
     );
 
     // A pool of one connection is refused.
@@ -689,3 +726,60 @@ both!(
     postgres_concurrent_claims_and_starts,
     mysql_concurrent_claims_and_starts
 );
+
+/// A MySQL saga start sets `innodb_lock_wait_timeout` to 1 s for its insert: a start dropped
+/// while it waits (its future dropped, then its transaction aborted or dropped) never hands that
+/// session to the next user of the pool: the connection is closed instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_a_dropped_start_never_leaves_its_lock_wait_on_a_pooled_connection() {
+    let server = Server::mysql().await;
+    let url = server.database().await;
+    let (holder, _) = server.open(&url, SqlxSettings::default()).await;
+    holder.apply_schema().await.unwrap();
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let store = SqlxStore::mysql(pool.clone());
+    // Another transaction's live start of the key: the store's insert waits for it.
+    let mut held = holder.tx().begin().await.unwrap();
+    holder
+        .sagas()
+        .sagas
+        .insert(&mut held, &saga("holder", "k-wait"))
+        .await
+        .unwrap();
+    for abort in [true, false] {
+        let mut tx = store.tx().begin().await.unwrap();
+        let waited = tokio::time::timeout(
+            Duration::from_millis(300),
+            store
+                .sagas()
+                .sagas
+                .insert(&mut tx, &saga("waiter", "k-wait")),
+        )
+        .await;
+        assert!(waited.is_err(), "dropped while it waited");
+        if abort {
+            store.tx().abort(&mut tx).await;
+        } else {
+            drop(tx);
+        }
+        let mut seen = Vec::new();
+        let (mut a, mut b) = (pool.acquire().await.unwrap(), pool.acquire().await.unwrap());
+        for c in [&mut a, &mut b] {
+            let row = sqlx::query("SELECT CAST(@@SESSION.innodb_lock_wait_timeout AS CHAR) AS t")
+                .fetch_one(&mut **c)
+                .await
+                .unwrap();
+            seen.push(sqlx::Row::get::<String, _>(&row, "t"));
+        }
+        assert_eq!(
+            seen,
+            ["50", "50"],
+            "aborted: {abort}: every pooled session has the default"
+        );
+    }
+    holder.tx().abort(&mut held).await;
+}

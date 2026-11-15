@@ -21,7 +21,8 @@ use std::sync::{Arc, RwLock};
 use kraken_messaging::error::MessagingError;
 use kraken_messaging::saga::Clock;
 use kraken_messaging::store::{StoreError, Tx};
-use sqlx::{AssertSqlSafe, Row as _, Transaction};
+use sqlx::pool::PoolConnection;
+use sqlx::{AssertSqlSafe, Row as _};
 
 #[cfg(feature = "mysql")]
 use sqlx::mysql::{MySql, MySqlConnection, MySqlDatabaseError, MySqlPool, MySqlRow};
@@ -60,16 +61,108 @@ pub(crate) enum Pool {
     My(MySqlPool),
 }
 
-/// A transaction of the store's database, as a [`Tx`] holds it: `None` once committed or rolled
-/// back.
-pub(crate) struct Held<DB: sqlx::Database>(pub(crate) Option<Transaction<'static, DB>>);
+/// A transaction of the store's database (a [`Tx`] holds one, and so does [`OwnTx`]): its pooled
+/// connection while it is open, after a `BEGIN` of the store's own (not an `sqlx::Transaction`,
+/// which hands its connection back to the pool whatever state the session is in).
+///
+/// A connection goes back to the pool only once its transaction ended cleanly (`COMMIT` or
+/// `ROLLBACK` succeeded) with the session as it found it. Otherwise it is closed: a transaction
+/// dropped while open (a future dropped mid-way, a `Tx` never ended), a failed end, or a session
+/// variable changed for a statement and not yet put back ([`Conn::session_changed`]). The server
+/// rolls back what a closed connection left open; nothing reaches the next user of the pool.
+pub(crate) struct Held<DB: sqlx::Database> {
+    conn: Option<PoolConnection<DB>>,
+    session_changed: bool,
+}
+
+impl<DB: sqlx::Database> Drop for Held<DB> {
+    fn drop(&mut self) {
+        if let Some(mut conn) = self.conn.take() {
+            conn.close_on_drop();
+        }
+    }
+}
+
+impl<DB: sqlx::Database> Held<DB> {
+    /// The connection while the transaction is open.
+    pub(crate) fn connection(&mut self) -> Option<&mut DB::Connection> {
+        self.conn.as_deref_mut()
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.conn.is_some()
+    }
+}
+
+macro_rules! held {
+    ($db:ty, $variant:ident) => {
+        impl Held<$db> {
+            /// A connection of `pool` in a transaction begun by `statement`.
+            pub(crate) async fn begin(
+                pool: &sqlx::Pool<$db>,
+                statement: &'static str,
+            ) -> Result<Held<$db>, sqlx::Error> {
+                let mut held = Held {
+                    conn: Some(pool.acquire().await?),
+                    session_changed: false,
+                };
+                // Inside `held` already: dropped here (an error, or this future dropped), the
+                // connection is closed.
+                if let Some(conn) = held.conn.as_mut() {
+                    sqlx::raw_sql(statement).execute(&mut **conn).await?;
+                }
+                Ok(held)
+            }
+
+            pub(crate) fn conn(&mut self) -> Option<Conn<'_>> {
+                let Held {
+                    conn,
+                    session_changed,
+                } = self;
+                conn.as_mut().map(|c| Conn {
+                    c: ConnRef::$variant(&mut **c),
+                    session_changed,
+                })
+            }
+
+            /// Commits (or rolls back) and lets go of the connection: back to the pool when that
+            /// ended cleanly with the session untouched, else closed. Nothing for an ended one.
+            pub(crate) async fn end(&mut self, commit: bool) -> Result<(), sqlx::Error> {
+                let Some(conn) = self.conn.as_mut() else {
+                    return Ok(());
+                };
+                let ended = sqlx::raw_sql(if commit { "COMMIT" } else { "ROLLBACK" })
+                    .execute(&mut **conn)
+                    .await
+                    .map(|_| ());
+                if let Some(mut conn) = self.conn.take()
+                    && (ended.is_err() || self.session_changed)
+                {
+                    conn.close_on_drop();
+                }
+                ended
+            }
+        }
+    };
+}
+
+#[cfg(feature = "postgres")]
+held!(Postgres, Pg);
+#[cfg(feature = "mysql")]
+held!(MySql, My);
 
 /// A connection of either database.
-pub(crate) enum Conn<'a> {
+enum ConnRef<'a> {
     #[cfg(feature = "postgres")]
     Pg(&'a mut PgConnection),
     #[cfg(feature = "mysql")]
     My(&'a mut MySqlConnection),
+}
+
+/// A connection in a transaction, and its transaction's session flag.
+pub(crate) struct Conn<'a> {
+    c: ConnRef<'a>,
+    session_changed: &'a mut bool,
 }
 
 /// A bind parameter.
@@ -203,11 +296,17 @@ impl Stmt {
     }
 
     /// U+0000 in a text parameter is refused (PostgreSQL cannot store it; neither database is
-    /// given one), naming the parameter.
+    /// given one), and so is an instant no timestamp holds, naming the parameter.
     fn checked(self) -> Result<Stmt, StoreError> {
         for (name, arg) in &self.args {
-            if let Arg::Text(Some(text)) = arg {
-                refuse_nul(&format!("the parameter {name}"), text)?;
+            match arg {
+                Arg::Text(Some(text)) => refuse_nul(&format!("the parameter {name}"), text)?,
+                Arg::Time(Some(ms)) if chrono::DateTime::from_timestamp_millis(*ms).is_none() => {
+                    return Err(StoreError::Failed(MessagingError::InvalidMessage(format!(
+                        "The message store cannot keep the instant {ms} ms from the epoch (the parameter {name}): out of range"
+                    ))));
+                }
+                _ => {}
             }
         }
         Ok(self)
@@ -248,6 +347,7 @@ pub(crate) fn placeholders(n: usize) -> String {
 
 #[cfg(feature = "postgres")]
 fn pg_time(ms: i64) -> chrono::DateTime<chrono::Utc> {
+    // In range: `Stmt::checked` refused any other.
     chrono::DateTime::from_timestamp_millis(ms).unwrap_or_default()
 }
 
@@ -298,12 +398,19 @@ fn my_query(
 
 impl Conn<'_> {
     pub(crate) fn dialect(&self) -> Dialect {
-        match self {
+        match self.c {
             #[cfg(feature = "postgres")]
-            Conn::Pg(_) => Dialect::Postgres,
+            ConnRef::Pg(_) => Dialect::Postgres,
             #[cfg(feature = "mysql")]
-            Conn::My(_) => Dialect::MySql,
+            ConnRef::My(_) => Dialect::MySql,
         }
+    }
+
+    /// Marks the session changed (a variable set for a statement) until it is put back: a
+    /// transaction ending meanwhile closes its connection rather than returning it to the pool.
+    #[cfg_attr(not(feature = "mysql"), allow(dead_code))] // only MySQL changes one today
+    pub(crate) fn session_changed(&mut self, changed: bool) {
+        *self.session_changed = changed;
     }
 
     /// Runs `stmt`; the rows it changed (MySQL: the rows it found, as Connector/J counts them),
@@ -314,14 +421,14 @@ impl Conn<'_> {
     ) -> Result<Result<u64, sqlx::Error>, StoreError> {
         let stmt = stmt.checked()?;
         let sql = stmt.render(self.dialect());
-        Ok(match self {
+        Ok(match &mut self.c {
             #[cfg(feature = "postgres")]
-            Conn::Pg(c) => pg_query(sql, stmt.args)
+            ConnRef::Pg(c) => pg_query(sql, stmt.args)
                 .execute(&mut **c)
                 .await
                 .map(|r| r.rows_affected()),
             #[cfg(feature = "mysql")]
-            Conn::My(c) => my_query(sql, stmt.args)
+            ConnRef::My(c) => my_query(sql, stmt.args)
                 .execute(&mut **c)
                 .await
                 .map(|r| r.rows_affected()),
@@ -335,9 +442,9 @@ impl Conn<'_> {
     pub(crate) async fn fetch_all(&mut self, stmt: Stmt) -> Result<Vec<Row>, StoreError> {
         let stmt = stmt.checked()?;
         let sql = stmt.render(self.dialect());
-        match self {
+        match &mut self.c {
             #[cfg(feature = "postgres")]
-            Conn::Pg(c) => Ok(pg_query(sql, stmt.args)
+            ConnRef::Pg(c) => Ok(pg_query(sql, stmt.args)
                 .fetch_all(&mut **c)
                 .await
                 .map_err(store_error)?
@@ -345,7 +452,7 @@ impl Conn<'_> {
                 .map(Row::Pg)
                 .collect()),
             #[cfg(feature = "mysql")]
-            Conn::My(c) => Ok(my_query(sql, stmt.args)
+            ConnRef::My(c) => Ok(my_query(sql, stmt.args)
                 .fetch_all(&mut **c)
                 .await
                 .map_err(store_error)?
@@ -460,6 +567,12 @@ impl Row {
     }
 }
 
+/// How a transaction at the database's default isolation begins.
+#[cfg(feature = "postgres")]
+pub(crate) const BEGIN: &str = "BEGIN";
+#[cfg(feature = "mysql")]
+pub(crate) const START: &str = "START TRANSACTION";
+
 /// What the stores share: the pool, the application's clock and the dialect.
 pub(crate) struct Db {
     pub(crate) pool: Pool,
@@ -469,44 +582,38 @@ pub(crate) struct Db {
 /// The store's own transaction of [`Db::own`] or [`Db::scope`].
 pub(crate) enum OwnTx {
     #[cfg(feature = "postgres")]
-    Pg(Transaction<'static, Postgres>),
+    Pg(Held<Postgres>),
     #[cfg(feature = "mysql")]
-    My(Transaction<'static, MySql>),
+    My(Held<MySql>),
 }
 
 impl OwnTx {
     pub(crate) fn conn(&mut self) -> Conn<'_> {
         match self {
             #[cfg(feature = "postgres")]
-            OwnTx::Pg(t) => Conn::Pg(&mut *t),
+            OwnTx::Pg(t) => t.conn(),
             #[cfg(feature = "mysql")]
-            OwnTx::My(t) => Conn::My(&mut *t),
+            OwnTx::My(t) => t.conn(),
         }
+        .expect("the store's own transaction is open until it is finished")
     }
 
     /// Commits when `result` is a success, else rolls back; `result` either way (a failed commit
     /// is the failure).
-    pub(crate) async fn finish<T>(self, result: Result<T, StoreError>) -> Result<T, StoreError> {
+    pub(crate) async fn finish<T>(
+        mut self,
+        result: Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let commit = result.is_ok();
+        let ended = match &mut self {
+            #[cfg(feature = "postgres")]
+            OwnTx::Pg(t) => t.end(commit).await,
+            #[cfg(feature = "mysql")]
+            OwnTx::My(t) => t.end(commit).await,
+        };
         match result {
-            Ok(value) => {
-                match self {
-                    #[cfg(feature = "postgres")]
-                    OwnTx::Pg(t) => t.commit().await,
-                    #[cfg(feature = "mysql")]
-                    OwnTx::My(t) => t.commit().await,
-                }
-                .map_err(store_error)?;
-                Ok(value)
-            }
-            Err(e) => {
-                let _ = match self {
-                    #[cfg(feature = "postgres")]
-                    OwnTx::Pg(t) => t.rollback().await,
-                    #[cfg(feature = "mysql")]
-                    OwnTx::My(t) => t.rollback().await,
-                };
-                Err(e)
-            }
+            Ok(value) => ended.map(|()| value).map_err(store_error),
+            Err(e) => Err(e),
         }
     }
 }
@@ -537,11 +644,14 @@ impl Scope<'_> {
 
 impl Conn<'_> {
     pub(crate) fn reborrow(&mut self) -> Conn<'_> {
-        match self {
-            #[cfg(feature = "postgres")]
-            Conn::Pg(c) => Conn::Pg(c),
-            #[cfg(feature = "mysql")]
-            Conn::My(c) => Conn::My(c),
+        Conn {
+            c: match &mut self.c {
+                #[cfg(feature = "postgres")]
+                ConnRef::Pg(c) => ConnRef::Pg(c),
+                #[cfg(feature = "mysql")]
+                ConnRef::My(c) => ConnRef::My(c),
+            },
+            session_changed: &mut *self.session_changed,
         }
     }
 }
@@ -573,9 +683,13 @@ impl Db {
     pub(crate) async fn begin(&self) -> Result<OwnTx, StoreError> {
         Ok(match &self.pool {
             #[cfg(feature = "postgres")]
-            Pool::Pg(p) => OwnTx::Pg(p.begin().await.map_err(store_error)?),
+            Pool::Pg(p) => OwnTx::Pg(
+                Held::<Postgres>::begin(p, BEGIN)
+                    .await
+                    .map_err(store_error)?,
+            ),
             #[cfg(feature = "mysql")]
-            Pool::My(p) => OwnTx::My(p.begin().await.map_err(store_error)?),
+            Pool::My(p) => OwnTx::My(Held::<MySql>::begin(p, START).await.map_err(store_error)?),
         })
     }
 
@@ -584,16 +698,19 @@ impl Db {
         Ok(match &self.pool {
             #[cfg(feature = "postgres")]
             Pool::Pg(p) => OwnTx::Pg(
-                p.begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+                Held::<Postgres>::begin(p, "BEGIN ISOLATION LEVEL READ COMMITTED")
                     .await
                     .map_err(store_error)?,
             ),
             // SET TRANSACTION applies to the next transaction only: the one started right after.
             #[cfg(feature = "mysql")]
             Pool::My(p) => OwnTx::My(
-                p.begin_with("SET TRANSACTION ISOLATION LEVEL READ COMMITTED; START TRANSACTION")
-                    .await
-                    .map_err(store_error)?,
+                Held::<MySql>::begin(
+                    p,
+                    "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; START TRANSACTION",
+                )
+                .await
+                .map_err(store_error)?,
             ),
         })
     }
@@ -608,13 +725,9 @@ impl Db {
         let dialect = self.dialect();
         let conn = match dialect {
             #[cfg(feature = "postgres")]
-            Dialect::Postgres => tx
-                .get_mut::<Held<Postgres>>()
-                .map(|held| held.0.as_mut().map(|t| Conn::Pg(t))),
+            Dialect::Postgres => tx.get_mut::<Held<Postgres>>().map(|held| held.conn()),
             #[cfg(feature = "mysql")]
-            Dialect::MySql => tx
-                .get_mut::<Held<MySql>>()
-                .map(|held| held.0.as_mut().map(|t| Conn::My(t))),
+            Dialect::MySql => tx.get_mut::<Held<MySql>>().map(|held| held.conn()),
         };
         match conn {
             Some(Some(conn)) => Ok(Scope::Joined(conn)),

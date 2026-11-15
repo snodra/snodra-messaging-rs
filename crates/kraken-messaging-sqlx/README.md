@@ -22,7 +22,7 @@ let app = KrakenMessaging::builder(Config::from_env()?).await?
         let mut tx = ctx.tx.lock().await;
         sqlx::query("UPDATE orders SET status = 'CONFIRMED' WHERE id = $1")
             .bind(&placed.id)
-            .execute(&mut **tx.transaction::<sqlx::Postgres>())
+            .execute(tx.connection::<sqlx::Postgres>())
             .await
             .map_err(|e| MessagingError::Storage(e.to_string()))?;
         Ok(())
@@ -40,9 +40,22 @@ let app = KrakenMessaging::builder(Config::from_env()?).await?
 | PostgreSQL | 13.0 (`jsonb`, `GENERATED ... STORED`) | `server_version_num` |
 | MySQL | 8.0.17, InnoDB (`utf8mb4_0900_bin`, functional `CAST(... AS JSON)`) | `VERSION()`; **MariaDB is refused** |
 | MySQL `sql_mode` | `STRICT_TRANS_TABLES` or `STRICT_ALL_TABLES` | `@@SESSION.sql_mode`: a value too long is refused, never truncated |
-| Pool | at least 2 connections | a write that commits on its own inside the service's transaction takes a second connection |
+| Pool | at least 2 connections (refused below); size it as below | `max_connections` of the pool |
 
 Each failure stops the startup with a message naming what is supported.
+
+**Pool size.** Every open transaction holds one connection until it ends: each handler running in its transaction (up
+to `KRAKEN_MAX_CONCURRENT_HANDLERS` hub handlers, plus each event processor's handler and the saga runtime's attempts),
+and each store call that commits on its own takes a second one while it runs, sometimes from inside such a transaction
+(a dead letter, the outbox relay's claim, a lease). Size the pool to the transactions that can be open together plus
+one at least (plus the service's own use of the pool). A smaller pool does not fail: a call waits for a free connection
+and, past the pool's `acquire_timeout` (30 s by default), fails with a storage error that the caller retries. The
+relay's LISTEN connection (PostgreSQL) is its own, outside the pool.
+
+**One database, one service.** A database (or schema) with these tables belongs to one logical service: its instances,
+in Kotlin, in Rust or both (two implementations of the same service share it, which is what the shared layout is for).
+Two different services keep separate databases or schemas: the processed-event markers, the processor control, the
+dead letters' key blocking and the deadline and failure-notice claims carry no service name.
 
 TLS to the database goes through sqlx's rustls (`tls-rustls-ring-native-roots`, no OpenSSL): set it in the connect options
 or the URL (`sslmode=verify-full`, `ssl-mode=VERIFY_IDENTITY`). The store never logs the pool's connect options, and its
@@ -124,7 +137,7 @@ dead letter's payload holding one is kept as `payload_binary`. Identifiers are c
 ## Transactions
 
 - `TxProvider::begin` is a `sqlx` transaction on the pool at the database's default isolation. A handler writes its own rows
-  in the transaction of the message it handles with `SqlxTxExt::transaction::<DB>()`; its rows, the outbox appends and the
+  in the transaction of the message it handles with `SqlxTxExt::connection::<DB>()` (the transaction's connection); its rows, the outbox appends and the
   processed-event markers commit or roll back together. A command handler (which gets no transaction) begins one with
   `store.tx().begin()` and passes it to `EventBus::publish_in` (see `examples/orders-sql`).
 - What commits on its own (dead letters but a retry's delete, processor control, the outbox, deadline, notice and lease

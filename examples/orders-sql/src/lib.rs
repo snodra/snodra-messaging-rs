@@ -61,7 +61,7 @@ pub fn handlers(builder: KrakenMessagingBuilder, store: SqlxStore) -> KrakenMess
                     sqlx::query("INSERT INTO orders (id, item, status) VALUES ($1, $2, 'PLACED')")
                         .bind(&order.id)
                         .bind(&order.item)
-                        .execute(&mut **tx.transaction::<Postgres>())
+                        .execute(tx.connection::<Postgres>())
                         .await
                         .map_err(storage)?;
                     events
@@ -98,7 +98,7 @@ pub fn handlers(builder: KrakenMessagingBuilder, store: SqlxStore) -> KrakenMess
             let mut tx = ctx.tx.lock().await;
             sqlx::query("UPDATE orders SET status = 'CONFIRMED' WHERE id = $1")
                 .bind(&placed.id)
-                .execute(&mut **tx.transaction::<Postgres>())
+                .execute(tx.connection::<Postgres>())
                 .await
                 .map_err(storage)?;
             Ok(())

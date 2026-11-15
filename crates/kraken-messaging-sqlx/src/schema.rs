@@ -37,7 +37,6 @@ const LOCK_WAIT: Duration = Duration::from_secs(60);
 #[cfg(feature = "postgres")]
 const PG_LOCK_POLL: Duration = Duration::from_millis(200);
 
-#[cfg(feature = "mysql")]
 const SUPPORTED: &str = "PostgreSQL 13 or later, MySQL 8.0.17 or later";
 
 /// The file of schema version 1 of `dialect`, by its path in both libraries.
@@ -72,24 +71,16 @@ pub(crate) async fn verify(pool: &Pool) -> Result<(), StoreError> {
         Pool::Pg(p) => {
             let mut c = p.acquire().await.map_err(failed)?;
             let row = sqlx::query(
-                "SELECT current_setting('server_version_num') AS num, current_setting('server_version') AS version",
+                "SELECT version() AS product, current_setting('server_version_num') AS num, \
+                 current_setting('server_version') AS version",
             )
             .fetch_one(&mut *c)
             .await
             .map_err(failed)?;
-            let num: i64 = row
-                .try_get::<String, _>("num")
-                .map_err(failed)?
-                .trim()
-                .parse()
-                .unwrap_or(0);
+            let product: String = row.try_get("product").map_err(failed)?;
+            let num: String = row.try_get("num").map_err(failed)?;
             let version: String = row.try_get("version").map_err(failed)?;
-            if num < 130_000 {
-                return Err(storage(format!(
-                    "The kraken message store needs PostgreSQL 13.0 or later; this server is PostgreSQL {version}"
-                )));
-            }
-            Ok(())
+            check_postgres(&product, &num, &version)
         }
         #[cfg(feature = "mysql")]
         Pool::My(p) => {
@@ -106,6 +97,23 @@ pub(crate) async fn verify(pool: &Pool) -> Result<(), StoreError> {
             check_mysql(&version, &mode)
         }
     }
+}
+
+/// The PostgreSQL server (`version()`, `server_version_num`, `server_version`) accepted, else why
+/// not: PostgreSQL itself (not a server speaking its protocol, such as CockroachDB), 13 or later.
+#[cfg(feature = "postgres")]
+pub(crate) fn check_postgres(product: &str, num: &str, version: &str) -> Result<(), StoreError> {
+    if !product.starts_with("PostgreSQL") {
+        return Err(storage(format!(
+            "The kraken message store supports {SUPPORTED}; this server is {product}"
+        )));
+    }
+    if num.trim().parse::<i64>().unwrap_or(0) < 130_000 {
+        return Err(storage(format!(
+            "The kraken message store needs PostgreSQL 13.0 or later; this server is PostgreSQL {version}"
+        )));
+    }
+    Ok(())
 }
 
 /// The MySQL server's version text and session `sql_mode` accepted, else why not.
@@ -142,42 +150,51 @@ fn failed(e: sqlx::Error) -> StoreError {
 }
 
 /// The schema version of the database `pool` reaches: the highest in `kraken_schema`, 0 when
-/// there is none (no table yet). Read in a transaction rolled back after.
+/// there is none (no table yet). Read in a transaction rolled back after. Any other failure (the
+/// connection, a missing right) is reported as it is.
 pub(crate) async fn version(pool: &Pool) -> Result<i64, StoreError> {
-    const SQL: &str = "SELECT MAX(version) AS v FROM kraken_schema";
+    const SQL: &str = "SELECT CAST(MAX(version) AS SIGNED) AS v FROM kraken_schema";
+    const PG_SQL: &str = "SELECT CAST(MAX(version) AS BIGINT) AS v FROM kraken_schema";
+    let unreadable = |e: sqlx::Error| storage(format!("cannot read the schema version: {e}"));
     let read = match pool {
         #[cfg(feature = "postgres")]
         Pool::Pg(p) => {
-            let mut tx = p.begin().await.map_err(crate::db::store_error)?;
-            let read = sqlx::query(SQL).fetch_one(&mut *tx).await;
+            let _ = SQL;
+            let mut tx = p.begin().await.map_err(unreadable)?;
+            let read = sqlx::query(PG_SQL).fetch_one(&mut *tx).await;
             let _ = tx.rollback().await;
-            read.map(|row| {
-                row.try_get::<Option<i32>, _>("v")
-                    .ok()
-                    .flatten()
-                    .map(i64::from)
-            })
+            read.and_then(|row| row.try_get::<Option<i64>, _>("v"))
         }
         #[cfg(feature = "mysql")]
         Pool::My(p) => {
-            let mut tx = p.begin().await.map_err(crate::db::store_error)?;
+            let _ = PG_SQL;
+            let mut tx = p.begin().await.map_err(unreadable)?;
             let read = sqlx::query(SQL).fetch_one(&mut *tx).await;
             let _ = tx.rollback().await;
-            read.map(|row| {
-                row.try_get::<Option<i64>, _>("v")
-                    .ok()
-                    .flatten()
-                    .or_else(|| {
-                        row.try_get::<Option<i32>, _>("v")
-                            .ok()
-                            .flatten()
-                            .map(i64::from)
-                    })
-            })
+            read.and_then(|row| row.try_get::<Option<i64>, _>("v"))
         }
     };
-    // An error is the missing table: version 0.
-    Ok(read.ok().flatten().unwrap_or(0))
+    match read {
+        Ok(v) => Ok(v.unwrap_or(0)),
+        Err(e) if missing_table(&e) => Ok(0),
+        Err(e) => Err(unreadable(e)),
+    }
+}
+
+/// Whether `e` is "no such table" (PostgreSQL 42P01, MySQL 1146).
+fn missing_table(e: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(db) = e else {
+        return false;
+    };
+    #[cfg(feature = "postgres")]
+    if let Some(pg) = db.try_downcast_ref::<sqlx::postgres::PgDatabaseError>() {
+        return pg.code() == "42P01";
+    }
+    #[cfg(feature = "mysql")]
+    if let Some(my) = db.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>() {
+        return my.number() == 1146;
+    }
+    false
 }
 
 /// For `KRAKEN_STORE_INIT_SCHEMA=false`: fails unless the database has the schema at
@@ -219,6 +236,9 @@ pub(crate) async fn apply(pool: &Pool, dialect: Dialect) -> Result<(), StoreErro
         #[cfg(feature = "postgres")]
         Pool::Pg(p) => {
             let mut c = p.acquire().await.map_err(failed)?;
+            // The connection holding the lock is closed when it goes (never back to the pool
+            // holding a session lock, even when this future is dropped mid-way).
+            c.close_on_drop();
             // A session lock: it needs a direct connection (not PgBouncer in transaction mode).
             let deadline = tokio::time::Instant::now() + LOCK_WAIT;
             loop {
@@ -260,6 +280,8 @@ pub(crate) async fn apply(pool: &Pool, dialect: Dialect) -> Result<(), StoreErro
         #[cfg(feature = "mysql")]
         Pool::My(p) => {
             let mut c = p.acquire().await.map_err(failed)?;
+            // As on PostgreSQL: never back to the pool holding the named lock.
+            c.close_on_drop();
             let got: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, ?)")
                 .bind(MYSQL_LOCK)
                 .bind(LOCK_WAIT.as_secs() as i64)
@@ -324,6 +346,22 @@ mod tests {
     #[test]
     fn the_schema_lock_key_is_the_kotlin_one() {
         assert_eq!(PG_LOCK, 5_427_483_300_711_319_629);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgresql_13_itself_and_not_a_compatible_server() {
+        let pg = "PostgreSQL 17.7 (Debian 17.7-3.pgdg130+1) on x86_64-pc-linux-gnu";
+        assert!(check_postgres(pg, "170007", "17.7 (Debian 17.7-3.pgdg130+1)").is_ok());
+        assert!(check_postgres("PostgreSQL 13.0 on x86_64", "130000", "13.0").is_ok());
+        let refusal = |p: &str, n: &str| check_postgres(p, n, "x").unwrap_err().to_string();
+        assert!(refusal("PostgreSQL 12.18 on x86_64", "120018").contains("needs PostgreSQL 13.0"));
+        let cockroach = refusal("CockroachDB CCL v24.1.0 (x86_64-pc-linux-gnu)", "130000");
+        assert!(
+            cockroach.contains("supports PostgreSQL 13 or later")
+                && cockroach.contains("this server is CockroachDB"),
+            "{cockroach}"
+        );
     }
 
     #[cfg(feature = "mysql")]

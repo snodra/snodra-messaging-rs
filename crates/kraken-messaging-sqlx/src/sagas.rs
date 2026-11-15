@@ -272,6 +272,9 @@ async fn insert_saga_row(
                 ))
                 .await?
                 .int("t")?;
+            // Until it is put back, a transaction ending (or dropped) closes the connection
+            // rather than return it to the pool with a 1 s lock wait.
+            conn.session_changed(true);
             conn.execute(
                 Stmt::new("SET SESSION innodb_lock_wait_timeout = ?")
                     .arg("seconds", MYSQL_START_WAIT_SECONDS),
@@ -283,6 +286,9 @@ async fn insert_saga_row(
                     Stmt::new("SET SESSION innodb_lock_wait_timeout = ?").arg("seconds", previous),
                 )
                 .await;
+            if restored.is_ok() {
+                conn.session_changed(false);
+            }
             match (inserted, restored) {
                 // The statement's own failure first: a failure to put the value back never hides
                 // it (it is logged).
