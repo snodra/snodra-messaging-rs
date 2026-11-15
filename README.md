@@ -24,8 +24,16 @@ The Rust counterpart of the Kotlin `kraken-messaging` starter. A service built o
 indistinguishable from a Kotlin one in front of the hub and Kafka: same protocol
 (`proto/hub.proto`), same `kraken.events` record format, same JSON shapes, same error codes. Its state (the outbox,
 the processed events, the dead letters, the processor control, the external calls and the sagas) lives in the service's
-own database through a message store add-on (ADR 0028): `.store(...)` on the builder. The MongoDB store is the crate
-`kraken-messaging-mongo` (`crates/`), the same collections and documents as the Kotlin library's.
+own database through a message store add-on (ADR 0028): `.store(...)` on the builder; its events go to an event store add-on
+(ADR 0027): `.event_store(...)`.
+
+| Crate | What it is |
+|---|---|
+| `kraken-messaging-rs` (this directory, lib `kraken_messaging`) | the core: hub client, handlers, outbox relay, event processors, sagas, the store interfaces, the in-memory stores and the conformance kits |
+| `crates/kraken-messaging-mongo` | the MongoDB message store: the same collections and documents as the Kotlin library's |
+| `crates/kraken-messaging-sqlx` | the SQL message store on PostgreSQL 13+ or MySQL 8.0.17+ (features `postgres`, `mysql`): the same tables as the Kotlin `kraken-messaging-jdbc` (see [The SQL message store](#the-sql-message-store)) |
+| `crates/kraken-messaging-kafka` | the Kafka event store |
+| `crates/kraken-messaging-rabbitmq` | the RabbitMQ Streams event store (see [The RabbitMQ Streams event store](#the-rabbitmq-streams-event-store)) |
 
 | Capability | Where |
 |---|---|
@@ -62,6 +70,7 @@ own database through a message store add-on (ADR 0028): `.store(...)` on the bui
 - [Dead letters](#dead-letters)
 - [Processor control](#processor-control)
 - [In-memory stores](#in-memory-stores)
+- [The SQL message store](#the-sql-message-store)
 - [The RabbitMQ Streams event store](#the-rabbitmq-streams-event-store)
 - [Security](#security)
 - [Metrics](#metrics)
@@ -1191,6 +1200,29 @@ deadlines (a later `.clock(..)` replaces it). `MemoryEventStore::events(source)`
 `MemoryStore::contents()` show what each store holds. `examples/service-c` tests its `audit`
 processor this way (`src/audit.rs`).
 
+## The SQL message store
+
+The crate `kraken-messaging-sqlx` (`crates/`, on `sqlx`) keeps the message store in the service's own PostgreSQL (13 or
+later, feature `postgres`) or MySQL (8.0.17 or later, InnoDB, a STRICT `sql_mode`, feature `mysql`) database, in the tables
+the Kotlin module `kraken-messaging-jdbc` writes, with the same values and meanings: a Kotlin service and a Rust service can
+share one database. The schema files (`db/kraken/<dialect>/V1__kraken.sql`) are the Kotlin module's, byte for byte.
+
+```rust
+let pool = sqlx::postgres::PgPoolOptions::new().max_connections(10).connect(&url).await?;
+let app = KrakenMessaging::builder(config).await?
+    .store(Arc::new(SqlxStore::postgres(pool).with_settings(SqlxSettings::from_env()?)))
+    .event_store(events)
+    // the service's handlers; a handler writes its rows in the transaction of the message it handles:
+    // sqlx::query(..).execute(&mut **ctx.tx.lock().await.transaction::<sqlx::Postgres>())
+    .start()
+    .await?;
+```
+
+Its settings (`KRAKEN_STORE_SQL_NOTIFY`, `KRAKEN_STORE_SQL_PURGE_INTERVAL_MS`), the schema and its version rule, the
+minimum versions, transactions, the PostgreSQL wake-up, the purge and the limits are in
+[crates/kraken-messaging-sqlx/README.md](crates/kraken-messaging-sqlx/README.md); `examples/orders-sql` is a small service
+on it.
+
 ## The RabbitMQ Streams event store
 
 The crate `kraken-messaging-rabbitmq` (`crates/`) is the event store on **RabbitMQ 3.13 or later
@@ -1655,7 +1687,8 @@ cargo test --all-features             # unit + integration tests (the in-memory 
 
 Most tests run on the in-memory stores (see [In-memory stores](#in-memory-stores)) and need no
 container. The integration tests that pin the add-ons' own behaviour, and the end-to-end tests,
-start Kafka (`apache/kafka`), MongoDB (replica set) and `kraken-hub:dev` with testcontainers. The hub image is built from the sibling repo: `docker build -t kraken-hub:dev .` in
+start Kafka (`apache/kafka`), MongoDB (replica set), PostgreSQL (`postgres:17.7`), MySQL (`mysql:8.4.7`) and
+`kraken-hub:dev` with testcontainers. The hub image is built from the sibling repo: `docker build -t kraken-hub:dev .` in
 `../kraken-hub` (override with `KRAKEN_HUB_IMAGE`); every end-to-end test runs that one image (the
 hub and this library ship together). `tests/e2e_protocol.rs` covers the handshake, timeouts,
 reconnect, flow control and status reports against it; `tests/e2e_multi_hub.rs`,
@@ -1675,6 +1708,10 @@ whenever the umbrella checkout exists.
 events, consumes `GreetingDelivered`, runs the banner saga (`src/banner.rs`: an idempotent printer adapter, a partner topic,
 a webhook on axum and a polling deadline, unit-tested with `SagaTestFixture`), and runs in the sandbox compose next to the
 Kotlin examples.
+
+`examples/orders-sql` is a small service on PostgreSQL with the SQL message store: `PlaceOrder` writes the order row and
+appends `OrderPlaced` in one transaction, the relay publishes it, its handler confirms the order (with its processed-event
+marker). Its end-to-end test runs through the hub image.
 
 
 ## CI/CD pipeline
