@@ -59,9 +59,10 @@
 //!   default, the Java client's), and always on deactivation and at close.
 //! - **The native dead letter** is the stream `<source>.dlt` (`kraken.events.dlt`), with the
 //!   headers the core writes (as the Kafka add-on's), created by the infrastructure: a stream
-//!   queue, e.g. `rabbitmqadmin declare queue --name kraken.events.dlt --type stream`
-//!   (`rabbitmqadmin` 2.x, shipped in the `-management` images; `rabbitmq-streams` has no
-//!   command for a plain stream).
+//!   queue, e.g. `rabbitmqadmin declare queue --name kraken.events.dlt --type stream --durable true`
+//!   (`rabbitmqadmin` 2.x, shipped in the `-management` images; from outside a node add `--host`,
+//!   `--port`, `--username` and `--password`; `rabbitmq-streams` has no command for a plain
+//!   stream).
 //!
 //! # What it declares
 //!

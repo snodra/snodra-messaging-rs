@@ -217,8 +217,9 @@ it (kept in the dispatch entry's headers); one sent by a deadline handler carrie
   letters.
 - **Payloads** (every store, before the store sees them, `store::check_outbox_payload`): a JSON object, UTF-8 without a
   byte order mark, no lone surrogate escape, no number a double cannot hold (`1e400`), every integer within `i64`, and
-  at most 100 levels of objects and arrays, its own object included (`{"a":1}` is one level; `MAX_PAYLOAD_DEPTH`, MySQL's
-  JSON limit, which no store may exceed). Anything else fails the publish with `InvalidMessage`.
+  at most depth 100 as MySQL's `JSON_DEPTH` counts (`{}` 1, `{"a":1}` 2, `{"a":[1]}` 3; `MAX_PAYLOAD_DEPTH`: MySQL keeps
+  no document nesting more than 100 objects and arrays, and no store may take what one store cannot). Anything else
+  fails the publish with `InvalidMessage`.
 - **Outbox**: `publish` inserts; the publisher relays in `createdAt, seq` order, stops the batch on a
   retriable failure, marks `failedAt` after 10 attempts, or at once when the event store refuses the event for good (too
   large, not authorized, a source it cannot have) or finds it invalid. One publish has 40 s (`OUTBOX_SEND_TIMEOUT`, as the
@@ -763,7 +764,7 @@ id of the message that scheduled it), `associate_with`, `remove_association_with
 start key, also from the start handler), `end()`, `send(&command, routing_key)`, `publish(&event, key)`, `schedule_after(duration, name, payload)`,
 `schedule_at(time, name, payload)` (both return the deadline id), `cancel(id)`, `cancel_all(name)`; at most 999 messages per
 handling of an instance. A published event must serialize to a JSON object the outbox takes (not a unit struct, no
-integer above `i64::MAX`, at most 100 levels deep; `store::check_outbox_payload`): anything else fails the handler with `InvalidMessage` naming the
+integer above `i64::MAX`, at most JSON depth 100; `store::check_outbox_payload`): anything else fails the handler with `InvalidMessage` naming the
 event (the relay counts one recorded before as `kraken_saga_command_failures_total{reason="INVALID"}` and gives it up). A handler gets no `Sender` or `EventBus`, and **must not capture one**: it would send inside the
 saga's transaction, for a state that may roll back, with no order, retry or idempotency key.
 
@@ -1399,10 +1400,11 @@ its dead-letter stream when the dead-letter mode is `event-store`:
 
 ```bash
 rabbitmq-streams add_super_stream kraken.events --partitions 6
-rabbitmqadmin declare queue --name kraken.events.dlt --type stream   # a plain stream: rabbitmq-streams has no command for it
+rabbitmqadmin declare queue --name kraken.events.dlt --type stream --durable true   # a plain stream: rabbitmq-streams has no command for it
 ```
 
-(`rabbitmqadmin` 2.x ships in the `-management` images and talks to the management API; any AMQP client declaring a
+(`rabbitmqadmin` 2.x ships in the `-management` images and talks to the management API, from outside a node with
+`--host`, `--port`, `--username` and `--password`; any AMQP client declaring a
 queue with `x-queue-type: stream` does the same.)
 
 A missing super stream fails the publish (retried by the outbox relay) and the processors'

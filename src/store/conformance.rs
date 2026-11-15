@@ -229,10 +229,10 @@ pub async fn appended_entry_is_claimed_in_created_seq_order(store: &dyn MessageS
     );
 }
 
-/// An outbox payload is a JSON object whose integers fit in an `i64`, nested at most
-/// [`MAX_PAYLOAD_DEPTH`] levels: anything else (not JSON, an array, a bare value, an integer above
+/// An outbox payload is a JSON object whose integers fit in an `i64`, at most
+/// [`MAX_PAYLOAD_DEPTH`] deep (MySQL's `JSON_DEPTH`): anything else (not JSON, an array, a bare value, an integer above
 /// `i64::MAX`, a number no double holds, a lone surrogate escape, a leading BOM, bytes that are
-/// not UTF-8, one level too deep) is refused with `InvalidMessage`, appended on its own or in a
+/// not UTF-8, one deeper) is refused with `InvalidMessage`, appended on its own or in a
 /// transaction, and nothing is appended. The deepest payload allowed is kept by every store.
 pub async fn outbox_rejects_a_payload_that_is_not_a_json_object(store: &dyn MessageStore) {
     let outbox = store.outbox();
@@ -323,9 +323,11 @@ pub async fn outbox_rejects_a_payload_that_is_not_a_json_object(store: &dyn Mess
     outbox.mark_sent(&ids(&claimed)).await.expect("mark_sent");
 }
 
-/// A JSON object nested `levels` deep: `{"a":{"a":...{"a":1}...}}`, `{"a":1}` being one level.
-fn nested(levels: usize) -> String {
-    format!("{}1{}", "{\"a\":".repeat(levels), "}".repeat(levels))
+/// A JSON object `depth` deep as MySQL's `JSON_DEPTH` counts: `{"a":{"a":...{"a":1}...}}`,
+/// `{"a":1}` being depth 2.
+fn nested(depth: usize) -> String {
+    let objects = depth - 1;
+    format!("{}1{}", "{\"a\":".repeat(objects), "}".repeat(objects))
 }
 
 /// `pending` counts the entries neither sent nor failed, held by a relay or not, and

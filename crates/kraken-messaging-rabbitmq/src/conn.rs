@@ -492,7 +492,8 @@ impl NoLeader {
         match self {
             NoLeader::NotInMetadata => failed(format!(
                 "the stream {stream} is unavailable right now: the broker's metadata names no \
-                 leader for it (a leader election, or the stream does not exist)"
+                 leader for it (it may have none during a leader election, or the stream may not \
+                 exist); the call is retried"
             )),
             NoLeader::DoesNotExist => failed(format!(
                 "the broker says the stream {stream} does not exist"
