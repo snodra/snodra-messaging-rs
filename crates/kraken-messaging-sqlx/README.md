@@ -150,7 +150,9 @@ dead letter's payload holding one is kept as `payload_binary`. Identifiers are c
   fails, and a `COMMIT` is answered with a rollback that sqlx reports as a success. So the store's commit of a service
   transaction first runs `SELECT 1` (one round trip; it fails with `25P02` in an aborted transaction): a handler that ignored
   a failed statement and returned `Ok` gets a failed commit, nothing of the transaction is committed (its rows, the outbox
-  appends, the marker), the connection is closed, and the record is not acknowledged: the core handles it again. MySQL has
+  appends, the marker), the connection is closed, and the record is not acknowledged: the core handles it again. The
+  probe costs one more round trip per commit of a service transaction on PostgreSQL (the store's own transactions run
+  none); sqlx exposes neither the `COMMIT` answer's tag nor the session's transaction status, which would spare it. MySQL has
   no aborted state: a failed statement is undone alone and the transaction goes on, so the rest of it commits; except a
   deadlock (`1213`), and a lock wait timeout with `innodb_rollback_on_timeout=ON`, which roll the whole transaction back and
   leave the session outside it (later statements commit one by one, the commit commits nothing, and sqlx does not tell):
