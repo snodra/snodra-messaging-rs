@@ -27,7 +27,7 @@ mod tx;
 #[cfg(feature = "testing")]
 pub mod conformance;
 
-pub use crate::events::check_outbox_payload;
+pub use crate::events::outbox::check_outbox_payload;
 pub use control::{
     ControlOperation, Locked, ProcessorControlState, ProcessorControlStore, RESET_KIND,
 };
