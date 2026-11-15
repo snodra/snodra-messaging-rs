@@ -320,11 +320,16 @@ async fn a_segment_moves_only_after_its_holder_let_it_go() {
         SubscriptionEvent::Assigned(s) if s.len() == 2
     ));
     let mut b = events.subscribe(spec("p")).await.expect("subscribe");
+    assert_eq!(
+        b.next().await.expect("next"),
+        SubscriptionEvent::Assigned(vec![]),
+        "b joined holding nothing yet: its first assignment is empty"
+    );
     assert!(
         tokio::time::timeout(Duration::from_millis(300), b.next())
             .await
             .is_err(),
-        "nothing for b while a has not let a segment go"
+        "nothing more for b while a has not let a segment go"
     );
     let SubscriptionEvent::Revoked(gone) = a.next().await.expect("next") else {
         panic!("a sees a segment revoked");

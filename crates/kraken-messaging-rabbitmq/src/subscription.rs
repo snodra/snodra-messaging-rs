@@ -4,7 +4,11 @@
 //!
 //! - **Assignment** is the broker's consumer updates: a partition whose consumer becomes active
 //!   is `Assigned`, one that stops being active is `Revoked` followed by an empty `Assigned`
-//!   (the change is over). On activation the subscription
+//!   (the change is over). A subscription active on no partition [`FIRST_SETTLE`] after it
+//!   subscribed to all of them announces `Assigned([])` (a member, idle); an activation before
+//!   that is the first `Assigned` instead, so an empty one never follows a real one as if
+//!   everything were lost (an activation after it is an ordinary later `Assigned`). On activation
+//!   the subscription
 //!   reads the offset stored under its name and answers the broker with it (the first offset
 //!   when none is stored); on deactivation it stores what was acknowledged first.
 //! - **Acknowledgement** moves the position stored under the subscription's name (server-side
@@ -56,6 +60,9 @@ const OFFSETS_FIRST: Duration = Duration::from_millis(500);
 pub const READY_LIMIT: usize = 1_000;
 /// How long a stored offset may take to be read back (at close, at deactivation).
 const STORE_WAIT: Duration = Duration::from_secs(5);
+/// How long after subscribing to every partition a subscription active on none announces its
+/// first assignment, empty (the broker activates a lone or first consumer at once).
+pub const FIRST_SETTLE: Duration = Duration::from_secs(1);
 /// The subscribe property that tells the members of one subscription apart (the management
 /// API shows it).
 pub const MEMBER_PROPERTY: &str = "kraken-member";
@@ -142,6 +149,8 @@ struct State {
     paused: bool,
     broken: Option<EventStoreError>,
     error: Option<String>,
+    /// An `Assigned` was queued: the subscription's first one is behind it.
+    announced: bool,
 }
 
 impl State {
@@ -301,6 +310,23 @@ impl RabbitSubscription {
                 return Err(e);
             }
         }
+        // Active on no partition once the broker had its moment: a member holding nothing.
+        let first = Arc::clone(&shared);
+        let settle = cancel.clone();
+        subscription.tasks.push(tokio::spawn(async move {
+            tokio::select! {
+                _ = settle.cancelled() => {}
+                _ = tokio::time::sleep(FIRST_SETTLE) => {
+                    let mut state = lock(&first.state);
+                    if !state.announced {
+                        state.announced = true;
+                        state.changes.push_back(SubscriptionEvent::Assigned(vec![]));
+                        drop(state);
+                        first.wake();
+                    }
+                }
+            }
+        }));
         let mut conns: Vec<Arc<Conn>> = Vec::new();
         for (conn, _) in &subscription.subs {
             if !conns.iter().any(|c| Arc::ptr_eq(c, conn)) {
@@ -591,6 +617,7 @@ impl PartTask {
                 part.inflight.clear();
                 part.head = part.head.max(stored);
             }
+            state.announced = true;
             state
                 .changes
                 .push_back(SubscriptionEvent::Assigned(vec![self.segment.clone()]));

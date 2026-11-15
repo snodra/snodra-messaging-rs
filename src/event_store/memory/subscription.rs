@@ -22,6 +22,9 @@ pub(super) struct MemorySubscription {
     left: bool,
     /// A `Revoked` was given and no `Assigned` since: the next step closes the change.
     changing: bool,
+    /// An `Assigned` was given: a new subscription's first event is one, empty when it holds
+    /// nothing.
+    announced: bool,
 }
 
 impl MemorySubscription {
@@ -35,6 +38,7 @@ impl MemorySubscription {
             turn: 0,
             left: false,
             changing: false,
+            announced: false,
         }
     }
 
@@ -78,10 +82,12 @@ impl MemorySubscription {
                     .insert(s, group.committed.get(&s).copied().unwrap_or(0));
             }
             self.changing = false;
+            self.announced = true;
             return Some(SubscriptionEvent::Assigned(names(&added)));
         }
-        if std::mem::take(&mut self.changing) {
-            // Every revocation is closed by an assignment, an empty one when nothing new came.
+        // Every revocation is closed by an assignment, an empty one when nothing new came; and a
+        // new subscription that holds nothing says so (a member, idle).
+        if std::mem::take(&mut self.changing) || !std::mem::replace(&mut self.announced, true) {
             return Some(SubscriptionEvent::Assigned(Vec::new()));
         }
         if self.paused || self.cursors.is_empty() {

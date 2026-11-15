@@ -226,3 +226,74 @@ async fn control_action_without_capability_is_unsupported() {
     assert_eq!(control.operation, None, "no lock: {control:?}");
     app.shutdown().await;
 }
+
+/// One processor's consumer on `events`, reading `spec`.
+fn consumer_of(events: &Log, spec: &SubscriptionSpec) -> Arc<EventConsumer> {
+    EventConsumer::processor(
+        ProcessorSettings {
+            name: "default".into(),
+            subscription: spec.clone(),
+            events: Arc::new(events.clone()),
+            max_attempts: 1,
+            backoff: Duration::from_millis(10),
+            dead_letter_mode: DeadLetterMode::Log,
+            dead_letter_retention: Duration::from_secs(60),
+            dead_letters: None,
+            metrics: Metrics::global(),
+        },
+        Arc::new(LocalEventDispatcher::new(
+            None,
+            Arc::new(HandlerRegistry::new()),
+            Arc::new(NoSagas),
+        )),
+    )
+    .unwrap()
+}
+
+/// More instances than segments on the in-memory event store: the instance that joined last
+/// holds nothing, and its processor reads RUNNING (a member, idle), never STARTING, because a new
+/// subscription announces its first assignment even when it is empty.
+#[tokio::test]
+async fn an_idle_newcomer_reads_running() {
+    let events = Log::full();
+    let spec = SubscriptionSpec {
+        name: "core.idle".into(),
+        source: SOURCE.into(),
+    };
+    let state = |m: &kraken_messaging::processors::ProcessorMonitor| {
+        ProcessorState::try_from(m.status().state).unwrap()
+    };
+    let cancel = CancellationToken::new();
+    let mut monitors = Vec::new();
+    let mut tasks = Vec::new();
+    for _ in 0..=support::event_store::SEGMENTS {
+        let consumer = consumer_of(&events, &spec);
+        let monitor = consumer.monitor();
+        tasks.push(consumer.start(cancel.clone()));
+        eventually("the newcomer reads RUNNING", || {
+            state(&monitor) == ProcessorState::ProcessorRunning
+        })
+        .await;
+        monitors.push(monitor);
+    }
+    eventually("every segment held by the first instances", || {
+        monitors[..support::event_store::SEGMENTS]
+            .iter()
+            .all(|m| m.status().segments.len() == 1)
+    })
+    .await;
+    let idle = monitors.last().unwrap();
+    assert!(
+        idle.status().segments.is_empty(),
+        "the last one holds nothing"
+    );
+    assert_eq!(
+        state(idle),
+        ProcessorState::ProcessorRunning,
+        "idle, running"
+    );
+    cancel.cancel();
+    for task in tasks {
+        task.await.unwrap();
+    }
+}

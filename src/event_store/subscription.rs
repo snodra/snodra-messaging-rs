@@ -4,6 +4,10 @@ use futures::future::BoxFuture;
 
 use super::{EventStoreError, SegmentStatus, SubscriptionEvent};
 
+/// The longest a new subscription takes to yield its first event, an `Assigned` (see
+/// [`Subscription`]); the conformance kit checks it.
+pub const FIRST_ASSIGNMENT_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// One instance's subscription of a processor ([`EventStore::subscribe`](super::EventStore::subscribe)):
 /// the segments the event store assigns it and their events, one at a time.
 ///
@@ -12,6 +16,11 @@ use super::{EventStoreError, SegmentStatus, SubscriptionEvent};
 ///   assignment changes.
 /// - **Order per segment.** A segment's events come in their order, each after the
 ///   [`SubscriptionEvent::Assigned`] naming its segment and before any `Revoked` of it.
+/// - **The first event is an `Assigned`** (an empty one when the subscription holds no segment),
+///   within [`FIRST_ASSIGNMENT_WITHIN`] of joining: an instance that joined and holds nothing is a
+///   member, idle (the core reports it `RUNNING`, not `STARTING`). An empty first `Assigned` may be
+///   followed by one naming segments; an `Assigned` naming segments is never followed by a late
+///   empty "first" one.
 /// - **Every `Revoked` is followed by an `Assigned`** (an empty one when nothing new comes): the
 ///   assignment change is over only then (the core reports the processor `STARTING` in between).
 ///   An event store that only moves segments away (a single active consumer losing one) still

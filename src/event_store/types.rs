@@ -152,7 +152,8 @@ pub struct Delivery {
 /// What [`Subscription::next`](super::Subscription::next) gives.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubscriptionEvent {
-    /// These segments became this subscription's (in addition to the ones it has).
+    /// These segments became this subscription's (in addition to the ones it has). A new
+    /// subscription's first event, empty when it holds nothing.
     Assigned(Vec<String>),
     /// These segments are this subscription's no longer; what it delivered of them and did not
     /// acknowledge comes again to whichever subscription gets them. Always followed by an

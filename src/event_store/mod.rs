@@ -45,7 +45,7 @@ pub mod conformance;
 
 pub use admin::{ReplayRange, ResetTarget, SubscriptionAdmin};
 pub use browse::EventBrowser;
-pub use subscription::Subscription;
+pub use subscription::{FIRST_ASSIGNMENT_WITHIN, Subscription};
 pub use types::{
     Capability, Delivery, EventStoreError, MAX_POSITION_BYTES, MAX_SEGMENT_BYTES, OutgoingEvent,
     SegmentStatus, SubscriptionEvent, SubscriptionSpec, dead_letter_source, headers, segment_order,

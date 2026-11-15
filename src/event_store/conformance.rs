@@ -47,6 +47,7 @@
 //! | [`same_key_arrives_in_publish_order`] | `sameKeyArrivesInPublishOrder` |
 //! | [`every_processor_gets_every_event`] | `everyProcessorGetsEveryEvent` |
 //! | [`instances_share_a_processor`] | `instancesShareAProcessor` |
+//! | [`a_joining_instance_announces_its_first_assignment`] | **none yet** |
 //! | [`an_instance_left_without_segments_closes_its_change`] | `anInstanceLeftWithoutSegmentsClosesItsChange` |
 //! | [`unacked_delivery_is_redelivered`] | `unackedDeliveryIsRedelivered` |
 //! | [`redelivered_after_commit_is_skipped`] | `redeliveredAfterCommitIsSkipped` |
@@ -79,9 +80,9 @@ use super::browse::{
     TailRequest, TailStream, TimeArg,
 };
 use super::{
-    Capability, Delivery, EventStore, EventStoreError, MAX_POSITION_BYTES, MAX_SEGMENT_BYTES,
-    OutgoingEvent, ReplayRange, ResetTarget, Subscription, SubscriptionAdmin, SubscriptionEvent,
-    SubscriptionSpec, dead_letter_source, headers, segment_order,
+    Capability, Delivery, EventStore, EventStoreError, FIRST_ASSIGNMENT_WITHIN, MAX_POSITION_BYTES,
+    MAX_SEGMENT_BYTES, OutgoingEvent, ReplayRange, ResetTarget, Subscription, SubscriptionAdmin,
+    SubscriptionEvent, SubscriptionSpec, dead_letter_source, headers, segment_order,
 };
 use crate::store::{MessageStore, ProcessedMarker};
 use crate::time::{now_ms, rfc3339};
@@ -122,6 +123,7 @@ pub async fn run_event_store_conformance(
         same_key_arrives_in_publish_order,
         every_processor_gets_every_event,
         instances_share_a_processor,
+        a_joining_instance_announces_its_first_assignment,
         an_instance_left_without_segments_closes_its_change,
         unacked_delivery_is_redelivered,
         redelivered_after_commit_is_skipped,
@@ -344,6 +346,51 @@ pub async fn instances_share_a_processor(kit: &EventStoreKit<'_>) {
     assert!(twice.is_empty(), "delivered to both instances: {twice:?}");
     a.close().await;
     b.close().await;
+}
+
+/// Instances join one subscription one at a time, one more than its segments, each reading the
+/// whole time: every newcomer's first event is an `Assigned` (an empty one when it holds nothing,
+/// as the last one may), within [`FIRST_ASSIGNMENT_WITHIN`] of joining, so an instance that joined
+/// and holds nothing is a member, idle, and never reads `STARTING`.
+pub async fn a_joining_instance_announces_its_first_assignment(kit: &EventStoreKit<'_>) {
+    let spec = kit.spec();
+    let first = kit.instance();
+    let mut readers = vec![Reader::join(&*first, &spec).await];
+    let mut stores = vec![first];
+    readers[0]
+        .until("the first instance holds segments", |r| {
+            !r.assigned.is_empty()
+        })
+        .await;
+    readers[0].pump(QUIET).await;
+    let segments = readers[0].assigned.len();
+    while readers.len() <= segments {
+        let store = kit.instance();
+        readers.push(Reader::join(&*store, &spec).await);
+        stores.push(store);
+        let newcomer = readers.len() - 1;
+        let deadline = Instant::now() + FIRST_ASSIGNMENT_WITHIN;
+        while readers[newcomer].first.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "instance {} of {} (assigned {:?}): its first assignment, possibly empty, within \
+                 {FIRST_ASSIGNMENT_WITHIN:?} of joining",
+                newcomer + 1,
+                segments + 1,
+                readers.iter().map(|r| &r.assigned).collect::<Vec<_>>()
+            );
+            futures::future::join_all(readers.iter_mut().map(|r| r.pump(SLICE))).await;
+        }
+        assert_eq!(
+            readers[newcomer].first,
+            Some("Assigned"),
+            "instance {}: the first event of a new subscription is an Assigned",
+            newcomer + 1
+        );
+    }
+    for r in readers {
+        r.close().await;
+    }
 }
 
 /// More instances than segments: instances join one at a time; after each join the segments
@@ -1594,6 +1641,8 @@ struct Reader {
     revoked: usize,
     /// Assignment changes seen (`Assigned` and `Revoked`).
     changes: usize,
+    /// The kind of the first event the subscription gave.
+    first: Option<&'static str>,
     /// A `Revoked` came and no `Assigned` after it yet (the contract closes every revocation
     /// with an assignment, possibly empty).
     changing: bool,
@@ -1616,6 +1665,7 @@ impl Reader {
             hold_everything: false,
             revoked: 0,
             changes: 0,
+            first: None,
             changing: false,
         }
     }
@@ -1677,6 +1727,11 @@ impl Reader {
     }
 
     fn take(&mut self, event: SubscriptionEvent) {
+        self.first.get_or_insert(match &event {
+            SubscriptionEvent::Assigned(_) => "Assigned",
+            SubscriptionEvent::Revoked(_) => "Revoked",
+            SubscriptionEvent::Delivery(_) => "Delivery",
+        });
         match event {
             SubscriptionEvent::Assigned(segments) => {
                 self.changes += 1;
