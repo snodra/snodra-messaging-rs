@@ -766,9 +766,9 @@ impl KrakenMessagingBuilder {
     /// `kraken-messaging-mongo`'s `MongoStore`), where the outbox, the processed events, the dead
     /// letters, the processor control, the external calls and the sagas live; the event bus
     /// (also one taken before this call) appends to its outbox. Publishing an event, an event
-    /// handler, a saga, an idempotent handler and a partner topic need one
+    /// handler, a saga, an idempotent handler and a partner source need one
     /// ([`start`](Self::start) fails naming what needs it); commands and queries do not. The
-    /// store's schema (MongoDB: its indexes) is prepared by `start` unless
+    /// store's schema (its add-on's own: indexes, tables) is prepared by `start` unless
     /// `Config::store_init_schema` is false (`KRAKEN_STORE_INIT_SCHEMA`), and the store stamps its
     /// own times with the builder's [`clock`](Self::clock).
     pub fn store(mut self, store: Arc<dyn MessageStore>) -> Self {

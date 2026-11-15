@@ -44,12 +44,12 @@ own database through a message store add-on (ADR 0028): `.store(...)` on the bui
 | Subscription queries: an initial result, then updates pushed by every owner instance | `subscription_query`, `QueryUpdateEmitter`, `Sender::subscribe` (see [Subscription queries](#subscription-queries)) |
 | Publish events through the message store's outbox, relayed to the event store | `events::EventBus`, `events::OutboxPublisher` |
 | The event store: one interface, an add-on per broker, a conformance kit | `event_store::EventStore`, `event_store::conformance` (feature `testing`) |
-| The message store: one interface per collection, an add-on per database, a conformance kit | `store::MessageStore`, `store::conformance` (feature `testing`) |
+| The message store: one interface per kind of record, an add-on per database, a conformance kit | `store::MessageStore`, `store::conformance` (feature `testing`) |
 | Consume events idempotently (marker + handler in one transaction) | `events::EventConsumer` |
 | Named event processors (own subscription, markers, status), dead letters with an admin API | `event_in`, `app.dead_letters()`, `app.processors()` (see [Event processors](#event-processors), [Dead letters](#dead-letters)) |
 | Processor control from the hub: pause, resume, reset (replay) with reset handlers, dead letters | `event_with` + `EventOptions::disallow_replay`, `reset_handler`, `app.processor_control()` (see [Processor control](#processor-control)) |
 | Identity from the forwarded JWT: JWKS verification or unverified parsing; handler guards | `identity::{IdentityResolver, JwksVerifier, Guard}` |
-| Sagas and deadlines on the Kotlin starter's collections, the relay, parked events | `KrakenMessagingBuilder::saga`, `saga::SagaContext`, `app.saga_failures()` (see [Sagas](#sagas)) |
+| Sagas and deadlines on the Kotlin starter's records, the relay, parked events | `KrakenMessagingBuilder::saga`, `saga::SagaContext`, `app.saga_failures()` (see [Sagas](#sagas)) |
 | Idempotent adapters, partner sources (read by an event-store add-on), webhooks; saga statistics | `idempotent_command`, `external_source`, `app.ingress()`, `external::webhook::verify`, `app.saga_stats()` |
 | A saga test fixture (feature `testing`) | `saga::testing::SagaTestFixture` |
 | In-memory event store and message store: tests, local runs and demos with no infrastructure | `event_store::memory::MemoryEventStore`, `store::memory::MemoryStore`, `testing::InMemoryStores` (feature `testing`; see [In-memory stores](#in-memory-stores)) |
@@ -185,7 +185,7 @@ it (kept in the dispatch entry's headers); one sent by a deadline handler carrie
 | `KRAKEN_HUB_TLS_SERVER_NAME` | the host of the address (for `dns:///name:port`, `name`) | the name the hub's certificate must carry, also sent as SNI (`HubTls.server_name`); needs `KRAKEN_HUB_TLS=true` |
 | `KRAKEN_HUB_TLS_CLIENT_CERT`, `KRAKEN_HUB_TLS_CLIENT_KEY` | none | the client certificate chain (leaf first) and its PKCS#8 PEM private key for mutual TLS (`HubTls.client_cert_file`, `HubTls.client_key_file`); both or neither; **they turn TLS on** like `KRAKEN_HUB_TLS=true` (`KRAKEN_HUB_TLS=false` next to them is an error); exclude `KRAKEN_HUB_TOKEN*` and `KRAKEN_HUB_OAUTH2_*` (one credential kind per service; a startup error naming both); the files are checked at startup. See [Authenticating with a client certificate](#authenticating-with-a-client-certificate-mtls) |
 | `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS` | true, 5 | one consumer per [event processor](#event-processors) with handlers (`default` also for sagas alone); the attempts and the 1 s backoff are shared by every processor |
-| `KRAKEN_EVENTS_DEAD_LETTER_MODE` | `collection` | where a record a processor cannot handle goes (see [Dead letters](#dead-letters)): `collection` (`dead_letters`, sequenced per key, admin API), `event-store` (the event store's `<source>.dlt`; needs the capability `native-dead-letter`) or `log` (logged and skipped); case-insensitive, anything else is a startup error (v0.4.0's `topic` names its replacement `event-store`) |
+| `KRAKEN_EVENTS_DEAD_LETTER_MODE` | `collection` | where a record a processor cannot handle goes (see [Dead letters](#dead-letters)): `collection` (the message store's dead letters, sequenced per key, admin API), `event-store` (the event store's `<source>.dlt`; needs the capability `native-dead-letter`) or `log` (logged and skipped); case-insensitive, anything else is a startup error (v0.4.0's `topic` names its replacement `event-store`) |
 | `KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS` | 2592000000 (30 d) | how long a letter is kept (`expire_at` = `parked_at` + this; the message store removes it then, which unblocks its key); at least 1000 (a startup error otherwise, also when set in code) |
 | `KRAKEN_OUTBOX_ENABLED`, `KRAKEN_OUTBOX_POLL_INTERVAL_MS`, `KRAKEN_OUTBOX_BATCH_SIZE`, `KRAKEN_OUTBOX_MAX_ATTEMPTS` | true, 200, 100, 10 | |
 | `KRAKEN_OUTBOX_LEASE_MS` | 120000 | how long a batch the relay claims stays its own; longer than a send (40 s), else a startup error. A batch stops before its lease could run out under a send; the next claim renews what the relay still holds |
@@ -789,25 +789,25 @@ service without sagas):
 |---|---|---|
 | `KRAKEN_SAGAS_ENABLED` | true | `false` with sagas registered: a warning, and no runtime, relay or scheduler |
 | `KRAKEN_SAGAS_MAX_ATTEMPTS` | 5 | attempts of one (event, saga type) on conflicts before it is parked (200 ms doubling to 5 s); a handler error gets two |
-| `KRAKEN_SAGAS_ENDED_RETENTION_MS` | 30 d | TTL of ended sagas |
-| `KRAKEN_SAGAS_DISPATCH_RETENTION_MS` | 7 d | TTL of dispatched `saga_dispatch` entries |
-| `KRAKEN_SAGAS_FAILED_RETENTION_MS` | 30 d | TTL of what failed for good: `saga_dispatch` entries given up on (`failedAt_ttl`) and parked events in `saga_failures` (`lastFailedAt_ttl`, moved on by a retry that fails again); at least 1000 ms |
+| `KRAKEN_SAGAS_ENDED_RETENTION_MS` | 30 d | retention of ended sagas |
+| `KRAKEN_SAGAS_DISPATCH_RETENTION_MS` | 7 d | retention of dispatched saga dispatch entries |
+| `KRAKEN_SAGAS_FAILED_RETENTION_MS` | 30 d | retention of what failed for good: saga dispatch entries given up on (from their failure) and parked saga events (from their last failure, moved on by a retry that fails again); at least 1000 ms |
 | `KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS` | 500 | how often the relay looks for recorded entries |
 | `KRAKEN_SAGAS_RELAY_LEASE_MS` | 30000 | one saga's dispatch lease, renewed while a send runs |
 | `KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS` | 10 | attempts of a command on transient failures before `EXHAUSTED` |
 | `KRAKEN_SAGAS_RELAY_INITIAL_BACKOFF_MS`, `_MAX_BACKOFF_MS` | 1000, 5 min | the relay's backoff (doubling) |
 | `KRAKEN_DEADLINES_POLL_INTERVAL_MS` | 1000 | how often due deadlines are looked for |
 | `KRAKEN_DEADLINES_LEASE_MS` | 30000 | how long a claimed deadline stays reserved (at least once) |
-| `KRAKEN_DEADLINES_RETENTION_MS` | 7 d | TTL of fired and cancelled deadlines |
+| `KRAKEN_DEADLINES_RETENTION_MS` | 7 d | retention of fired and cancelled deadlines |
 | `KRAKEN_EXTERNAL_CALLS_LEASE_MS` | 5 min | how long an `IN_PROGRESS` call may take before its outcome is unknown |
-| `KRAKEN_EXTERNAL_CALLS_RETENTION_MS` | 30 d | TTL of `external_calls` |
+| `KRAKEN_EXTERNAL_CALLS_RETENTION_MS` | 30 d | retention of the external call records |
 
 Partner sources (`external_source(name, provider, translator)`, the provider an event-store add-on's, e.g. the Kafka
 add-on's `KafkaExternalSource`; an empty or reserved name or two sources of one name fail `start()`) and the webhook
 secret are set in code.
 `builder.clock(Clock)` replaces the clock of the runtime, the relay, the scheduler, the adapters and the ingress
-(`ManualClock` in tests). The runtime, the relay, the scheduler and the gauge sampler run only with a registered saga, the
-`external_calls` indexes only with an idempotent handler, a partner consumer per source; `app.ingress()` always exists.
+(`ManualClock` in tests). The runtime, the relay, the scheduler and the gauge sampler run only with a registered saga, a
+partner source's reader per source; `app.ingress()` always exists.
 Saga commands to a type the service handles itself go to its own handler without the hub. Shutdown stops the relay, the
 scheduler and the sampler first (at most 20 s for the three together), then the rest.
 
@@ -858,7 +858,7 @@ Steps: `given_events`, `given_current_time` (default 2026-01-01T00:00:00Z), `whe
 `when_time_elapses`, `when_command_failed(&command, reason, message)` (the relay's `SagaCommandFailed` for a command the saga
 sent). Expectations: `expect_active_sagas`, `expect_association`, `expect_dispatched_commands`, `expect_published_events`
 (several types in one slice: `&[&A { .. }, &B { .. }]`, compared by wire type and JSON), `expect_scheduled_deadline`,
-`expect_no_scheduled_deadlines`, `expect_saga_ended`; `store()` reads the documents. A step that fails (a handler error or
+`expect_no_scheduled_deadlines`, `expect_saga_ended`; `store()` reads the records. A step that fails (a handler error or
 panic, a state that does not survive its JSON text) and an expectation that does not hold **panic**, naming the saga; a
 failing step leaves nothing behind. The methods are synchronous: call them from a `#[test]` (or from an async test without
 holding the fixture across an `.await`).
@@ -1880,7 +1880,7 @@ sandbox's 5 s) must stay well under the window.
 
 | Series (Prometheus) | Type | Labels | Meaning |
 |---|---|---|---|
-| `kraken_outbox_pending` | gauge | — | outbox documents neither sent nor failed, as the relay's last poll saw them (the batch, or a count of all of them behind a full batch); only where the relay runs, every instance reports the same database: aggregate with `max by (job)` |
+| `kraken_outbox_pending` | gauge | — | outbox entries neither sent nor failed, as the relay's last poll saw them (the batch, or a count of all of them behind a full batch); only where the relay runs, every instance reports the same store: aggregate with `max by (job)` |
 | `kraken_outbox_oldest_age_seconds` | gauge | — | age of the oldest of them now, 0 when none |
 | `kraken_outbox_published_total` | counter | `outcome` (`ok`, `failed`) | publish attempts (`failed`: any attempt that did not publish, retried or given up) |
 | `kraken_events_consumed_total` | counter | `processor`, `type`, `outcome` | one per record and processor at its final outcome there: `handled` (stage 1 ran, and in `default` the saga stage; or only the saga stage for a type only sagas handle), `duplicate` (the marker was there and no saga stage ran, or the record's letter was there already), `skipped` (the processor does not handle the type), `parked` (taken by the dead letters, the store's or the event store's `<source>.dlt`: `HANDLER_FAILED`, `INVALID`, `SEQUENCED`), `failed` (given up without a letter: mode `log`, or the saga stage failed for good); a redelivery or a stop mid-attempts counts nothing |
