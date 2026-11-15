@@ -106,18 +106,29 @@ pub fn check_outbox_payload(type_name: &str, payload: &[u8]) -> Result<(), Messa
     let text = std::str::from_utf8(payload).unwrap_or_default();
     match integer_out_of_range(text) {
         None => Ok(()),
-        Some(n) => Err(MessagingError::InvalidMessage(format!(
-            "the payload of event {type_name} holds the integer {n}, {}, so it cannot be an outbox entry",
-            if n.starts_with('-') {
-                "below i64::MIN"
+        Some(n) => {
+            // The token is ASCII: cut on any byte, at most 64 of them in the message.
+            let shown = if n.len() > MAX_SHOWN_INTEGER {
+                format!("{}... ({} characters)", &n[..MAX_SHOWN_INTEGER], n.len())
             } else {
-                "above i64::MAX"
-            }
-        ))),
+                n.to_string()
+            };
+            Err(MessagingError::InvalidMessage(format!(
+                "the payload of event {type_name} holds the integer {shown}, {}, so it cannot be an outbox entry",
+                if n.starts_with('-') {
+                    "below i64::MIN"
+                } else {
+                    "above i64::MAX"
+                }
+            )))
+        }
     }
 }
 
 pub(crate) use check_outbox_payload as check_payload_text;
+
+/// The most characters of a refused integer an error message quotes.
+const MAX_SHOWN_INTEGER: usize = 64;
 
 /// The first integer token of the JSON `text` (outside strings, without `.`, `e` or `E`) that
 /// no `i64` holds. `text` is valid JSON.
@@ -348,6 +359,20 @@ mod tests {
             };
             assert!(why.contains(side), "{why}");
         }
+    }
+
+    #[test]
+    fn a_long_refused_integer_is_quoted_cut_to_64_characters() {
+        let digits = "9".repeat(100);
+        let why = refused(&format!("{{\"n\":{digits}}}")).expect("refused");
+        assert!(
+            why.contains(&format!(
+                "holds the integer {}... (100 characters), above i64::MAX",
+                "9".repeat(64)
+            )),
+            "{why}"
+        );
+        assert!(why.len() < 200, "{why}");
     }
 
     #[test]
