@@ -140,7 +140,9 @@ fn check_position(now: &Now, position: u64) -> Result<(), EventStoreError> {
 
 impl SubscriptionAdmin for RabbitAdmin {
     /// The members the management API shows (an error, never "none", when it cannot tell),
-    /// plus this process's own open subscriptions of the name.
+    /// plus this process's own open subscriptions of the name. The API lists a consumer only
+    /// after its next metrics collection (about every 5 s): one another process opened within the
+    /// last seconds can be missing.
     fn members(&self) -> Result<Vec<String>, EventStoreError> {
         let streams = self.with_nodes(async |nodes| {
             Ok(self

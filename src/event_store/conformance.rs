@@ -320,12 +320,18 @@ pub async fn instances_share_a_processor(kit: &EventStoreKit<'_>) {
 }
 
 /// More instances than segments: instances join one at a time; after each join the segments
-/// are spread (none held twice, none by an instance holding more than its share, rounded up)
-/// and every instance's last assignment change closed (a
+/// are spread (none held twice, every one held, and once there are two instances or more no
+/// instance holds every segment) and every instance's last assignment change closed (a
 /// `Revoked` followed by an `Assigned`, an empty one for an instance left without segments).
-/// The instances join until one that held segments holds none (or there are twice as many
-/// instances as segments, two more): that instance saw its revocation closed by `Assigned([])`,
-/// so the core reports it running, idle, never starting.
+/// How the segments spread beyond that is the event store's (a third party's assignor is not
+/// constrained). The instances join until one that held segments holds none (or there are twice
+/// as many instances as segments, two more; a run that reaches that cap without such an instance
+/// says so on stderr, the check then proved less): that instance saw its revocation closed by
+/// `Assigned([])`, so the core reports it running, idle, never starting.
+///
+/// After each join the check watches for the change the join may cause: until a revocation
+/// somewhere, or until the newcomer saw its first change and a slice then passed with no event at
+/// any instance, at most [`JOIN_WINDOW`].
 pub async fn an_instance_left_without_segments_closes_its_change(kit: &EventStoreKit<'_>) {
     let spec = kit.spec();
     let first = kit.instance();
@@ -339,31 +345,35 @@ pub async fn an_instance_left_without_segments_closes_its_change(kit: &EventStor
     readers[0].pump(QUIET).await;
     let all: BTreeSet<String> = readers[0].assigned.clone();
     let mut stores = vec![first];
-    // Spread: every segment held once, none by an instance holding more than its share
-    // (rounded up), every change closed.
+    // Spread: every segment held once, no instance holding every segment once there are two,
+    // every change closed.
     let settled = |readers: &[Reader]| {
         let held: Vec<&String> = readers.iter().flat_map(|r| &r.assigned).collect();
         let unique: BTreeSet<&String> = held.iter().copied().collect();
-        let share = all.len().div_ceil(readers.len());
         held.len() == unique.len()
             && unique.len() == all.len()
-            && readers
-                .iter()
-                .all(|r| r.assigned.len() <= share && !r.changing)
+            && (readers.len() < 2 || readers.iter().all(|r| r.assigned.len() < all.len()))
+            && readers.iter().all(|r| !r.changing)
     };
+    let cap = 2 * all.len() + 2;
     let mut emptied = false;
-    while !emptied && readers.len() < 2 * all.len() + 2 {
+    while !emptied && readers.len() < cap {
         let store = kit.instance();
         let revoked_before: usize = readers.iter().map(|r| r.revoked).sum();
         readers.push(Reader::join(&*store, &spec).await);
         stores.push(store);
-        // The join may move segments (a revocation somewhere) or leave the newcomer idle: wait
-        // for a revocation, at most a window, before checking the spread.
+        let newcomer = readers.len() - 1;
         let deadline = Instant::now() + JOIN_WINDOW;
         while readers.iter().map(|r| r.revoked).sum::<usize>() == revoked_before
             && Instant::now() < deadline
         {
-            futures::future::join_all(readers.iter_mut().map(|r| r.pump(SLICE))).await;
+            let taken: usize = futures::future::join_all(readers.iter_mut().map(|r| r.pump(SLICE)))
+                .await
+                .into_iter()
+                .sum();
+            if taken == 0 && readers[newcomer].changes > 0 {
+                break;
+            }
         }
         all_until(
             &mut readers,
@@ -374,6 +384,15 @@ pub async fn an_instance_left_without_segments_closes_its_change(kit: &EventStor
         emptied = readers
             .iter()
             .any(|r| r.assigned.is_empty() && r.revoked > 0);
+    }
+    if !emptied {
+        eprintln!(
+            "event store conformance check `an_instance_left_without_segments_closes_its_change` \
+             on event store `{}`: {cap} instances and none that held segments was left without \
+             any (assigned {:?}): the empty assignment that closes such a change was not seen",
+            stores[0].name(),
+            readers.iter().map(|r| &r.assigned).collect::<Vec<_>>()
+        );
     }
     assert!(
         readers.iter().any(|r| r.assigned.is_empty()),
@@ -1546,6 +1565,8 @@ struct Reader {
     hold_everything: bool,
     /// `Revoked` changes seen.
     revoked: usize,
+    /// Assignment changes seen (`Assigned` and `Revoked`).
+    changes: usize,
     /// A `Revoked` came and no `Assigned` after it yet (the contract closes every revocation
     /// with an assignment, possibly empty).
     changing: bool,
@@ -1567,6 +1588,7 @@ impl Reader {
             held: HashSet::new(),
             hold_everything: false,
             revoked: 0,
+            changes: 0,
             changing: false,
         }
     }
@@ -1607,18 +1629,22 @@ impl Reader {
             .unwrap_or_else(|e| panic!("{name}: redeliver {} {}: {e}", d.segment, d.position));
     }
 
-    /// Takes what the subscription gives for `slice`.
-    async fn pump(&mut self, slice: Duration) {
+    /// Takes what the subscription gives for `slice`; how many events it gave.
+    async fn pump(&mut self, slice: Duration) -> usize {
         let deadline = Instant::now() + slice;
+        let mut taken = 0;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return;
+                return taken;
             }
             match tokio::time::timeout(left, self.subscription().next()).await {
-                Err(_) => return,
+                Err(_) => return taken,
                 Ok(Err(e)) => panic!("{}: next: {e}", self.name),
-                Ok(Ok(event)) => self.take(event),
+                Ok(Ok(event)) => {
+                    taken += 1;
+                    self.take(event);
+                }
             }
         }
     }
@@ -1626,6 +1652,7 @@ impl Reader {
     fn take(&mut self, event: SubscriptionEvent) {
         match event {
             SubscriptionEvent::Assigned(segments) => {
+                self.changes += 1;
                 self.changing = false;
                 for segment in segments {
                     assert!(
@@ -1637,6 +1664,7 @@ impl Reader {
                 }
             }
             SubscriptionEvent::Revoked(segments) => {
+                self.changes += 1;
                 self.revoked += 1;
                 self.changing = true;
                 for segment in segments {

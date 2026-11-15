@@ -71,9 +71,20 @@ async fn observe(
         .await
         .unwrap();
     assert!(ok.is_ok());
-    // Metrics are collected every few seconds.
-    tokio::time::sleep(Duration::from_secs(6)).await;
-    let consumers = rabbit.consumers().await;
+    // The API lists a consumer only after a collection interval (~5 s): ask until it lists both
+    // readers (the subscription's, named, and the raw one, unnamed), or answers anything but 200
+    // (metrics collection off).
+    let consumers = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let (status, body) = rabbit.consumers().await;
+            if status != 200 || lists_both(&body) {
+                return (status, body);
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("the API lists both readers within 60 s");
     let overview = rabbit.overview().await;
     // Asked from another store (as another process would): only the API can tell.
     let elsewhere = RabbitEventStore::new(rabbit.config()).unwrap();
@@ -82,6 +93,15 @@ async fn observe(
     sub.close().await;
     store.close().await;
     (consumers, overview, listed)
+}
+
+/// Whether the consumer list `body` holds a named consumer and an unnamed one.
+fn lists_both(body: &str) -> bool {
+    let Ok(serde_json::Value::Array(consumers)) = serde_json::from_str(body) else {
+        return false;
+    };
+    let named = |c: &&serde_json::Value| c["properties"].get("name").is_some();
+    consumers.iter().any(|c| named(&c)) && consumers.iter().any(|c| !named(&c))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -1266,7 +1266,10 @@ name; headers are AMQP application properties; dead letters go to the stream `<s
 `browse`, `lag` and `native-dead-letter` are always declared; **`replay` only with the
 management API** (`KRAKEN_RABBITMQ_MANAGEMENT_URL`, plugin `rabbitmq_stream_management`): a reset
 is refused while an instance reads the processor, and only the management API can tell. Without
-it, a reset is answered `UNSUPPORTED`.
+it, a reset is answered `UNSUPPORTED`. The management API lists a consumer only after its next
+metrics collection (about every 5 s): an instance in another process that subscribed within the
+last seconds can be missing from a reset's members check (this process's own subscriptions are
+always counted), so stop every instance and wait a few seconds before a reset.
 
 | Variable | Default | Meaning |
 |---|---|---|

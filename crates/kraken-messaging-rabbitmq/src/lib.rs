@@ -72,7 +72,9 @@
 //! `management_agent.disable_metrics_collector`, no `replay` is declared); every
 //! reset asks again and fails, never "nobody reads", on an answer it cannot trust; this
 //! process's own open subscriptions count as readers too, and the offsets a reset stored are read
-//! back once all are stored.
+//! back once all are stored. The API lists a consumer only after its next metrics collection
+//! (about every 5 s): an instance in another process that subscribed within the last seconds can
+//! be missing from the members check.
 //!
 //! # How it differs from the Kafka add-on
 //!
@@ -257,7 +259,8 @@ impl RabbitEventStore {
     }
 
     /// The connections the store's publishers hold now (a bounded number, whatever replacements
-    /// happened).
+    /// happened). For the add-on's tests, not part of its API.
+    #[doc(hidden)]
     pub async fn publishing_connections(&self) -> usize {
         self.publisher.connections().await
     }
