@@ -423,7 +423,8 @@ fn flag(name: &str, value: &str) -> Result<bool, EventStoreError> {
     }
 }
 
-/// The content of the file `KRAKEN_RABBITMQ_<name>_FILE` (its trailing line break removed), else
+/// The content of the file `KRAKEN_RABBITMQ_<name>_FILE` (surrounding whitespace removed, as the
+/// core's secret files; an empty one is an error), else
 /// `KRAKEN_RABBITMQ_<name>`: the file wins when both are set, as the core's `_FILE` settings.
 fn secret(
     vars: &std::collections::HashMap<String, String>,
@@ -438,7 +439,13 @@ fn secret(
         let content = std::fs::read_to_string(path).map_err(|e| {
             EventStoreError::Invalid(format!("{file_var}: cannot read {path}: {e}"))
         })?;
-        return Ok(Some(content.trim_end_matches(['\r', '\n']).to_string()));
+        let secret = content.trim();
+        if secret.is_empty() {
+            return Err(EventStoreError::Invalid(format!(
+                "{file_var}: {path} is empty"
+            )));
+        }
+        return Ok(Some(secret.to_string()));
     }
     Ok(vars
         .get(&format!("KRAKEN_RABBITMQ_{name}"))
@@ -559,6 +566,40 @@ mod tests {
         for secret in ["s3cr3t-value", "other-s3cr3t"] {
             assert!(!shown.contains(secret), "{shown}");
         }
+    }
+
+    /// A secret file's content is trimmed of surrounding whitespace (Unicode, both ends, as the
+    /// core's secret files); one empty after that is a startup error, never an empty password.
+    #[test]
+    fn a_secret_file_is_trimmed_and_an_empty_one_is_refused() {
+        let dir = std::env::temp_dir().join(format!("kraken-rmq-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let padded = dir.join("padded");
+        std::fs::write(&padded, " \t s3cr3t \r\n\n").unwrap();
+        let config = RabbitConfig::from_vars(vars(&[(
+            "KRAKEN_RABBITMQ_PASSWORD_FILE",
+            padded.to_str().unwrap(),
+        )]))
+        .unwrap();
+        assert_eq!(config.password, "s3cr3t");
+        for (name, content) in [("empty", ""), ("blank", " \n\t\r\n")] {
+            let file = dir.join(name);
+            std::fs::write(&file, content).unwrap();
+            for var in [
+                "KRAKEN_RABBITMQ_PASSWORD_FILE",
+                "KRAKEN_RABBITMQ_MANAGEMENT_PASSWORD_FILE",
+            ] {
+                let refused = RabbitConfig::from_vars(vars(&[
+                    ("KRAKEN_RABBITMQ_MANAGEMENT_URL", "http://m:15672"),
+                    (var, file.to_str().unwrap()),
+                ]));
+                assert!(
+                    matches!(&refused, Err(EventStoreError::Invalid(m)) if m.contains(var) && m.contains("empty")),
+                    "{var} {name}: {refused:?}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// As the core's `_FILE` settings: a file, when set, wins over the variable, for the stream

@@ -1420,7 +1420,7 @@ always counted), so stop every instance and wait a few seconds before a reset.
 | `KRAKEN_RABBITMQ_PORT` | 5552 (5551 with TLS) | the port of a host given without one |
 | `KRAKEN_RABBITMQ_VIRTUAL_HOST` | `/` | |
 | `KRAKEN_RABBITMQ_USERNAME` | `guest` | |
-| `KRAKEN_RABBITMQ_PASSWORD` / `_PASSWORD_FILE` | `guest` | the password, or a file holding it (the file wins when both are set, as for the core's `_FILE` settings); never logged |
+| `KRAKEN_RABBITMQ_PASSWORD` / `_PASSWORD_FILE` | `guest` | the password, or a file holding it (the file wins when both are set, as for the core's `_FILE` settings; surrounding whitespace is trimmed, and a file empty after that is a startup error); never logged |
 | `KRAKEN_RABBITMQ_TLS` | false | TLS (rustls, no OpenSSL) to every node |
 | `KRAKEN_RABBITMQ_TLS_CA_FILE` | none | PEM CA certificates the nodes are verified against; required with TLS (the store never connects unverified) |
 | `KRAKEN_RABBITMQ_LOAD_BALANCER` | false | the hosts are a load balancer: connect through it until it lands on the node needed |

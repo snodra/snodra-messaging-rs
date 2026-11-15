@@ -124,7 +124,7 @@
 //! | `KRAKEN_RABBITMQ_PORT` | 5552 (5551 with TLS) | the port of a host given without one |
 //! | `KRAKEN_RABBITMQ_VIRTUAL_HOST` | `/` | |
 //! | `KRAKEN_RABBITMQ_USERNAME` | `guest` | |
-//! | `KRAKEN_RABBITMQ_PASSWORD` / `_PASSWORD_FILE` | `guest` | the password, or a file holding it (the file wins) |
+//! | `KRAKEN_RABBITMQ_PASSWORD` / `_PASSWORD_FILE` | `guest` | the password, or a file holding it (the file wins; its surrounding whitespace is trimmed, and an empty file is a startup error) |
 //! | `KRAKEN_RABBITMQ_TLS` | false | TLS (rustls) to every node |
 //! | `KRAKEN_RABBITMQ_TLS_CA_FILE` | none | PEM CA certificates the nodes are verified against; required with TLS |
 //! | `KRAKEN_RABBITMQ_LOAD_BALANCER` | false | the hosts are a load balancer: connect through it until it lands on the node needed |
