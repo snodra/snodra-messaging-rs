@@ -401,3 +401,37 @@ async fn the_in_memory_stores_warn_that_they_are_not_durable() {
         logs.text()
     );
 }
+
+/// A setting removed when the stores became add-ons, still set, is one startup warning naming
+/// its replacement; the value is ignored (no alias).
+#[tokio::test]
+async fn a_removed_setting_still_set_is_a_startup_warning() {
+    // SAFETY: no test of this binary reads these variables except the startup warning itself,
+    // and nothing else in the process reads or writes the environment concurrently with a write.
+    unsafe {
+        std::env::set_var("KRAKEN_KAFKA_TOPIC", "orders.events");
+        std::env::set_var("KRAKEN_MONGODB_URI", "mongodb://mongo:27017/orders");
+    }
+    let logs = support::logs::Captured::default();
+    let _guard = logs.install();
+    let app = builder("127.0.0.1:1").await.start().await.unwrap();
+    app.shutdown().await;
+    let warnings: Vec<String> = logs
+        .lines()
+        .into_iter()
+        .filter(|l| l.contains("WARN") && l.contains("is no longer read"))
+        .collect();
+    assert_eq!(warnings.len(), 2, "{}", logs.text());
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("KRAKEN_KAFKA_TOPIC") && w.contains("KRAKEN_EVENTS_SOURCE")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("KRAKEN_MONGODB_URI") && w.contains("MongoStore::new")),
+        "{warnings:?}"
+    );
+}

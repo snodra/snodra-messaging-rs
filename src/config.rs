@@ -922,6 +922,37 @@ fn pairs<T>(
     Ok(out)
 }
 
+/// Settings the library read before the event store and the message store became add-ons
+/// (ADR 0027, ADR 0028), each with what replaced it. They are not read (no alias before v1):
+/// one still set is a startup warning, see [`removed_setting_warnings`].
+const REMOVED_SETTINGS: [(&str, &str); 4] = [
+    ("KRAKEN_KAFKA_TOPIC", "set KRAKEN_EVENTS_SOURCE instead"),
+    (
+        "KRAKEN_KAFKA_DEAD_LETTER_MODE",
+        "set KRAKEN_EVENTS_DEAD_LETTER_MODE instead (the value `topic` is now `event-store`)",
+    ),
+    (
+        "KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS",
+        "set KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS instead",
+    ),
+    (
+        "KRAKEN_MONGODB_URI",
+        "the message store is an add-on built in code: kraken-messaging-mongo's MongoStore::new(client, db) with a client the service builds",
+    ),
+];
+
+/// One warning for each removed setting the environment (`lookup`) still sets (blank is unset),
+/// naming its replacement. `KrakenMessagingBuilder::start` logs them.
+pub(crate) fn removed_setting_warnings(lookup: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    REMOVED_SETTINGS
+        .iter()
+        .filter(|(name, _)| lookup(name).is_some_and(|v| !v.trim().is_empty()))
+        .map(|(name, replacement)| {
+            format!("{name} is set but is no longer read and its value is ignored: {replacement}")
+        })
+        .collect()
+}
+
 fn flag(name: &str, v: &str) -> Result<bool, MessagingError> {
     match v.trim().to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" => Ok(true),
@@ -1909,5 +1940,42 @@ mod tests {
         let mut c = code_config();
         c.outbox_lease = Duration::from_secs(41);
         assert!(c.validate().is_ok());
+    }
+
+    /// One warning per removed setting still set, naming what replaced it; the value is not
+    /// read (no alias before v1), so the configuration is the same with or without it.
+    #[test]
+    fn a_removed_setting_still_set_is_one_warning_naming_its_replacement_and_its_value_is_ignored()
+    {
+        let removed = [
+            ("KRAKEN_KAFKA_TOPIC", "orders.events"),
+            ("KRAKEN_KAFKA_DEAD_LETTER_MODE", "topic"),
+            ("KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS", "1000"),
+            ("KRAKEN_MONGODB_URI", "mongodb://mongo:27017/orders"),
+        ];
+        let env: HashMap<&str, &str> = removed.into_iter().collect();
+        let warnings = removed_setting_warnings(|n| env.get(n).map(|v| v.to_string()));
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        for ((name, _), replacement) in removed.iter().zip([
+            "KRAKEN_EVENTS_SOURCE",
+            "KRAKEN_EVENTS_DEAD_LETTER_MODE",
+            "KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS",
+            "MongoStore::new",
+        ]) {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.starts_with(name) && w.contains(replacement)),
+                "{name} -> {replacement}: {warnings:?}"
+            );
+        }
+        let with = from(&removed);
+        let without = from(&[]);
+        assert_eq!(with.events_source, without.events_source);
+        assert_eq!(with.dead_letter_mode, without.dead_letter_mode);
+        assert_eq!(with.dead_letter_retention, without.dead_letter_retention);
+        // Unset or blank: nothing to say.
+        assert!(removed_setting_warnings(|_| None).is_empty());
+        assert!(removed_setting_warnings(|_| Some(" ".into())).is_empty());
     }
 }
