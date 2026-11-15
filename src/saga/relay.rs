@@ -405,7 +405,8 @@ impl SagaDispatchRelay {
     }
 
     /// Gives up an EVENT entry whose payload cannot become an outbox entry: `failed_at`, the
-    /// reason `INVALID` and the message, logged at error. No failure notice: `SagaCommandFailed`
+    /// reason `INVALID` and the message, logged at error and counted on
+    /// `kraken.saga.command.failures{reason=INVALID}`. No failure notice: `SagaCommandFailed`
     /// is about commands. The saga's later entries continue, as after a failed command (ruling 9).
     async fn fail_event(
         &self,
@@ -424,6 +425,8 @@ impl SagaDispatchRelay {
                 },
             )
             .await?;
+        self.metrics
+            .command_failure_unhandled(&entry.type_name, FailureReason::Invalid);
         tracing::error!(
             "Saga {} event {} ({}) can never be published, it is given up: {message}",
             entry.saga_id,

@@ -920,6 +920,11 @@ async fn an_event_entry_that_cannot_become_an_outbox_document_fails_for_good_and
         .collect();
     assert_eq!(errors.len(), 3, "{errors:?}");
     assert!(errors[0].contains("s9:1000"), "{}", errors[0]);
+    assert_eq!(
+        *rl.metrics.unhandled.lock().unwrap(),
+        vec![("rl.Announced".to_string(), FailureReason::Invalid); 3],
+        "each refused event counts on kraken.saga.command.failures{{reason=INVALID}}"
+    );
 }
 
 #[tokio::test]

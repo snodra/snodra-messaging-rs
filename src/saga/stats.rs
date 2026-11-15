@@ -12,7 +12,8 @@
 //! - `kraken.external.calls{handler,outcome}`, outcome `succeeded | replayed | failed | retryable
 //!   | unknown` (the handler is its message's wire type name);
 //! - `kraken.saga.command.failures{type,reason}`: a `SagaCommandFailed` nobody handled (`type` is
-//!   the failed command's wire type, `reason` the `FailureReason` name, e.g. `NO_HANDLER`);
+//!   the failed command's wire type, `reason` the `FailureReason` name, e.g. `NO_HANDLER`), or a
+//!   saga event the outbox refuses (`type` the event's wire type, `reason` `INVALID`);
 //! - the gauges `kraken.sagas.active{type}` and `kraken.saga.dispatch.pending`, which no hook
 //!   moves: [`SagaStats::sample_once`] counts them in the message store, and
 //!   [`SagaStats::start_sampler`] does so every [`SAMPLE_INTERVAL`] (15 s, as Kotlin). A failed

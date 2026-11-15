@@ -61,7 +61,8 @@ pub trait SagaMetrics: Send + Sync {
     fn external_call(&self, _handler: &str, _outcome: ExternalOutcome) {}
 
     /// A `SagaCommandFailed` for `command_type` reached no saga or handler (or could not be
-    /// delivered): logged at error, `kraken_saga_command_failures_total`.
+    /// delivered), or a saga event of that type was refused by the outbox (`INVALID`): logged at
+    /// error, `kraken_saga_command_failures_total`.
     fn command_failure_unhandled(&self, _command_type: &str, _reason: FailureReason) {}
 }
 
