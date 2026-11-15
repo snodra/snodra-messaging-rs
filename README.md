@@ -1322,7 +1322,7 @@ let app = KrakenMessaging::builder(config).await?
 | Variable | Default | Meaning |
 |---|---|---|
 | `KRAKEN_KAFKA_BOOTSTRAP` | `kafka:19092` | the bootstrap servers (`bootstrap.servers`); a blank value is the default |
-| `KRAKEN_KAFKA_PROPERTY_<NAME>` | none | one librdkafka property for every client the store creates: `<NAME>` in lower case, `_` for `.` and `__` for a literal `_` (`KRAKEN_KAFKA_PROPERTY_SECURITY_PROTOCOL=SASL_SSL` is `security.protocol`, `KRAKEN_KAFKA_PROPERTY_SASL_MECHANISM=SCRAM-SHA-512` is `sasl.mechanism`, `KRAKEN_KAFKA_PROPERTY_LOG__LEVEL=6` is `log_level`); values never appear in `Debug` output or logs |
+| `KRAKEN_KAFKA_PROPERTY_<NAME>` | none | one librdkafka property for every client the store creates (`partitioner`, a producer property, for the producer only): `<NAME>` in lower case, `_` for `.` and `__` for a literal `_` (`KRAKEN_KAFKA_PROPERTY_SECURITY_PROTOCOL=SASL_SSL` is `security.protocol`, `KRAKEN_KAFKA_PROPERTY_SASL_MECHANISM=SCRAM-SHA-512` is `sasl.mechanism`, `KRAKEN_KAFKA_PROPERTY_LOG__LEVEL=6` is `log_level`); values never appear in `Debug` output or logs |
 
 - **`KafkaConfig`**: `KafkaConfig::new(bootstrap)` or `from_env()`, then `property` (every client),
   `producer_property`, `consumer_property` (they override the environment's for their clients; a
@@ -1337,7 +1337,8 @@ let app = KrakenMessaging::builder(config).await?
   `partitioner=murmur2_random` (`DEFAULT_PARTITIONER`), the Java client's default (murmur2 of the
   key, positive, modulo the partition count; an event without a key on a random partition), so one
   key from a Kotlin and a Rust publisher lands on one partition and keeps its order across both.
-  `KRAKEN_KAFKA_PROPERTY_PARTITIONER` (or `producer_property("partitioner", ..)`) chooses another.
+  `KRAKEN_KAFKA_PROPERTY_PARTITIONER` (which goes to the producer only, not to the consumers) or
+  `producer_property("partitioner", ..)` chooses another.
 - **Publishing** is the idempotent producer (`enable.idempotence`), one send in at most 40 s
   (`SEND_TIMEOUT`); a record too large, a topic that cannot exist or a refused authorization is
   given up by the relay at once.

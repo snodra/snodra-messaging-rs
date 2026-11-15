@@ -36,8 +36,9 @@
 //!
 //! **Partitions**: the producer partitions keys as the Java client's default partitioner does
 //! (librdkafka `partitioner=murmur2_random`, [`DEFAULT_PARTITIONER`]), so one key from a Kotlin and
-//! a Rust publisher lands on one partition and keeps its order; a `partitioner` property
-//! (`KRAKEN_KAFKA_PROPERTY_PARTITIONER`) chooses another.
+//! a Rust publisher lands on one partition and keeps its order; a `partitioner` producer property
+//! (`KRAKEN_KAFKA_PROPERTY_PARTITIONER`, which reaches the producer only, or
+//! [`KafkaConfig::producer_property`]) chooses another.
 //!
 //! **TLS** (`security.protocol=SSL` or `SASL_SSL`) needs the cargo feature `ssl` of this crate,
 //! which builds librdkafka with a vendored, statically linked OpenSSL (no system OpenSSL at run
@@ -79,6 +80,10 @@ const CAPABILITIES: [Capability; 4] = Capability::ALL;
 /// ([`KafkaConfig::from_env`]).
 pub const PROPERTY_PREFIX: &str = "KRAKEN_KAFKA_PROPERTY_";
 
+/// The properties from the environment that only the producer reads: given to a consumer, librdkafka
+/// would log them as ignored.
+pub const PRODUCER_ONLY: [&str; 1] = ["partitioner"];
+
 /// How the store reaches Kafka. Its `Debug` shows the properties' names, never their values.
 #[derive(Clone, PartialEq, Eq)]
 pub struct KafkaConfig {
@@ -110,7 +115,8 @@ impl KafkaConfig {
     }
 
     /// `KRAKEN_KAFKA_BOOTSTRAP` (default `kafka:19092`), and every `KRAKEN_KAFKA_PROPERTY_<NAME>`
-    /// as a property for every client (see the crate docs for the names).
+    /// as a property for every client (see the crate docs for the names), except the producer's
+    /// own [`PRODUCER_ONLY`] ones, which go to the producer only.
     pub fn from_env() -> KafkaConfig {
         KafkaConfig::from_vars(std::env::vars())
     }
@@ -119,15 +125,21 @@ impl KafkaConfig {
     pub fn from_vars(vars: impl IntoIterator<Item = (String, String)>) -> KafkaConfig {
         let mut bootstrap = None;
         let mut properties = HashMap::new();
+        let mut producer_properties = HashMap::new();
         for (name, value) in vars {
             if name == "KRAKEN_KAFKA_BOOTSTRAP" {
                 bootstrap = Some(value);
             } else if let Some(property) = property_name(&name) {
-                properties.insert(property, value);
+                if PRODUCER_ONLY.contains(&property.as_str()) {
+                    producer_properties.insert(property, value);
+                } else {
+                    properties.insert(property, value);
+                }
             }
         }
         KafkaConfig {
             properties,
+            producer_properties,
             ..KafkaConfig::new(&bootstrap_or_default(bootstrap))
         }
     }
@@ -428,6 +440,26 @@ mod tests {
             KafkaEventStore::new(fixed).err(),
             Some(EventStoreError::Invalid(m)) if m.contains("group.id")
         ));
+    }
+
+    /// `partitioner` is a producer property: from the environment it reaches the producer only
+    /// (a consumer would log it as ignored).
+    #[test]
+    fn the_partitioner_from_the_environment_reaches_the_producer_only() {
+        let config = KafkaConfig::from_vars([
+            (
+                "KRAKEN_KAFKA_PROPERTY_PARTITIONER".to_string(),
+                "fnv1a".to_string(),
+            ),
+            (
+                "KRAKEN_KAFKA_PROPERTY_SASL_USERNAME".to_string(),
+                "svc".to_string(),
+            ),
+        ]);
+        assert_eq!(config.producer()["partitioner"], "fnv1a");
+        assert!(!config.consumer().contains_key("partitioner"));
+        assert!(!config.properties.contains_key("partitioner"));
+        assert_eq!(config.consumer()["sasl.username"], "svc");
     }
 
     #[test]

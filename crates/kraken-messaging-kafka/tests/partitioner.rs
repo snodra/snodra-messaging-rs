@@ -22,7 +22,7 @@ const PARTITIONS: i32 = 6;
 /// murmur2 with seed `0x9747b28c`, the positive mask `& 0x7fffffff`). Computed with a transcript
 /// of `Utils.murmur2` that reproduces the vectors of Kafka's `UtilsTest.testMurmur2` (`"21"` →
 /// -973932308, `"foobar"` → -790332482, `"abc"` → 479470107, ...).
-const JAVA_PARTITIONS: [(&str, i32); 8] = [
+const JAVA_PARTITIONS: [(&str, i32); 9] = [
     ("order-1", 4),
     ("order-2", 3),
     ("order-3", 3),
@@ -31,6 +31,8 @@ const JAVA_PARTITIONS: [(&str, i32); 8] = [
     ("o-1001", 1),
     ("a", 4),
     ("kraken", 0),
+    // An empty key is a key (not none): hashed like any other, as Java hashes an empty array.
+    ("", 3),
 ];
 
 async fn create_topic(bootstrap: &str, topic: &str) {
@@ -84,7 +86,7 @@ fn partitions_of_keys(bootstrap: &str, topic: &str, expected: usize) -> BTreeMap
     let deadline = Instant::now() + Duration::from_secs(30);
     while found.len() < expected && Instant::now() < deadline {
         if let Some(Ok(m)) = consumer.poll(Duration::from_millis(200)) {
-            let key = String::from_utf8(m.key().unwrap().to_vec()).unwrap();
+            let key = String::from_utf8(m.key().unwrap_or_default().to_vec()).unwrap();
             found.insert(key, m.partition());
         }
     }
@@ -130,7 +132,7 @@ async fn a_key_lands_on_the_partition_the_java_default_partitioner_gives_it_unle
             "fnv1a".to_string(),
         ),
     ]);
-    assert_eq!(config.properties["partitioner"], "fnv1a");
+    assert_eq!(config.producer_properties["partitioner"], "fnv1a");
     let overridden = published_partitions(config, &bootstrap).await;
     assert_eq!(overridden.len(), JAVA_PARTITIONS.len());
     assert_ne!(overridden, java, "another partitioner, other partitions");
