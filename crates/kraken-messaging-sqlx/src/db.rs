@@ -126,9 +126,11 @@ impl<DB: sqlx::Database> Held<DB> {
 
     /// Commits (or rolls back) and lets go of the connection: back to the pool when that ended
     /// cleanly with the session untouched, else closed. A commit with a nested transaction still
-    /// open (depth above 1) or with the transaction ended by someone else (depth 0) commits
-    /// nothing: the connection is closed (the server rolls it back) and the commit fails. Nothing
-    /// for an ended one.
+    /// open (sqlx's depth above 1) commits nothing: the connection is closed (the server rolls it
+    /// back) and the commit fails; so does one whose transaction was ended through sqlx's
+    /// transaction manager by someone else (depth 0). A raw `COMMIT` or `ROLLBACK` run on the
+    /// connection does not change sqlx's depth and is not seen here: it stays forbidden
+    /// ([`SqlxTxExt`](crate::SqlxTxExt)). Nothing for an ended one.
     pub(crate) async fn end(&mut self, commit: bool) -> Result<(), StoreError> {
         let Some(conn) = self.conn.as_mut() else {
             return Ok(());
@@ -140,8 +142,10 @@ impl<DB: sqlx::Database> Held<DB> {
             }
             return if commit {
                 Err(storage(if depth == 0 {
-                    "the store's transaction was ended on its connection by someone else (a raw \
-                     COMMIT or ROLLBACK?): it is rolled back, nothing of it is committed"
+                    "the store's transaction was ended by someone else through sqlx's \
+                     transaction manager (sqlx's depth is 0): it committed or rolled back then, \
+                     not at the store's commit, and the connection is closed (never run COMMIT or \
+                     ROLLBACK on the store's connection: a raw one is not even seen)"
                         .to_string()
                 } else {
                     format!(
@@ -165,6 +169,39 @@ impl<DB: sqlx::Database> Held<DB> {
             conn.close_on_drop();
         }
         ended.map_err(store_error)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl Held<Postgres> {
+    /// [`end`](Self::end) with a commit, for a transaction foreign code ran statements in (the
+    /// service's): PostgreSQL aborts the whole transaction on a failed statement and answers a
+    /// later `COMMIT` with a rollback that sqlx reports as a success, so a statement that failed
+    /// on the connection and whose error was ignored (a handler going on as if it had not) would
+    /// pass for a commit. A probe first (`SELECT 1`, one round trip; it fails with `25P02` in an
+    /// aborted transaction) finds it: the connection is closed (the server rolls back) and the
+    /// commit fails, nothing of it committed.
+    pub(crate) async fn commit_checked(&mut self) -> Result<(), StoreError> {
+        let Some(conn) = self.conn.as_mut() else {
+            return Ok(());
+        };
+        if <Postgres as sqlx::Database>::TransactionManager::get_transaction_depth(conn) == 1
+            && let Err(e) = sqlx::raw_sql("SELECT 1").execute(&mut **conn).await
+        {
+            if let Some(mut conn) = self.conn.take() {
+                conn.close_on_drop();
+            }
+            return Err(match &e {
+                sqlx::Error::Database(db) if db.code().as_deref() == Some("25P02") => storage(
+                    "the store's transaction was aborted by a statement that failed on its \
+                     connection (an error ignored by a handler?): it is rolled back, nothing of it \
+                     is committed"
+                        .to_string(),
+                ),
+                _ => store_error(e),
+            });
+        }
+        self.end(true).await
     }
 }
 

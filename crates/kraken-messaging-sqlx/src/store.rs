@@ -243,6 +243,11 @@ impl MessageStore for SqlxStore {
 /// (`connection.begin()`, `Connection::transaction`) is a savepoint of the store's transaction:
 /// nothing commits before the store's commit, and one left open fails it. Do not change the
 /// session either (`SET`, `LISTEN`, advisory locks): the connection goes back to the pool.
+///
+/// Return a statement's error rather than going on: on PostgreSQL a failed statement aborts the
+/// whole transaction, and the store's commit then fails (nothing of it is committed); on MySQL a
+/// failed statement is undone alone, but a deadlock rolls the whole transaction back unseen
+/// (see the crate README, "Transactions").
 pub trait SqlxTxExt {
     /// The connection.
     ///
@@ -301,7 +306,7 @@ impl TxProvider for SqlTx {
                 if !held.is_open() {
                     return Err(ended());
                 }
-                return held.end(true).await;
+                return held.commit_checked().await;
             }
             #[cfg(feature = "mysql")]
             if let Some(held) = tx.get_mut::<Held<MySql>>() {

@@ -146,10 +146,20 @@ dead letter's payload holding one is kept as `payload_binary`. Identifiers are c
   transaction through sqlx (`connection.begin()`, `Connection::transaction`, `Acquire::begin`) is a **savepoint** of the
   store's transaction: its commit releases the savepoint, its rollback undoes only what it did, and nothing commits before
   the store's commit. A nested transaction left open fails the store's commit: nothing is committed.
+- **A statement that fails on that connection.** On PostgreSQL it aborts the whole transaction: every later statement
+  fails, and a `COMMIT` is answered with a rollback that sqlx reports as a success. So the store's commit of a service
+  transaction first runs `SELECT 1` (one round trip; it fails with `25P02` in an aborted transaction): a handler that ignored
+  a failed statement and returned `Ok` gets a failed commit, nothing of the transaction is committed (its rows, the outbox
+  appends, the marker), the connection is closed, and the record is not acknowledged: the core handles it again. MySQL has
+  no aborted state: a failed statement is undone alone and the transaction goes on, so the rest of it commits; except a
+  deadlock (`1213`), and a lock wait timeout with `innodb_rollback_on_timeout=ON`, which roll the whole transaction back and
+  leave the session outside it (later statements commit one by one, the commit commits nothing, and sqlx does not tell):
+  return such an error from the handler, never swallow it.
 - A handler must not change the session of that connection either (`SET`, `LISTEN`, advisory locks, auto-commit): it goes
   back to the pool for the next user.
 - The connection goes back to the pool only when its transaction ended cleanly; it is closed when the transaction was
-  dropped while open, its end failed, or the session was changed (the MySQL saga start's lock wait until it is put back).
+  dropped while open, its end failed, a nested transaction was left open (on a commit and on an abort), the transaction was
+  found aborted (above), or the session was changed (the MySQL saga start's lock wait until it is put back).
 - A commit cancelled while it runs (its future dropped) and then aborted is reported as failed, although the server may have
   committed it: its outcome is unknown, as with any commit whose answer is lost. The core's retries and the processed-event
   markers make a repeated attempt harmless.

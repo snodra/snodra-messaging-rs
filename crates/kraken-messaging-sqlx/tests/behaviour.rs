@@ -907,3 +907,230 @@ async fn mysql_a_dropped_start_never_leaves_its_lock_wait_on_a_pooled_connection
     }
     holder.tx().abort(&mut held).await;
 }
+
+/// The id of the session behind the transaction's connection.
+async fn session_id(kind: Kind, tx: &mut Tx) -> String {
+    match kind {
+        Kind::Postgres => sqlx::query_scalar("SELECT CAST(pg_backend_pid() AS TEXT)")
+            .fetch_one(tx.connection::<sqlx::Postgres>())
+            .await
+            .unwrap(),
+        Kind::MySql => sqlx::query_scalar("SELECT CAST(CONNECTION_ID() AS CHAR)")
+            .fetch_one(tx.connection::<sqlx::MySql>())
+            .await
+            .unwrap(),
+    }
+}
+
+/// Waits until the server no longer lists the session `id`: its connection was closed, not
+/// returned to the pool.
+async fn wait_session_gone(raw: &Raw, id: &str) {
+    let table = match raw.kind() {
+        Kind::Postgres => format!("pg_stat_activity WHERE pid = {id}"),
+        Kind::MySql => format!("information_schema.processlist WHERE id = {id}"),
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while raw.count(&table).await != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the session {id} is still open: its connection went back to the pool"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// An abort with a nested transaction left open on the connection: the store's transaction is
+/// rolled back, and the connection is closed (its session ends), never handed back to the pool.
+async fn abort_with_a_leaked_nested_transaction(kind: Kind) {
+    use sqlx::Connection;
+    let server = Server::of(kind).await;
+    let (store, raw) = server.store().await;
+    let txs = store.tx();
+    let mut tx = txs.begin().await.unwrap();
+    let session = session_id(kind, &mut tx).await;
+    store
+        .outbox()
+        .append(&mut tx, entry("l-abort"))
+        .await
+        .unwrap();
+    match kind {
+        Kind::Postgres => {
+            std::mem::forget(tx.connection::<sqlx::Postgres>().begin().await.unwrap())
+        }
+        Kind::MySql => std::mem::forget(tx.connection::<sqlx::MySql>().begin().await.unwrap()),
+    }
+    txs.abort(&mut tx).await;
+    wait_session_gone(&raw, &session).await;
+    assert_eq!(
+        raw.count("kraken_outbox WHERE id = 'l-abort'").await,
+        0,
+        "rolled back"
+    );
+}
+
+both!(
+    abort_with_a_leaked_nested_transaction,
+    postgres_an_abort_with_a_nested_transaction_left_open_closes_the_connection,
+    mysql_an_abort_with_a_nested_transaction_left_open_closes_the_connection
+);
+
+/// PostgreSQL: a statement that failed on the handler's connection aborts the whole transaction,
+/// and a `COMMIT` then is answered with a rollback that sqlx reports as a success. The store's
+/// commit finds it and fails: nothing is committed, the connection is closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_a_commit_after_a_failed_statement_on_the_connection_fails() {
+    let server = Server::postgres().await;
+    let (store, raw) = server.store().await;
+    raw.exec("CREATE TABLE orders (id VARCHAR(64) NOT NULL PRIMARY KEY)")
+        .await;
+    let txs = store.tx();
+    let mut tx = txs.begin().await.unwrap();
+    let session = session_id(Kind::Postgres, &mut tx).await;
+    sqlx::query("INSERT INTO orders (id) VALUES ('f-1')")
+        .execute(tx.connection::<sqlx::Postgres>())
+        .await
+        .unwrap();
+    store.outbox().append(&mut tx, entry("f-1")).await.unwrap();
+    assert!(
+        store
+            .processed_events()
+            .record(&mut tx, &marker("m-f-1"))
+            .await
+            .unwrap()
+    );
+    let failed = sqlx::query("SELECT 1 / 0")
+        .execute(tx.connection::<sqlx::Postgres>())
+        .await;
+    assert!(failed.is_err(), "the statement fails (and is ignored)");
+    let committed = txs.commit(&mut tx).await;
+    assert!(
+        committed
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("aborted")),
+        "the commit fails: {committed:?}"
+    );
+    assert_eq!(
+        (
+            raw.count("orders WHERE id = 'f-1'").await,
+            raw.count("kraken_outbox WHERE id = 'f-1'").await,
+            raw.count("kraken_processed_events WHERE id = 'm-f-1'")
+                .await,
+        ),
+        (0, 0, 0),
+        "nothing committed"
+    );
+    wait_session_gone(&raw, &session).await;
+}
+
+/// MySQL has no aborted transaction: a failed statement is undone alone and the transaction goes
+/// on, so the rest of it commits (as the README says).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_a_failed_statement_on_the_connection_is_undone_alone() {
+    let server = Server::mysql().await;
+    let (store, raw) = server.store().await;
+    raw.exec("CREATE TABLE orders (id VARCHAR(64) NOT NULL PRIMARY KEY)")
+        .await;
+    let txs = store.tx();
+    let mut tx = txs.begin().await.unwrap();
+    sqlx::query("INSERT INTO orders (id) VALUES ('f-1')")
+        .execute(tx.connection::<sqlx::MySql>())
+        .await
+        .unwrap();
+    store.outbox().append(&mut tx, entry("f-1")).await.unwrap();
+    let failed = sqlx::query("INSERT INTO orders (id) VALUES ('f-1')")
+        .execute(tx.connection::<sqlx::MySql>())
+        .await;
+    assert!(failed.is_err(), "a duplicate key (ignored)");
+    txs.commit(&mut tx).await.unwrap();
+    assert_eq!(
+        (
+            raw.count("orders WHERE id = 'f-1'").await,
+            raw.count("kraken_outbox WHERE id = 'f-1'").await,
+        ),
+        (1, 1),
+        "the rest of the transaction commits"
+    );
+}
+
+/// A handler that runs a failing statement on its connection, ignores the error and returns `Ok`
+/// (PostgreSQL): the record is not acknowledged on that attempt (its commit fails, nothing of it
+/// is committed) and is handled again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_a_handler_that_ignores_a_failed_statement_is_not_acknowledged() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use kraken_messaging::testing::InMemoryStores;
+    use kraken_messaging::{Event, KrakenMessaging, message_type};
+
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+    struct Placed {
+        id: String,
+    }
+    message_type!(Placed, "swallow.Placed");
+    impl Event for Placed {}
+
+    let server = Server::postgres().await;
+    let (store, raw) = server.store().await;
+    raw.exec("CREATE TABLE orders (id VARCHAR(64) NOT NULL PRIMARY KEY)")
+        .await;
+    let stores = InMemoryStores::new();
+    let mut config = stores.config("swallow");
+    config.consumer_max_attempts = 3;
+    let attempts = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&attempts);
+    let app = KrakenMessaging::builder(config)
+        .await
+        .unwrap()
+        .store(Arc::new(store))
+        .event_store(Arc::new(stores.event_store().clone()))
+        .event::<Placed, _, _>(move |placed, ctx| {
+            let counted = Arc::clone(&counted);
+            async move {
+                let attempt = counted.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut tx = ctx.tx.lock().await;
+                let conn = tx.connection::<sqlx::Postgres>();
+                sqlx::query("INSERT INTO orders (id) VALUES ($1)")
+                    .bind(format!("{}-{attempt}", placed.id))
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| MessagingError::Storage(e.to_string()))?;
+                if attempt == 1 {
+                    // Fails, and the handler goes on as if it had not.
+                    let _ = sqlx::query("SELECT 1 / 0").execute(&mut *conn).await;
+                }
+                Ok(())
+            }
+        })
+        .start()
+        .await
+        .unwrap();
+
+    let id = stores
+        .publish(&Placed { id: "o".into() }, Some("o"))
+        .await
+        .unwrap();
+    let marker = format!("kraken_processed_events WHERE id = 'processor:default:{id}'");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while raw.count(&marker).await == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the record was never handled with a commit (attempts: {})",
+            attempts.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "handled again after the failed commit"
+    );
+    assert_eq!(
+        (
+            raw.count("orders WHERE id = 'o-1'").await,
+            raw.count("orders WHERE id = 'o-2'").await,
+        ),
+        (0, 1),
+        "the first attempt committed nothing"
+    );
+    app.shutdown().await;
+}
