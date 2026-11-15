@@ -18,10 +18,12 @@
 
 use std::cmp::Ordering as Order;
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::FutureExt;
 use futures::future::BoxFuture;
 use opentelemetry::Value;
 use tokio::sync::Notify;
@@ -333,7 +335,19 @@ impl EventConsumer {
                 )),
                 _ => None,
             };
-            self.consume(&cancel).await;
+            // A panic ends the reader (an event store's subscription that panicked): STOPPED
+            // with the reason until the processor is started again, never RUNNING while nothing
+            // reads.
+            if let Err(panic) = AssertUnwindSafe(self.consume(&cancel)).catch_unwind().await {
+                let cause = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("(no message)");
+                tracing::error!(processor = %self.name, "the processor stopped reading until it is started again: its reader panicked: {cause}");
+                self.monitor
+                    .error(&format!("reader stopped: panicked: {cause}"));
+            }
             self.monitor.stopped();
             helpers.cancel();
             if let Some(sampler) = sampler {
@@ -382,13 +396,14 @@ impl EventConsumer {
                     self.monitor.revoked(&segments);
                 }
                 Step::Next(Ok(SubscriptionEvent::Delivery(record))) => {
-                    delivered = true;
-                    // Paused since the last turn: not handled, handed out again on the resume.
+                    // Paused since the last turn: not handled, handed out again on the resume
+                    // (and no delivery as far as the resubscribe backoff goes).
                     self.apply_pause(subscription, &mut paused);
                     if paused {
                         redeliver(subscription, &record, &self.name);
                         continue;
                     }
+                    delivered = true;
                     // While a handler runs (it may take long), the status still follows the
                     // subscription and a pause still reaches it.
                     let handled = self.handle_record(&record, cancel);
@@ -1042,6 +1057,253 @@ mod tests {
         assert_eq!(h("kraken-dlt-original-topic"), "kraken.events");
         assert_eq!(h("kraken-dlt-original-partition"), "3");
         assert_eq!(h("kraken-dlt-original-offset"), "41");
+    }
+
+    /// What a scripted subscription does on each `next`.
+    #[derive(Clone)]
+    enum Turn {
+        Assigned(&'static [&'static str]),
+        /// Hands out the record at this position of segment `0`.
+        Deliver(&'static str),
+        Fail,
+        Panic,
+    }
+
+    /// An event store whose subscriptions play a script each (the `n`th subscription the `n`th
+    /// script; then nothing more comes), ignore `pause`, and whose publish (the dead-letter
+    /// source's) fails while `publish_fails`. It records when each subscription was made.
+    struct Scripted {
+        scripts: Mutex<std::collections::VecDeque<Vec<Turn>>>,
+        subscribed: Arc<Mutex<Vec<tokio::time::Instant>>>,
+        publish_fails: AtomicBool,
+    }
+
+    impl Scripted {
+        fn new(scripts: Vec<Vec<Turn>>) -> Arc<Scripted> {
+            Arc::new(Scripted {
+                scripts: Mutex::new(scripts.into()),
+                subscribed: Arc::default(),
+                publish_fails: AtomicBool::new(true),
+            })
+        }
+    }
+
+    impl EventStore for Scripted {
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+        fn capabilities(&self) -> &[Capability] {
+            &[Capability::NativeDeadLetter]
+        }
+        fn publish<'a>(
+            &'a self,
+            _: &'a OutgoingEvent,
+        ) -> BoxFuture<'a, Result<(), EventStoreError>> {
+            let fails = self.publish_fails.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if fails {
+                    Err(EventStoreError::Failed(
+                        "the dead-letter source is down".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+        fn subscribe(
+            &self,
+            _: SubscriptionSpec,
+        ) -> BoxFuture<'_, Result<Box<dyn Subscription>, EventStoreError>> {
+            self.subscribed
+                .lock()
+                .unwrap()
+                .push(tokio::time::Instant::now());
+            let script = self.scripts.lock().unwrap().pop_front().unwrap_or_default();
+            Box::pin(async move {
+                Ok(Box::new(Played {
+                    turns: script.into(),
+                }) as Box<dyn Subscription>)
+            })
+        }
+        fn admin(
+            &self,
+            _: &SubscriptionSpec,
+        ) -> Result<Box<dyn crate::event_store::SubscriptionAdmin>, EventStoreError> {
+            Err(EventStoreError::Unsupported(Capability::Replay))
+        }
+        fn compare(&self, a: &str, b: &str) -> Order {
+            a.cmp(b)
+        }
+    }
+
+    struct Played {
+        turns: std::collections::VecDeque<Turn>,
+    }
+
+    impl Subscription for Played {
+        /// Cancel-safe: the turn is taken when the future is polled, and it is ready then.
+        fn next(&mut self) -> BoxFuture<'_, Result<SubscriptionEvent, EventStoreError>> {
+            Box::pin(async move {
+                match self.turns.pop_front() {
+                    Some(Turn::Assigned(segments)) => Ok(SubscriptionEvent::Assigned(
+                        segments.iter().map(|s| s.to_string()).collect(),
+                    )),
+                    Some(Turn::Deliver(position)) => Ok(SubscriptionEvent::Delivery(Delivery {
+                        segment: "0".into(),
+                        position: position.into(),
+                        ..delivery()
+                    })),
+                    Some(Turn::Fail) => Err(EventStoreError::Failed("the script broke".into())),
+                    Some(Turn::Panic) => panic!("the script panicked"),
+                    None => std::future::pending().await,
+                }
+            })
+        }
+        fn ack(&mut self, _: &str, _: &str) -> Result<(), EventStoreError> {
+            Ok(())
+        }
+        fn redeliver(&mut self, _: &str, _: &str) -> Result<(), EventStoreError> {
+            Ok(())
+        }
+        fn pause(&mut self) {}
+        fn resume(&mut self) {}
+        fn segments(&self) -> Vec<crate::event_store::SegmentStatus> {
+            Vec::new()
+        }
+        fn close(self: Box<Self>) -> BoxFuture<'static, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+    struct Happened {}
+    crate::message_type!(Happened, "t.Happened");
+    impl crate::types::Event for Happened {}
+
+    /// A consumer of `events` in mode `event-store`, whose one handler fails every time (counted
+    /// in `runs`), one attempt per record; its control.
+    fn consumer(
+        events: &Arc<Scripted>,
+        runs: &Arc<std::sync::atomic::AtomicU32>,
+    ) -> (Arc<EventConsumer>, Arc<ConsumerControl>) {
+        let events: Arc<dyn EventStore> = Arc::clone(events) as Arc<dyn EventStore>;
+        let mut registry = crate::hub::HandlerRegistry::new();
+        let counted = Arc::clone(runs);
+        registry.event::<Happened, _, _>(move |_, _| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            async { Err(MessagingError::Storage("the handler fails".into())) }
+        });
+        let store: Arc<dyn crate::store::MessageStore> =
+            Arc::new(crate::store::memory::MemoryStore::new());
+        let dispatcher = Arc::new(LocalEventDispatcher::new(
+            Some(store),
+            Arc::new(registry),
+            Arc::new(super::super::NoSagas),
+        ));
+        let settings = ProcessorSettings {
+            name: "default".into(),
+            subscription: SubscriptionSpec {
+                name: "svc.default".into(),
+                source: "kraken.events".into(),
+            },
+            events: Arc::clone(&events),
+            max_attempts: 1,
+            backoff: Duration::from_millis(10),
+            dead_letter_mode: DeadLetterMode::EventStore,
+            dead_letter_retention: Duration::from_secs(60),
+            dead_letters: None,
+            metrics: Metrics::global(),
+        };
+        let monitor = Arc::new(ProcessorMonitor::new(
+            "default",
+            &settings.subscription,
+            &events,
+            DeadLetterMode::EventStore,
+            vec!["t.Happened".into()],
+        ));
+        let control = Arc::new(ConsumerControl::new(Arc::clone(&events)));
+        let consumer =
+            EventConsumer::controlled(settings, dispatcher, monitor, Arc::clone(&control)).unwrap();
+        (consumer, control)
+    }
+
+    async fn eventually(what: &str, check: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        while !check() {
+            assert!(tokio::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// When a subscription ends, what its records left pending ends with it: a record whose
+    /// dead letter could not be written is handled again (its handlers run) by the next
+    /// subscription, as on another instance, not sent straight to the dead letters.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_letter_is_forgotten_with_its_subscription() {
+        let events = Scripted::new(vec![
+            vec![Turn::Assigned(&["0"]), Turn::Deliver("1"), Turn::Fail],
+            vec![Turn::Assigned(&["0"]), Turn::Deliver("1")],
+        ]);
+        let runs = Arc::default();
+        let (consumer, _control) = consumer(&events, &runs);
+        let cancel = CancellationToken::new();
+        let task = consumer.start(cancel.clone());
+        eventually("subscribed again", || {
+            events.subscribed.lock().unwrap().len() == 2
+        })
+        .await;
+        eventually("the handlers ran again", || {
+            runs.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    /// A delivery handed back because the processor is paused is no delivery for the
+    /// resubscribe backoff: subscriptions that only hand back records and fail keep backing off.
+    #[tokio::test(start_paused = true)]
+    async fn a_delivery_handed_back_for_a_pause_does_not_reset_the_backoff() {
+        let broken = || vec![Turn::Assigned(&["0"]), Turn::Deliver("1"), Turn::Fail];
+        let events = Scripted::new(vec![broken(), broken(), broken(), broken()]);
+        let runs = Arc::default();
+        let (consumer, control) = consumer(&events, &runs);
+        control.set_paused(true);
+        let cancel = CancellationToken::new();
+        let task = consumer.start(cancel.clone());
+        eventually("four subscriptions", || {
+            events.subscribed.lock().unwrap().len() == 4
+        })
+        .await;
+        let at = events.subscribed.lock().unwrap().clone();
+        let waits: Vec<u64> = at.windows(2).map(|w| (w[1] - w[0]).as_secs()).collect();
+        assert_eq!(waits, [1, 2, 4], "it keeps backing off");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "paused: nothing handled");
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    /// A reader ended by a panic leaves the processor STOPPED with the reason, never RUNNING
+    /// (or STARTING) while nothing reads.
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_ended_by_a_panic_reads_stopped_with_the_reason() {
+        let events = Scripted::new(vec![vec![Turn::Assigned(&["0"]), Turn::Panic]]);
+        let runs = Arc::default();
+        let (consumer, _control) = consumer(&events, &runs);
+        let monitor = consumer.monitor();
+        let task = consumer.start(CancellationToken::new());
+        let ended = task.await;
+        assert!(ended.is_ok(), "the panic is the reader's, not the task's");
+        let status = monitor.status();
+        assert_eq!(
+            crate::proto::ProcessorState::try_from(status.state).unwrap(),
+            crate::proto::ProcessorState::ProcessorStopped
+        );
+        assert!(
+            status.last_error.contains("the script panicked"),
+            "{}",
+            status.last_error
+        );
     }
 
     #[test]
