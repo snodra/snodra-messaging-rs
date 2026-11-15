@@ -58,8 +58,10 @@
 //!   [`StorePolicy::messages`] acknowledgements or [`StorePolicy::interval`] (10 000 / 5 s by
 //!   default, the Java client's), and always on deactivation and at close.
 //! - **The native dead letter** is the stream `<source>.dlt` (`kraken.events.dlt`), with the
-//!   headers the core writes (as the Kafka add-on's), created by the infrastructure
-//!   (`rabbitmq-streams add_stream kraken.events.dlt`).
+//!   headers the core writes (as the Kafka add-on's), created by the infrastructure: a stream
+//!   queue, e.g. `rabbitmqadmin declare queue --name kraken.events.dlt --type stream`
+//!   (`rabbitmqadmin` 2.x, shipped in the `-management` images; `rabbitmq-streams` has no
+//!   command for a plain stream).
 //!
 //! # What it declares
 //!
@@ -68,7 +70,10 @@
 //! a reset is refused while an instance reads the subscription, and only the management API can
 //! tell (the stream protocol lists no consumers). Without it, [`EventStore::admin`] is
 //! `Unsupported(replay)` and the hub offers no reset. [`RabbitEventStore::open`] asks the API
-//! once at start (it must answer; with metrics collection off, `management.disable_stats` or
+//! once at start (it must answer: the setting is one URL, so with it configured `open` fails
+//! while that node is down even when the rest of a cluster is healthy; put the API behind a load
+//! balancer, or use [`RabbitEventStore::new`], which declares `replay` without asking; with
+//! metrics collection off, `management.disable_stats` or
 //! `management_agent.disable_metrics_collector`, no `replay` is declared); every
 //! reset asks again and fails, never "nobody reads", on an answer it cannot trust; this
 //! process's own open subscriptions count as readers too, and the offsets a reset stored are read
@@ -98,12 +103,21 @@
 //!
 //! # Bounds when something stalls
 //!
-//! - **A consuming connection that stops reading** (a frame the client cannot decode, a
-//!   stalled node) is found by the status refresh within about 20 s (its 5 s period plus the
-//!   10 s request bound); the subscription then ends, its consumers are unsubscribed (the write
-//!   side still works) and the partitions are free for another instance within about 40 s
-//!   (the close stores the position first, bounded by 10 s more). A connection whose close is
-//!   not answered has its heartbeats stopped: the broker drops it after two missed heartbeats.
+//! - **Hand-over.** An instance that stops or crashes hands its partitions over at once (the
+//!   broker activates another consumer of the name). After the loss of a broker **node**, a
+//!   partition whose active consumer was connected to that node (every partition led by it: a
+//!   subscription reads each partition on its leader's connection) has no active consumer until
+//!   the broker's `consumer_disconnected_timeout` passes (60 s by default on RabbitMQ 4.x;
+//!   measured 60.1 s on a 3-node cluster), then another instance's consumer takes it. Nothing is
+//!   lost and the order holds; the events wait.
+//! - **A consuming connection that stops reading** (a frame the client cannot decode, a hung
+//!   node) is found by the status refresh, which shares its loop with the head reads: measured
+//!   ~33 s after a node hung (the 5 s period, then up to three 10 s request bounds: the head
+//!   read's open and unsubscribe, then the liveness request). The subscription then ends and
+//!   closes: it flushes the positions (up to 10 s), joins its tasks and unsubscribes (up to 10 s),
+//!   measured ~20 s more. The hand-over that follows is the broker's, as above. A connection
+//!   whose close is not answered has its heartbeats stopped: the broker drops it after two
+//!   missed heartbeats.
 //! - **A publisher connection that confirms nothing** within the confirm timeout (30 s by
 //!   default) is replaced: that publish fails (the relay tries again) and the next one opens a
 //!   new connection.

@@ -1379,7 +1379,7 @@ crate docs give the whole layout on the wire.
 use kraken_messaging_rabbitmq::{RabbitConfig, RabbitEventStore};
 
 // `open` asks the management API (when configured) once: it must answer, and with its metrics
-// off no reset is offered. `new` connects nothing.
+// off no reset is offered. `new` connects nothing and asks nothing.
 let events = RabbitEventStore::open(RabbitConfig::from_env()?).await?;
 let app = KrakenMessaging::builder(config).await?
     .event_store(Arc::new(events))
@@ -1395,8 +1395,11 @@ its dead-letter stream when the dead-letter mode is `event-store`:
 
 ```bash
 rabbitmq-streams add_super_stream kraken.events --partitions 6
-rabbitmq-streams add_stream kraken.events.dlt
+rabbitmqadmin declare queue --name kraken.events.dlt --type stream   # a plain stream: rabbitmq-streams has no command for it
 ```
+
+(`rabbitmqadmin` 2.x ships in the `-management` images and talks to the management API; any AMQP client declaring a
+queue with `x-queue-type: stream` does the same.)
 
 A missing super stream fails the publish (retried by the outbox relay) and the processors'
 subscriptions (retried after a backoff), naming the command above.
@@ -1465,10 +1468,17 @@ compression on kraken streams.
 - After a crash up to 10 000 events or 5 s per partition are delivered again (the position is
   stored periodically; the processed-event markers skip them), and the event browser's lag view
   trails by as much.
-- Stalls: a consuming connection that stops reading is found within about 20 s, and its
-  partitions are free for another instance within about 40 s; a broker answering slower than
-  10 s fails every request (subscriptions are taken again after the backoff, the relay
+- Hand-over: an instance that stops or crashes hands its partitions over at once. After the loss of a broker **node**,
+  a partition whose active consumer was connected to it (every partition that node led: a subscription reads each
+  partition on its leader's connection) has no active consumer until the broker's `consumer_disconnected_timeout`
+  passes (60 s by default on RabbitMQ 4.x; measured 60.1 s on a 3-node cluster). Nothing is lost and the order holds.
+- Stalls: a consuming connection that stops reading (a hung node) was found after ~33 s in the cluster run (the 5 s
+  refresh, then up to three 10 s request bounds) and closed in ~20 s more (positions flushed, consumers unsubscribed);
+  a broker answering slower than 10 s fails every request (subscriptions are taken again after the backoff, the relay
   retries), nothing is lost.
+- The management API is one URL (`KRAKEN_RABBITMQ_MANAGEMENT_URL`): with it configured, `open` fails while that node
+  is down, even when the rest of the cluster is healthy. Put the API behind a load balancer, or use `new` (it declares
+  `replay` without asking).
 - The event browser's lag view lists the subscriptions this process subscribed, the ones the
   management API shows reading, and `KRAKEN_RABBITMQ_KNOWN_SUBSCRIPTIONS` (the stream protocol
   cannot list the names with a stored offset).
