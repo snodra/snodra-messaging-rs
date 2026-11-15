@@ -7,7 +7,7 @@
 //! headers, its key the record's key, its payload the record's value, a dead letter goes to
 //! `<topic>.dlt`.
 //!
-//! Capabilities: all four. `replay` (reset a group's offsets, [`admin`]), `lag` (committed
+//! Capabilities: all four. `replay` (reset a group's offsets, [`KafkaAdmin`]), `lag` (committed
 //! offsets and high watermarks, refreshed by the subscription every [`OFFSETS_REFRESH`]),
 //! `native-dead-letter` (`.dlt` topics) and `browse` ([`KafkaBrowser`]: search, one record, the
 //! topics, the consumer groups' lag and the tail, read-only, never a group of its own).

@@ -1,6 +1,7 @@
-//! Testing a saga without Kafka or a database (S2-R6, feature `testing`): [`SagaTestFixture`] drives
-//! one saga definition with events and time over the crate's own [`SagaRuntime`] and the
-//! in-memory ports of [`InMemorySagaStore`]. The Rust form of the Kotlin
+//! Testing a saga without an event store or a database (S2-R6, feature `testing`):
+//! [`SagaTestFixture`](crate::saga::testing::SagaTestFixture) drives one saga definition with
+//! events and time over the crate's own [`SagaRuntime`] and the in-memory ports of
+//! [`InMemorySagaStore`](crate::saga::testing::InMemorySagaStore). The Rust form of the Kotlin
 //! `kraken-messaging-test` `SagaTestFixture`.
 //!
 //! ```ignore

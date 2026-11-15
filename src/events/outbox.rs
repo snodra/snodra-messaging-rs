@@ -90,7 +90,7 @@ fn too_big(json: &serde_json::Value) -> Option<&serde_json::Number> {
     }
 }
 
-/// [`check_payload`] of a JSON text, the outbox contract every store applies
+/// The outbox contract every store applies, checked on a JSON text
 /// ([`OutboxEntry::payload`](crate::store::OutboxEntry::payload)): JSON, an object, and every
 /// integer in it (a number written without `.`, `e` or `E`) within the signed 64-bit range. The
 /// integers are read from the text itself: a JSON parser reads an integer below `i64::MIN` or

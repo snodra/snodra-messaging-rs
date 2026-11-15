@@ -325,7 +325,7 @@ impl EventConsumer {
     }
 
     /// Consumes until `cancel` (then leaves the subscription); in mode `collection` also counts
-    /// the processor's letters (every [`DEAD_LETTERS_SAMPLE`] and after a park).
+    /// the processor's letters (every 30 s and after a park).
     pub fn start(self: Arc<Self>, cancel: CancellationToken) -> JoinHandle<()> {
         tokio::spawn(async move {
             let helpers = cancel.child_token();

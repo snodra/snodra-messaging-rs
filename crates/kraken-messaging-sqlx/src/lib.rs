@@ -31,6 +31,10 @@
 //!
 //! Times are the application's clock (the builder's, [`MessageStore::use_clock`]), at
 //! millisecond precision, UTC; never the database's.
+//!
+//! [`MessageStore::init_schema`]: kraken_messaging::store::MessageStore::init_schema
+//! [`MessageStore::check_schema`]: kraken_messaging::store::MessageStore::check_schema
+//! [`MessageStore::use_clock`]: kraken_messaging::store::MessageStore::use_clock
 
 #[cfg(any(feature = "postgres", feature = "mysql"))]
 mod control;

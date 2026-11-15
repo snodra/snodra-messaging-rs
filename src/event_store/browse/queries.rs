@@ -271,7 +271,7 @@ pub fn heartbeat_period(requested: Option<u64>) -> Duration {
 /// The most bytes of a value an error message quotes.
 const MAX_QUOTED: usize = 64;
 
-/// `s` quoted for an error message, cut to [`MAX_QUOTED`] bytes (`...` when cut): an error
+/// `s` quoted for an error message, cut to 64 bytes (`...` when cut): an error
 /// never echoes unbounded input.
 pub fn quoted(s: &str) -> String {
     let (shown, cut_off) = super::records::cut(s, MAX_QUOTED);

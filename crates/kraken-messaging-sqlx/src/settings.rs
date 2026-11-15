@@ -31,7 +31,7 @@ impl Default for SqlxSettings {
 }
 
 impl SqlxSettings {
-    /// The defaults, with [`NOTIFY_VAR`] (`true`/`false`) and [`PURGE_INTERVAL_VAR`]
+    /// The defaults, with `KRAKEN_STORE_SQL_NOTIFY` (`true`/`false`) and `KRAKEN_STORE_SQL_PURGE_INTERVAL_MS`
     /// (milliseconds, 0 = off) when set.
     pub fn from_env() -> Result<SqlxSettings, MessagingError> {
         Self::from_vars(|name| std::env::var(name).ok())
