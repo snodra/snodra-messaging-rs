@@ -124,7 +124,7 @@
 //! | `KRAKEN_RABBITMQ_PORT` | 5552 (5551 with TLS) | the port of a host given without one |
 //! | `KRAKEN_RABBITMQ_VIRTUAL_HOST` | `/` | |
 //! | `KRAKEN_RABBITMQ_USERNAME` | `guest` | |
-//! | `KRAKEN_RABBITMQ_PASSWORD` / `_PASSWORD_FILE` | `guest` | the password, or a file holding it (the variable wins) |
+//! | `KRAKEN_RABBITMQ_PASSWORD` / `_PASSWORD_FILE` | `guest` | the password, or a file holding it (the file wins) |
 //! | `KRAKEN_RABBITMQ_TLS` | false | TLS (rustls) to every node |
 //! | `KRAKEN_RABBITMQ_TLS_CA_FILE` | none | PEM CA certificates the nodes are verified against; required with TLS |
 //! | `KRAKEN_RABBITMQ_LOAD_BALANCER` | false | the hosts are a load balancer: connect through it until it lands on the node needed |
@@ -132,7 +132,7 @@
 //! | `KRAKEN_RABBITMQ_OFFSET_STORE_MESSAGES` | 10000 | store a subscription's position every so many acknowledgements... |
 //! | `KRAKEN_RABBITMQ_OFFSET_STORE_INTERVAL_MS` | 5000 | ...or this often, whichever comes first |
 //! | `KRAKEN_RABBITMQ_MANAGEMENT_URL` | none | the management API (`http://rabbitmq:15672`, no credentials in it): declares `replay`, lists live subscriptions |
-//! | `KRAKEN_RABBITMQ_MANAGEMENT_USERNAME` / `_PASSWORD` / `_PASSWORD_FILE` | the stream user's | |
+//! | `KRAKEN_RABBITMQ_MANAGEMENT_USERNAME` / `_PASSWORD` / `_PASSWORD_FILE` | the stream user's | the file wins over the password |
 //! | `KRAKEN_RABBITMQ_MANAGEMENT_CA_FILE` | none | PEM CA certificates of an `https` management API |
 //! | `KRAKEN_RABBITMQ_KNOWN_SUBSCRIPTIONS` | none | subscription names the browser's lag view always lists |
 //!

@@ -1280,7 +1280,7 @@ always counted), so stop every instance and wait a few seconds before a reset.
 | `KRAKEN_RABBITMQ_PORT` | 5552 (5551 with TLS) | the port of a host given without one |
 | `KRAKEN_RABBITMQ_VIRTUAL_HOST` | `/` | |
 | `KRAKEN_RABBITMQ_USERNAME` | `guest` | |
-| `KRAKEN_RABBITMQ_PASSWORD` / `_PASSWORD_FILE` | `guest` | the password, or a file holding it (the variable wins); never logged |
+| `KRAKEN_RABBITMQ_PASSWORD` / `_PASSWORD_FILE` | `guest` | the password, or a file holding it (the file wins when both are set, as for the core's `_FILE` settings); never logged |
 | `KRAKEN_RABBITMQ_TLS` | false | TLS (rustls, no OpenSSL) to every node |
 | `KRAKEN_RABBITMQ_TLS_CA_FILE` | none | PEM CA certificates the nodes are verified against; required with TLS (the store never connects unverified) |
 | `KRAKEN_RABBITMQ_LOAD_BALANCER` | false | the hosts are a load balancer: connect through it until it lands on the node needed |
@@ -1288,7 +1288,7 @@ always counted), so stop every instance and wait a few seconds before a reset.
 | `KRAKEN_RABBITMQ_OFFSET_STORE_MESSAGES` | 10000 | a processor stores its position every so many acknowledgements... |
 | `KRAKEN_RABBITMQ_OFFSET_STORE_INTERVAL_MS` | 5000 | ...or this often, whichever first, and always when a partition moves away and at shutdown (every stored position is an entry in the stream) |
 | `KRAKEN_RABBITMQ_MANAGEMENT_URL` | none | the management API (`http://rabbitmq:15672`, no credentials in the URL): declares `replay`, shows live subscriptions; metrics collection must be on (neither `management.disable_stats` nor `management_agent.disable_metrics_collector`) |
-| `KRAKEN_RABBITMQ_MANAGEMENT_USERNAME` / `_PASSWORD` / `_PASSWORD_FILE` | the stream user's | |
+| `KRAKEN_RABBITMQ_MANAGEMENT_USERNAME` / `_PASSWORD` / `_PASSWORD_FILE` | the stream user's | the management API's own login; its password file wins over its password, too |
 | `KRAKEN_RABBITMQ_MANAGEMENT_CA_FILE` | none | PEM CA certificates of an `https` management API |
 | `KRAKEN_RABBITMQ_KNOWN_SUBSCRIPTIONS` | none | subscription names the event browser's lag view always lists |
 

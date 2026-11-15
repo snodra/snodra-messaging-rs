@@ -423,29 +423,27 @@ fn flag(name: &str, value: &str) -> Result<bool, EventStoreError> {
     }
 }
 
-/// `KRAKEN_RABBITMQ_<name>`, else the content of the file `KRAKEN_RABBITMQ_<name>_FILE` (its
-/// trailing line break removed); the variable wins when both are set.
+/// The content of the file `KRAKEN_RABBITMQ_<name>_FILE` (its trailing line break removed), else
+/// `KRAKEN_RABBITMQ_<name>`: the file wins when both are set, as the core's `_FILE` settings.
 fn secret(
     vars: &std::collections::HashMap<String, String>,
     name: &str,
 ) -> Result<Option<String>, EventStoreError> {
-    if let Some(value) = vars
-        .get(&format!("KRAKEN_RABBITMQ_{name}"))
-        .filter(|v| !v.is_empty())
-    {
-        return Ok(Some(value.clone()));
-    }
     let file_var = format!("KRAKEN_RABBITMQ_{name}_FILE");
-    let Some(path) = vars
+    if let Some(path) = vars
         .get(&file_var)
         .map(|p| p.trim())
         .filter(|p| !p.is_empty())
-    else {
-        return Ok(None);
-    };
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| EventStoreError::Invalid(format!("{file_var}: cannot read {path}: {e}")))?;
-    Ok(Some(content.trim_end_matches(['\r', '\n']).to_string()))
+    {
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            EventStoreError::Invalid(format!("{file_var}: cannot read {path}: {e}"))
+        })?;
+        return Ok(Some(content.trim_end_matches(['\r', '\n']).to_string()));
+    }
+    Ok(vars
+        .get(&format!("KRAKEN_RABBITMQ_{name}"))
+        .filter(|v| !v.is_empty())
+        .cloned())
 }
 
 #[cfg(test)]
@@ -563,21 +561,51 @@ mod tests {
         }
     }
 
+    /// As the core's `_FILE` settings: a file, when set, wins over the variable, for the stream
+    /// user and the management API alike; a file that cannot be read is an error even then.
     #[test]
-    fn the_variable_wins_over_the_file() {
+    fn the_file_wins_over_the_variable() {
+        let dir = std::env::temp_dir().join(format!("kraken-rmq-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stream = dir.join("password");
+        std::fs::write(&stream, "stream-file\n").unwrap();
+        let management = dir.join("management-password");
+        std::fs::write(&management, "management-file\n").unwrap();
         let config = RabbitConfig::from_vars(vars(&[
             ("KRAKEN_RABBITMQ_PASSWORD", "direct"),
-            ("KRAKEN_RABBITMQ_PASSWORD_FILE", "/no/such/kraken/file"),
+            ("KRAKEN_RABBITMQ_PASSWORD_FILE", stream.to_str().unwrap()),
             ("KRAKEN_RABBITMQ_MANAGEMENT_URL", "http://m:15672"),
             ("KRAKEN_RABBITMQ_MANAGEMENT_USERNAME", "admin"),
+            ("KRAKEN_RABBITMQ_MANAGEMENT_PASSWORD", "m-pass"),
+            (
+                "KRAKEN_RABBITMQ_MANAGEMENT_PASSWORD_FILE",
+                management.to_str().unwrap(),
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(config.password, "stream-file");
+        assert_eq!(
+            config.management_login(),
+            ("admin".to_string(), "management-file".to_string())
+        );
+        let unreadable = RabbitConfig::from_vars(vars(&[
+            ("KRAKEN_RABBITMQ_PASSWORD", "direct"),
+            ("KRAKEN_RABBITMQ_PASSWORD_FILE", "/no/such/kraken/file"),
+        ]));
+        assert!(
+            matches!(unreadable, Err(EventStoreError::Invalid(ref m)) if m.contains("KRAKEN_RABBITMQ_PASSWORD_FILE")),
+            "{unreadable:?}"
+        );
+        // Without a file, the variable.
+        let config = RabbitConfig::from_vars(vars(&[
+            ("KRAKEN_RABBITMQ_PASSWORD", "direct"),
+            ("KRAKEN_RABBITMQ_MANAGEMENT_URL", "http://m:15672"),
             ("KRAKEN_RABBITMQ_MANAGEMENT_PASSWORD", "m-pass"),
         ]))
         .unwrap();
         assert_eq!(config.password, "direct");
-        assert_eq!(
-            config.management_login(),
-            ("admin".to_string(), "m-pass".to_string())
-        );
+        assert_eq!(config.management_login().1, "m-pass");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 
