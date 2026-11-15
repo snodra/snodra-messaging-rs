@@ -937,7 +937,7 @@ const REMOVED_SETTINGS: [(&str, &str); 4] = [
     ),
     (
         "KRAKEN_MONGODB_URI",
-        "the message store is an add-on built in code: kraken-messaging-mongo's MongoStore::new(client, db) with a client the service builds",
+        "the message store is an add-on built in code: kraken-messaging-mongo's MongoStore::new(client, db) with a client the service builds (a service that reads this variable itself for that client can ignore this warning)",
     ),
 ];
 
