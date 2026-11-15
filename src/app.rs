@@ -849,6 +849,8 @@ impl KrakenMessagingBuilder {
             store.use_clock(clock.clone());
             if config.store_init_schema {
                 store.init_schema(&config).await?;
+            } else {
+                store.check_schema().await?;
             }
         }
         let saga_metrics: Arc<dyn SagaMetrics> =
@@ -919,6 +921,13 @@ impl KrakenMessagingBuilder {
         let cancel = CancellationToken::new();
         let handlers = TaskTracker::new();
         let mut tasks = Vec::new();
+        // What the store runs on its own (e.g. the SQL add-on's purge), until the shutdown.
+        if let Some(background) = store
+            .as_ref()
+            .and_then(|store| store.background(&config, cancel.clone()))
+        {
+            tasks.push(tokio::spawn(background));
+        }
 
         // The event processors (ADR 0022): `default` (the ordinary handlers and the sagas; the
         // consumer also runs for a service whose events only sagas handle), then the named ones.

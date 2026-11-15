@@ -379,3 +379,141 @@ fn saga(id: &str, start_key: Option<&str>) -> SagaDocument {
         updated_at_ms: 1,
     }
 }
+
+/// A store that checks its schema (failing when told to) and runs a background task, delegating
+/// everything else to a `MemoryStore`.
+struct HookedStore {
+    inner: MemoryStore,
+    schema_missing: bool,
+    checked: Arc<std::sync::atomic::AtomicUsize>,
+    background: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl MessageStore for HookedStore {
+    fn name(&self) -> &'static str {
+        "hooked"
+    }
+    fn init_schema<'a>(
+        &'a self,
+        config: &'a kraken_messaging::Config,
+    ) -> futures::future::BoxFuture<'a, Result<(), StoreError>> {
+        self.inner.init_schema(config)
+    }
+    fn check_schema(&self) -> futures::future::BoxFuture<'_, Result<(), StoreError>> {
+        self.checked
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let missing = self.schema_missing;
+        Box::pin(async move {
+            if missing {
+                Err(StoreError::Failed(
+                    kraken_messaging::MessagingError::Storage("the schema is at version 0".into()),
+                ))
+            } else {
+                Ok(())
+            }
+        })
+    }
+    fn background(
+        &self,
+        _config: &kraken_messaging::Config,
+        stop: tokio_util::sync::CancellationToken,
+    ) -> Option<futures::future::BoxFuture<'static, ()>> {
+        let running = Arc::clone(&self.background);
+        Some(Box::pin(async move {
+            running.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            stop.cancelled().await;
+            running.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }))
+    }
+    fn use_clock(&self, clock: kraken_messaging::saga::Clock) {
+        self.inner.use_clock(clock)
+    }
+    fn tx(&self) -> Arc<dyn kraken_messaging::store::TxProvider> {
+        self.inner.tx()
+    }
+    fn outbox(&self) -> Arc<dyn kraken_messaging::store::OutboxStore> {
+        self.inner.outbox()
+    }
+    fn processed_events(&self) -> Arc<dyn kraken_messaging::store::ProcessedEventStore> {
+        self.inner.processed_events()
+    }
+    fn dead_letters(&self) -> Arc<dyn kraken_messaging::store::DeadLetterStore> {
+        self.inner.dead_letters()
+    }
+    fn processor_control(&self) -> Arc<dyn kraken_messaging::store::ProcessorControlStore> {
+        self.inner.processor_control()
+    }
+    fn external_calls(&self) -> Arc<dyn kraken_messaging::store::ExternalCallStore> {
+        self.inner.external_calls()
+    }
+    fn sagas(&self) -> kraken_messaging::store::SagaStores {
+        self.inner.sagas()
+    }
+}
+
+/// `start()` checks the store's schema instead of preparing it when `store_init_schema` is off
+/// (a missing schema fails the startup), and runs the store's background task until the
+/// shutdown.
+#[tokio::test]
+async fn start_checks_the_schema_when_init_is_off_and_runs_the_stores_background_task() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let hooked = |schema_missing: bool| {
+        let (checked, background) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let store = HookedStore {
+            inner: MemoryStore::new(),
+            schema_missing,
+            checked: Arc::clone(&checked),
+            background: Arc::clone(&background),
+        };
+        (store, checked, background)
+    };
+    let config = |init: bool| {
+        let mut config = kraken_messaging::Config::new("hooked", "static://127.0.0.1:1");
+        config.hub_enabled = false;
+        config.outbox_enabled = false;
+        config.store_init_schema = init;
+        config
+    };
+    let start = async |store: HookedStore, init: bool| {
+        kraken_messaging::KrakenMessaging::builder(config(init))
+            .await
+            .unwrap()
+            .store(Arc::new(store))
+            .start()
+            .await
+    };
+
+    let (store, checked, background) = hooked(true);
+    let refused = start(store, false).await.err().expect("a missing schema");
+    assert!(
+        refused.to_string().contains("the schema is at version 0"),
+        "{refused}"
+    );
+    assert_eq!(checked.load(Ordering::SeqCst), 1);
+    assert_eq!(background.load(Ordering::SeqCst), 0, "not started");
+
+    let (store, checked, background) = hooked(true);
+    let app = start(store, true).await.expect("init on: no check");
+    assert_eq!(checked.load(Ordering::SeqCst), 0);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while background.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the background task runs");
+    app.shutdown().await;
+    assert_eq!(
+        background.load(Ordering::SeqCst),
+        0,
+        "stopped by the shutdown"
+    );
+
+    let (store, checked, _) = hooked(false);
+    start(store, false)
+        .await
+        .expect("the schema is there")
+        .shutdown()
+        .await;
+    assert_eq!(checked.load(Ordering::SeqCst), 1);
+}

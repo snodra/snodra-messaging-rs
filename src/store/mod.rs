@@ -115,7 +115,9 @@ pub struct SagaStores {
 ///
 /// [`KrakenMessagingBuilder::start`](crate::KrakenMessagingBuilder::start) hands the store the
 /// application's clock ([`use_clock`](Self::use_clock)), then prepares its schema
-/// ([`init_schema`](Self::init_schema)) unless `Config::store_init_schema` is false.
+/// ([`init_schema`](Self::init_schema)), or checks it when `Config::store_init_schema` is false
+/// ([`check_schema`](Self::check_schema)), then starts what it runs in the background
+/// ([`background`](Self::background)).
 pub trait MessageStore: Send + Sync {
     /// The add-on's name (`mongo`, `postgres`, `mysql`, `memory`), for logs and errors.
     fn name(&self) -> &'static str;
@@ -123,6 +125,26 @@ pub trait MessageStore: Send + Sync {
     /// Prepares what the store needs in its database, idempotently: indexes (MongoDB, with the
     /// retentions of `config` as TTLs), tables (SQL), nothing (in memory).
     fn init_schema<'a>(&'a self, config: &'a Config) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// With `Config::store_init_schema` false (the service applies the schema itself): fails
+    /// unless the database has what this store needs, e.g. an SQL schema at the version it reads
+    /// or later. The default checks nothing.
+    fn check_schema(&self) -> BoxFuture<'_, Result<(), StoreError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// What the store runs in the background while the application runs (e.g. the SQL add-on's
+    /// purge of what the retentions of `config` let go), until `stop` is cancelled at the
+    /// application's shutdown; spawned by `start()` once the schema is ready. The default runs
+    /// nothing.
+    fn background(
+        &self,
+        config: &Config,
+        stop: tokio_util::sync::CancellationToken,
+    ) -> Option<BoxFuture<'static, ()>> {
+        let _ = (config, stop);
+        None
+    }
 
     /// The application's clock: what the store stamps the times it sets itself with (an outbox
     /// entry's sending, a claim's lease). Until called, the system clock.
