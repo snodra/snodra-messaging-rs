@@ -934,10 +934,12 @@ impl HubConnection {
                 .ok_or_else(|| MessagingError::HubUnavailable("not connected to the hub".into()))?;
             (live.tx.clone(), live.grants.initial(), live.stream)
         };
+        // Counted before it is written: its ack may be handled before `send` returns.
+        let ours = self.count_later_register(stream);
         tx.send(self.register(initial))
             .await
             .map_err(|_| MessagingError::HubUnavailable("hub stream closed".into()))?;
-        Ok((stream, self.count_later_register(stream)))
+        Ok((stream, ours))
     }
 
     /// Counts one more `Register` written on `stream` after its handshake: its number.
@@ -969,13 +971,12 @@ impl HubConnection {
                 .ok_or_else(|| MessagingError::HubUnavailable("not connected to the hub".into()))?;
             (live.tx.clone(), live.grants.initial())
         };
-        let stream = self.live.lock().unwrap().as_ref().map(|l| l.stream);
+        if let Some(stream) = self.live.lock().unwrap().as_ref().map(|l| l.stream) {
+            self.count_later_register(stream);
+        }
         tx.send(self.register_with(RegisteredTypes::default(), initial))
             .await
             .map_err(|_| MessagingError::HubUnavailable("hub stream closed".into()))?;
-        if let Some(stream) = stream {
-            self.count_later_register(stream);
-        }
         Ok(())
     }
 

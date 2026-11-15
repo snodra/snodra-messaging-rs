@@ -175,9 +175,11 @@ pub async fn hub_with(options: HubOptions) -> HubContainer {
     let container = match options.port {
         Some(port) => {
             // A fixed port is free when picked, not when Docker binds it (another process may
-            // take it meanwhile: "failed to bind port"); the HTTP port is picked again then.
+            // take it meanwhile: "failed to bind port", "port is already allocated"): both
+            // ports are picked again then. The caller reads the hub's address back.
             let mut tries = 0;
-            let (container, http_port) = loop {
+            let mut port = port;
+            let (container, port, http_port) = loop {
                 tries += 1;
                 let http_port = free_port();
                 match build()
@@ -186,9 +188,10 @@ pub async fn hub_with(options: HubOptions) -> HubContainer {
                     .start()
                     .await
                 {
-                    Ok(container) => break (container, http_port),
-                    Err(e) if tries < 3 && e.to_string().contains("bind") => {
-                        eprintln!("hub container: {e}; trying again");
+                    Ok(container) => break (container, port, http_port),
+                    Err(e) if tries < 3 && bind_failure(&e.to_string()) => {
+                        eprintln!("hub container: {e}; trying again on other ports");
+                        port = free_port();
                     }
                     Err(e) => panic!("hub container: {e}"),
                 }
@@ -230,6 +233,15 @@ impl MongoDb {
         let base = self.uri.split('/').take(3).collect::<Vec<_>>().join("/");
         format!("{base}/{db}?directConnection=true")
     }
+}
+
+/// Whether a container start failed because a host port was taken (Docker words it several
+/// ways: "failed to bind port", "Bind for 0.0.0.0:N failed: port is already allocated").
+pub fn bind_failure(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("bind")
+        || error.contains("already allocated")
+        || error.contains("address already in use")
 }
 
 /// A free TCP port on the host, for containers that must keep their mapping across restarts.
