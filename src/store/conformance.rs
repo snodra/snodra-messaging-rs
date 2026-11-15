@@ -22,7 +22,8 @@
 //!
 //! The kit must run on a multi-thread runtime (`#[tokio::test(flavor = "multi_thread")]`): two
 //! tasks race in [`concurrent_relays_publish_each_entry_once`],
-//! [`two_schedulers_claim_each_due_deadline_once`] and [`two_relays_never_hold_one_saga_lease`].
+//! [`two_schedulers_claim_each_due_deadline_once`], [`two_relays_never_hold_one_saga_lease`] and
+//! [`concurrent_notice_claims_return_each_notice_once`].
 //! Its time bounds leave the store a second or more: a store stamps times with the application
 //! clock, and the kit never compares the host clock with a stamped time at a finer margin.
 //!
@@ -60,7 +61,7 @@
 //! | [`two_schedulers_claim_each_due_deadline_once`] | **`concurrentDeadlineClaimsReturnEachDeadlineOnce`** |
 //! | [`dispatch_hands_out_each_saga_in_seq_order`] | **`sagaDispatchEntriesAreRelayedInOrderPerSaga`** and **`sagaDispatchLeaseIsExclusiveUntilItExpires`** (one check here) |
 //! | [`two_relays_never_hold_one_saga_lease`] | **`concurrentLeaseClaimsGrantOneOwner`** |
-//! | **none** (Kotlin only; here the notice claim is checked by one relay at a time, in [`dispatch_hands_out_each_saga_in_seq_order`]) | `concurrentNoticeClaimsReturnEachNoticeOnce` |
+//! | [`concurrent_notice_claims_return_each_notice_once`] | `concurrentNoticeClaimsReturnEachNoticeOnce` |
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -129,6 +130,7 @@ pub async fn run_store_conformance(store: Arc<dyn MessageStore>) {
         two_schedulers_claim_each_due_deadline_once,
         dispatch_hands_out_each_saga_in_seq_order,
         two_relays_never_hold_one_saga_lease,
+        concurrent_notice_claims_return_each_notice_once,
     );
 }
 
@@ -2500,6 +2502,80 @@ pub async fn two_relays_never_hold_one_saga_lease(store: &dyn MessageStore) {
     for id in ids.iter() {
         let owner = if a.contains(id) { "relay-a" } else { "relay-b" };
         queue.release_lease(id, owner).await.expect("release_lease");
+    }
+}
+
+/// Two relays claiming due failure notices at the same time (started together, on a
+/// multi-thread runtime), each until none is left: every notice is claimed by exactly one of them,
+/// once.
+pub async fn concurrent_notice_claims_return_each_notice_once(store: &dyn MessageStore) {
+    const NOTICES: usize = 40;
+    let queue = store.sagas().dispatch;
+    let txs = store.tx();
+    let now = now_ms();
+    let entries: Vec<SagaDispatchDocument> = (0..NOTICES)
+        .map(|_| {
+            dispatch_entry(
+                &uuid::Uuid::new_v4().to_string(),
+                1000,
+                DispatchKind::Command,
+                now - 1_000,
+            )
+        })
+        .collect();
+    let mut tx = txs.begin().await.expect("begin");
+    queue.record(&mut tx, &entries).await.expect("record");
+    txs.commit(&mut tx).await.expect("commit");
+    for e in &entries {
+        queue
+            .mark_failed(
+                &e.id,
+                &DispatchFailure {
+                    attempts: Some(1),
+                    reason: FailureReason::NoHandler,
+                    message: "nobody".into(),
+                    failed_at_ms: now,
+                    notice_at_ms: Some(now),
+                },
+            )
+            .await
+            .expect("mark_failed");
+    }
+    let mine: HashSet<String> = entries.iter().map(|e| e.id.clone()).collect();
+
+    let start = Arc::new(Barrier::new(2));
+    let relay = || {
+        let (queue, start, mine) = (Arc::clone(&queue), Arc::clone(&start), mine.clone());
+        tokio::spawn(async move {
+            tokio::time::timeout(BARRIER_WAIT, start.wait())
+                .await
+                .expect("the other relay never started");
+            let mut got = Vec::new();
+            // Another check's notices claimed on the way stay reserved.
+            while let Some(e) = queue
+                .claim_due_notice(now, now + 60_000)
+                .await
+                .expect("claim_due_notice")
+            {
+                if mine.contains(&e.id) {
+                    got.push(e.id);
+                }
+                tokio::task::yield_now().await;
+            }
+            got
+        })
+    };
+    let (a, b) = tokio::join!(relay(), relay());
+    let (a, b) = (a.expect("relay-a"), b.expect("relay-b"));
+    let claimed: HashSet<String> = a.iter().chain(&b).cloned().collect();
+    assert_eq!(claimed, mine, "every due notice was claimed");
+    assert_eq!(
+        a.len() + b.len(),
+        NOTICES,
+        "a notice was claimed twice: {a:?} and {b:?}"
+    );
+    for id in &mine {
+        queue.clear_notice(id).await.expect("clear_notice");
     }
 }
 
