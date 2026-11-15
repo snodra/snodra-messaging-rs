@@ -25,6 +25,42 @@
 //! [`two_schedulers_claim_each_due_deadline_once`] and [`two_relays_never_hold_one_saga_lease`].
 //! Its time bounds leave the store a second or more: a store stamps times with the application
 //! clock, and the kit never compares the host clock with a stamped time at a finer margin.
+//!
+//! # The checks and their names in kraken-messaging
+//!
+//! The Kotlin kit (`MessageStoreConformanceTest` in `kraken-messaging-test`) checks the same
+//! contract; each check here, in the order it runs, with the name of its Kotlin twin (the same
+//! name in camelCase unless the row says otherwise):
+//!
+//! | Rust check | Kotlin check |
+//! |---|---|
+//! | [`appended_entry_is_claimed_in_created_seq_order`] | `appendedEntryIsClaimedInCreatedSeqOrder` |
+//! | [`outbox_rejects_a_payload_that_is_not_a_json_object`] | **`outboxPayloadMustBeAJsonObject`** |
+//! | [`pending_counts_entries_neither_sent_nor_failed`] | **`oldestPendingIsTheOldestEntryNeitherSentNorFailed`** |
+//! | [`rolled_back_transaction_leaves_no_outbox_entry`] | `rolledBackTransactionLeavesNoOutboxEntry` |
+//! | [`rolled_back_handler_leaves_no_processed_marker`] | `rolledBackHandlerLeavesNoProcessedMarker` |
+//! | [`processed_marker_records_once`] | `processedMarkerRecordsOnce` |
+//! | [`delete_markers_removes_only_the_range`] | `deleteMarkersRemovesOnlyTheRange` |
+//! | [`concurrent_relays_publish_each_entry_once`] | `concurrentRelaysPublishEachEntryOnce` |
+//! | [`expired_lease_is_reclaimed`] | `expiredLeaseIsReclaimed` |
+//! | [`purge_removes_only_sent_before`] | `purgeRemovesOnlySentBefore` |
+//! | [`dead_letters_sequence_per_key`] | `deadLettersSequencePerKey` |
+//! | [`dead_letter_parked_inside_rolled_back_transaction_is_kept`] | `deadLetterParkedInsideRolledBackTransactionIsKept` |
+//! | [`dead_letter_deleted_in_a_transaction_goes_with_it`] | **none** (Rust only) |
+//! | [`control_lock_is_exclusive_until_lease_expires`] | `controlLockIsExclusiveUntilLeaseExpires` |
+//! | [`pause_state_round_trips`] | `pauseStateRoundTrips` |
+//! | [`replay_ranges_round_trip`] | `replayRangesRoundTrip` |
+//! | [`processor_control_write_inside_rolled_back_transaction_is_kept`] | `processorControlWriteInsideRolledBackTransactionIsKept` |
+//! | [`external_call_idempotency_returns_first_result`] | `externalCallIdempotencyReturnsFirstResult` |
+//! | [`saga_ports_round_trip`] | `sagaPortsRoundTrip` |
+//! | [`two_transactions_starting_one_saga_key_leave_one_live_saga`] | **`concurrentStartsOfOneSagaKeyLetOneWin`** |
+//! | [`two_transactions_updating_one_saga_version_commit_once`] | **`concurrentUpdatesOfOneSagaLetOneWin`** |
+//! | [`saga_dispatch_store_refuses_an_event_the_outbox_would_refuse`] | **`sagaEventTheOutboxWouldRefuseIsNotRecorded`** |
+//! | [`due_deadline_is_claimed_once_until_its_lease_passes`] | **`dueDeadlinesAreClaimedOnceUntilTheirLeaseExpires`** |
+//! | [`two_schedulers_claim_each_due_deadline_once`] | **`concurrentDeadlineClaimsReturnEachDeadlineOnce`** |
+//! | [`dispatch_hands_out_each_saga_in_seq_order`] | **`sagaDispatchEntriesAreRelayedInOrderPerSaga`** and **`sagaDispatchLeaseIsExclusiveUntilItExpires`** (one check here) |
+//! | [`two_relays_never_hold_one_saga_lease`] | **`concurrentLeaseClaimsGrantOneOwner`** |
+//! | **none** (Kotlin only; here the notice claim is checked by one relay at a time, in [`dispatch_hands_out_each_saga_in_seq_order`]) | `concurrentNoticeClaimsReturnEachNoticeOnce` |
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;

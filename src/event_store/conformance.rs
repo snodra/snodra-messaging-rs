@@ -34,6 +34,33 @@
 //!   that does not answer fails the check naming the step, and so does a
 //!   [`SubscriptionAdmin`] call (each runs on a thread of its own, so a blocked one is left
 //!   behind rather than holding the runtime).
+//!
+//! # The checks and their names in kraken-messaging
+//!
+//! The Kotlin kit (`EventStoreConformanceTest` in `kraken-messaging-test`) checks the same
+//! contract under the same names in camelCase; the browser checks are this kit's alone (the event
+//! browser is a Rust crate, so the Kotlin event stores have none):
+//!
+//! | Rust check | Kotlin check |
+//! |---|---|
+//! | [`headers_round_trip`] | `headersRoundTrip` |
+//! | [`same_key_arrives_in_publish_order`] | `sameKeyArrivesInPublishOrder` |
+//! | [`every_processor_gets_every_event`] | `everyProcessorGetsEveryEvent` |
+//! | [`instances_share_a_processor`] | `instancesShareAProcessor` |
+//! | [`an_instance_left_without_segments_closes_its_change`] | `anInstanceLeftWithoutSegmentsClosesItsChange` |
+//! | [`unacked_delivery_is_redelivered`] | `unackedDeliveryIsRedelivered` |
+//! | [`redelivered_after_commit_is_skipped`] | `redeliveredAfterCommitIsSkipped` |
+//! | [`paused_subscription_receives_nothing_and_resumes_in_place`] | `pausedSubscriptionReceivesNothingAndResumesInPlace` |
+//! | [`replay_from_earliest_redelivers_history`] (with `replay`) | `replayFromEarliestRedeliversHistory` |
+//! | [`admin_without_replay_is_unsupported`] (without `replay`) | `adminWithoutReplayIsUnsupported` |
+//! | [`lag_counts_unacked`] (with `lag`) | `lagCountsUnacked` |
+//! | [`lag_unknown_without_capability`] (without `lag`) | `lagUnknownWithoutCapability` |
+//! | [`dead_letter_source_receives`] (with `native-dead-letter`) | `deadLetterSourceReceives` |
+//! | [`search_finds_by_type_key_and_correlation`] (with `browse`) | **none** (Rust only) |
+//! | [`search_stops_at_bounds`] (with `browse`) | **none** (Rust only) |
+//! | [`tail_streams_new_events`] (with `browse`) | **none** (Rust only) |
+//! | [`browser_never_commits_a_position`] (with `browse`) | **none** (Rust only) |
+//! | [`no_browser_without_capability`] (without `browse`) | **none** (Rust only) |
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
@@ -331,7 +358,7 @@ pub async fn instances_share_a_processor(kit: &EventStoreKit<'_>) {
 ///
 /// After each join the check watches for the change the join may cause: until a revocation
 /// somewhere, or until the newcomer saw its first change and a slice then passed with no event at
-/// any instance, at most [`JOIN_WINDOW`].
+/// any instance, at most 6 s.
 pub async fn an_instance_left_without_segments_closes_its_change(kit: &EventStoreKit<'_>) {
     let spec = kit.spec();
     let first = kit.instance();
