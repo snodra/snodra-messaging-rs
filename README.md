@@ -175,7 +175,7 @@ it (kept in the dispatch entry's headers); one sent by a deadline handler carrie
 | `KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS` | 600000 | how long a streaming query handler waits for credit before it ends its stream with `TIMEOUT` "no credit within <d>" and releases its permits (see [Streaming queries](#streaming-queries)); the default is the hub's default `KRAKEN_HUB_MAX_STREAM_DURATION` (10 min); at least 1 (`0` is rejected at startup, also when set in code) |
 | `KRAKEN_HUB_MAX_SUBSCRIPTIONS` | 1024 | the most subscription queries this instance serves at once (see [Subscription queries](#subscription-queries)): a subscription request beyond it is refused with `ReplyEnd{error = RESOURCE_EXHAUSTED}` `subscription limit (N) reached`, which the subscriber sees as `HandlerBusy`; subscriptions hold no handler permit, so this is their only bound here; the hub has its own per-instance limit (`KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE`, 1024); at least 1 (`0` is rejected at startup, also when set in code) |
 | `KRAKEN_HUB_TOKEN` | none | the static access token sent in `Register.credentials.token` on every hub stream (`Config.hub_token`, a `SecretString` whose `Debug` prints `"***"`); needed when the hub runs `KRAKEN_HUB_AUTH_MODE=enforce`, ignored by a hub in `off` mode; an empty value is no token; never logged (see [Security](#security)) |
-| `KRAKEN_HUB_TOKEN_FILE` | none | a file holding the token, for container secrets (`Config.hub_token_file`); read at startup (an unreadable file is a startup error) and again before every reconnect, so a rotated secret needs no restart; **wins over `KRAKEN_HUB_TOKEN` when both are set**; surrounding whitespace is trimmed, an empty file is no token at startup, and after a good read it keeps the last token |
+| `KRAKEN_HUB_TOKEN_FILE` | none | a file holding the token, for container secrets (`Config.hub_token_file`); read at startup (an unreadable file, or one empty after trimming its surrounding whitespace, is a startup error naming the setting and the path) and again before every reconnect, so a rotated secret needs no restart; **wins over `KRAKEN_HUB_TOKEN` when both are set**; a file found empty at a reconnect keeps the last token read |
 | `KRAKEN_HUB_OAUTH2_TOKEN_URI` | none | turns JWT authentication on (`Config.hub_oauth2`): the Keycloak token endpoint, e.g. `https://keycloak/realms/kraken/protocol/openid-connect/token`; needs a client secret and excludes `KRAKEN_HUB_TOKEN` / `KRAKEN_HUB_TOKEN_FILE` (both set is a startup error); see [Authenticating with a JWT](#authenticating-with-a-jwt-keycloak-client-credentials) |
 | `KRAKEN_HUB_OAUTH2_CLIENT_ID` | `KRAKEN_SERVICE_NAME` | the Keycloak client id; it must be the service name (the hub checks the token's `azp` against it) |
 | `KRAKEN_HUB_OAUTH2_CLIENT_SECRET`, `KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE` | none | the client secret (`SecretString`, never logged), or a file holding it, **which wins** and is re-read on every token fetch so a rotated secret applies without a restart; one of them is required with the token URI |
@@ -1583,13 +1583,12 @@ path or the code, not the value. An empty token is no token. Generate one per se
 `openssl rand -hex 32`; the hub's ACL holds only its SHA-256 (`kraken-hub acl hash -`).
 
 **Token file.** `KRAKEN_HUB_TOKEN_FILE` (or `Config.hub_token_file`) names a file with the token, the
-way container secrets arrive (`/run/secrets/...`). It is read at startup (unreadable is a startup
-error, `Config::validate`) and **again before every reconnect**: rotate the secret, and the next
+way container secrets arrive (`/run/secrets/...`). It is read at startup (unreadable, or empty after
+trimming its surrounding whitespace, is a startup error naming the setting and the path, `Config::validate`) and **again before every reconnect**: rotate the secret, and the next
 attempt uses it, no restart. If both settings are set **the file wins**. If the file cannot be read
 later (a secret mid-swap) the last token read from it is kept and a warning logged. The same holds
 for a file that is **empty after a good read** (a non-atomic rotation caught between the truncate and
-the write): the last good token is kept and one warning logged until a good read follows. At
-startup an empty file still means no token. Prefer an atomic swap (write a new file, rename it over
+the write): the last good token is kept and one warning logged until a good read follows. Prefer an atomic swap (write a new file, rename it over
 the old one) all the same.
 
 **Rejections.** In `enforce` mode the hub closes the stream of a service it refuses: `UNAUTHENTICATED`

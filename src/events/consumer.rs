@@ -1084,7 +1084,11 @@ mod tests {
                 &DeadLetterError::new("Invalid", "no id"),
             );
             assert_eq!(e.id, "kraken.events-3-41", "{id:?}");
-            assert_eq!(e.headers.get("id").map(String::as_str), id, "headers as they were");
+            assert_eq!(
+                e.headers.get("id").map(String::as_str),
+                id,
+                "headers as they were"
+            );
         }
     }
 

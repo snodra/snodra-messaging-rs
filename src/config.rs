@@ -124,7 +124,8 @@ pub struct Config {
     /// A file holding the token (`KRAKEN_HUB_TOKEN_FILE`), for container secrets. Read at
     /// startup ([`Config::validate`]) and again on every reconnect, so a rotated secret is picked
     /// up without a restart. **It wins over `hub_token` when both are set.** Surrounding
-    /// whitespace is trimmed; an empty file is no token.
+    /// whitespace is trimmed; a file empty at startup is an error ([`Config::validate`]), one
+    /// found empty at a reconnect keeps the last token read.
     pub hub_token_file: Option<PathBuf>,
     /// TLS to the hubs (`KRAKEN_HUB_TLS=true`, with `KRAKEN_HUB_TLS_CA` and
     /// `KRAKEN_HUB_TLS_SERVER_NAME`). `None` (the default): plain text, unless an address starts
@@ -668,12 +669,18 @@ impl Config {
             ));
         }
         if let Some(path) = &self.hub_token_file {
-            crate::security::read_token_file(path).map_err(|e| {
+            let token = crate::security::read_token_file(path).map_err(|e| {
                 MessagingError::InvalidMessage(format!(
                     "hub_token_file (KRAKEN_HUB_TOKEN_FILE) '{}' cannot be read: {e}",
                     path.display()
                 ))
             })?;
+            if token.is_none() {
+                return Err(MessagingError::InvalidMessage(format!(
+                    "hub_token_file (KRAKEN_HUB_TOKEN_FILE) '{}' is empty",
+                    path.display()
+                )));
+            }
         }
         self.validate_sagas()?;
         if self.dead_letter_retention < Duration::from_secs(1) {
@@ -1378,6 +1385,27 @@ mod tests {
             "the file is read per connect, not stored here"
         );
         assert!(!format!("{c:?}").contains("from-the-file"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A token file empty at startup (after trimming) fails it, naming the setting and the path,
+    /// as the other secret files; set in code, the same.
+    #[test]
+    fn an_empty_token_file_at_startup_is_an_error() {
+        let dir = secret_dir();
+        for (name, content) in [("empty", ""), ("blank", " \n\t\r\n")] {
+            let path = dir.join(name);
+            std::fs::write(&path, content).unwrap();
+            let refused = try_from(&[("KRAKEN_HUB_TOKEN_FILE", path.to_str().unwrap())]);
+            assert!(
+                matches!(&refused, Err(MessagingError::InvalidMessage(m))
+                    if m.contains("KRAKEN_HUB_TOKEN_FILE") && m.contains(path.to_str().unwrap()) && m.contains("empty")),
+                "{name}: {refused:?}"
+            );
+            let mut c = code_config();
+            c.hub_token_file = Some(path.clone());
+            assert!(c.validate().is_err(), "{name}, set in code");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
