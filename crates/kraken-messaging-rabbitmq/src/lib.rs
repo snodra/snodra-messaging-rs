@@ -68,7 +68,8 @@
 //! a reset is refused while an instance reads the subscription, and only the management API can
 //! tell (the stream protocol lists no consumers). Without it, [`EventStore::admin`] is
 //! `Unsupported(replay)` and the hub offers no reset. [`RabbitEventStore::open`] asks the API
-//! once at start (it must answer; with `management.disable_stats` no `replay` is declared); every
+//! once at start (it must answer; with metrics collection off, `management.disable_stats` or
+//! `management_agent.disable_metrics_collector`, no `replay` is declared); every
 //! reset asks again and fails, never "nobody reads", on an answer it cannot trust; this
 //! process's own open subscriptions count as readers too, and the offsets a reset stored are read
 //! back once all are stored.
@@ -85,10 +86,33 @@
 //!   are silent for 1.5 s; one answering and the other not is a failure.
 //! - **Partitions** are read when a subscription joins: one added later is read after the
 //!   instances subscribe again; publishing reads them again every 30 s.
-//! - **Publishing** waits for the broker's confirm of each event; there is no deduplication (no
+//! - **Publishing** waits for the broker's confirm of each event, one event at a time (the relay
+//!   publishes sequentially), so its rate is one confirm round trip per event: the network
+//!   latency to the stream's leader and the broker's write (fsync) time decide it (~1 700/s on a
+//!   local broker); there is no deduplication (no
 //!   producer name): an event the outbox publishes again after a crash is a duplicate, which the
 //!   processed-event markers skip. A refusal for good (`access refused`, a message over the 1 MiB
 //!   frame) is `Rejected`; anything else, a missing stream included, is `Failed` and retried.
+//!
+//! # Bounds when something stalls
+//!
+//! - **A consuming connection that stops reading** (a frame the client cannot decode, a
+//!   stalled node) is found by the status refresh within about 20 s (its 5 s period plus the
+//!   10 s request bound); the subscription then ends, its consumers are unsubscribed (the write
+//!   side still works) and the partitions are free for another instance within about 40 s
+//!   (the close stores the position first, bounded by 10 s more). A connection whose close is
+//!   not answered has its heartbeats stopped: the broker drops it after two missed heartbeats.
+//! - **A publisher connection that confirms nothing** within the confirm timeout (30 s by
+//!   default) is replaced: that publish fails (the relay tries again) and the next one opens a
+//!   new connection.
+//! - **A consistently slow broker** (answers over 10 s) makes every request fail as if the
+//!   connection were gone: subscriptions end and the core subscribes again after its backoff,
+//!   publishes fail and the relay retries, browser calls answer `unavailable`. Nothing is lost;
+//!   nothing moves until the broker answers in time again.
+//! - **After a crash**, a subscription stored its position at most 10 000 acknowledgements or
+//!   5 s ago (the store policy): up to that much per partition is delivered again (the
+//!   processed-event markers skip it), and the browser's lag view, which reads the stored
+//!   positions, trails by as much.
 //!
 //! # Settings ([`RabbitConfig`], `KRAKEN_RABBITMQ_*`)
 //!
@@ -102,6 +126,7 @@
 //! | `KRAKEN_RABBITMQ_TLS` | false | TLS (rustls) to every node |
 //! | `KRAKEN_RABBITMQ_TLS_CA_FILE` | none | PEM CA certificates the nodes are verified against; required with TLS |
 //! | `KRAKEN_RABBITMQ_LOAD_BALANCER` | false | the hosts are a load balancer: connect through it until it lands on the node needed |
+//! | `KRAKEN_RABBITMQ_CONFIRM_TIMEOUT_MS` | 30000 | the longest a publish waits for its confirm; a connection that confirms nothing in time is replaced |
 //! | `KRAKEN_RABBITMQ_OFFSET_STORE_MESSAGES` | 10000 | store a subscription's position every so many acknowledgements... |
 //! | `KRAKEN_RABBITMQ_OFFSET_STORE_INTERVAL_MS` | 5000 | ...or this often, whichever comes first |
 //! | `KRAKEN_RABBITMQ_MANAGEMENT_URL` | none | the management API (`http://rabbitmq:15672`, no credentials in it): declares `replay`, lists live subscriptions |
@@ -184,7 +209,8 @@ impl RabbitEventStore {
 
     /// [`new`](Self::new), then, with a management API, asks it once: `Failed` when it does not
     /// answer; `replay` is not declared when its metrics collection is off
-    /// (`management.disable_stats`), since its consumer list is then empty whoever reads.
+    /// (`management.disable_stats` or `management_agent.disable_metrics_collector`), since its
+    /// consumer list then answers nothing.
     pub async fn open(config: RabbitConfig) -> Result<RabbitEventStore, EventStoreError> {
         config.validate()?;
         let mut management = management::Management::of(&config)?;
@@ -192,7 +218,8 @@ impl RabbitEventStore {
             && !m.stats_enabled().await?
         {
             tracing::warn!(
-                "the RabbitMQ management API collects no metrics (management.disable_stats): \
+                "the RabbitMQ management API collects no metrics (management.disable_stats or \
+                 management_agent.disable_metrics_collector): \
                  the event store does not declare replay"
             );
             management = None;
@@ -227,6 +254,12 @@ impl RabbitEventStore {
     /// without it closes them on a task.
     pub async fn close(&self) {
         self.publisher.close().await;
+    }
+
+    /// The connections the store's publishers hold now (a bounded number, whatever replacements
+    /// happened).
+    pub async fn publishing_connections(&self) -> usize {
+        self.publisher.connections().await
     }
 }
 

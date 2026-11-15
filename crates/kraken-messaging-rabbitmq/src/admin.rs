@@ -245,7 +245,9 @@ impl SubscriptionAdmin for RabbitAdmin {
                     .await?;
             }
             // Read back once all are stored: an instance that joined meanwhile and stored its
-            // own position undoes the reset, which then fails.
+            // own position undoes the reset, which then fails. This rarely catches one (an
+            // instance stores periodically, not at once): the guard is the members check before
+            // (the management API and this process's own subscriptions).
             for (stream, from) in &moves {
                 let conn = nodes.leader(stream).await?.ok_or_else(|| {
                     EventStoreError::Failed(format!("rabbitmq: the stream {stream} is gone"))

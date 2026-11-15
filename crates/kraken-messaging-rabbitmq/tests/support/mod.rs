@@ -17,7 +17,7 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 pub const IMAGE: (&str, &str) = ("rabbitmq", "4.4.0-management");
 
 pub struct RabbitMq {
-    _container: ContainerAsync<GenericImage>,
+    pub container: ContainerAsync<GenericImage>,
     /// `127.0.0.1:<port>` of the stream protocol.
     pub stream: String,
     /// `http://127.0.0.1:<port>` of the management API.
@@ -56,6 +56,54 @@ impl RabbitMq {
         client.close().await.unwrap();
     }
 
+    /// The stream consumers the management API lists now: its status and its raw answer.
+    pub async fn consumers(&self) -> (u16, String) {
+        let response = reqwest::Client::new()
+            .get(format!("{}/api/stream/consumers/%2F", self.management))
+            .basic_auth("guest", Some("guest"))
+            .send()
+            .await
+            .expect("the management API");
+        let status = response.status().as_u16();
+        (status, response.text().await.unwrap_or_default())
+    }
+
+    /// The management API's overview.
+    pub async fn overview(&self) -> serde_json::Value {
+        reqwest::Client::new()
+            .get(format!("{}/api/overview", self.management))
+            .basic_auth("guest", Some("guest"))
+            .send()
+            .await
+            .expect("the management API")
+            .json()
+            .await
+            .expect("JSON")
+    }
+
+    /// The stream connections the management API lists now named `name`.
+    pub async fn connections_named(&self, name: &str) -> usize {
+        let all: serde_json::Value = reqwest::Client::new()
+            .get(format!("{}/api/stream/connections/%2F", self.management))
+            .basic_auth("guest", Some("guest"))
+            .send()
+            .await
+            .expect("the management API")
+            .json()
+            .await
+            .expect("JSON");
+        all.as_array()
+            .map(|all| {
+                all.iter()
+                    .filter(|c| {
+                        c["client_properties"]["connection_name"] == name
+                            || c["user_provided_name"] == name
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     /// The plain stream `name`.
     pub async fn stream(&self, name: &str) {
         let client = self.client().await;
@@ -68,6 +116,15 @@ impl RabbitMq {
     }
 }
 
+/// Whether a start failed because a host port was taken ("failed to bind port", "Bind for
+/// 0.0.0.0:N failed: port is already allocated").
+fn bind_failure(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("bind")
+        || error.contains("already allocated")
+        || error.contains("address already in use")
+}
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -78,6 +135,11 @@ fn free_port() -> u16 {
 
 /// Starts the broker (removed when the value is dropped).
 pub async fn rabbitmq() -> RabbitMq {
+    rabbitmq_with("").await
+}
+
+/// Starts the broker with `conf` added to its configuration (`rabbitmq.conf` lines).
+pub async fn rabbitmq_with(extra: &str) -> RabbitMq {
     // The stream port is published on a host port the node advertises, so it is picked here;
     // the management port is Docker's. A picked port taken meanwhile by another process ("failed
     // to bind port") is picked again.
@@ -85,7 +147,9 @@ pub async fn rabbitmq() -> RabbitMq {
     let (container, port) = loop {
         tries += 1;
         let port = free_port();
-        let conf = format!("stream.advertised_host = 127.0.0.1\nstream.advertised_port = {port}\n");
+        let conf = format!(
+            "stream.advertised_host = 127.0.0.1\nstream.advertised_port = {port}\n{extra}\n"
+        );
         let started = GenericImage::new(IMAGE.0, IMAGE.1)
             .with_exposed_port(5552.tcp())
             .with_exposed_port(15672.tcp())
@@ -102,7 +166,7 @@ pub async fn rabbitmq() -> RabbitMq {
             .await;
         match started {
             Ok(container) => break (container, port),
-            Err(e) if tries < 3 && e.to_string().contains("bind") => {
+            Err(e) if tries < 3 && bind_failure(&e.to_string()) => {
                 eprintln!("rabbitmq container: {e}; trying again");
             }
             Err(e) => panic!("rabbitmq container: {e}"),
@@ -113,7 +177,7 @@ pub async fn rabbitmq() -> RabbitMq {
         .await
         .expect("the management port");
     let broker = RabbitMq {
-        _container: container,
+        container,
         stream: format!("127.0.0.1:{port}"),
         management: format!("http://127.0.0.1:{http}"),
     };
@@ -129,7 +193,7 @@ pub async fn rabbitmq() -> RabbitMq {
         )
         .await;
         let api = reqwest::Client::new()
-            .get(format!("{}/api/stream/consumers/%2F", broker.management))
+            .get(format!("{}/api/overview", broker.management))
             .basic_auth("guest", Some("guest"))
             .send()
             .await

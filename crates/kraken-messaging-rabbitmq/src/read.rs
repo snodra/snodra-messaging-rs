@@ -161,25 +161,27 @@ pub(crate) async fn bounds(
     bounds_of(stream, first?, last?)
 }
 
-/// The head of `stream` (and its last chunk's time), reading only the last chunk; the first is
-/// read too when the last is silent, to tell an empty stream (both silent) from a stalled read
-/// (which fails).
+/// The head of `stream` (and its last chunk's time): both reads at once, so an empty stream
+/// costs one [`QUIET`] wait, not two in a row.
 pub(crate) async fn head(
     conn: &Arc<Conn>,
     stream: &str,
     deadline: Instant,
 ) -> Result<Bounds, EventStoreError> {
-    match one_chunk(conn, stream, OffsetSpecification::Last, deadline).await? {
-        Some((last, count, timestamp)) => Ok(Bounds {
-            first: 0,
-            head: last + count,
-            last_timestamp: Some(timestamp),
-        }),
-        None => {
-            let first = one_chunk(conn, stream, OffsetSpecification::First, deadline).await?;
-            bounds_of(stream, first, None)
-        }
-    }
+    let bounds = bounds(conn, stream, deadline).await?;
+    Ok(Bounds { first: 0, ..bounds })
+}
+
+/// The head of a stream known to hold events (its last chunk only); `None` when the read is
+/// silent (stalled: the stream is not empty).
+pub(crate) async fn head_of_known(
+    conn: &Arc<Conn>,
+    stream: &str,
+    deadline: Instant,
+) -> Result<Option<u64>, EventStoreError> {
+    Ok(one_chunk(conn, stream, OffsetSpecification::Last, deadline)
+        .await?
+        .map(|(first, count, _)| first + count))
 }
 
 /// The streams found empty lately, so a browser call does not wait [`QUIET`] on each of them
@@ -321,26 +323,30 @@ mod tests {
     async fn an_empty_answer_is_kept_briefly_and_a_full_one_never() {
         let cache = EmptyCache::default();
         let reads = std::sync::atomic::AtomicUsize::new(0);
+        // Counts the reads that run (a future built but not awaited is no read).
         let read = |b: Bounds| {
-            reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async move { Ok(b) }
+            let reads = &reads;
+            async move {
+                reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(b)
+            }
         };
         let full = Bounds {
             first: 0,
             head: 3,
             last_timestamp: Some(1),
         };
+        let count = || reads.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(cache.bounds("a", read(full)).await.unwrap(), full);
         assert_eq!(cache.bounds("a", read(full)).await.unwrap(), full);
+        assert_eq!(count(), 2, "a full answer is read every time");
         cache.bounds("b", read(Bounds::default())).await.unwrap();
-        cache.bounds("b", read(full)).await.unwrap(); // not read: kept empty
-        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(count(), 3);
         assert_eq!(
-            cache
-                .bounds("b", async { panic!("not read again") })
-                .await
-                .unwrap(),
-            Bounds::default()
+            cache.bounds("b", read(full)).await.unwrap(),
+            Bounds::default(),
+            "kept empty"
         );
+        assert_eq!(count(), 3, "not read again while the empty answer is kept");
     }
 }

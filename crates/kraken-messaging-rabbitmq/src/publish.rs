@@ -14,7 +14,8 @@ use crate::wire;
 
 /// How long a source's partitions are published to before they are read again.
 pub const LAYOUT_FOR: Duration = Duration::from_secs(30);
-/// The longest a publish waits for the broker's confirm.
+/// The longest a publish waits for the broker's confirm, by default
+/// ([`RabbitConfig::confirm_timeout`](crate::RabbitConfig::confirm_timeout)).
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// The largest publish frame the store sends: the client's and the broker's default frame size
 /// (1 MiB). A larger event is refused for good.
@@ -40,11 +41,14 @@ struct State {
 
 pub(crate) struct Publisher {
     state: Mutex<State>,
+    confirm_timeout: Duration,
 }
 
 impl Publisher {
     pub fn new(broker: Broker) -> Publisher {
+        let confirm_timeout = broker.config().confirm_timeout;
         Publisher {
+            confirm_timeout,
             state: Mutex::new(State {
                 nodes: Nodes::new(broker),
                 layouts: HashMap::new(),
@@ -68,7 +72,7 @@ impl Publisher {
                 }
             }
         };
-        let outcome = tokio::time::timeout(SEND_TIMEOUT, confirm).await;
+        let outcome = tokio::time::timeout(self.confirm_timeout, confirm).await;
         match outcome {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(code))) => {
@@ -87,10 +91,17 @@ impl Publisher {
                 )))
             }
             Err(_) => {
+                // A connection that confirms nothing in time is replaced: its read task may
+                // have stopped, and every later publish on it would wait as long.
                 conn.forget_confirm(id);
+                let mut state = self.state.lock().await;
+                state.publishers.retain(|_, (c, _)| !Arc::ptr_eq(c, &conn));
+                state.layouts.clear();
+                conn.abandon("no confirm in time");
+                state.nodes.prune();
                 Err(failed(format!(
-                    "the broker did not confirm an event to {} within {SEND_TIMEOUT:?}",
-                    event.source
+                    "the broker did not confirm an event to {} within {:?}: the connection is replaced",
+                    event.source, self.confirm_timeout
                 )))
             }
         }
@@ -98,6 +109,11 @@ impl Publisher {
 
     pub async fn close(&self) {
         self.state.lock().await.nodes.close().await;
+    }
+
+    /// The connections the publisher holds now.
+    pub async fn connections(&self) -> usize {
+        self.state.lock().await.nodes.held()
     }
 }
 

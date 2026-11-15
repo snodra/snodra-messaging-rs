@@ -846,16 +846,20 @@ async fn refresh(
                 return;
             }
         }
-        let active: Vec<(String, String)> = lock(&shared.state)
+        // (segment, stream, known to hold events: then its last chunk alone gives the head).
+        let active: Vec<(String, String, bool)> = lock(&shared.state)
             .parts
             .iter()
             .filter(|p| p.active)
-            .map(|p| (p.segment.clone(), p.stream.clone()))
+            .map(|p| {
+                let known = p.next > 0 || p.head.is_some_and(|h| h > 0);
+                (p.segment.clone(), p.stream.clone(), known)
+            })
             .collect();
         let mut conns = Vec::with_capacity(active.len());
-        for (segment, stream) in &active {
+        for (segment, stream, known) in &active {
             match nodes.leader(stream).await {
-                Ok(Some(conn)) => conns.push((segment.clone(), stream.clone(), conn)),
+                Ok(Some(conn)) => conns.push((segment.clone(), stream.clone(), *known, conn)),
                 Ok(None) => {}
                 Err(e) => {
                     tracing::debug!(%stream, "the head was not read: {e}");
@@ -866,8 +870,18 @@ async fn refresh(
         let deadline = Instant::now() + Duration::from_secs(5);
         let heads = tokio::select! {
             _ = cancel.cancelled() => break,
-            heads = futures::future::join_all(conns.iter().map(|(segment, stream, conn)| async move {
-                (segment.clone(), read::head(conn, stream, deadline).await)
+            heads = futures::future::join_all(conns.iter().map(|(segment, stream, known, conn)| async move {
+                let head = if *known {
+                    // Its last chunk only, never its first every few seconds.
+                    match read::head_of_known(conn, stream, deadline).await {
+                        Ok(Some(head)) => Ok(read::Bounds { head, ..Default::default() }),
+                        Ok(None) => Err(failed(format!("the last chunk of {stream} did not come"))),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    read::head(conn, stream, deadline).await
+                };
+                (segment.clone(), head)
             })) => heads,
         };
         let mut all_known = !active.is_empty();

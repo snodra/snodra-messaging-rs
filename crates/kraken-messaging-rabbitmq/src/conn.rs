@@ -158,6 +158,8 @@ pub(crate) struct Conn {
     /// The node as the broker advertises it.
     pub node: (String, u32),
     next_sub: AtomicU8,
+    /// A close was started on a task (at most one per connection).
+    closing: AtomicBool,
     next_publisher: std::sync::atomic::AtomicU16,
 }
 
@@ -191,6 +193,7 @@ impl Conn {
             routes,
             node,
             next_sub: AtomicU8::new(0),
+            closing: AtomicBool::new(false),
             next_publisher: std::sync::atomic::AtomicU16::new(0),
         })
     }
@@ -283,12 +286,39 @@ impl Conn {
         lock(&self.routes.confirms).remove(&publishing_id);
     }
 
-    /// Closes the connection (bounded); a connection already gone is left as it is.
+    /// Closes the connection, bounded by [`CONNECT_TIMEOUT`]. A connection that does not answer
+    /// its close (its read task stopped) cannot be closed through the client, so its heartbeats
+    /// are stopped instead: the broker then drops it after two missed heartbeats (2 x 60 s), and
+    /// nothing of the add-on waits on it any longer.
     pub async fn close(&self) {
-        if !self.client.is_closed() {
-            let _ = tokio::time::timeout(CONNECT_TIMEOUT, self.client.close()).await;
-        }
         self.routes.close("closed");
+        if self.client.is_closed() {
+            return;
+        }
+        if tokio::time::timeout(CONNECT_TIMEOUT, self.client.close())
+            .await
+            .is_err()
+        {
+            let _ = tokio::time::timeout(CONNECT_TIMEOUT, self.client.set_heartbeat(0)).await;
+        }
+    }
+
+    /// Closes the connection on a task of its own (bounded as [`close`](Self::close)).
+    pub fn close_detached(self: &Arc<Self>) {
+        if self.closing.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let conn = Arc::clone(self);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { conn.close().await });
+        }
+    }
+
+    /// Takes the connection as gone without waiting: what waits on it fails, and it is closed
+    /// on a task of its own.
+    pub fn abandon(self: &Arc<Self>, why: &str) {
+        self.routes.close(why);
+        self.close_detached();
     }
 
     /// The stored offset of `reference` on `stream` (the next offset it reads); `None` when it
@@ -547,16 +577,26 @@ impl Nodes {
         if self.seed.as_ref().is_some_and(|c| Arc::ptr_eq(c, conn)) {
             self.seed = None;
         }
-        let conn = Arc::clone(conn);
-        tokio::spawn(async move { conn.close().await });
+        conn.close_detached();
     }
 
     /// Forgets the connections that are gone (they reconnect on the next call).
     pub fn prune(&mut self) {
-        self.conns.retain(|_, c| !c.is_closed());
-        if self.seed.as_ref().is_some_and(|c| c.is_closed()) {
-            self.seed = None;
+        self.conns.retain(|_, c| {
+            let gone = c.is_closed();
+            if gone {
+                c.close_detached();
+            }
+            !gone
+        });
+        if let Some(seed) = self.seed.take_if(|c| c.is_closed()) {
+            seed.close_detached();
         }
+    }
+
+    /// The connections held now (the seed included).
+    pub fn held(&self) -> usize {
+        self.conns.len() + usize::from(self.seed.is_some())
     }
 
     /// Closes every connection.

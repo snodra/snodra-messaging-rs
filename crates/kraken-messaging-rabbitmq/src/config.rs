@@ -16,7 +16,8 @@ pub const DEFAULT_TLS_PORT: u16 = 5551;
 pub const DEFAULT_HOST: &str = "rabbitmq";
 
 /// The management HTTP API (the plugins `rabbitmq_management` and `rabbitmq_stream_management`,
-/// with metrics collection on: `management.disable_stats` false): who reads a subscription now.
+/// with metrics collection on: neither `management.disable_stats` nor
+/// `management_agent.disable_metrics_collector`): who reads a subscription now.
 /// Its `Debug` never shows the password.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Management {
@@ -83,6 +84,9 @@ pub struct RabbitConfig {
     /// When a subscription stores its acknowledged offset (every stored offset is an entry in
     /// the stream).
     pub offset_store: StorePolicy,
+    /// The longest a publish waits for the broker's confirm; a connection that confirms nothing
+    /// in time is replaced.
+    pub confirm_timeout: Duration,
     /// The browser's sources (the first is the default) and bounds.
     pub browse: BrowseSettings,
 }
@@ -103,6 +107,7 @@ impl RabbitConfig {
             management: None,
             known_subscriptions: Vec::new(),
             offset_store: StorePolicy::default(),
+            confirm_timeout: crate::publish::SEND_TIMEOUT,
             browse: BrowseSettings::default(),
         }
     }
@@ -178,6 +183,13 @@ impl RabbitConfig {
                 ))
             })?;
         }
+        if let Some(ms) = get("CONFIRM_TIMEOUT_MS") {
+            config.confirm_timeout = Duration::from_millis(ms.parse().map_err(|_| {
+                EventStoreError::Invalid(format!(
+                    "KRAKEN_RABBITMQ_CONFIRM_TIMEOUT_MS is not a number: {ms}"
+                ))
+            })?);
+        }
         if let Some(ms) = get("OFFSET_STORE_INTERVAL_MS") {
             config.offset_store.interval = Duration::from_millis(ms.parse().map_err(|_| {
                 EventStoreError::Invalid(format!(
@@ -246,6 +258,12 @@ impl RabbitConfig {
         if let Some(m) = &mut self.management {
             m.ca_file = Some(ca_file.into());
         }
+        self
+    }
+
+    /// The longest a publish waits for its confirm.
+    pub fn confirm_timeout(mut self, timeout: Duration) -> RabbitConfig {
+        self.confirm_timeout = timeout;
         self
     }
 
@@ -360,6 +378,11 @@ impl RabbitConfig {
                 Some(_) => {}
             }
         }
+        if self.confirm_timeout.is_zero() {
+            return Err(EventStoreError::Invalid(
+                "the confirm timeout is at least 1 ms".into(),
+            ));
+        }
         if self.offset_store.messages == 0 || self.offset_store.interval.is_zero() {
             return Err(EventStoreError::Invalid(
                 "the offset store policy needs at least 1 message and 1 ms".into(),
@@ -383,6 +406,7 @@ impl std::fmt::Debug for RabbitConfig {
             .field("management", &self.management)
             .field("known_subscriptions", &self.known_subscriptions)
             .field("offset_store", &self.offset_store)
+            .field("confirm_timeout", &self.confirm_timeout)
             .field("browse", &self.browse)
             .finish()
     }

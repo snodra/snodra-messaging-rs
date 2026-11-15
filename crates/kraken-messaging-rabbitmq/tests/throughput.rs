@@ -1,7 +1,7 @@
 //! Throughput on a real broker, as the Kotlin Kafka add-on measures it: 10 000 events published
 //! the relay's way (one at a time, each awaiting its confirm), then read by one subscription that
-//! acknowledges each and does nothing else. Consuming must reach 3 000 events/s; both rates are
-//! printed.
+//! acknowledges each and does nothing else. Consuming must reach 3 000 events/s, publishing
+//! 500/s (a regression guard only); both rates are printed.
 
 mod support;
 
@@ -16,6 +16,9 @@ use kraken_messaging_rabbitmq::RabbitEventStore;
 const EVENTS: usize = 10_000;
 /// Events per second a no-op reader reaches at least.
 const CONSUME_FLOOR: f64 = 3_000.0;
+/// Events per second published one at a time, each confirmed: a floor that only guards against
+/// a regression (the rate is reported; it depends on the round trip to the broker).
+const PUBLISH_FLOOR: f64 = 500.0;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_no_op_reader_consumes_at_least_3000_events_per_second() {
@@ -73,6 +76,11 @@ async fn a_no_op_reader_consumes_at_least_3000_events_per_second() {
          consumed in {consuming:?} ({:.0}/s)",
         rate(publishing),
         rate(consuming)
+    );
+    assert!(
+        rate(publishing) >= PUBLISH_FLOOR,
+        "published {:.0} events/s, under {PUBLISH_FLOOR}",
+        rate(publishing)
     );
     assert!(
         rate(consuming) >= CONSUME_FLOOR,

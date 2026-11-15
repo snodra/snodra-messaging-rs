@@ -97,8 +97,11 @@ impl Management {
         serde_json::from_slice(&body).map_err(|e| unavailable(format!("not JSON: {e}")))
     }
 
-    /// Whether the broker collects the metrics the consumer list comes from: with
-    /// `management.disable_stats` the list is empty whoever reads, so it cannot tell.
+    /// Whether the broker collects the metrics the consumer list comes from. Observed on
+    /// RabbitMQ 4.4: with `management.disable_stats = true` or
+    /// `management_agent.disable_metrics_collector = true`, the overview reports
+    /// `disable_stats: true` and the consumer list answers HTTP 400 ("Stats in management UI are
+    /// disabled on this node"); both fail here, never "nobody reads".
     pub async fn stats_enabled(&self) -> Result<bool, EventStoreError> {
         let overview = self.get("overview").await?;
         match overview.get("disable_stats") {
@@ -115,8 +118,9 @@ impl Management {
     pub async fn consumers(&self) -> Result<Vec<Consumer>, EventStoreError> {
         if !self.stats_enabled().await? {
             return Err(EventStoreError::Failed(
-                "the RabbitMQ management API collects no metrics (management.disable_stats): it \
-                 cannot tell who reads a subscription"
+                "the RabbitMQ management API collects no metrics (management.disable_stats or \
+                 management_agent.disable_metrics_collector): it cannot tell who reads a \
+                 subscription"
                     .into(),
             ));
         }

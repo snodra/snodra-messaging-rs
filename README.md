@@ -1244,9 +1244,10 @@ it, a reset is answered `UNSUPPORTED`.
 | `KRAKEN_RABBITMQ_TLS` | false | TLS (rustls, no OpenSSL) to every node |
 | `KRAKEN_RABBITMQ_TLS_CA_FILE` | none | PEM CA certificates the nodes are verified against; required with TLS (the store never connects unverified) |
 | `KRAKEN_RABBITMQ_LOAD_BALANCER` | false | the hosts are a load balancer: connect through it until it lands on the node needed |
+| `KRAKEN_RABBITMQ_CONFIRM_TIMEOUT_MS` | 30000 | the longest a publish waits for the broker's confirm; a connection that confirms nothing in time is replaced |
 | `KRAKEN_RABBITMQ_OFFSET_STORE_MESSAGES` | 10000 | a processor stores its position every so many acknowledgements... |
 | `KRAKEN_RABBITMQ_OFFSET_STORE_INTERVAL_MS` | 5000 | ...or this often, whichever first, and always when a partition moves away and at shutdown (every stored position is an entry in the stream) |
-| `KRAKEN_RABBITMQ_MANAGEMENT_URL` | none | the management API (`http://rabbitmq:15672`, no credentials in the URL): declares `replay`, shows live subscriptions; metrics collection must be on (`management.disable_stats = false`) |
+| `KRAKEN_RABBITMQ_MANAGEMENT_URL` | none | the management API (`http://rabbitmq:15672`, no credentials in the URL): declares `replay`, shows live subscriptions; metrics collection must be on (neither `management.disable_stats` nor `management_agent.disable_metrics_collector`) |
 | `KRAKEN_RABBITMQ_MANAGEMENT_USERNAME` / `_PASSWORD` / `_PASSWORD_FILE` | the stream user's | |
 | `KRAKEN_RABBITMQ_MANAGEMENT_CA_FILE` | none | PEM CA certificates of an `https` management API |
 | `KRAKEN_RABBITMQ_KNOWN_SUBSCRIPTIONS` | none | subscription names the event browser's lag view always lists |
@@ -1275,8 +1276,19 @@ compression on kraken streams.
 - Partitions are read when a processor subscribes: a partition added later is read once the
   instances subscribe again (a restart); publishing reads them again every 30 s.
 - No producer deduplication: an event the outbox publishes again after a crash is a duplicate,
-  which the processed-event markers skip. Each publish waits for the broker's confirm. An event
-  over the 1 MiB frame, or refused for access, is given up at once.
+  which the processed-event markers skip. Each publish waits for the broker's confirm, one
+  event at a time (the relay publishes sequentially), so the relay's rate is one confirm round
+  trip per event: the latency to the stream's leader and the broker's write time decide it
+  (about 1 700 events/s against a local broker; consuming reaches about 6 700/s). A publisher
+  connection that confirms nothing within `KRAKEN_RABBITMQ_CONFIRM_TIMEOUT_MS` (30 s) is
+  replaced. An event over the 1 MiB frame, or refused for access, is given up at once.
+- After a crash up to 10 000 events or 5 s per partition are delivered again (the position is
+  stored periodically; the processed-event markers skip them), and the event browser's lag view
+  trails by as much.
+- Stalls: a consuming connection that stops reading is found within about 20 s, and its
+  partitions are free for another instance within about 40 s; a broker answering slower than
+  10 s fails every request (subscriptions are taken again after the backoff, the relay
+  retries), nothing is lost.
 - The event browser's lag view lists the subscriptions this process subscribed, the ones the
   management API shows reading, and `KRAKEN_RABBITMQ_KNOWN_SUBSCRIPTIONS` (the stream protocol
   cannot list the names with a stored offset).
