@@ -47,7 +47,7 @@
 //! | [`same_key_arrives_in_publish_order`] | `sameKeyArrivesInPublishOrder` |
 //! | [`every_processor_gets_every_event`] | `everyProcessorGetsEveryEvent` |
 //! | [`instances_share_a_processor`] | `instancesShareAProcessor` |
-//! | [`a_joining_instance_announces_its_first_assignment`] | **none yet** |
+//! | [`a_joining_instance_announces_its_first_assignment`] | `aJoiningInstanceAnnouncesItsFirstAssignment` |
 //! | [`an_instance_left_without_segments_closes_its_change`] | `anInstanceLeftWithoutSegmentsClosesItsChange` |
 //! | [`unacked_delivery_is_redelivered`] | `unackedDeliveryIsRedelivered` |
 //! | [`redelivered_after_commit_is_skipped`] | `redeliveredAfterCommitIsSkipped` |
@@ -395,7 +395,8 @@ pub async fn a_joining_instance_announces_its_first_assignment(kit: &EventStoreK
 
 /// More instances than segments: instances join one at a time; after each join the segments
 /// are spread (none held twice, every one held, and once there are two instances or more no
-/// instance holds every segment) and every instance's last assignment change closed (a
+/// former holder, an instance that held segments before the join, holds every segment) and every
+/// instance's last assignment change closed (a
 /// `Revoked` followed by an `Assigned`, an empty one for an instance left without segments).
 /// How the segments spread beyond that is the event store's (a third party's assignor is not
 /// constrained). The instances join until one that held segments holds none (or there are twice
@@ -419,19 +420,26 @@ pub async fn an_instance_left_without_segments_closes_its_change(kit: &EventStor
     readers[0].pump(QUIET).await;
     let all: BTreeSet<String> = readers[0].assigned.clone();
     let mut stores = vec![first];
-    // Spread: every segment held once, no instance holding every segment once there are two,
-    // every change closed.
-    let settled = |readers: &[Reader]| {
+    // Spread: every segment held once, no former holder (an instance that held segments before
+    // the join) keeping every segment once there are two, every change closed. A newcomer may
+    // take them all: how the segments spread beyond that is the event store's.
+    let settled = |readers: &[Reader], former: &[usize]| {
         let held: Vec<&String> = readers.iter().flat_map(|r| &r.assigned).collect();
         let unique: BTreeSet<&String> = held.iter().copied().collect();
         held.len() == unique.len()
             && unique.len() == all.len()
-            && (readers.len() < 2 || readers.iter().all(|r| r.assigned.len() < all.len()))
+            && (readers.len() < 2
+                || former
+                    .iter()
+                    .all(|&i| readers[i].assigned.len() < all.len()))
             && readers.iter().all(|r| !r.changing)
     };
     let cap = 2 * all.len() + 2;
     let mut emptied = false;
     while !emptied && readers.len() < cap {
+        let former: Vec<usize> = (0..readers.len())
+            .filter(|&i| !readers[i].assigned.is_empty())
+            .collect();
         let store = kit.instance();
         let revoked_before: usize = readers.iter().map(|r| r.revoked).sum();
         readers.push(Reader::join(&*store, &spec).await);
@@ -452,7 +460,7 @@ pub async fn an_instance_left_without_segments_closes_its_change(kit: &EventStor
         all_until(
             &mut readers,
             "the segments spread, every revocation closed by an assignment",
-            settled,
+            |readers| settled(readers, &former),
         )
         .await;
         emptied = readers
