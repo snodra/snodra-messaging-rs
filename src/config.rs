@@ -46,6 +46,9 @@ impl DeadLetterMode {
             "collection" => Ok(DeadLetterMode::Collection),
             "event-store" => Ok(DeadLetterMode::EventStore),
             "log" => Ok(DeadLetterMode::Log),
+            "topic" => Err(MessagingError::InvalidMessage(format!(
+                "{name}: the mode `topic` is now `event-store`, got '{v}'"
+            ))),
             _ => Err(MessagingError::InvalidMessage(format!(
                 "{name} must be collection, event-store or log, got '{v}'"
             ))),
@@ -336,12 +339,16 @@ impl Config {
     /// `KRAKEN_HUB_RETRY_ENABLED=true` sets `hub_retry` to the
     /// policy the other `KRAKEN_HUB_RETRY_*` variables describe (defaults: 3 attempts, 100 ms
     /// doubling to 2 s); those are validated whether or not retry is enabled.
+    /// A removed setting still set (`KRAKEN_KAFKA_TOPIC`, `KRAKEN_KAFKA_DEAD_LETTER_MODE`,
+    /// `KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS`) is an error naming every one and its replacement,
+    /// and so is the old dead-letter mode `topic` (now `event-store`).
     pub fn from_env() -> Result<Config, MessagingError> {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
 
     /// [`Config::from_env`] over an arbitrary variable lookup (hermetic in tests).
     fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, MessagingError> {
+        removed_settings(&lookup)?;
         let required = |name: &str| {
             lookup(name)
                 .filter(|v| !v.trim().is_empty())
@@ -922,35 +929,38 @@ fn pairs<T>(
     Ok(out)
 }
 
-/// Settings the library read before the event store and the message store became add-ons
-/// (ADR 0027, ADR 0028), each with what replaced it. They are not read (no alias before v1):
-/// one still set is a startup warning, see [`removed_setting_warnings`].
-const REMOVED_SETTINGS: [(&str, &str); 4] = [
-    ("KRAKEN_KAFKA_TOPIC", "set KRAKEN_EVENTS_SOURCE instead"),
+/// Settings the library read before the event store became an add-on (ADR 0027), each with what
+/// replaced it. They are not read (no alias before v1), and one still set fails
+/// [`Config::from_env`] ([`removed_settings`]): ignored, a source or a mode would misroute events.
+/// `KRAKEN_MONGODB_URI`, also no longer read, is not here: a service may keep it for its own
+/// MongoDB client.
+const REMOVED_SETTINGS: [(&str, &str); 3] = [
+    ("KRAKEN_KAFKA_TOPIC", "KRAKEN_EVENTS_SOURCE"),
     (
         "KRAKEN_KAFKA_DEAD_LETTER_MODE",
-        "set KRAKEN_EVENTS_DEAD_LETTER_MODE instead (the value `topic` is now `event-store`)",
+        "KRAKEN_EVENTS_DEAD_LETTER_MODE (the value `topic` is now `event-store`)",
     ),
     (
         "KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS",
-        "set KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS instead",
-    ),
-    (
-        "KRAKEN_MONGODB_URI",
-        "the message store is an add-on built in code: kraken-messaging-mongo's MongoStore::new(client, db) with a client the service builds (a service that reads this variable itself for that client can ignore this warning)",
+        "KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS",
     ),
 ];
 
-/// One warning for each removed setting the environment (`lookup`) still sets (blank is unset),
-/// naming its replacement. `KrakenMessagingBuilder::start` logs them.
-pub(crate) fn removed_setting_warnings(lookup: impl Fn(&str) -> Option<String>) -> Vec<String> {
-    REMOVED_SETTINGS
+/// The error for the removed settings the environment (`lookup`) still sets (blank is unset),
+/// naming every one and its replacement; `Ok` when none is set.
+fn removed_settings(lookup: &impl Fn(&str) -> Option<String>) -> Result<(), MessagingError> {
+    let set: Vec<String> = REMOVED_SETTINGS
         .iter()
         .filter(|(name, _)| lookup(name).is_some_and(|v| !v.trim().is_empty()))
-        .map(|(name, replacement)| {
-            format!("{name} is set but is no longer read and its value is ignored: {replacement}")
-        })
-        .collect()
+        .map(|(name, replacement)| format!("{name} (use {replacement})"))
+        .collect();
+    if set.is_empty() {
+        return Ok(());
+    }
+    Err(MessagingError::InvalidMessage(format!(
+        "removed settings are set; they are no longer read, unset them: {}",
+        set.join(", ")
+    )))
 }
 
 fn flag(name: &str, v: &str) -> Result<bool, MessagingError> {
@@ -1942,40 +1952,51 @@ mod tests {
         assert!(c.validate().is_ok());
     }
 
-    /// One warning per removed setting still set, naming what replaced it; the value is not
-    /// read (no alias before v1), so the configuration is the same with or without it.
+    /// A removed setting still set fails the configuration, one message naming every offender
+    /// and its replacement (a silently ignored source or mode would misroute events);
+    /// `KRAKEN_MONGODB_URI` is not one of them (a service may read it for its own client).
     #[test]
-    fn a_removed_setting_still_set_is_one_warning_naming_its_replacement_and_its_value_is_ignored()
-    {
+    fn a_removed_setting_still_set_fails_naming_every_offender_and_its_replacement() {
         let removed = [
             ("KRAKEN_KAFKA_TOPIC", "orders.events"),
             ("KRAKEN_KAFKA_DEAD_LETTER_MODE", "topic"),
             ("KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS", "1000"),
-            ("KRAKEN_MONGODB_URI", "mongodb://mongo:27017/orders"),
         ];
-        let env: HashMap<&str, &str> = removed.into_iter().collect();
-        let warnings = removed_setting_warnings(|n| env.get(n).map(|v| v.to_string()));
-        assert_eq!(warnings.len(), 4, "{warnings:?}");
-        for ((name, _), replacement) in removed.iter().zip([
-            "KRAKEN_EVENTS_SOURCE",
-            "KRAKEN_EVENTS_DEAD_LETTER_MODE",
-            "KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS",
-            "MongoStore::new",
-        ]) {
+        let refused = try_from(&removed);
+        let Err(MessagingError::InvalidMessage(message)) = &refused else {
+            panic!("{refused:?}");
+        };
+        for (name, replacement) in [
+            ("KRAKEN_KAFKA_TOPIC", "KRAKEN_EVENTS_SOURCE"),
+            (
+                "KRAKEN_KAFKA_DEAD_LETTER_MODE",
+                "KRAKEN_EVENTS_DEAD_LETTER_MODE",
+            ),
+            (
+                "KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS",
+                "KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS",
+            ),
+        ] {
             assert!(
-                warnings
-                    .iter()
-                    .any(|w| w.starts_with(name) && w.contains(replacement)),
-                "{name} -> {replacement}: {warnings:?}"
+                message.contains(name) && message.contains(replacement),
+                "{name} -> {replacement}: {message}"
             );
         }
-        let with = from(&removed);
-        let without = from(&[]);
-        assert_eq!(with.events_source, without.events_source);
-        assert_eq!(with.dead_letter_mode, without.dead_letter_mode);
-        assert_eq!(with.dead_letter_retention, without.dead_letter_retention);
-        // Unset or blank: nothing to say.
-        assert!(removed_setting_warnings(|_| None).is_empty());
-        assert!(removed_setting_warnings(|_| Some(" ".into())).is_empty());
+        // One alone is refused too; blank is unset.
+        assert!(try_from(&[("KRAKEN_KAFKA_TOPIC", "t")]).is_err());
+        assert!(try_from(&[("KRAKEN_KAFKA_TOPIC", " ")]).is_ok());
+        // The service's own MongoDB URI is neither refused nor read.
+        assert!(try_from(&[("KRAKEN_MONGODB_URI", "mongodb://mongo:27017/orders")]).is_ok());
+    }
+
+    /// The v0.4.0 value `topic` of the dead-letter mode is refused naming its replacement.
+    #[test]
+    fn the_old_dead_letter_mode_topic_fails_naming_event_store() {
+        let refused = try_from(&[("KRAKEN_EVENTS_DEAD_LETTER_MODE", "topic")]);
+        assert!(
+            matches!(&refused, Err(MessagingError::InvalidMessage(m))
+                if m.contains("KRAKEN_EVENTS_DEAD_LETTER_MODE") && m.contains("`topic`") && m.contains("event-store")),
+            "{refused:?}"
+        );
     }
 }

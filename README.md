@@ -185,7 +185,7 @@ it (kept in the dispatch entry's headers); one sent by a deadline handler carrie
 | `KRAKEN_HUB_TLS_SERVER_NAME` | the host of the address (for `dns:///name:port`, `name`) | the name the hub's certificate must carry, also sent as SNI (`HubTls.server_name`); needs `KRAKEN_HUB_TLS=true` |
 | `KRAKEN_HUB_TLS_CLIENT_CERT`, `KRAKEN_HUB_TLS_CLIENT_KEY` | none | the client certificate chain (leaf first) and its PKCS#8 PEM private key for mutual TLS (`HubTls.client_cert_file`, `HubTls.client_key_file`); both or neither; **they turn TLS on** like `KRAKEN_HUB_TLS=true` (`KRAKEN_HUB_TLS=false` next to them is an error); exclude `KRAKEN_HUB_TOKEN*` and `KRAKEN_HUB_OAUTH2_*` (one credential kind per service; a startup error naming both); the files are checked at startup. See [Authenticating with a client certificate](#authenticating-with-a-client-certificate-mtls) |
 | `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS` | true, 5 | one consumer per [event processor](#event-processors) with handlers (`default` also for sagas alone); the attempts and the 1 s backoff are shared by every processor |
-| `KRAKEN_EVENTS_DEAD_LETTER_MODE` | `collection` | where a record a processor cannot handle goes (see [Dead letters](#dead-letters)): `collection` (`dead_letters`, sequenced per key, admin API), `event-store` (the event store's `<source>.dlt`; needs the capability `native-dead-letter`) or `log` (logged and skipped); case-insensitive, anything else is a startup error |
+| `KRAKEN_EVENTS_DEAD_LETTER_MODE` | `collection` | where a record a processor cannot handle goes (see [Dead letters](#dead-letters)): `collection` (`dead_letters`, sequenced per key, admin API), `event-store` (the event store's `<source>.dlt`; needs the capability `native-dead-letter`) or `log` (logged and skipped); case-insensitive, anything else is a startup error (v0.4.0's `topic` names its replacement `event-store`) |
 | `KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS` | 2592000000 (30 d) | how long a letter is kept (`expire_at` = `parked_at` + this; the message store removes it then, which unblocks its key); at least 1000 (a startup error otherwise, also when set in code) |
 | `KRAKEN_OUTBOX_ENABLED`, `KRAKEN_OUTBOX_POLL_INTERVAL_MS`, `KRAKEN_OUTBOX_BATCH_SIZE`, `KRAKEN_OUTBOX_MAX_ATTEMPTS` | true, 200, 100, 10 | |
 | `KRAKEN_OUTBOX_LEASE_MS` | 120000 | how long a batch the relay claims stays its own; longer than a send (40 s), else a startup error. A batch stops before its lease could run out under a send; the next claim renews what the relay still holds |
@@ -1502,7 +1502,7 @@ mongodb = "3.9.1"
 **The builder.** The service builds both stores and hands them over:
 
 ```rust,ignore
-let client = mongodb::Client::with_uri_str(&mongodb_uri).await?;   // KRAKEN_MONGODB_URI is no longer read
+let client = mongodb::Client::with_uri_str(&std::env::var("KRAKEN_MONGODB_URI")?).await?; // the service's own, now
 let db = client.default_database().expect("the URI names a database");
 let app = KrakenMessaging::builder(Config::from_env()?).await?
     .store(Arc::new(kraken_messaging_mongo::MongoStore::new(client, db)))
@@ -1532,15 +1532,16 @@ let app = KrakenMessaging::builder(Config::from_env()?).await?
   `kraken_messaging_kafka`, and the provider is `KafkaExternalSource::new(name, source, service_name,
   &kafka.bootstrap_servers)?` (see [The Kafka event store](#the-kafka-event-store)).
 
-**Settings** renamed, with no alias (each one still set is a WARN at `start()` naming its
-replacement; its value is ignored):
+**Settings** renamed, with no alias. One still set fails `Config::from_env` with one message naming
+every such setting and its replacement (ignored, a source or a mode would misroute events), and the
+old dead-letter mode `topic` fails naming `event-store`:
 
 | v0.4.0 | Now |
 |---|---|
 | `KRAKEN_KAFKA_TOPIC` | `KRAKEN_EVENTS_SOURCE` |
 | `KRAKEN_KAFKA_DEAD_LETTER_MODE` (`collection`, `topic`, `log`) | `KRAKEN_EVENTS_DEAD_LETTER_MODE` (`collection`, `event-store`, `log`) |
 | `KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS` | `KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS` |
-| `KRAKEN_MONGODB_URI` (required) | not read: the service builds its MongoDB client itself |
+| `KRAKEN_MONGODB_URI` (required) | not read by the library, and not refused: the service builds its MongoDB client itself and may keep reading this variable for it |
 | `KRAKEN_KAFKA_BOOTSTRAP` | unchanged, now read by `KafkaConfig::from_env` (same default `kafka:19092`) |
 
 New settings: `KRAKEN_HUB_ENABLED`, `KRAKEN_OUTBOX_LEASE_MS`, `KRAKEN_STORE_INIT_SCHEMA` (core);

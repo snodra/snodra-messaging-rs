@@ -830,9 +830,6 @@ impl KrakenMessagingBuilder {
             }
             Some(events) => check_dead_letter_mode(config.dead_letter_mode, &**events)?,
         }
-        for warning in crate::config::removed_setting_warnings(|name| std::env::var(name).ok()) {
-            tracing::warn!("{warning}");
-        }
         if !config.sagas_enabled && !saga_types.is_empty() {
             tracing::warn!(sagas = ?saga_types.iter().map(SagaType::name).collect::<Vec<_>>(), "sagas are registered but KRAKEN_SAGAS_ENABLED=false: they do not run");
         }
