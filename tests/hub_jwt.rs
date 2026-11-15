@@ -903,6 +903,11 @@ async fn a_token_endpoint_that_refuses_opens_no_stream_logs_one_error_and_recove
         rejection.contains("Invalid client credentials"),
         "{rejection}"
     );
+    assert_eq!(
+        conn.latest_rejection(),
+        None,
+        "a token endpoint's failure is not a hub's refusal"
+    );
 
     let lines: Vec<String> = captured
         .lines()
