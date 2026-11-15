@@ -168,11 +168,7 @@ impl State {
         if let Some((conn, id)) = self.publishers.get(stream).filter(|(c, _)| !c.is_closed()) {
             return Ok((Arc::clone(conn), *id));
         }
-        let conn = self
-            .nodes
-            .leader(stream)
-            .await?
-            .ok_or_else(|| failed(format!("the stream {stream} does not exist")))?;
+        let conn = self.nodes.require_leader(stream).await?;
         let Some(id) = conn.publisher_id() else {
             self.publishers.retain(|_, (c, _)| !Arc::ptr_eq(c, &conn));
             self.nodes.forget(&conn);

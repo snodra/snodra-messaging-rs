@@ -354,11 +354,7 @@ impl RabbitSubscription {
         member: &str,
         super_stream: bool,
     ) -> Result<(), EventStoreError> {
-        let conn = self
-            .nodes
-            .leader(stream)
-            .await?
-            .ok_or_else(|| failed(format!("the stream {stream} does not exist")))?;
+        let conn = self.nodes.require_leader(stream).await?;
         let (sub, frames) = conn.route(stream)?;
         let (cmds, cmd_rx) = mpsc::unbounded_channel();
         lock(&self.shared.state).parts.push(Part {
@@ -886,8 +882,8 @@ async fn refresh(
         let mut conns = Vec::with_capacity(active.len());
         for (segment, stream, known) in &active {
             match nodes.leader(stream).await {
-                Ok(Some(conn)) => conns.push((segment.clone(), stream.clone(), *known, conn)),
-                Ok(None) => {}
+                Ok(Ok(conn)) => conns.push((segment.clone(), stream.clone(), *known, conn)),
+                Ok(Err(_)) => {}
                 Err(e) => {
                     tracing::debug!(%stream, "the head was not read: {e}");
                     nodes.prune();

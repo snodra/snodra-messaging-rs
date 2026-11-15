@@ -148,9 +148,7 @@ async fn locate(
     parts.sort_by(|a, b| kraken_messaging::event_store::segment_order(&a.segment, &b.segment));
     let mut conns = Vec::with_capacity(parts.len());
     for part in &parts {
-        let conn = nodes.leader(&part.stream).await?.ok_or_else(|| {
-            EventStoreError::Failed(format!("rabbitmq: the stream {} is gone", part.stream))
-        })?;
+        let conn = nodes.require_leader(&part.stream).await?;
         conns.push(conn);
     }
     let bounds = futures::future::join_all(parts.iter().zip(&conns).map(|(part, conn)| async {

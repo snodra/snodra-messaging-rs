@@ -98,9 +98,7 @@ impl RabbitAdmin {
         let deadline = Instant::now() + CALL_BUDGET;
         let mut all = Vec::new();
         for part in self.layout(nodes).await? {
-            let conn = nodes.leader(&part.stream).await?.ok_or_else(|| {
-                EventStoreError::Failed(format!("rabbitmq: the stream {} is gone", part.stream))
-            })?;
+            let conn = nodes.require_leader(&part.stream).await?;
             let stored = conn.stored_offset(&self.spec.name, &part.stream).await?;
             let bounds = read::bounds(&conn, &part.stream, deadline).await?;
             if let Some(stored) = stored.filter(|s| *s > bounds.head) {
@@ -178,12 +176,7 @@ impl SubscriptionAdmin for RabbitAdmin {
                 ResetTarget::Timestamp(ts) => {
                     let deadline = Instant::now() + CALL_BUDGET;
                     for n in &now {
-                        let conn = nodes.leader(&n.part.stream).await?.ok_or_else(|| {
-                            EventStoreError::Failed(format!(
-                                "rabbitmq: the stream {} is gone",
-                                n.part.stream
-                            ))
-                        })?;
+                        let conn = nodes.require_leader(&n.part.stream).await?;
                         let from = read::offset_at(&conn, &n.part.stream, *ts, &n.bounds, deadline)
                             .await?;
                         ranges.push(range(n, from));
@@ -240,9 +233,7 @@ impl SubscriptionAdmin for RabbitAdmin {
                 moves.push((n.part.stream.clone(), from));
             }
             for (stream, from) in &moves {
-                let conn = nodes.leader(stream).await?.ok_or_else(|| {
-                    EventStoreError::Failed(format!("rabbitmq: the stream {stream} is gone"))
-                })?;
+                let conn = nodes.require_leader(stream).await?;
                 conn.store_offset(&self.spec.name, stream, *from, STORE_WAIT)
                     .await?;
             }
@@ -251,9 +242,7 @@ impl SubscriptionAdmin for RabbitAdmin {
             // instance stores periodically, not at once): the guard is the members check before
             // (the management API and this process's own subscriptions).
             for (stream, from) in &moves {
-                let conn = nodes.leader(stream).await?.ok_or_else(|| {
-                    EventStoreError::Failed(format!("rabbitmq: the stream {stream} is gone"))
-                })?;
+                let conn = nodes.require_leader(stream).await?;
                 let now = conn.stored_offset(&self.spec.name, stream).await?;
                 if now != Some(*from) {
                     return Err(EventStoreError::SubscribersActive(format!(

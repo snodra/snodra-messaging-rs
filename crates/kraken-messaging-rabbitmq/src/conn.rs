@@ -477,6 +477,30 @@ pub(crate) struct Part {
     pub stream: String,
 }
 
+/// Why a stream has no leader to talk to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NoLeader {
+    /// The metadata answer names no leader for it: a leader election under way (a node lost),
+    /// or a stream that does not exist; the answer does not tell them apart.
+    NotInMetadata,
+    /// The broker answered that the stream does not exist.
+    DoesNotExist,
+}
+
+impl NoLeader {
+    pub fn error(self, stream: &str) -> EventStoreError {
+        match self {
+            NoLeader::NotInMetadata => failed(format!(
+                "the stream {stream} is unavailable right now: the broker's metadata names no \
+                 leader for it (a leader election, or the stream does not exist)"
+            )),
+            NoLeader::DoesNotExist => failed(format!(
+                "the broker says the stream {stream} does not exist"
+            )),
+        }
+    }
+}
+
 /// One connection per node, opened as needed.
 pub(crate) struct Nodes {
     broker: Broker,
@@ -506,29 +530,39 @@ impl Nodes {
         Ok(conn)
     }
 
-    /// A connection to the leader of `stream`; `None` when the stream does not exist.
-    pub async fn leader(&mut self, stream: &str) -> Result<Option<Arc<Conn>>, EventStoreError> {
+    /// A connection to the leader of `stream`, or why there is none: [`NoLeader`].
+    pub async fn leader(
+        &mut self,
+        stream: &str,
+    ) -> Result<Result<Arc<Conn>, NoLeader>, EventStoreError> {
         let seed = self.seed().await?;
         let metadata = seed
             .timed(seed.client.metadata(vec![stream.to_string()]))
             .await
             .map_err(failed)?;
+        // The client leaves out a stream whose answer names no leader, whatever its code: a
+        // stream electing one and a stream that does not exist look the same here.
         let Some(found) = metadata.get(stream) else {
-            return Ok(None);
+            return Ok(Err(NoLeader::NotInMetadata));
         };
         if found.response_code != ResponseCode::Ok {
             return match found.response_code {
-                ResponseCode::StreamDoesNotExist => Ok(None),
+                ResponseCode::StreamDoesNotExist => Ok(Err(NoLeader::DoesNotExist)),
                 ref code => Err(failed(format!("the stream {stream}: {code:?}"))),
             };
         }
         let node = (found.leader.host.clone(), found.leader.port);
         if let Some(conn) = self.conns.get(&node).filter(|c| !c.is_closed()) {
-            return Ok(Some(Arc::clone(conn)));
+            return Ok(Ok(Arc::clone(conn)));
         }
         let conn = Arc::new(self.broker.to_node(&node).await?);
         self.conns.insert(node, Arc::clone(&conn));
-        Ok(Some(conn))
+        Ok(Ok(conn))
+    }
+
+    /// [`leader`](Self::leader), with no leader a `Failed` saying why (retried by the caller).
+    pub async fn require_leader(&mut self, stream: &str) -> Result<Arc<Conn>, EventStoreError> {
+        self.leader(stream).await?.map_err(|no| no.error(stream))
     }
 
     /// The streams of `source`, in segment order of the broker's partition order: the
@@ -627,6 +661,26 @@ impl Drop for Nodes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stream without a leader in the metadata is said to be unavailable right now (an election
+    /// looks the same), never flatly "does not exist"; only the broker's own code says that.
+    #[test]
+    fn no_leader_says_why() {
+        let EventStoreError::Failed(m) = NoLeader::NotInMetadata.error("kraken.events-0") else {
+            panic!("Failed")
+        };
+        assert!(
+            m.contains("kraken.events-0 is unavailable right now") && m.contains("no leader"),
+            "{m}"
+        );
+        let EventStoreError::Failed(m) = NoLeader::DoesNotExist.error("kraken.events-0") else {
+            panic!("Failed")
+        };
+        assert!(
+            m.contains("the broker says the stream kraken.events-0 does not exist"),
+            "{m}"
+        );
+    }
 
     /// TLS options build with the CA file (read when a connection opens) and a provider
     /// installed for the process; without TLS nothing is installed.
