@@ -200,6 +200,11 @@ pub async fn outbox_rejects_a_payload_that_is_not_a_json_object(store: &dyn Mess
         b"\"text\"",
         b"null",
         b"{\"n\":18446744073709551615}",
+        // Read as floats by a JSON parser, so only the text tells them apart.
+        b"{\"n\":-9223372036854775809}",
+        b"{\"n\":18446744073709551616}",
+        b"{\"n\":123456789012345678901234567890}",
+        b"{\"a\":[1,{\"b\":[2,-99999999999999999999]}]}",
     ] {
         let shown = String::from_utf8_lossy(payload).into_owned();
         let bad = OutboxEntry {
@@ -230,6 +235,21 @@ pub async fn outbox_rejects_a_payload_that_is_not_a_json_object(store: &dyn Mess
         .await
         .expect("claim");
     assert!(claimed.is_empty(), "nothing appended: {:?}", ids(&claimed));
+    // The same digits in a string, a decimal, an exponent and the i64 bounds are fine.
+    let fine = OutboxEntry {
+        payload: br#"{"s":"123456789012345678901234567890","d":1.5,"e":1e30,"max":9223372036854775807,"min":-9223372036854775808}"#.to_vec(),
+        ..entry("conformance.Fine", now_ms(), 0)
+    };
+    outbox
+        .append_now(fine.clone())
+        .await
+        .expect("a payload within the contract");
+    let claimed = outbox
+        .claim("relay-a", LONG_LEASE, 100)
+        .await
+        .expect("claim");
+    assert_eq!(ids(&claimed), ids(&[fine]));
+    outbox.mark_sent(&ids(&claimed)).await.expect("mark_sent");
 }
 
 /// `pending` counts the entries neither sent nor failed, held by a relay or not, and
@@ -2129,9 +2149,15 @@ pub async fn saga_dispatch_store_refuses_an_event_the_outbox_would_refuse(
     let sagas = store.sagas();
     let txs = store.tx();
     let now = now_ms();
-    for (n, payload) in ["[1]", "null", "{\"n\":18446744073709551615}"]
-        .into_iter()
-        .enumerate()
+    for (n, payload) in [
+        "[1]",
+        "null",
+        "{\"n\":18446744073709551615}",
+        "{\"n\":-9223372036854775809}",
+        "{\"n\":123456789012345678901234567890}",
+    ]
+    .into_iter()
+    .enumerate()
     {
         let saga_id = uuid::Uuid::new_v4().to_string();
         let fine = dispatch_entry(&saga_id, 1000, DispatchKind::Event, now);

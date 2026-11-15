@@ -17,6 +17,7 @@ pub use consumer::{
     classify_with,
 };
 pub use dispatch::{LocalEventDispatcher, NoSagas, SagaStage};
+pub use outbox::check_outbox_payload;
 pub use outbox::{EventBus, new_outbox_entry};
 pub(crate) use outbox::{check_payload, check_payload_text};
 #[cfg(feature = "testing")]

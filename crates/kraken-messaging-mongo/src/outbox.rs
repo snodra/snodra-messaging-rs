@@ -79,9 +79,10 @@ impl OutboxDocument {
     }
 }
 
-/// The BSON document an event's JSON payload becomes: it must be a JSON object whose numbers BSON
-/// can hold (an integer above `i64::MAX` it cannot). Anything else is `InvalidMessage` naming the
-/// event type: no retry can change it.
+/// The BSON document an event's JSON payload becomes: it must be a JSON object whose integers
+/// fit in an `i64` (the outbox contract, [`kraken_messaging::store::check_outbox_payload`], which
+/// reads them from the text: an integer a JSON parser reads as a float would become a BSON double).
+/// Anything else is `InvalidMessage` naming the event type: no retry can change it.
 pub(crate) fn payload_document(type_name: &str, payload: &[u8]) -> Result<Document, StoreError> {
     let invalid = |why: String| {
         StoreError::Failed(MessagingError::InvalidMessage(format!(
@@ -98,6 +99,7 @@ pub(crate) fn payload_document(type_name: &str, payload: &[u8]) -> Result<Docume
             "is not a JSON object, so it cannot be an outbox document".into(),
         ));
     }
+    kraken_messaging::store::check_outbox_payload(type_name, payload)?;
     mongodb::bson::to_document(&json)
         .map_err(|e| invalid(format!("cannot be an outbox document: {e}")))
 }
@@ -327,8 +329,32 @@ mod tests {
     fn a_number_bson_cannot_hold_is_invalid() {
         let why = refusal(format!("{{\"n\":{}}}", u64::MAX).as_bytes());
         assert!(
-            why.starts_with("the payload of event t.Happened cannot be an outbox document"),
+            why.starts_with(
+                "the payload of event t.Happened holds the integer 18446744073709551615, above i64::MAX"
+            ),
             "{why}"
+        );
+    }
+
+    /// Integers a JSON parser reads as floats (below `i64::MIN`, above `u64::MAX`, 30 digits)
+    /// are refused, not stored as BSON doubles; the same digits in a string or a decimal are not
+    /// integers.
+    #[test]
+    fn an_integer_outside_i64_is_invalid_even_when_read_as_a_float() {
+        for payload in [
+            &br#"{"n":-9223372036854775809}"#[..],
+            br#"{"n":18446744073709551616}"#,
+            br#"{"a":[{"n":123456789012345678901234567890}]}"#,
+        ] {
+            let why = refusal(payload);
+            assert!(why.contains("holds the integer"), "{why}");
+        }
+        assert!(
+            payload_document(
+                "t.Happened",
+                br#"{"s":"123456789012345678901234567890","d":1.5}"#
+            )
+            .is_ok()
         );
     }
 

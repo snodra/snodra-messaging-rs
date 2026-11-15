@@ -135,40 +135,19 @@ pub(crate) fn strings(text: Option<&str>) -> Result<HashMap<String, String>, Sto
     })
 }
 
-/// Refuses `payload` with `InvalidMessage` naming the event `type_name` unless it is a JSON object
-/// whose integers fit in a signed 64-bit integer (the outbox's contract), with no U+0000 in its
-/// strings or keys (written as an escape, which PostgreSQL's `jsonb` refuses).
+/// Refuses `payload` with `InvalidMessage` naming the event `type_name` unless it keeps the outbox
+/// contract ([`kraken_messaging::store::check_outbox_payload`]: a JSON object whose integers fit
+/// in a signed 64-bit integer, read from the text), with no U+0000 in its strings or keys (written
+/// as an escape, which PostgreSQL's `jsonb` refuses).
 pub(crate) fn require_object(type_name: &str, payload: &[u8]) -> Result<(), StoreError> {
-    let json: serde_json::Value = serde_json::from_slice(payload).map_err(|e| {
-        invalid(format!(
-            "the payload of event {type_name} is not JSON, so it cannot be an outbox entry: {e}"
-        ))
-    })?;
-    if !json.is_object() {
-        return Err(invalid(format!(
-            "the payload of event {type_name} is not a JSON object, so it cannot be an outbox entry"
-        )));
-    }
-    if let Some(n) = too_big(&json) {
-        return Err(invalid(format!(
-            "the payload of event {type_name} holds the integer {n}, above i64::MAX, so it cannot be an outbox entry"
-        )));
-    }
+    kraken_messaging::store::check_outbox_payload(type_name, payload)?;
+    let json: serde_json::Value = serde_json::from_slice(payload)?;
     if has_nul(&json) {
         return Err(invalid(format!(
             "The message store refuses the character U+0000 in the payload of event {type_name}"
         )));
     }
     Ok(())
-}
-
-fn too_big(json: &serde_json::Value) -> Option<&serde_json::Number> {
-    match json {
-        serde_json::Value::Number(n) if n.is_u64() && !n.is_i64() => Some(n),
-        serde_json::Value::Array(items) => items.iter().find_map(too_big),
-        serde_json::Value::Object(fields) => fields.values().find_map(too_big),
-        _ => None,
-    }
 }
 
 fn has_nul(json: &serde_json::Value) -> bool {
@@ -261,11 +240,17 @@ mod tests {
     #[test]
     fn outbox_payloads_must_be_json_objects_of_i64_integers_without_nul() {
         assert!(require_object("t.E", br#"{"n":9223372036854775807}"#).is_ok());
+        assert!(
+            require_object("t.E", br#"{"s":"123456789012345678901234567890","d":1.5}"#).is_ok()
+        );
         for bad in [
             &b"not json"[..],
             b"[1]",
             b"null",
             br#"{"n":18446744073709551615}"#,
+            br#"{"n":-9223372036854775809}"#,
+            br#"{"n":18446744073709551616}"#,
+            br#"{"a":[{"n":123456789012345678901234567890}]}"#,
             br#"{"s":"a\u0000b"}"#,
             br#"{"a\u0000":1}"#,
         ] {

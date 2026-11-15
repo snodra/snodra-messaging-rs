@@ -90,14 +90,75 @@ fn too_big(json: &serde_json::Value) -> Option<&serde_json::Number> {
     }
 }
 
-/// [`check_payload`] of a JSON text.
-pub(crate) fn check_payload_text(type_name: &str, payload: &[u8]) -> Result<(), MessagingError> {
+/// [`check_payload`] of a JSON text, the outbox contract every store applies
+/// ([`OutboxEntry::payload`](crate::store::OutboxEntry::payload)): JSON, an object, and every
+/// integer in it (a number written without `.`, `e` or `E`) within the signed 64-bit range. The
+/// integers are read from the text itself: a JSON parser reads an integer below `i64::MIN` or
+/// above `u64::MAX` as a float, which a store would then keep changed.
+pub fn check_outbox_payload(type_name: &str, payload: &[u8]) -> Result<(), MessagingError> {
     let json: serde_json::Value = serde_json::from_slice(payload).map_err(|e| {
         MessagingError::InvalidMessage(format!(
             "the payload of event {type_name} is not JSON, so it cannot be an outbox entry: {e}"
         ))
     })?;
-    check_payload(type_name, &json)
+    check_payload(type_name, &json)?;
+    // Valid JSON, hence UTF-8.
+    let text = std::str::from_utf8(payload).unwrap_or_default();
+    match integer_out_of_range(text) {
+        None => Ok(()),
+        Some(n) => Err(MessagingError::InvalidMessage(format!(
+            "the payload of event {type_name} holds the integer {n}, {}, so it cannot be an outbox entry",
+            if n.starts_with('-') {
+                "below i64::MIN"
+            } else {
+                "above i64::MAX"
+            }
+        ))),
+    }
+}
+
+pub(crate) use check_outbox_payload as check_payload_text;
+
+/// The first integer token of the JSON `text` (outside strings, without `.`, `e` or `E`) that
+/// no `i64` holds. `text` is valid JSON.
+fn integer_out_of_range(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            match c {
+                b'\\' => i += 2,
+                b'"' => {
+                    in_string = false;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+            continue;
+        }
+        match c {
+            b'"' => {
+                in_string = true;
+                i += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                while i < bytes.len()
+                    && matches!(bytes[i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+                {
+                    i += 1;
+                }
+                let token = &text[start..i];
+                if !token.contains(['.', 'e', 'E']) && token.parse::<i64>().is_err() {
+                    return Some(token);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// The publishing side of events: appends to the message store's outbox, inside the caller's
@@ -242,5 +303,64 @@ impl EventBus {
 
     fn next_seq(&self) -> i64 {
         self.seq.fetch_add(1, Ordering::SeqCst) + 1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refused(payload: &str) -> Option<String> {
+        match check_outbox_payload("t.E", payload.as_bytes()) {
+            Ok(()) => None,
+            Err(MessagingError::InvalidMessage(why)) => Some(why),
+            Err(other) => panic!("{other:?}"),
+        }
+    }
+
+    /// Every integer of the text must fit an `i64`, whatever a JSON parser makes of it: below
+    /// `i64::MIN` and above `u64::MAX` are read as floats, and were let through.
+    #[test]
+    fn integers_outside_i64_are_refused_wherever_they_are() {
+        for (payload, n) in [
+            (r#"{"n":-9223372036854775809}"#, "-9223372036854775809"),
+            (r#"{"n":18446744073709551616}"#, "18446744073709551616"),
+            (r#"{"n":18446744073709551615}"#, "18446744073709551615"),
+            (
+                r#"{"n":123456789012345678901234567890}"#,
+                "123456789012345678901234567890",
+            ),
+            (
+                r#"{"a":[1,{"b":[2,99999999999999999999]}]}"#,
+                "99999999999999999999",
+            ),
+            (
+                r#"{"s":"x\"","n":-99999999999999999999}"#,
+                "-99999999999999999999",
+            ),
+        ] {
+            let why = refused(payload).unwrap_or_else(|| panic!("accepted {payload}"));
+            assert!(why.contains(&format!("holds the integer {n}, ")), "{why}");
+            let side = if n.starts_with('-') {
+                "below i64::MIN"
+            } else {
+                "above i64::MAX"
+            };
+            assert!(why.contains(side), "{why}");
+        }
+    }
+
+    #[test]
+    fn what_fits_and_what_is_not_an_integer_is_accepted() {
+        for payload in [
+            r#"{"n":9223372036854775807,"m":-9223372036854775808}"#,
+            r#"{"s":"123456789012345678901234567890"}"#,
+            r#"{"s":"a\"123456789012345678901234567890\"b"}"#,
+            r#"{"d":1.5,"e":1e30,"f":-2.5E-3,"g":123456789012345678901234567890.0}"#,
+            r#"{"z":-0,"a":[0,[-1,{"b":2}]]}"#,
+            r#"{"k123456789012345678901234567890":1}"#,
+        ] {
+            assert_eq!(refused(payload), None, "{payload}");
+        }
     }
 }
