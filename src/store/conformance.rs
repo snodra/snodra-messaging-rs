@@ -82,6 +82,7 @@ use super::{
 };
 use crate::error::MessagingError;
 use crate::event_store::ReplayRange;
+use crate::events::outbox::MAX_PAYLOAD_DEPTH;
 use crate::saga::FailureReason;
 use crate::saga::store::{
     Association, DeadlineDocument, DeadlineStatus, DispatchKind, SagaDispatchDocument,
@@ -228,14 +229,24 @@ pub async fn appended_entry_is_claimed_in_created_seq_order(store: &dyn MessageS
     );
 }
 
-/// An outbox payload is a JSON object whose integers fit in an `i64`: anything else (not JSON,
-/// an array, a bare value, an integer above `i64::MAX`) is refused with `InvalidMessage`,
-/// appended on its own or in a transaction, and nothing is appended.
+/// An outbox payload is a JSON object whose integers fit in an `i64`, nested at most
+/// [`MAX_PAYLOAD_DEPTH`] levels: anything else (not JSON, an array, a bare value, an integer above
+/// `i64::MAX`, a number no double holds, a lone surrogate escape, a leading BOM, bytes that are
+/// not UTF-8, one level too deep) is refused with `InvalidMessage`, appended on its own or in a
+/// transaction, and nothing is appended. The deepest payload allowed is kept by every store.
 pub async fn outbox_rejects_a_payload_that_is_not_a_json_object(store: &dyn MessageStore) {
     let outbox = store.outbox();
     drain(&*outbox).await;
+    let too_deep = nested(MAX_PAYLOAD_DEPTH + 1).into_bytes();
     for payload in [
         &b"not json"[..],
+        b"{\"n\":1e400}",
+        b"{\"n\":-1e400}",
+        b"{\"s\":\"\\ud800\"}",
+        b"{\"\\udc00\":1}",
+        b"\xef\xbb\xbf{}",
+        b"{\"s\":\"\xff\"}",
+        &too_deep,
         b"[1,2]",
         b"\"text\"",
         b"null",
@@ -290,6 +301,31 @@ pub async fn outbox_rejects_a_payload_that_is_not_a_json_object(store: &dyn Mess
         .expect("claim");
     assert_eq!(ids(&claimed), ids(&[fine]));
     outbox.mark_sent(&ids(&claimed)).await.expect("mark_sent");
+    // The deepest payload allowed is kept as appended, on every store.
+    let deepest = OutboxEntry {
+        payload: nested(MAX_PAYLOAD_DEPTH).into_bytes(),
+        ..entry("conformance.Deep", now_ms(), 0)
+    };
+    outbox
+        .append_now(deepest.clone())
+        .await
+        .expect("the deepest payload allowed");
+    let claimed = outbox
+        .claim("relay-a", LONG_LEASE, 100)
+        .await
+        .expect("claim");
+    assert_eq!(ids(&claimed), ids(std::slice::from_ref(&deepest)));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&claimed[0].payload).expect("JSON"),
+        serde_json::from_slice::<serde_json::Value>(&deepest.payload).expect("JSON"),
+        "kept as appended"
+    );
+    outbox.mark_sent(&ids(&claimed)).await.expect("mark_sent");
+}
+
+/// A JSON object nested `levels` deep: `{"a":{"a":...{"a":1}...}}`, `{"a":1}` being one level.
+fn nested(levels: usize) -> String {
+    format!("{}1{}", "{\"a\":".repeat(levels), "}".repeat(levels))
 }
 
 /// `pending` counts the entries neither sent nor failed, held by a relay or not, and
@@ -2196,12 +2232,16 @@ pub async fn saga_dispatch_store_refuses_an_event_the_outbox_would_refuse(
     let sagas = store.sagas();
     let txs = store.tx();
     let now = now_ms();
+    let too_deep = nested(MAX_PAYLOAD_DEPTH + 1);
     for (n, payload) in [
         "[1]",
         "null",
         "{\"n\":18446744073709551615}",
         "{\"n\":-9223372036854775809}",
         "{\"n\":123456789012345678901234567890}",
+        "{\"n\":1e400}",
+        "{\"s\":\"\\ud800\"}",
+        too_deep.as_str(),
     ]
     .into_iter()
     .enumerate()

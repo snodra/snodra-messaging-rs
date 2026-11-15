@@ -52,22 +52,34 @@ pub fn new_outbox_entry<E: Event>(
     })
 }
 
-/// An outbox payload must be a JSON object whose integers fit in a signed 64-bit integer (the
-/// outbox contract, [`OutboxEntry::payload`]). Anything else (a unit struct's `null`, an array,
-/// a bare value, an integer above `i64::MAX`) is `InvalidMessage` naming the event type: no retry
-/// can change it.
+/// The most levels of objects and arrays an outbox payload nests, its own object included
+/// (`{"a":1}` is one level, `{"a":[1]}` two): MySQL keeps no deeper JSON document (its limit is
+/// 100), so no store may take one.
+pub const MAX_PAYLOAD_DEPTH: usize = 100;
+
+/// An outbox payload must be a JSON object whose integers fit in a signed 64-bit integer, nested
+/// at most [`MAX_PAYLOAD_DEPTH`] levels (the outbox contract, [`OutboxEntry::payload`]). Anything
+/// else (a unit struct's `null`, an array, a bare value, an integer above `i64::MAX`, one level
+/// too deep) is `InvalidMessage` naming the event type: no retry can change it.
 pub(crate) fn check_payload(
     type_name: &str,
     json: &serde_json::Value,
 ) -> Result<(), MessagingError> {
     let found = match json {
         serde_json::Value::Object(_) => {
-            return match too_big(json) {
-                None => Ok(()),
-                Some(n) => Err(MessagingError::InvalidMessage(format!(
+            if let Some(n) = too_big(json) {
+                return Err(MessagingError::InvalidMessage(format!(
                     "the payload of event {type_name} holds the integer {n}, above i64::MAX, so it cannot be an outbox entry"
-                ))),
-            };
+                )));
+            }
+            let levels = depth(json);
+            if levels > MAX_PAYLOAD_DEPTH {
+                return Err(MessagingError::InvalidMessage(format!(
+                    "the payload of event {type_name} nests {levels} levels of objects and arrays, more than the \
+                     {MAX_PAYLOAD_DEPTH} every store keeps, so it cannot be an outbox entry"
+                )));
+            }
+            return Ok(());
         }
         serde_json::Value::Null => "null",
         serde_json::Value::Bool(_) => "a boolean",
@@ -78,6 +90,16 @@ pub(crate) fn check_payload(
     Err(MessagingError::InvalidMessage(format!(
         "the payload of event {type_name} is {found}, not a JSON object, so it cannot be an outbox entry"
     )))
+}
+
+/// The levels of objects and arrays `json` nests, its own included: a scalar 0, `{}` and
+/// `{"a":1}` 1, `{"a":[1]}` 2.
+fn depth(json: &serde_json::Value) -> usize {
+    match json {
+        serde_json::Value::Array(items) => 1 + items.iter().map(depth).max().unwrap_or(0),
+        serde_json::Value::Object(fields) => 1 + fields.values().map(depth).max().unwrap_or(0),
+        _ => 0,
+    }
 }
 
 /// The first integer of `json` no `i64` holds.
@@ -91,8 +113,10 @@ fn too_big(json: &serde_json::Value) -> Option<&serde_json::Number> {
 }
 
 /// The outbox contract every store applies, checked on a JSON text
-/// ([`OutboxEntry::payload`](crate::store::OutboxEntry::payload)): JSON, an object, and every
-/// integer in it (a number written without `.`, `e` or `E`) within the signed 64-bit range. The
+/// ([`OutboxEntry::payload`](crate::store::OutboxEntry::payload)): JSON (UTF-8, no byte order
+/// mark, no lone surrogate escape, no number a double cannot hold), an object nested at most
+/// [`MAX_PAYLOAD_DEPTH`] levels, and every integer in it (a number written without `.`, `e` or
+/// `E`) within the signed 64-bit range. The
 /// integers are read from the text itself: a JSON parser reads an integer below `i64::MIN` or
 /// above `u64::MAX` as a float, which a store would then keep changed.
 pub fn check_outbox_payload(type_name: &str, payload: &[u8]) -> Result<(), MessagingError> {
@@ -327,6 +351,37 @@ mod tests {
             Err(MessagingError::InvalidMessage(why)) => Some(why),
             Err(other) => panic!("{other:?}"),
         }
+    }
+
+    /// At most 100 levels of objects and arrays, the payload's own object included (MySQL's
+    /// limit); arrays count as objects do; the message names the levels.
+    #[test]
+    fn a_payload_nested_deeper_than_every_store_keeps_is_refused() {
+        let objects = |n: usize| format!("{}1{}", "{\"a\":".repeat(n), "}".repeat(n));
+        let arrays = |n: usize| format!("{{\"a\":{}1{}}}", "[".repeat(n - 1), "]".repeat(n - 1));
+        assert_eq!(refused("{}"), None);
+        for deep in [objects(100), arrays(100)] {
+            assert_eq!(refused(&deep), None, "100 levels are kept");
+        }
+        for deep in [objects(101), arrays(101)] {
+            let why = refused(&deep).expect("101 levels");
+            assert!(
+                why.contains("nests 101 levels") && why.contains("100"),
+                "{why}"
+            );
+        }
+        // Each refused before the store: not JSON a Rust consumer reads, whatever the store.
+        for bad in [
+            "{\"n\":1e400}",
+            "{\"n\":-1e400}",
+            "{\"s\":\"\\ud800\"}",
+            "{\"\\udc00\":1}",
+            "\u{feff}{}",
+        ] {
+            assert!(refused(bad).is_some(), "{bad}");
+        }
+        assert!(check_outbox_payload("t.E", b"{\"s\":\"\xff\"}").is_err());
+        assert_eq!(refused("{\"n\":1e-400,\"s\":\"\\ud83d\\ude00\"}"), None);
     }
 
     /// Every integer of the text must fit an `i64`, whatever a JSON parser makes of it: below

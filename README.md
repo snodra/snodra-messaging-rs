@@ -215,6 +215,10 @@ it (kept in the dispatch entry's headers); one sent by a deadline handler carrie
   source, segment, position and reason, never the payload, and skipped). Records with an unhandled type are
   skipped; records without `type`, or with a non-object payload for a handled type, are INVALID
   letters.
+- **Payloads** (every store, before the store sees them, `store::check_outbox_payload`): a JSON object, UTF-8 without a
+  byte order mark, no lone surrogate escape, no number a double cannot hold (`1e400`), every integer within `i64`, and
+  at most 100 levels of objects and arrays, its own object included (`{"a":1}` is one level; `MAX_PAYLOAD_DEPTH`, MySQL's
+  JSON limit, which no store may exceed). Anything else fails the publish with `InvalidMessage`.
 - **Outbox**: `publish` inserts; the publisher relays in `createdAt, seq` order, stops the batch on a
   retriable failure, marks `failedAt` after 10 attempts, or at once when the event store refuses the event for good (too
   large, not authorized, a source it cannot have) or finds it invalid. One publish has 40 s (`OUTBOX_SEND_TIMEOUT`, as the
@@ -759,7 +763,7 @@ id of the message that scheduled it), `associate_with`, `remove_association_with
 start key, also from the start handler), `end()`, `send(&command, routing_key)`, `publish(&event, key)`, `schedule_after(duration, name, payload)`,
 `schedule_at(time, name, payload)` (both return the deadline id), `cancel(id)`, `cancel_all(name)`; at most 999 messages per
 handling of an instance. A published event must serialize to a JSON object the outbox takes (not a unit struct, no
-integer above `i64::MAX`; `store::check_outbox_payload`): anything else fails the handler with `InvalidMessage` naming the
+integer above `i64::MAX`, at most 100 levels deep; `store::check_outbox_payload`): anything else fails the handler with `InvalidMessage` naming the
 event (the relay counts one recorded before as `kraken_saga_command_failures_total{reason="INVALID"}` and gives it up). A handler gets no `Sender` or `EventBus`, and **must not capture one**: it would send inside the
 saga's transaction, for a state that may roll back, with no order, retry or idempotency key.
 
