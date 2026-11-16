@@ -106,11 +106,18 @@ async fn the_hub_shows_the_processors_their_letters_and_their_lag() {
             .as_array()
             .and_then(|all| all.iter().find(|s| s["serviceName"] == "svc-e2e-proc"))
             .cloned();
-        if let Some(s) = service
-            && s["processors"]
+        // Each processor is a consumer group of its own: `default` may still wait for its first
+        // assignment when `orders` has already parked its letters.
+        let processor = |s: &serde_json::Value, name: &str| {
+            s["processors"]
                 .as_array()
-                .and_then(|ps| ps.iter().find(|p| p["name"] == "orders"))
-                .is_some_and(|p| p["deadLetters"] == 2 && p["lag"] == 0)
+                .and_then(|ps| ps.iter().find(|p| p["name"] == name))
+                .cloned()
+        };
+        if let Some(s) = service
+            && processor(&s, "orders").is_some_and(|p| p["deadLetters"] == 2 && p["lag"] == 0)
+            && processor(&s, "default")
+                .is_some_and(|p| p["state"] == "RUNNING" && p["processedTotal"] == 2)
         {
             break s;
         }

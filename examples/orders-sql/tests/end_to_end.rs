@@ -114,16 +114,18 @@ async fn an_order_is_placed_published_and_confirmed_once() {
         .get("id")
         .cloned()
         .expect("the event id");
-    assert_eq!(
+    // The relay marks the row sent after the event store took the event, so the handler can
+    // confirm the order first.
+    eventually("the outbox row, sent", async || {
         count(
             &pool,
             "SELECT COUNT(*) FROM kraken_outbox WHERE id = $1 AND sent_at IS NOT NULL",
-            &event_id
+            &event_id,
         )
-        .await,
-        1,
-        "the outbox row, sent"
-    );
+        .await
+            == 1
+    })
+    .await;
     assert_eq!(
         count(
             &pool,
