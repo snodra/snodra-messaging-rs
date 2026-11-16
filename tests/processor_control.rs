@@ -645,9 +645,13 @@ async fn a_prepare_leaves_the_group_until_the_finish_or_the_lease_expiry() {
     })
     .await;
 
-    // A finish releases at once; a repeated finish (nothing held) is ok.
+    // A finish releases at once; a repeated finish (nothing held) is ok. The prepare goes to
+    // both instances and returns with the first reply, so the other may still be leaving.
     ok(hub.control("audit", prepare("op-3", 30_000), ASK).await);
-    assert!(members(&kafka.bootstrap, group).is_empty());
+    eventually("both left the group", WITHIN, || async {
+        members(&kafka.bootstrap, group).is_empty()
+    })
+    .await;
     ok(hub
         .control_to(Some(app.instance_id()), "audit", finish("op-3", false), ASK)
         .await);
