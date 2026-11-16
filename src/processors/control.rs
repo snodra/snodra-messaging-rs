@@ -13,16 +13,18 @@ use std::time::Duration;
 
 use super::DeadLetters;
 use super::admin::RetryResult;
-use super::control_store::PAUSED_LOCALLY;
-use super::dead_letters::DeadLetterDocument;
 use super::monitor::cut_bytes;
-use super::reset::ResetTarget;
 use super::runner::{ProcessorRunner, Refusal};
 use crate::config::DeadLetterMode;
 use crate::error::MessagingError;
+use crate::event_store::ResetTarget;
 use crate::proto::control_reply::Result as Answer;
 use crate::proto::control_request::Action;
 use crate::proto::{self, ControlRefusal, ControlReply, ControlRequest};
+use crate::store::DeadLetter;
+
+/// Who paused a processor through [`ProcessorControl::pause`] (the control state's `paused_by`).
+pub const PAUSED_LOCALLY: &str = "local";
 
 /// The most bytes of a refusal's message, an `ok` detail, a retry's error and a letter's error
 /// message (the hub cuts there too).
@@ -30,7 +32,7 @@ pub const MAX_CONTROL_TEXT_BYTES: usize = 512;
 /// The most letters one `dead_letter_list` returns.
 pub const MAX_LIST_LIMIT: u32 = 100;
 /// The shortest lease a `reset_prepare` may ask for (the hub asks for 30 s): a shorter one would
-/// lapse before anything happened and have the executor extend it against MongoDB in a spin.
+/// lapse before anything happened and have the executor extend it against the store in a spin.
 pub const MIN_RESET_LEASE_MS: i64 = 1000;
 /// The refusal of a prepare without an operation id or with a lease under [`MIN_RESET_LEASE_MS`].
 pub(crate) const BAD_PREPARE: &str =
@@ -232,7 +234,7 @@ impl ProcessorControl {
             mode => Err(refused(Refusal::new(
                 ControlRefusal::Invalid,
                 format!(
-                    "dead letters are not kept in mode {} (KRAKEN_KAFKA_DEAD_LETTER_MODE)",
+                    "dead letters are not kept in mode {} (KRAKEN_EVENTS_DEAD_LETTER_MODE)",
                     mode.as_str()
                 ),
             ))),
@@ -265,11 +267,7 @@ impl ProcessorControl {
     }
 
     /// The letter `id` when it is one of `processor`'s; `Ok(None)` when there is none.
-    async fn letter_of(
-        &self,
-        processor: &str,
-        id: &str,
-    ) -> Result<Option<DeadLetterDocument>, Answer> {
+    async fn letter_of(&self, processor: &str, id: &str) -> Result<Option<DeadLetter>, Answer> {
         self.collection_mode()?;
         if id.is_empty() {
             return Err(refused(Refusal::new(
@@ -344,13 +342,13 @@ impl ProcessorControl {
 }
 
 /// A letter without its record: no payload, no headers.
-fn summary(l: &DeadLetterDocument) -> proto::DeadLetterSummary {
+fn summary(l: &DeadLetter) -> proto::DeadLetterSummary {
     proto::DeadLetterSummary {
         id: l.id.clone(),
         processor: l.processor.clone(),
-        topic: l.topic.clone(),
-        partition: l.partition,
-        offset: l.offset,
+        source: l.source.clone(),
+        segment: l.segment.clone(),
+        position: l.position.clone(),
         key: l.key.clone().unwrap_or_default(),
         event_id: l.event_id.clone().unwrap_or_default(),
         event_type: l.event_type.clone().unwrap_or_default(),
@@ -359,8 +357,8 @@ fn summary(l: &DeadLetterDocument) -> proto::DeadLetterSummary {
         error_message: cut_bytes(&l.error.message, MAX_CONTROL_TEXT_BYTES),
         blocked_by: l.blocked_by.clone().unwrap_or_default(),
         attempts: u32::try_from(l.attempts).unwrap_or(0),
-        parked_at_ms: l.parked_at.timestamp_millis(),
-        last_attempt_at_ms: l.last_attempt_at.timestamp_millis(),
+        parked_at_ms: l.parked_at_ms,
+        last_attempt_at_ms: l.last_attempt_at_ms,
     }
 }
 
@@ -439,16 +437,11 @@ fn describe(answer: &Answer) -> String {
 mod tests {
     use super::*;
 
-    /// A control without runners over a database that is never connected to.
+    /// A control without runners and without a store.
     async fn control() -> ProcessorControl {
-        let client =
-            mongodb::Client::with_uri_str("mongodb://127.0.0.1:1/x?serverSelectionTimeoutMS=200")
-                .await
-                .unwrap();
-        let db = client.default_database().unwrap();
         ProcessorControl::new(
             Vec::new(),
-            DeadLetters::new(db, DeadLetterMode::Collection, vec![]),
+            DeadLetters::new(None, DeadLetterMode::Collection, vec![]),
         )
     }
 

@@ -59,7 +59,7 @@
 //!   when its stream is closed fail like on any lost stream. A certificate with less than a tenth
 //!   of its lifetime (at most 24 h) left, and no renewed file, is warned about once.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -86,7 +86,8 @@ use crate::security::HubTls;
 
 use super::auth::{AuthKind, AuthStatus};
 use super::connection::{
-    Hooks, HubConnection, HubSettings, Inbound, RegisteredTypes, StreamId, hub_id,
+    Hooks, HubConnection, HubRejection, HubSettings, Inbound, RegisteredTypes, Sequenced, StreamId,
+    hub_id,
 };
 use super::mtls::{self, ClientIdentity};
 use super::targets::{HubTargets, permit_share, rank_keyed, rank_round_robin, resolved_targets};
@@ -213,6 +214,8 @@ pub struct HubPool {
     in_flight: Arc<AtomicUsize>,
     /// Credential refreshes written to any hub (monotonic: members come and go).
     refreshes_sent: Arc<AtomicU64>,
+    /// The newest refusal by any hub (kept: members come and go).
+    latest_rejection: Arc<Mutex<Option<Sequenced>>>,
     changes: watch::Sender<u64>,
     /// The client certificate watch (mTLS only).
     certificate: Mutex<CertificateWatch>,
@@ -223,6 +226,8 @@ pub struct HubPool {
     processor_status: Mutex<Option<ProcessorStatusSource>>,
     /// Built around one connection the caller owns ([`HubPool::of`]): no tasks of its own.
     external: bool,
+    /// Turned off ([`turn_off`](Self::turn_off), `Config::hub_enabled` false): never connects.
+    off: AtomicBool,
     started: AtomicBool,
     cancel: CancellationToken,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -299,6 +304,7 @@ impl HubPool {
             turn: AtomicUsize::new(0),
             in_flight: Arc::new(AtomicUsize::new(0)),
             refreshes_sent: Arc::new(AtomicU64::new(0)),
+            latest_rejection: Arc::new(Mutex::new(None)),
             changes,
             certificate: Mutex::new(CertificateWatch::default()),
             probes: Mutex::new(vec![]),
@@ -312,6 +318,7 @@ impl HubPool {
             roll_delay: Mutex::new(Arc::new(|bound| roll_delay(bound, random_unit()))),
             processor_status: Mutex::new(None),
             external,
+            off: AtomicBool::new(false),
             started: AtomicBool::new(false),
             cancel: CancellationToken::new(),
             tasks: Mutex::new(vec![]),
@@ -363,9 +370,30 @@ impl HubPool {
         *self.roll_delay.lock().unwrap() = source;
     }
 
-    /// Starts every connection, the status reports and (for `dns:///`) the resolution loop.
+    /// Turns the pool off before [`start`](Self::start): it never connects, and a send fails at
+    /// once with `HubUnavailable` naming `KRAKEN_HUB_ENABLED`.
+    pub fn turn_off(&self) {
+        self.off.store(true, Ordering::SeqCst);
+    }
+
+    /// What a send fails with when no hub took it.
+    fn unavailable(&self) -> MessagingError {
+        MessagingError::HubUnavailable(if self.off.load(Ordering::SeqCst) {
+            "the hub is turned off (KRAKEN_HUB_ENABLED=false, Config::hub_enabled): nothing is \
+             sent to other services"
+                .into()
+        } else {
+            "not connected to the hub".into()
+        })
+    }
+
+    /// Starts every connection, the status reports and (for `dns:///`) the resolution loop;
+    /// nothing when turned off.
     pub fn start(self: &Arc<Self>) {
-        if self.external || self.started.swap(true, Ordering::SeqCst) {
+        if self.external
+            || self.off.load(Ordering::SeqCst)
+            || self.started.swap(true, Ordering::SeqCst)
+        {
             return;
         }
         for m in self.members() {
@@ -392,8 +420,12 @@ impl HubPool {
     }
 
     /// True once at least one hub confirmed the registration (the client can send); see
-    /// [`await_all_registered`](Self::await_all_registered) for every hub.
+    /// [`await_all_registered`](Self::await_all_registered) for every hub. False at once when the
+    /// pool is turned off ([`turn_off`](Self::turn_off)): no hub ever will.
     pub async fn await_registered(&self, timeout: Duration) -> bool {
+        if self.off.load(Ordering::SeqCst) {
+            return false;
+        }
         let mut changes = self.changes.subscribe();
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -412,8 +444,11 @@ impl HubPool {
     /// True once every hub of the pool confirmed the registration (kraken-messaging's
     /// `HubConnections.awaitRegistered`): there is at least one connection, and every connection still in use
     /// (not a closed duplicate, not draining) has a handshaken stream. With `dns:///`, the hubs of
-    /// the latest resolution.
+    /// the latest resolution. False at once when the pool is turned off.
     pub async fn await_all_registered(&self, timeout: Duration) -> bool {
+        if self.off.load(Ordering::SeqCst) {
+            return false;
+        }
         let mut changes = self.changes.subscribe();
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -544,6 +579,43 @@ impl HubPool {
         Some(live[first].ack.clone())
     }
 
+    /// The latest refusal of this instance's registration by each hub that refuses it now
+    /// ([`HubConnection::last_rejection`]), by hub: its id when it registered this instance
+    /// before ([`HubConnection::last_hub_id`]), else the target dialled as `host:port` (a refused
+    /// `Register` carries no hub id). A hub that accepts a registration again leaves the map.
+    pub fn rejections(&self) -> BTreeMap<String, String> {
+        self.members()
+            .iter()
+            .filter_map(|m| {
+                let rejection = m.conn.last_rejection()?;
+                let hub = m
+                    .conn
+                    .last_hub_id()
+                    .unwrap_or_else(|| super::targets::target_id(m.address()));
+                Some((hub, rejection))
+            })
+            .collect()
+    }
+
+    /// The newest refusal of this instance's registration by any hub
+    /// ([`HubConnection::latest_rejection`]): replaced by a newer refusal only, never cleared by a
+    /// later acceptance, kept when its hub leaves the pool.
+    pub fn latest_rejection(&self) -> Option<HubRejection> {
+        if self.external {
+            return self
+                .members()
+                .iter()
+                .filter_map(|m| m.conn.latest_rejection_sequenced())
+                .max_by_key(|(seq, _)| *seq)
+                .map(|(_, r)| r);
+        }
+        self.latest_rejection
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|(_, r)| r)
+    }
+
     /// Requests that arrived on any hub and whose handler has not finished.
     pub fn handlers_in_flight(&self) -> usize {
         if self.external {
@@ -578,8 +650,7 @@ impl HubPool {
                 }
             }
         }
-        Err(last
-            .unwrap_or_else(|| MessagingError::HubUnavailable("not connected to the hub".into())))
+        Err(last.unwrap_or_else(|| self.unavailable()))
     }
 
     /// Like [`send_where`](Self::send_where) over the live hubs whose address is not in `tried`, which also
@@ -606,8 +677,7 @@ impl HubPool {
                 }
             }
         }
-        Err(last
-            .unwrap_or_else(|| MessagingError::HubUnavailable("not connected to the hub".into())))
+        Err(last.unwrap_or_else(|| self.unavailable()))
     }
 
     /// Writes `msg` to the hub stream `stream`, if it is still the current stream of its
@@ -639,6 +709,26 @@ impl HubPool {
     /// Lets the pool see whether requests written to a stream are unanswered (draining).
     pub(crate) fn add_pending_probe(&self, probe: PendingProbe) {
         self.probes.lock().unwrap().push(probe);
+    }
+
+    /// The first step of a graceful shutdown: registers no types with every hub (each stops
+    /// routing to this instance and hands its queued requests to the other instances at once;
+    /// replies to what it already forwarded still go through) and waits at most `within` for
+    /// every hub's ack. True when every connected hub acked in time; nothing to do (and true)
+    /// when the pool is turned off.
+    pub async fn deregister(&self, within: Duration) -> bool {
+        if self.off.load(Ordering::SeqCst) {
+            return true;
+        }
+        let members = self.members();
+        futures::future::join_all(
+            members
+                .iter()
+                .map(|m| m.conn.deregister_for_shutdown(within)),
+        )
+        .await
+        .into_iter()
+        .all(|acked| acked)
     }
 
     /// Stops the background tasks and closes every stream (each hub drops this instance at once).
@@ -778,6 +868,7 @@ impl HubPool {
             }),
             in_flight: Arc::clone(&self.in_flight),
             refreshes_sent: Arc::clone(&self.refreshes_sent),
+            latest_rejection: Arc::clone(&self.latest_rejection),
         });
         let member = Arc::new(Member {
             conn,

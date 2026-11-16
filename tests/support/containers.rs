@@ -145,38 +145,57 @@ async fn probe_or_fail(addr: &str) {
 
 pub async fn hub_with(options: HubOptions) -> HubContainer {
     let (name, tag) = hub_image_or_fail();
-    let mut image = GenericImage::new(name, tag)
-        .with_exposed_port(7000.tcp())
-        .with_exposed_port(7001.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("hub listening"))
-        .with_env_var("KRAKEN_HUB_HTTP_LISTEN", "0.0.0.0:7001")
-        .with_env_var("KRAKEN_HUB_OTLP_ENDPOINT", "")
-        .with_env_var(
-            "KRAKEN_HUB_LOG",
-            std::env::var("KRAKEN_TEST_HUB_LOG").unwrap_or_else(|_| "info".to_string()),
-        );
-    for (k, v) in &options.env {
-        image = image.with_env_var(k.clone(), v.clone());
-    }
-    let mut image = image;
-    for (host, container) in &options.mounts {
-        image = image.with_mount(
-            Mount::bind_mount(host.clone(), container.clone())
-                .with_access_mode(AccessMode::ReadOnly),
-        );
-    }
-    for (name, address) in &options.host_names {
-        image = image.with_host(name.clone(), testcontainers::core::Host::Addr(*address));
-    }
+    // Built anew for every start (a request is used up by it).
+    let build = || {
+        let mut image = GenericImage::new(name.clone(), tag.clone())
+            .with_exposed_port(7000.tcp())
+            .with_exposed_port(7001.tcp())
+            .with_wait_for(WaitFor::message_on_stdout("hub listening"))
+            .with_env_var("KRAKEN_HUB_HTTP_LISTEN", "0.0.0.0:7001")
+            .with_env_var("KRAKEN_HUB_OTLP_ENDPOINT", "")
+            .with_env_var(
+                "KRAKEN_HUB_LOG",
+                std::env::var("KRAKEN_TEST_HUB_LOG").unwrap_or_else(|_| "info".to_string()),
+            );
+        for (k, v) in &options.env {
+            image = image.with_env_var(k.clone(), v.clone());
+        }
+        let mut image = image;
+        for (host, container) in &options.mounts {
+            image = image.with_mount(
+                Mount::bind_mount(host.clone(), container.clone())
+                    .with_access_mode(AccessMode::ReadOnly),
+            );
+        }
+        for (name, address) in &options.host_names {
+            image = image.with_host(name.clone(), testcontainers::core::Host::Addr(*address));
+        }
+        image
+    };
     let container = match options.port {
         Some(port) => {
-            let http_port = free_port();
-            let container = image
-                .with_mapped_port(port, 7000.tcp())
-                .with_mapped_port(http_port, 7001.tcp())
-                .start()
-                .await
-                .expect("hub container");
+            // A fixed port is free when picked, not when Docker binds it (another process may
+            // take it meanwhile: "failed to bind port", "port is already allocated"): both
+            // ports are picked again then. The caller reads the hub's address back.
+            let mut tries = 0;
+            let mut port = port;
+            let (container, port, http_port) = loop {
+                tries += 1;
+                let http_port = free_port();
+                match build()
+                    .with_mapped_port(port, 7000.tcp())
+                    .with_mapped_port(http_port, 7001.tcp())
+                    .start()
+                    .await
+                {
+                    Ok(container) => break (container, port, http_port),
+                    Err(e) if tries < 3 && bind_failure(&e.to_string()) => {
+                        eprintln!("hub container: {e}; trying again on other ports");
+                        port = free_port();
+                    }
+                    Err(e) => panic!("hub container: {e}"),
+                }
+            };
             probe_or_fail(&format!("127.0.0.1:{port}")).await;
             probe_or_fail(&format!("127.0.0.1:{http_port}")).await;
             return HubContainer {
@@ -185,7 +204,7 @@ pub async fn hub_with(options: HubOptions) -> HubContainer {
                 http: format!("http://127.0.0.1:{http_port}"),
             };
         }
-        None => image.start().await.expect("hub container"),
+        None => build().start().await.expect("hub container"),
     };
     let grpc = container
         .get_host_port_ipv4(7000.tcp())
@@ -214,6 +233,15 @@ impl MongoDb {
         let base = self.uri.split('/').take(3).collect::<Vec<_>>().join("/");
         format!("{base}/{db}?directConnection=true")
     }
+}
+
+/// Whether a container start failed because a host port was taken (Docker words it several
+/// ways: "failed to bind port", "Bind for 0.0.0.0:N failed: port is already allocated").
+pub fn bind_failure(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("bind")
+        || error.contains("already allocated")
+        || error.contains("address already in use")
 }
 
 /// A free TCP port on the host, for containers that must keep their mapping across restarts.

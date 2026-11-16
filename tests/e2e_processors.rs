@@ -41,13 +41,8 @@ async fn the_hub_shows_the_processors_their_letters_and_their_lag() {
     let kafka = support::containers::kafka().await;
     let mongo = support::containers::mongo().await;
     let topic = "e2e.events";
-    let mut config = Config::new(
-        "svc-e2e-proc",
-        &hub.address,
-        &kafka.bootstrap,
-        &mongo.uri_for("e2e"),
-    );
-    config.kafka_topic = topic.to_string();
+    let mut config = Config::new("svc-e2e-proc", &hub.address);
+    config.events_source = topic.to_string();
     config.outbox_enabled = false;
     config.consumer_max_attempts = 1;
     config.hub_status_interval = Duration::from_millis(500);
@@ -56,6 +51,8 @@ async fn the_hub_shows_the_processors_their_letters_and_their_lag() {
     let app = KrakenMessaging::builder(config)
         .await
         .unwrap()
+        .store(support::mongo_store(&mongo.uri_for("e2e")).await)
+        .event_store(support::kafka_events(&kafka.bootstrap))
         .event::<Ordered, _, _>(|_, _| async { Ok(()) })
         .event_in::<Ordered, _, _>("orders", move |e, _| {
             let fail = Arc::clone(&fail);
@@ -130,8 +127,13 @@ async fn the_hub_shows_the_processors_their_letters_and_their_lag() {
         .collect();
     assert_eq!(names, ["default", "orders"], "{service}");
     let orders = &processors[1];
-    assert_eq!(orders["groupId"], "svc-e2e-proc.orders", "{orders}");
-    assert_eq!(orders["topic"], topic);
+    assert_eq!(orders["subscription"], "svc-e2e-proc.orders", "{orders}");
+    assert_eq!(orders["source"], topic);
+    assert_eq!(orders["eventStore"], "kafka", "{orders}");
+    assert_eq!(
+        orders["capabilities"],
+        serde_json::json!(["browse", "lag", "native-dead-letter", "replay"])
+    );
     assert_eq!(orders["state"], "FAILING", "{orders}");
     assert_eq!(orders["deadLetterMode"], "collection");
     assert_eq!(orders["failedTotal"], 1);
@@ -144,10 +146,10 @@ async fn the_hub_shows_the_processors_their_letters_and_their_lag() {
         "{orders}"
     );
     assert_eq!(orders["instances"][0]["instanceId"], app.instance_id());
-    assert_eq!(orders["instances"][0]["partitions"][0]["committed"], 2);
+    assert_eq!(orders["instances"][0]["segments"][0]["committed"], "2");
     assert_eq!(service["deadLetters"], 2, "{service}");
     let default = &processors[0];
-    assert_eq!(default["groupId"], "svc-e2e-proc.default");
+    assert_eq!(default["subscription"], "svc-e2e-proc.default");
     assert_eq!(default["state"], "RUNNING", "{default}");
     assert_eq!(default["processedTotal"], 2);
 

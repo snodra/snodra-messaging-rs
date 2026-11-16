@@ -1,5 +1,5 @@
 //! The bounded retry of one saga event inside stage 2 (ADR 0021 rulings 3 and 33). Only a
-//! **conflict** (a version check, a start-key duplicate, a Mongo write conflict or a transient
+//! **conflict** (a version check, a start-key duplicate, a store write conflict or a transient
 //! transaction error) backs off: it is retried up to `max_attempts` attempts in all with the
 //! policy's jittered exponential backoff (default 5 attempts, 200 ms doubling up to 5 s). Any
 //! other failure, a handler's above all, is not cured by waiting: it gets

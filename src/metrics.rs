@@ -45,7 +45,7 @@ pub const EVENTS_CONSUMED: &str = "kraken.events.consumed";
 /// `kraken_event_handler_duration_seconds{processor,type}`: one stage-1 attempt that ran the
 /// handlers.
 pub const EVENT_HANDLER_DURATION: &str = "kraken.event.handler.duration";
-/// `kraken_processor_lag{processor,partition}`: the lag of an assigned partition, as the status.
+/// `kraken_processor_lag{processor,segment}`: the lag of an assigned segment, as the status.
 pub const PROCESSOR_LAG: &str = "kraken.processor.lag";
 /// `kraken_processor_state{processor,state}`: 1 for the processor's state now, 0 for the others.
 pub const PROCESSOR_STATE: &str = "kraken.processor.state";
@@ -91,7 +91,7 @@ pub enum Consumed {
     /// Given up without a letter: mode `log` after the attempts or for a malformed record, or
     /// only the saga stage failed for good (in `default`).
     Failed,
-    /// Taken by the dead letters (mode `collection` or `topic`): it failed on every attempt
+    /// Taken by the dead letters (mode `collection` or `event-store`): it failed on every attempt
     /// (`HANDLER_FAILED`), was malformed (`INVALID`) or its key had a parked letter
     /// (`SEQUENCED`).
     Parked,

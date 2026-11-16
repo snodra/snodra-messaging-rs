@@ -6,12 +6,15 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use kraken_messaging::config::DeadLetterMode;
-use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::kafka::{
-    EventBus, EventConsumer, LocalEventDispatcher, NoSagas, OutboxPublisher, ProcessorSettings,
-    ensure_indexes, headers,
+use kraken_messaging::event_store::{SubscriptionSpec, headers};
+use kraken_messaging::events::{
+    EventBus, EventConsumer, LocalEventDispatcher, NoSagas, OutboxPublisher,
+    OutboxPublisherSettings, ProcessorSettings,
 };
+use kraken_messaging::hub::HandlerRegistry;
 use kraken_messaging::metrics::{self, Metrics};
+use kraken_messaging::saga::Clock;
+use kraken_messaging::store::MessageStore;
 use kraken_messaging::{Event, message_type};
 use mongodb::bson::doc;
 use rdkafka::Message;
@@ -42,17 +45,12 @@ macro_rules! require_docker {
     };
 }
 
-async fn db(uri: &str) -> (mongodb::Client, mongodb::Database) {
-    let client = mongodb::Client::with_uri_str(uri).await.unwrap();
-    let db = client.default_database().expect("database in uri");
-    ensure_indexes(
-        &db,
-        Duration::from_secs(7 * 86_400),
-        Duration::from_secs(30 * 86_400),
+/// The MongoDB message store of `uri` (its indexes in place) and its database.
+async fn db(uri: &str) -> (Arc<dyn MessageStore>, mongodb::Database) {
+    (
+        support::mongo_store(uri).await,
+        support::mongo_db(uri).await,
     )
-    .await
-    .unwrap();
-    (client, db)
 }
 
 fn raw_consumer(bootstrap: &str, group: &str) -> StreamConsumer {
@@ -72,8 +70,7 @@ fn raw_consumer(bootstrap: &str, group: &str) -> StreamConsumer {
 fn consumer(
     bootstrap: &str,
     service: &str,
-    client: mongodb::Client,
-    db: mongodb::Database,
+    store: Arc<dyn MessageStore>,
     registry: HandlerRegistry,
     max_attempts: u32,
     metrics: &Metrics,
@@ -81,19 +78,20 @@ fn consumer(
     EventConsumer::processor(
         ProcessorSettings {
             name: "default".into(),
-            bootstrap_servers: bootstrap.into(),
-            group_id: format!("{service}.default"),
-            topic: TOPIC.into(),
+            subscription: SubscriptionSpec {
+                name: format!("{service}.default"),
+                source: TOPIC.into(),
+            },
+            events: support::kafka_events(bootstrap),
             max_attempts,
             backoff: Duration::from_millis(50),
             dead_letter_mode: DeadLetterMode::Log,
             dead_letter_retention: Duration::from_secs(86_400),
-            db: None,
+            dead_letters: None,
             metrics: metrics.clone(),
         },
         Arc::new(LocalEventDispatcher::new(
-            client,
-            db,
+            Some(store),
             Arc::new(registry),
             Arc::new(NoSagas),
         )),
@@ -106,17 +104,21 @@ async fn outbox_relays_to_kafka_with_kotlin_headers() {
     require_docker!();
     let kafka = support::containers::kafka().await;
     let mongo = support::containers::mongo().await;
-    let (_client, db) = db(&mongo.uri).await;
-    let bus = EventBus::new(db.clone());
+    let (store, db) = db(&mongo.uri).await;
+    let bus = EventBus::over(store.outbox());
     let meter = TestMeter::new();
     let publisher = OutboxPublisher::new(
-        db.clone(),
-        &kafka.bootstrap,
-        TOPIC,
-        "svc-a",
-        Duration::from_millis(100),
-        100,
-        10,
+        store.outbox(),
+        support::kafka_events(&kafka.bootstrap),
+        OutboxPublisherSettings {
+            source: TOPIC.into(),
+            service_name: "svc-a".into(),
+            poll_interval: Duration::from_millis(100),
+            batch_size: 100,
+            max_attempts: 10,
+            lease: Duration::from_secs(120),
+        },
+        Clock::system(),
         &Metrics::new(meter.meter()),
     )
     .unwrap();
@@ -186,7 +188,7 @@ async fn consumer_handles_once_and_dedupes() {
     require_docker!();
     let kafka = support::containers::kafka().await;
     let mongo = support::containers::mongo().await;
-    let (client, db) = db(&mongo.uri).await;
+    let (store, db) = db(&mongo.uri).await;
     let calls = Arc::new(AtomicUsize::new(0));
     let seen_user = Arc::new(std::sync::Mutex::new(None::<String>));
     let mut registry = HandlerRegistry::new();
@@ -207,8 +209,7 @@ async fn consumer_handles_once_and_dedupes() {
     let consumer = consumer(
         &kafka.bootstrap,
         "svc-b",
-        client,
-        db.clone(),
+        store,
         registry,
         3,
         &Metrics::new(meter.meter()),
@@ -304,7 +305,7 @@ async fn panicking_handler_is_retried_then_skipped() {
     require_docker!();
     let kafka = support::containers::kafka().await;
     let mongo = support::containers::mongo().await;
-    let (client, db) = db(&mongo.uri).await;
+    let (store, db) = db(&mongo.uri).await;
     let attempts = Arc::new(AtomicUsize::new(0));
     let good = Arc::new(AtomicUsize::new(0));
     let mut registry = HandlerRegistry::new();
@@ -326,8 +327,7 @@ async fn panicking_handler_is_retried_then_skipped() {
     let consumer = consumer(
         &kafka.bootstrap,
         "svc-c",
-        client,
-        db.clone(),
+        store,
         registry,
         2,
         &Metrics::new(meter.meter()),
@@ -415,8 +415,8 @@ async fn panicking_handler_is_retried_then_skipped() {
 async fn failed_send_marks_attempts() {
     require_docker!();
     let mongo = support::containers::mongo().await;
-    let (_client, db) = db(&mongo.uri).await;
-    let bus = EventBus::new(db.clone());
+    let (store, db) = db(&mongo.uri).await;
+    let bus = EventBus::over(store.outbox());
     for id in ["e-x", "e-y", "e-z"] {
         bus.publish(
             &Happened {
@@ -432,13 +432,17 @@ async fn failed_send_marks_attempts() {
     // and the batch stops there.
     let meter = TestMeter::new();
     let publisher = OutboxPublisher::new(
-        db.clone(),
-        "127.0.0.1:1",
-        TOPIC,
-        "svc-a",
-        Duration::from_millis(100),
-        2,
-        10,
+        store.outbox(),
+        support::kafka_events("127.0.0.1:1"),
+        OutboxPublisherSettings {
+            source: TOPIC.into(),
+            service_name: "svc-a".into(),
+            poll_interval: Duration::from_millis(100),
+            batch_size: 2,
+            max_attempts: 10,
+            lease: Duration::from_secs(120),
+        },
+        Clock::system(),
         &Metrics::new(meter.meter()),
     )
     .unwrap();
@@ -484,8 +488,8 @@ impl Event for Huge {}
 async fn non_retriable_send_marks_failed_immediately() {
     require_docker!();
     let mongo = support::containers::mongo().await;
-    let (_client, db) = db(&mongo.uri).await;
-    let bus = EventBus::new(db.clone());
+    let (store, db) = db(&mongo.uri).await;
+    let bus = EventBus::over(store.outbox());
     // 2 MB payload exceeds the producer's message.max.bytes (1 MB): MessageSizeTooLarge is final, not retriable.
     bus.publish(
         &Huge {
@@ -505,13 +509,17 @@ async fn non_retriable_send_marks_failed_immediately() {
     .await
     .unwrap();
     let publisher = OutboxPublisher::new(
-        db.clone(),
-        "127.0.0.1:1",
-        TOPIC,
-        "svc-a",
-        Duration::from_millis(100),
-        100,
-        10,
+        store.outbox(),
+        support::kafka_events("127.0.0.1:1"),
+        OutboxPublisherSettings {
+            source: TOPIC.into(),
+            service_name: "svc-a".into(),
+            poll_interval: Duration::from_millis(100),
+            batch_size: 100,
+            max_attempts: 10,
+            lease: Duration::from_secs(120),
+        },
+        Clock::system(),
         &Metrics::global(),
     )
     .unwrap();

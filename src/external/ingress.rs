@@ -6,18 +6,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use mongodb::Database;
-use mongodb::bson::{Document, doc};
-
 use crate::codec;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
-use crate::kafka::dispatch::Outcome;
-use crate::kafka::{LocalEventDispatcher, PROCESSED_EVENTS_COLLECTION, headers};
+use crate::event_store::headers;
+use crate::events::LocalEventDispatcher;
+use crate::events::dispatch::Outcome;
 use crate::saga::Clock;
+use crate::store::{MessageStore, ProcessedMarker};
 use crate::types::Event;
 
-/// The prefix of the marker id (in `processed_events`) that remembers a finished webhook call,
+/// The prefix of the marker id (in the processed events) that remembers a finished webhook call,
 /// next to the dispatcher's own markers.
 pub const INGRESS_MARKER_PREFIX: &str = "ingress:";
 
@@ -34,19 +33,20 @@ pub enum IngressResult {
 #[derive(Clone)]
 pub struct ExternalEventIngress {
     dispatcher: Arc<LocalEventDispatcher>,
-    db: Database,
+    /// `None`: a service without a message store, where every call fails.
+    store: Option<Arc<dyn MessageStore>>,
     clock: Clock,
 }
 
 impl ExternalEventIngress {
     pub fn new(
         dispatcher: Arc<LocalEventDispatcher>,
-        db: Database,
+        store: Option<Arc<dyn MessageStore>>,
         clock: Clock,
     ) -> ExternalEventIngress {
         ExternalEventIngress {
             dispatcher,
-            db,
+            store,
             clock,
         }
     }
@@ -85,8 +85,13 @@ impl ExternalEventIngress {
         }
         let dedupe_id = format!("{source}:{dedupe_key}");
         let marker = format!("{INGRESS_MARKER_PREFIX}{dedupe_id}");
-        let markers = self.db.collection::<Document>(PROCESSED_EVENTS_COLLECTION);
-        if markers.count_documents(doc! { "_id": &marker }).await? > 0 {
+        let store = self.store.as_ref().ok_or_else(|| {
+            MessagingError::InvalidMessage(
+                "the webhook ingress needs a message store: add .store(...)".into(),
+            )
+        })?;
+        let markers = store.processed_events();
+        if markers.exists(&marker).await? {
             return Ok(IngressResult::Duplicate);
         }
 
@@ -116,17 +121,22 @@ impl ExternalEventIngress {
             tracing::warn!(source = %source, dedupe_key = %dedupe_key, r#type = E::TYPE, "webhook event has no handler or saga in this service");
             return Ok(IngressResult::Accepted);
         }
-        let inserted = markers
-            .insert_one(
-                doc! { "_id": &marker, "type": E::TYPE, "processedAt": self.clock.now_bson() },
-            )
-            .await;
-        match inserted {
-            Ok(_) => Ok(IngressResult::Accepted),
+        let marker = ProcessedMarker {
+            id: marker,
+            type_name: E::TYPE.to_string(),
+            processed_at_ms: self.clock.now_ms(),
+            processor: None,
+            source: None,
+            segment: None,
+            position: None,
+        };
+        // A marker of its own, outside any transaction.
+        let mut tx = store.tx().plain().await?;
+        match markers.record(&mut tx, &marker).await? {
+            true => Ok(IngressResult::Accepted),
             // A simultaneous delivery finished first; the dispatch above skipped everything by
             // its markers.
-            Err(e) if crate::saga::ports::is_duplicate_key(&e) => Ok(IngressResult::Duplicate),
-            Err(e) => Err(e.into()),
+            false => Ok(IngressResult::Duplicate),
         }
     }
 }

@@ -1,6 +1,7 @@
 //! Saga statistics (S2 Task 12, S2-R7, ADR 0021 ruling 21): every counter and gauge of the Kotlin
 //! meters moves on the matching action of a real runtime, scheduler, relay and idempotent adapter
-//! on MongoDB. The Rust form of the Kotlin `SagaMetricsTest`.
+//! on the in-memory message store. The Rust form of the Kotlin `SagaMetricsTest`.
+#![cfg(feature = "testing")]
 
 mod support;
 
@@ -9,9 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use kraken_messaging::events::{EventBus, LocalEventDispatcher, SagaStage};
 use kraken_messaging::external::{ExternalCallSettings, ExternalCalls, IdempotencyKey};
 use kraken_messaging::hub::{HandlerRegistry, SendOptions};
-use kraken_messaging::kafka::{EventBus, LocalEventDispatcher, SagaStage};
 use kraken_messaging::saga::stats::{
     DEADLINES_DUE, EXTERNAL_CALLS, SAGA_COMMAND_FAILURES, SAGA_DISPATCH_PENDING, SAGA_EVENTS,
     SAGAS_ACTIVE, SAGAS_STARTED, SagaStats,
@@ -22,19 +23,9 @@ use kraken_messaging::saga::{
     SagaRetry, SagaRuntime, SagaType,
 };
 use kraken_messaging::{Command, Event, MessagingError, RetryPolicy, message_type};
-use mongodb::bson::{DateTime, Document, doc};
 use serde::{Deserialize, Serialize};
 use support::order_saga::{Bump, Finish, Gate, OrderPlaced, broken_saga, order_saga};
 use support::saga::{Store, event_ctx, t0};
-
-macro_rules! require_docker {
-    () => {
-        if !support::docker_available() {
-            eprintln!("docker not available, skipping");
-            return;
-        }
-    };
-}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -143,7 +134,6 @@ fn placed(order_id: &str) -> OrderPlaced {
 
 #[tokio::test]
 async fn the_saga_lifecycle_and_event_outcomes_are_counted() {
-    require_docker!();
     let st = St::start().await;
     let runtime = st.runtime(vec![order_saga(&st.gate)]);
 
@@ -180,7 +170,6 @@ async fn the_saga_lifecycle_and_event_outcomes_are_counted() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_version_conflict_and_a_parked_event_are_counted() {
-    require_docker!();
     let st = St::start().await;
     let runtime = st.runtime(vec![order_saga(&st.gate)]);
     deliver(&runtime, &placed("o2")).await;
@@ -222,7 +211,6 @@ async fn a_version_conflict_and_a_parked_event_are_counted() {
 
 #[tokio::test]
 async fn deadlines_fired_and_overdue_are_counted() {
-    require_docker!();
     let st = St::start().await;
     let switch = Arc::new(AtomicBool::new(false));
     let runtime = st.runtime(vec![charge_saga(&switch)]);
@@ -235,7 +223,7 @@ async fn deadlines_fired_and_overdue_are_counted() {
     )
     .await;
     let scheduler = DeadlineScheduler::new(
-        st.store.db.clone(),
+        st.store.message_store().sagas().deadlines,
         Arc::clone(&runtime),
         st.store.clock.clock(),
         DeadlineSettings {
@@ -270,7 +258,6 @@ async fn deadlines_fired_and_overdue_are_counted() {
 
 #[tokio::test]
 async fn the_pending_dispatch_and_active_saga_gauges_follow_the_stored_state() {
-    require_docker!();
     let st = St::start().await;
     let runtime = st.runtime(vec![order_saga(&st.gate)]);
     assert_eq!(
@@ -281,7 +268,13 @@ async fn the_pending_dispatch_and_active_saga_gauges_follow_the_stored_state() {
 
     deliver(&runtime, &placed("o4")).await; // records a command and an event
     deliver(&runtime, &placed("o5")).await;
-    st.stats.sample_once(&st.store.db).await.unwrap();
+    st.stats
+        .sample_once(
+            &*st.store.message_store().sagas().sagas,
+            &*st.store.message_store().sagas().dispatch,
+        )
+        .await
+        .unwrap();
     assert_eq!(
         st.stats.gauge(SAGAS_ACTIVE, &[("type", "rt.Order")]),
         Some(2)
@@ -295,16 +288,19 @@ async fn the_pending_dispatch_and_active_saga_gauges_follow_the_stored_state() {
         },
     )
     .await;
-    st.store
-        .db
-        .collection::<Document>("saga_dispatch")
-        .update_many(
-            doc! {},
-            doc! { "$set": { "dispatchedAt": DateTime::from_system_time(t0()) } },
+    let at = kraken_messaging::time::epoch_ms(t0());
+    st.store.edit(|c| {
+        c.dispatch
+            .iter_mut()
+            .for_each(|e| e.dispatched_at_ms = Some(at))
+    });
+    st.stats
+        .sample_once(
+            &*st.store.message_store().sagas().sagas,
+            &*st.store.message_store().sagas().dispatch,
         )
         .await
         .unwrap();
-    st.stats.sample_once(&st.store.db).await.unwrap();
     assert_eq!(st.stats.active("rt.Order"), Some(1));
     assert_eq!(
         st.stats.dispatch_pending(),
@@ -313,15 +309,15 @@ async fn the_pending_dispatch_and_active_saga_gauges_follow_the_stored_state() {
     );
 
     // The sampler task samples at once and keeps going until cancelled.
-    st.store
-        .db
-        .collection::<Document>("saga_dispatch")
-        .update_many(doc! {}, doc! { "$unset": { "dispatchedAt": "" } })
-        .await
-        .unwrap();
+    st.store.edit(|c| {
+        c.dispatch
+            .iter_mut()
+            .for_each(|e| e.dispatched_at_ms = None)
+    });
     let cancel = tokio_util::sync::CancellationToken::new();
     let sampler = st.stats.start_sampler(
-        st.store.db.clone(),
+        st.store.message_store().sagas().sagas,
+        st.store.message_store().sagas().dispatch,
         Duration::from_millis(20),
         cancel.clone(),
     );
@@ -336,18 +332,16 @@ async fn the_pending_dispatch_and_active_saga_gauges_follow_the_stored_state() {
 
 #[tokio::test]
 async fn an_unhandled_command_failure_is_counted_by_command_type_and_reason() {
-    require_docker!();
     let st = St::start().await;
     let runtime = st.runtime(vec![order_saga(&st.gate)]);
     let registry = Arc::new(HandlerRegistry::new()); // nobody handles rt.DoIt
     let relay = SagaDispatchRelay::new(
-        st.store.client.clone(),
-        st.store.db.clone(),
+        st.store.message_store().tx(),
+        st.store.message_store().sagas().dispatch,
         Arc::new(LocalRawCommandSender::new(Arc::clone(&registry))),
-        EventBus::new(st.store.db.clone()),
+        EventBus::over(st.store.message_store().outbox()),
         Arc::new(LocalEventDispatcher::new(
-            st.store.client.clone(),
-            st.store.db.clone(),
+            Some(st.store.message_store()),
             registry,
             runtime.clone(),
         )),
@@ -380,10 +374,9 @@ async fn an_unhandled_command_failure_is_counted_by_command_type_and_reason() {
 
 #[tokio::test]
 async fn adapter_calls_are_counted_by_handler_and_outcome() {
-    require_docker!();
     let st = St::start().await;
     let calls = ExternalCalls::new(
-        st.store.db.clone(),
+        st.store.message_store().external_calls(),
         st.store.clock.clock(),
         ExternalCallSettings::default(),
         Arc::new(st.stats.clone()),

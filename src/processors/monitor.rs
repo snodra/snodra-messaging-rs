@@ -1,23 +1,27 @@
 //! What one processor reports in `InstanceStatus.processors` (ADR 0022): kept in memory by the
-//! consumer, its rebalance callbacks and its offset refresher, and read by the hub pool's status
-//! tick under a short lock (never a Kafka or Mongo call).
+//! processor's consumer (the assignment changes its subscription reports, and the subscription's
+//! segment statuses it copies), and read by the hub pool's status tick under a short lock (never
+//! an event-store or store call).
 //!
-//! State: STOPPED while its consumer does not run (stopping at shutdown, or out of the group for a
-//! reset, ADR 0023); else PAUSED while its control document says so; else FAILING for 60 s after
-//! a record exhausted its attempts, a letter could not be parked or the consumer reported an
-//! error; else STARTING before the first assignment (an empty one counts) and between a revoke
-//! and the next assign; else RUNNING. `operation_id` names the reset holding the processor's
-//! lock, `replaying` and `replay_until` its open replay ranges on the assigned partitions that
-//! this instance's position (or the group's committed offset) has not passed yet: a partition
-//! stops replaying as its last replayed record is acknowledged, not when the poll removes the
-//! range from the document.
+//! State: STOPPED while its consumer does not run (stopping at shutdown, or out of its
+//! subscription for a reset, ADR 0023); else PAUSED while its control document says so; else
+//! FAILING for 60 s after a record exhausted its attempts, a letter could not be parked or the
+//! subscription reported an error; else STARTING before the first assignment (an empty one
+//! counts) and between a revoke and the next assign; else RUNNING. `operation_id` names the reset
+//! holding the processor's lock, `replaying` and `replay_until` its open replay ranges on the
+//! assigned segments that the subscription's committed position (its position while nothing is
+//! committed) has not passed yet: a segment stops replaying as its last replayed record is
+//! acknowledged, not when the poll removes the range from the document. Segments are listed in
+//! [`segment_order`]; positions are compared with the event store's
+//! [`compare`](EventStore::compare) only.
 //!
 //! The processor gauges (ADR 0026) read the same status when the meter collects:
 //! `kraken.processor.state{processor,state}` (every state, 1 for the current one),
-//! `kraken.processor.lag{processor,partition}` (each assigned partition whose lag is known) and
+//! `kraken.processor.lag{processor,segment}` (each assigned segment whose lag is known) and
 //! `kraken.dead.letters{processor}`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::cmp::Ordering as Order;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -27,8 +31,9 @@ use opentelemetry::metrics::AsyncInstrument;
 use tokio::sync::Notify;
 
 use crate::config::DeadLetterMode;
+use crate::event_store::{EventStore, SegmentStatus, SubscriptionSpec, segment_order};
 use crate::metrics::{DEAD_LETTERS, Metrics, PROCESSOR_LAG, PROCESSOR_STATE};
-use crate::proto::{PartitionStatus, ProcessorState, ProcessorStatus};
+use crate::proto::{self, ProcessorState, ProcessorStatus};
 
 /// The states a processor reports, with their `state` label (the `ProcessorState` name without
 /// `PROCESSOR_`, lower case, as the hub's `kraken_hub_processor_state`).
@@ -44,23 +49,14 @@ const STATES: [(ProcessorState, &str); 5] = [
 pub const FAILING_FOR: Duration = Duration::from_secs(60);
 /// The most bytes of `last_error` (cut at a UTF-8 boundary).
 pub const MAX_LAST_ERROR_BYTES: usize = 512;
+/// The most bytes of `event_store` and of each capability, and the most capabilities (the hub's
+/// bounds).
+pub const MAX_EVENT_STORE_BYTES: usize = 64;
+pub const MAX_CAPABILITY_BYTES: usize = 64;
+pub const MAX_CAPABILITIES: usize = 16;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Offsets {
-    position: i64,
-    committed: i64,
-    high_watermark: i64,
-}
-
-impl Default for Offsets {
-    fn default() -> Self {
-        Offsets {
-            position: -1,
-            committed: -1,
-            high_watermark: -1,
-        }
-    }
-}
+/// The order of two positions of one segment: the event store's.
+type Compare = Arc<dyn Fn(&str, &str) -> Order + Send + Sync>;
 
 #[derive(Default)]
 struct State {
@@ -68,20 +64,24 @@ struct State {
     rebalancing: bool,
     stopped: bool,
     generation: u64,
-    partitions: BTreeMap<i32, Offsets>,
+    /// The assigned segments, with what the subscription last reported of each.
+    segments: HashMap<String, SegmentStatus>,
     last_error: Option<(String, i64)>,
     failing_since: Option<Instant>,
     paused: bool,
     operation: Option<String>,
-    /// Partition → the `until` of its open replay range.
-    replay: BTreeMap<i32, i64>,
+    /// Segment → the `until` of its open replay range.
+    replay: HashMap<String, String>,
 }
 
 /// See the module docs.
 pub struct ProcessorMonitor {
     name: String,
-    group_id: String,
-    topic: String,
+    subscription: String,
+    source: String,
+    event_store: String,
+    capabilities: Vec<String>,
+    compare: Compare,
     mode: DeadLetterMode,
     event_types: Vec<String>,
     state: Mutex<State>,
@@ -91,27 +91,40 @@ pub struct ProcessorMonitor {
     sample: Notify,
 }
 
-fn lag_attrs(processor: &str, partition: i32) -> [KeyValue; 2] {
+fn lag_attrs(processor: &str, segment: &str) -> [KeyValue; 2] {
     [
         KeyValue::new("processor", processor.to_string()),
-        KeyValue::new("partition", partition.to_string()),
+        KeyValue::new("segment", segment.to_string()),
     ]
 }
 
 impl ProcessorMonitor {
+    /// The monitor of processor `name` reading `spec` on `events`.
     pub fn new(
         name: &str,
-        group_id: &str,
-        topic: &str,
+        spec: &SubscriptionSpec,
+        events: &Arc<dyn EventStore>,
         mode: DeadLetterMode,
         mut event_types: Vec<String>,
     ) -> ProcessorMonitor {
         event_types.sort();
         event_types.dedup();
+        let mut capabilities: Vec<String> = events
+            .capabilities()
+            .iter()
+            .map(|c| cut_bytes(c.as_str(), MAX_CAPABILITY_BYTES))
+            .collect();
+        capabilities.sort();
+        capabilities.dedup();
+        capabilities.truncate(MAX_CAPABILITIES);
+        let store = Arc::clone(events);
         ProcessorMonitor {
             name: name.to_string(),
-            group_id: group_id.to_string(),
-            topic: topic.to_string(),
+            subscription: spec.name.clone(),
+            source: spec.source.clone(),
+            event_store: cut_bytes(events.name(), MAX_EVENT_STORE_BYTES),
+            capabilities,
+            compare: Arc::new(move |a, b| store.compare(a, b)),
             mode,
             event_types,
             state: Mutex::new(State::default()),
@@ -127,33 +140,37 @@ impl ProcessorMonitor {
     }
 
     /// Registers the processor gauges of `monitors` on `metrics`; a monitor reports while it
-    /// lives. The lag of a partition that left the assignment (or whose monitor is gone) is
+    /// lives. The lag of a segment that left the assignment (or whose monitor is gone) is
     /// observed once more as 0, then not at all: Prometheus keeps a series that stops at its last
     /// value for minutes (no staleness over OTLP), which next to the new owner's would read as a
-    /// lag nobody has. An assigned partition whose lag is unknown is not observed (0 means caught
+    /// lag nobody has. An assigned segment whose lag is unknown is not observed (0 means caught
     /// up).
     pub(crate) fn observe(monitors: &[Arc<ProcessorMonitor>], metrics: &Metrics) {
         let watched: Arc<[Weak<ProcessorMonitor>]> = monitors.iter().map(Arc::downgrade).collect();
         let lag = {
             let watched = Arc::clone(&watched);
-            let last = Mutex::new(HashSet::<(String, i32)>::new());
+            let last = Mutex::new(HashSet::<(String, String)>::new());
             move |o: &dyn AsyncInstrument<u64>| {
                 let statuses: Vec<ProcessorStatus> = watched
                     .iter()
                     .filter_map(Weak::upgrade)
                     .map(|m| m.status())
                     .collect();
-                let assigned: HashSet<(String, i32)> = statuses
+                let assigned: HashSet<(String, String)> = statuses
                     .iter()
-                    .flat_map(|s| s.partitions.iter().map(|p| (s.name.clone(), p.partition)))
+                    .flat_map(|s| {
+                        s.segments
+                            .iter()
+                            .map(|p| (s.name.clone(), p.segment.clone()))
+                    })
                     .collect();
                 let mut last = last.lock().unwrap();
-                for (processor, partition) in last.difference(&assigned) {
-                    o.observe(0, &lag_attrs(processor, *partition));
+                for (processor, segment) in last.difference(&assigned) {
+                    o.observe(0, &lag_attrs(processor, segment));
                 }
                 for s in &statuses {
-                    for p in s.partitions.iter().filter(|p| p.lag >= 0) {
-                        o.observe(p.lag as u64, &lag_attrs(&s.name, p.partition));
+                    for p in s.segments.iter().filter(|p| p.lag >= 0) {
+                        o.observe(p.lag as u64, &lag_attrs(&s.name, &p.segment));
                     }
                 }
                 *last = assigned;
@@ -185,7 +202,7 @@ impl ProcessorMonitor {
             .build();
         meter
             .u64_observable_gauge(PROCESSOR_LAG)
-            .with_description("Records behind on each partition assigned to this instance whose lag is known, as the processor status (a partition that left the assignment reads 0 once)")
+            .with_description("Records behind on each segment assigned to this instance whose lag is known, as the processor status (a segment that left the assignment reads 0 once)")
             .with_callback(lag)
             .build();
         meter
@@ -200,8 +217,9 @@ impl ProcessorMonitor {
             .build();
     }
 
-    pub fn topic(&self) -> &str {
-        &self.topic
+    /// The source the processor reads.
+    pub fn source(&self) -> &str {
+        &self.source
     }
 
     /// The status now (wall clock for `last_error_at_ms`).
@@ -225,31 +243,37 @@ impl ProcessorMonitor {
         } else {
             ProcessorState::ProcessorRunning
         };
-        let partitions: Vec<PartitionStatus> = st
-            .partitions
-            .iter()
-            .map(|(&partition, o)| PartitionStatus {
-                partition,
-                position: o.position,
-                committed: o.committed,
-                high_watermark: o.high_watermark,
-                lag: lag(o),
-                replay_until: st
+        let text = |p: &Option<String>| p.clone().unwrap_or_default();
+        let segments: Vec<proto::SegmentStatus> = sorted(st.segments.keys())
+            .into_iter()
+            .map(|segment| {
+                let o = &st.segments[&segment];
+                let replay_until = st
                     .replay
-                    .get(&partition)
-                    .copied()
-                    .filter(|&until| o.position.max(o.committed) < until)
-                    .unwrap_or(0),
+                    .get(&segment)
+                    .filter(|until| !self.passed(progress(o), until))
+                    .cloned()
+                    .unwrap_or_default();
+                proto::SegmentStatus {
+                    position: text(&o.position),
+                    committed: text(&o.committed),
+                    head: text(&o.head),
+                    lag: o
+                        .lag
+                        .map_or(-1, |lag| i64::try_from(lag).unwrap_or(i64::MAX)),
+                    replay_until,
+                    segment,
+                }
             })
             .collect();
-        let replaying = partitions.iter().any(|p| p.replay_until > 0);
+        let replaying = segments.iter().any(|p| !p.replay_until.is_empty());
         let (last_error, last_error_at_ms) = st.last_error.clone().unwrap_or_default();
         ProcessorStatus {
             name: self.name.clone(),
-            group_id: self.group_id.clone(),
-            topic: self.topic.clone(),
+            subscription: self.subscription.clone(),
+            source: self.source.clone(),
             state: state as i32,
-            partitions,
+            segments,
             processed_total: self.processed.load(Ordering::Relaxed),
             failed_total: self.failed.load(Ordering::Relaxed),
             dead_letters: if self.mode == DeadLetterMode::Collection {
@@ -263,25 +287,38 @@ impl ProcessorMonitor {
             dead_letter_mode: self.mode.as_str().to_string(),
             replaying,
             operation_id: st.operation.clone().unwrap_or_default(),
+            event_store: self.event_store.clone(),
+            capabilities: self.capabilities.clone(),
         }
     }
 
-    /// A rebalance assigned `partitions` (an empty assignment counts).
-    pub fn assigned(&self, partitions: &[i32]) {
+    /// Whether `at` (a position of a segment, `None` unknown) is at or past `until`.
+    fn passed(&self, at: Option<&str>, until: &str) -> bool {
+        at.is_some_and(|at| (self.compare)(at, until) != Order::Less)
+    }
+
+    /// The subscription was assigned `segments` (an empty assignment counts).
+    pub fn assigned(&self, segments: &[String]) {
         let mut st = self.state.lock().unwrap();
-        for &p in partitions {
-            st.partitions.insert(p, Offsets::default());
+        for s in segments {
+            st.segments.insert(
+                s.clone(),
+                SegmentStatus {
+                    segment: s.clone(),
+                    ..SegmentStatus::default()
+                },
+            );
         }
         st.assigned_once = true;
         st.rebalancing = false;
         st.generation += 1;
     }
 
-    /// A rebalance revoked `partitions`: STARTING until the next assignment.
-    pub fn revoked(&self, partitions: &[i32]) {
+    /// The subscription lost `segments`: STARTING until the next assignment.
+    pub fn revoked(&self, segments: &[String]) {
         let mut st = self.state.lock().unwrap();
-        for p in partitions {
-            st.partitions.remove(p);
+        for s in segments {
+            st.segments.remove(s);
         }
         st.rebalancing = true;
     }
@@ -291,25 +328,27 @@ impl ProcessorMonitor {
         self.state.lock().unwrap().generation
     }
 
-    /// The partitions assigned now, sorted.
-    pub fn assigned_partitions(&self) -> Vec<i32> {
-        self.state
-            .lock()
-            .unwrap()
-            .partitions
-            .keys()
-            .copied()
-            .collect()
+    /// The segments assigned now, in [`segment_order`].
+    pub fn assigned_segments(&self) -> Vec<String> {
+        sorted(self.state.lock().unwrap().segments.keys())
     }
 
-    /// The record at `offset` of `partition` was acknowledged; `processed` counts it in
-    /// `processed_total` (its stage 1 completed).
-    pub fn acknowledged(&self, partition: i32, offset: i64, processed: bool) {
+    /// A record was acknowledged; `processed` counts it in `processed_total` (its stage 1
+    /// completed).
+    pub fn acknowledged(&self, processed: bool) {
         if processed {
             self.processed.fetch_add(1, Ordering::Relaxed);
         }
-        if let Some(o) = self.state.lock().unwrap().partitions.get_mut(&partition) {
-            o.position = offset.saturating_add(1);
+    }
+
+    /// What the subscription reports of its segments (positions and lag); a segment not
+    /// assigned is ignored.
+    pub fn segments(&self, statuses: Vec<SegmentStatus>) {
+        let mut st = self.state.lock().unwrap();
+        for status in statuses {
+            if let Some(known) = st.segments.get_mut(&status.segment) {
+                *known = status;
+            }
         }
     }
 
@@ -319,21 +358,12 @@ impl ProcessorMonitor {
         self.error(message);
     }
 
-    /// The consumer (or parking) reported an error: FAILING, `last_error`.
+    /// The subscription (or parking) reported an error: FAILING, `last_error`.
     pub fn error(&self, message: &str) {
         let at_ms = chrono::Utc::now().timestamp_millis();
         let mut st = self.state.lock().unwrap();
         st.last_error = Some((cut_bytes(message, MAX_LAST_ERROR_BYTES), at_ms));
         st.failing_since = Some(Instant::now());
-    }
-
-    /// The committed offsets and high watermarks read off the consumer thread (-1 unknown); a
-    /// partition no longer assigned is ignored.
-    pub fn offsets(&self, partition: i32, committed: i64, high_watermark: i64) {
-        if let Some(o) = self.state.lock().unwrap().partitions.get_mut(&partition) {
-            o.committed = committed.max(-1);
-            o.high_watermark = high_watermark.max(-1);
-        }
     }
 
     /// The sampled `countDocuments({processor})` of `dead_letters`.
@@ -350,11 +380,11 @@ impl ProcessorMonitor {
         self.sample.notified().await
     }
 
-    /// The processor is stopping or stopped; its partitions are forgotten.
+    /// The processor is stopping or stopped; its segments are forgotten.
     pub fn stopped(&self) {
         let mut st = self.state.lock().unwrap();
         st.stopped = true;
-        st.partitions.clear();
+        st.segments.clear();
     }
 
     /// Its consumer starts (again): STARTING until the first assignment.
@@ -363,7 +393,7 @@ impl ProcessorMonitor {
         st.stopped = false;
         st.assigned_once = false;
         st.rebalancing = false;
-        st.partitions.clear();
+        st.segments.clear();
     }
 
     /// The control document pauses it (PAUSED while its consumer runs) or not.
@@ -376,18 +406,31 @@ impl ProcessorMonitor {
         self.state.lock().unwrap().operation = operation.map(str::to_string);
     }
 
-    /// The open replay ranges of its topic: partition → `until`.
-    pub fn set_replay(&self, ranges: BTreeMap<i32, i64>) {
+    /// The open replay ranges of its source: segment → `until`.
+    pub fn set_replay(&self, ranges: HashMap<String, String>) {
         self.state.lock().unwrap().replay = ranges;
     }
 
-    /// How far this instance is on an assigned `partition`: the higher of the next offset after
-    /// the last record it acknowledged and the group's committed offset (`None` unknown).
-    pub fn progress(&self, partition: i32) -> Option<i64> {
+    /// Whether this instance is at or past `until` on the assigned `segment`: the subscription's
+    /// committed position (its position while nothing is committed) is (`false` unknown).
+    pub fn passed_on(&self, segment: &str, until: &str) -> bool {
         let st = self.state.lock().unwrap();
-        let o = st.partitions.get(&partition)?;
-        Some(o.position.max(o.committed)).filter(|&at| at >= 0)
+        st.segments
+            .get(segment)
+            .is_some_and(|o| self.passed(progress(o), until))
     }
+}
+
+/// How far a segment is: its committed position, else its position.
+fn progress(o: &SegmentStatus) -> Option<&str> {
+    o.committed.as_deref().or(o.position.as_deref())
+}
+
+/// `names` in [`segment_order`].
+fn sorted<'a>(names: impl Iterator<Item = &'a String>) -> Vec<String> {
+    let mut all: Vec<String> = names.cloned().collect();
+    all.sort_by(|a, b| segment_order(a, b));
+    all
 }
 
 /// `text` cut to at most `max` bytes at a UTF-8 boundary.
@@ -402,38 +445,103 @@ pub(crate) fn cut_bytes(text: &str, max: usize) -> String {
     text[..end].to_string()
 }
 
-/// `high_watermark - committed` (with no commit: `high_watermark - position`); -1 unknown; never
-/// negative.
-fn lag(o: &Offsets) -> i64 {
-    if o.high_watermark < 0 {
-        return -1;
-    }
-    let base = if o.committed >= 0 {
-        o.committed
-    } else if o.position >= 0 {
-        o.position
-    } else {
-        return -1;
-    };
-    (o.high_watermark - base).max(0)
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use futures::future::BoxFuture;
+
     use super::*;
+    use crate::event_store::{
+        Capability, EventStoreError, OutgoingEvent, Subscription, SubscriptionAdmin,
+    };
+
+    /// An event store with decimal positions that is never reached: what a monitor reads of one.
+    pub(crate) struct Decimal(pub Vec<Capability>);
+
+    impl EventStore for Decimal {
+        fn name(&self) -> &'static str {
+            "decimal"
+        }
+        fn capabilities(&self) -> &[Capability] {
+            &self.0
+        }
+        fn publish<'a>(
+            &'a self,
+            _: &'a OutgoingEvent,
+        ) -> BoxFuture<'a, Result<(), EventStoreError>> {
+            unreachable!()
+        }
+        fn subscribe(
+            &self,
+            _: SubscriptionSpec,
+        ) -> BoxFuture<'_, Result<Box<dyn Subscription>, EventStoreError>> {
+            unreachable!()
+        }
+        fn admin(
+            &self,
+            _: &SubscriptionSpec,
+        ) -> Result<Box<dyn SubscriptionAdmin>, EventStoreError> {
+            unreachable!()
+        }
+        fn compare(&self, a: &str, b: &str) -> Order {
+            a.parse::<i64>().unwrap().cmp(&b.parse::<i64>().unwrap())
+        }
+    }
+
+    pub(crate) fn decimal() -> Arc<dyn EventStore> {
+        Arc::new(Decimal(Capability::ALL.to_vec()))
+    }
+
+    fn spec() -> SubscriptionSpec {
+        SubscriptionSpec {
+            name: "svc.orders".into(),
+            source: "kraken.events".into(),
+        }
+    }
 
     fn monitor() -> ProcessorMonitor {
         ProcessorMonitor::new(
             "orders",
-            "svc.orders",
-            "kraken.events",
+            &spec(),
+            &decimal(),
             DeadLetterMode::Collection,
             vec!["t.B".into(), "t.A".into(), "t.B".into()],
         )
     }
 
+    fn names(all: &[&str]) -> Vec<String> {
+        all.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// What the subscription reports of `segment`: committed, position and head (-1 unknown),
+    /// the lag from them as a store with `lag` would.
+    fn seg(segment: &str, position: i64, committed: i64, head: i64) -> SegmentStatus {
+        let known = |n: i64| (n >= 0).then(|| n.to_string());
+        let base = if committed >= 0 { committed } else { position };
+        SegmentStatus {
+            segment: segment.into(),
+            position: known(position),
+            committed: known(committed),
+            head: known(head),
+            lag: (head >= 0 && base >= 0).then(|| (head - base).max(0) as u64),
+        }
+    }
+
     fn state(m: &ProcessorMonitor, now: Instant) -> ProcessorState {
         ProcessorState::try_from(m.status_at(now).state).unwrap()
+    }
+
+    /// An instance that loses every segment is running, idle, once the revocation is closed
+    /// by an empty assignment (the event-store contract), not starting.
+    #[test]
+    fn an_instance_left_without_segments_is_running_after_the_empty_assignment() {
+        let m = monitor();
+        let t0 = Instant::now();
+        m.assigned(&names(&["0", "1"]));
+        m.revoked(&names(&["0", "1"]));
+        assert_eq!(state(&m, t0), ProcessorState::ProcessorStarting);
+        m.assigned(&[]);
+        assert_eq!(state(&m, t0), ProcessorState::ProcessorRunning);
+        assert!(m.status_at(t0).segments.is_empty());
     }
 
     #[test]
@@ -459,45 +567,42 @@ mod tests {
             "every state, the others at 0"
         );
 
-        m.assigned(&[0, 1]);
-        m.offsets(0, 5, 12);
+        m.assigned(&names(&["0", "1"]));
+        m.segments(vec![seg("0", -1, 5, 12)]);
         m.set_dead_letters(3);
         assert_eq!(state_of(&t), ["running"]);
         assert_eq!(
-            t.value(
-                PROCESSOR_LAG,
-                &[("processor", "orders"), ("partition", "0")]
-            ),
+            t.value(PROCESSOR_LAG, &[("processor", "orders"), ("segment", "0")]),
             Some(7.0)
         );
         assert_eq!(
             t.points_of(PROCESSOR_LAG).len(),
             1,
-            "partition 1's lag is not known yet"
+            "segment 1's lag is not known yet"
         );
         assert_eq!(t.value(DEAD_LETTERS, &[("processor", "orders")]), Some(3.0));
 
         // Prometheus keeps a series that stops at its last value (no staleness over OTLP): a
-        // revoked partition reads 0 once, then is gone; its new owner reports it from then on.
-        m.revoked(&[0]);
+        // revoked segment reads 0 once, then is gone; its new owner reports it from then on.
+        m.revoked(&names(&["0"]));
         let lag = |t: &TestMeter| {
             let mut lag: Vec<(String, f64)> = t
                 .points_of(PROCESSOR_LAG)
                 .into_iter()
-                .map(|p| (p.attributes["partition"].clone(), p.value))
+                .map(|p| (p.attributes["segment"].clone(), p.value))
                 .collect();
             lag.sort_by(|a, b| a.0.cmp(&b.0));
             lag
         };
         assert_eq!(lag(&t), [("0".to_string(), 0.0)], "revoked: 0 once");
         assert_eq!(lag(&t), [], "then no longer reported");
-        // Partition 1 is still assigned, its lag unknown: absent, not 0 (0 means caught up).
-        assert_eq!(m.assigned_partitions(), [1]);
+        // Segment 1 is still assigned, its lag unknown: absent, not 0 (0 means caught up).
+        assert_eq!(m.assigned_segments(), ["1"]);
         drop(m);
         assert_eq!(
             lag(&t),
             [("1".to_string(), 0.0)],
-            "a dropped monitor's partitions read 0 once"
+            "a dropped monitor's segments read 0 once"
         );
         assert!(
             t.points_of(PROCESSOR_STATE).is_empty(),
@@ -507,11 +612,16 @@ mod tests {
     }
 
     #[test]
-    fn identity_fields_and_sorted_event_types() {
+    fn identity_fields_event_store_capabilities_and_sorted_event_types() {
         let s = monitor().status();
         assert_eq!(s.name, "orders");
-        assert_eq!(s.group_id, "svc.orders");
-        assert_eq!(s.topic, "kraken.events");
+        assert_eq!(s.subscription, "svc.orders");
+        assert_eq!(s.source, "kraken.events");
+        assert_eq!(s.event_store, "decimal");
+        assert_eq!(
+            s.capabilities,
+            ["browse", "lag", "native-dead-letter", "replay"]
+        );
         assert_eq!(s.event_types, ["t.A", "t.B"]);
         assert_eq!(s.dead_letter_mode, "collection");
         assert_eq!(
@@ -519,7 +629,7 @@ mod tests {
             (0, 0, 0)
         );
         assert_eq!((s.last_error.as_str(), s.last_error_at_ms), ("", 0));
-        assert!(s.partitions.is_empty());
+        assert!(s.segments.is_empty());
     }
 
     #[test]
@@ -543,7 +653,7 @@ mod tests {
             ProcessorState::ProcessorStarting,
             "rebalancing"
         );
-        m.assigned(&[1, 0]);
+        m.assigned(&names(&["1", "0"]));
         assert_eq!(state(&m, t0), ProcessorState::ProcessorRunning);
         let g = m.generation();
         m.exhausted("handler failed: boom");
@@ -554,13 +664,13 @@ mod tests {
             ProcessorState::ProcessorRunning,
             "60 s later"
         );
-        m.revoked(&[0, 1]);
+        m.revoked(&names(&["0", "1"]));
         assert_eq!(
             state(&m, failed_at),
             ProcessorState::ProcessorFailing,
             "failing wins"
         );
-        m.assigned(&[0]);
+        m.assigned(&names(&["0"]));
         assert!(m.generation() > g);
         m.error("all brokers down");
         let s = m.status_at(Instant::now());
@@ -593,96 +703,120 @@ mod tests {
         assert_eq!(m.status().operation_id, "");
     }
 
-    #[test]
-    fn replay_ranges_of_the_assigned_partitions_and_progress() {
-        let m = monitor();
-        m.assigned(&[0, 1]);
-        m.set_replay(BTreeMap::from([(1, 40), (5, 9)]));
-        let s = m.status();
-        assert!(s.replaying);
-        assert_eq!(
-            s.partitions
-                .iter()
-                .map(|p| (p.partition, p.replay_until))
-                .collect::<Vec<_>>(),
-            [(0, 0), (1, 40)]
-        );
-        m.set_replay(BTreeMap::from([(5, 9)]));
-        assert!(!m.status().replaying, "not one of its partitions");
-        assert_eq!(m.progress(1), None);
-        m.acknowledged(1, 9, true);
-        assert_eq!(m.progress(1), Some(10));
-        m.offsets(1, 30, 40);
-        assert_eq!(m.progress(1), Some(30));
-        assert_eq!(m.progress(7), None);
+    fn replay(all: &[(&str, &str)]) -> HashMap<String, String> {
+        all.iter()
+            .map(|(s, u)| (s.to_string(), u.to_string()))
+            .collect()
     }
 
     #[test]
-    fn a_partition_stops_replaying_as_soon_as_its_position_passes_the_range() {
+    fn replay_ranges_of_the_assigned_segments_and_progress() {
         let m = monitor();
-        m.assigned(&[1, 2]);
-        m.set_replay(BTreeMap::from([(1, 40), (2, 10)]));
+        m.assigned(&names(&["0", "1"]));
+        m.set_replay(replay(&[("1", "40"), ("5", "9")]));
+        let s = m.status();
+        assert!(s.replaying);
+        assert_eq!(
+            s.segments
+                .iter()
+                .map(|p| (p.segment.as_str(), p.replay_until.as_str()))
+                .collect::<Vec<_>>(),
+            [("0", ""), ("1", "40")]
+        );
+        m.set_replay(replay(&[("5", "9")]));
+        assert!(!m.status().replaying, "not one of its segments");
+        assert!(!m.passed_on("1", "10"), "nothing known");
+        m.segments(vec![seg("1", 10, -1, 40)]);
+        assert!(
+            m.passed_on("1", "10"),
+            "the position while nothing is committed"
+        );
+        m.segments(vec![seg("1", 31, 30, 40)]);
+        assert!(
+            m.passed_on("1", "30") && !m.passed_on("1", "31"),
+            "the committed one"
+        );
+        assert!(!m.passed_on("7", "0"), "not assigned");
+    }
+
+    #[test]
+    fn a_segment_stops_replaying_as_soon_as_its_committed_position_passes_the_range() {
+        let m = monitor();
+        m.assigned(&names(&["1", "2"]));
+        m.set_replay(replay(&[("1", "40"), ("2", "9")]));
         let until = |m: &ProcessorMonitor| {
             m.status()
-                .partitions
+                .segments
                 .iter()
-                .map(|p| (p.partition, p.replay_until))
+                .map(|p| (p.segment.clone(), p.replay_until.clone()))
                 .collect::<Vec<_>>()
         };
-        m.acknowledged(1, 38, true);
+        m.segments(vec![seg("1", 39, 39, 50)]);
         assert!(m.status().replaying);
-        assert_eq!(until(&m), [(1, 40), (2, 10)]);
+        assert_eq!(
+            until(&m),
+            [("1".into(), "40".into()), ("2".into(), "9".into())]
+        );
 
         // The last record of the range is acknowledged: not replaying from now on, without
         // waiting for the poll to remove the range from the document.
-        m.acknowledged(1, 39, true);
-        assert_eq!(until(&m), [(1, 0), (2, 10)]);
-        assert!(m.status().replaying, "partition 2 still replays");
-        // The group's committed offset (another instance consumed it before a rebalance).
-        m.offsets(2, 10, 50);
-        assert_eq!(until(&m), [(1, 0), (2, 0)]);
+        m.segments(vec![seg("1", 40, 40, 50)]);
+        assert_eq!(
+            until(&m),
+            [("1".into(), "".into()), ("2".into(), "9".into())]
+        );
+        assert!(m.status().replaying, "segment 2 still replays");
+        // Compared by the event store's order, not as text ("10" < "9" as text).
+        m.segments(vec![seg("2", -1, 10, 50)]);
+        assert_eq!(
+            until(&m),
+            [("1".into(), "".into()), ("2".into(), "".into())]
+        );
         assert!(!m.status().replaying);
     }
 
     #[test]
-    fn partitions_positions_offsets_and_lag() {
+    fn segments_in_segment_order_with_positions_and_lag() {
         let m = monitor();
-        m.assigned(&[2, 0, 1]);
-        assert_eq!(m.assigned_partitions(), [0, 1, 2]);
-        // 0: nothing known; 1: processed and committed known; 2: no commit yet, position known.
-        m.acknowledged(1, 9, true);
-        m.offsets(1, 8, 20);
-        m.acknowledged(2, 4, false);
-        m.offsets(2, -1, 15);
-        m.offsets(7, 1, 2); // not assigned: ignored
+        m.assigned(&names(&["10", "2", "0", "1"]));
+        assert_eq!(m.assigned_segments(), ["0", "1", "2", "10"]);
+        m.segments(vec![
+            seg("1", 10, 8, 20),
+            seg("2", 5, -1, 15),
+            seg("7", 1, 1, 2), // not assigned: ignored
+        ]);
         let s = m.status();
-        let p: Vec<(i32, i64, i64, i64, i64)> = s
-            .partitions
+        let p: Vec<(&str, &str, &str, &str, i64)> = s
+            .segments
             .iter()
             .map(|p| {
                 (
-                    p.partition,
-                    p.position,
-                    p.committed,
-                    p.high_watermark,
+                    p.segment.as_str(),
+                    p.position.as_str(),
+                    p.committed.as_str(),
+                    p.head.as_str(),
                     p.lag,
                 )
             })
             .collect();
         assert_eq!(
             p,
-            [(0, -1, -1, -1, -1), (1, 10, 8, 20, 12), (2, 5, -1, 15, 10)]
+            [
+                ("0", "", "", "", -1),
+                ("1", "10", "8", "20", 12),
+                ("2", "5", "", "15", 10),
+                ("10", "", "", "", -1)
+            ]
         );
-        assert_eq!(s.processed_total, 1);
-        // A committed offset above the (older) watermark never gives a negative lag.
-        m.offsets(1, 25, 20);
-        assert_eq!(m.status().partitions[1].lag, 0);
-        m.revoked(&[1]);
-        assert_eq!(m.assigned_partitions(), [0, 2]);
-        m.assigned(&[1]);
+        m.acknowledged(true);
+        m.acknowledged(false);
+        assert_eq!(m.status().processed_total, 1);
+        m.revoked(&names(&["1"]));
+        assert_eq!(m.assigned_segments(), ["0", "2", "10"]);
+        m.assigned(&names(&["1"]));
         assert_eq!(
-            m.status().partitions[1].position,
-            -1,
+            m.status().segments[1].position,
+            "",
             "fresh after a reassignment"
         );
     }
@@ -702,11 +836,17 @@ mod tests {
 
     #[test]
     fn dead_letters_count_and_mode() {
-        let m = ProcessorMonitor::new("default", "svc", "t", DeadLetterMode::Topic, vec![]);
+        let m = ProcessorMonitor::new(
+            "default",
+            &spec(),
+            &decimal(),
+            DeadLetterMode::EventStore,
+            vec![],
+        );
         m.set_dead_letters(3);
         let s = m.status();
         assert_eq!(s.dead_letters, 0, "0 unless mode collection");
-        assert_eq!(s.dead_letter_mode, "topic");
+        assert_eq!(s.dead_letter_mode, "event-store");
         let m = monitor();
         m.set_dead_letters(3);
         assert_eq!(m.status().dead_letters, 3);

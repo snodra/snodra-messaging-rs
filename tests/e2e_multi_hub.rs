@@ -12,9 +12,7 @@ use std::time::{Duration, Instant};
 use kraken_messaging::hub::SendOptions;
 use kraken_messaging::{Command, Config, KrakenMessaging, MessagingError, message_type};
 use serde::{Deserialize, Serialize};
-use support::containers::{
-    HubContainer, HubOptions, free_port, hub_with, mongo, wait_until_reachable,
-};
+use support::containers::{HubContainer, HubOptions, free_port, hub_with, wait_until_reachable};
 
 macro_rules! require_docker {
     () => {
@@ -50,8 +48,8 @@ async fn two_hubs() -> (HubContainer, HubContainer) {
     tokio::join!(start(IDS[0]), start(IDS[1]))
 }
 
-fn config(service: &str, hubs: &str, mongo: &str) -> Config {
-    let mut c = Config::new(service, hubs, "127.0.0.1:1", mongo);
+fn config(service: &str, hubs: &str) -> Config {
+    let mut c = Config::new(service, hubs);
     c.outbox_enabled = false;
     c.consumer_enabled = false;
     c.reconnect_backoff_min = Duration::from_millis(100);
@@ -133,10 +131,10 @@ async fn traffic(hub: &HubContainer, type_name: &str) -> u64 {
 #[tokio::test]
 async fn both_hubs_list_the_instance_with_both_ids_and_share_unkeyed_requests() {
     require_docker!();
-    let ((h1, h2), db) = tokio::join!(two_hubs(), mongo());
+    let (h1, h2) = two_hubs().await;
     let hubs = format!("{},{}", h1.address, h2.address);
-    let b = worker(config("e2e-b", &hubs, &db.uri_for("b"))).await;
-    let a = caller(config("e2e-a", &hubs, &db.uri_for("a"))).await;
+    let b = worker(config("e2e-b", &hubs)).await;
+    let a = caller(config("e2e-a", &hubs)).await;
     assert!(b.await_all_hubs(Duration::from_secs(15)).await);
     registered_on(&b, &IDS, Duration::from_secs(15)).await;
     let registered = Instant::now();
@@ -200,10 +198,10 @@ async fn both_hubs_list_the_instance_with_both_ids_and_share_unkeyed_requests() 
 async fn a_hub_stopped_mid_traffic_fails_over_and_is_rejoined_after_its_restart() {
     require_docker!();
     support::init_tracing();
-    let ((h1, h2), db) = tokio::join!(two_hubs(), mongo());
+    let (h1, h2) = two_hubs().await;
     let hubs = format!("{},{}", h1.address, h2.address);
-    let b = worker(config("e2e-b", &hubs, &db.uri_for("b"))).await;
-    let a = Arc::new(caller(config("e2e-a", &hubs, &db.uri_for("a"))).await);
+    let b = worker(config("e2e-b", &hubs)).await;
+    let a = Arc::new(caller(config("e2e-a", &hubs)).await);
     registered_on(&b, &IDS, Duration::from_secs(15)).await;
     registered_on(&a, &IDS, Duration::from_secs(15)).await;
 
@@ -343,9 +341,9 @@ async fn permits_reach(hub: &HubContainer, service: &str, want: u64, limit: Dura
 #[tokio::test]
 async fn a_stopped_hubs_permits_move_to_the_other_and_are_not_revoked_on_its_return() {
     require_docker!();
-    let ((h1, h2), db) = tokio::join!(two_hubs(), mongo());
+    let (h1, h2) = two_hubs().await;
     let hubs = format!("{},{}", h1.address, h2.address);
-    let b = worker(config("e2e-b", &hubs, &db.uri_for("b"))).await;
+    let b = worker(config("e2e-b", &hubs)).await;
     registered_on(&b, &IDS, Duration::from_secs(15)).await;
     for hub in [&h1, &h2] {
         permits_reach(hub, "e2e-b", 4, Duration::from_secs(10)).await;
@@ -383,18 +381,16 @@ async fn a_stopped_hubs_permits_move_to_the_other_and_are_not_revoked_on_its_ret
 #[tokio::test]
 async fn one_hub_reached_through_two_targets_keeps_the_instance_registered() {
     require_docker!();
-    let (h, db) = tokio::join!(
-        hub_with(
-            HubOptions::new()
-                .port(free_port())
-                .env("KRAKEN_HUB_ID", "e2e-solo"),
-        ),
-        mongo()
-    );
+    let h = hub_with(
+        HubOptions::new()
+            .port(free_port())
+            .env("KRAKEN_HUB_ID", "e2e-solo"),
+    )
+    .await;
     let port = h.address.rsplit_once(':').unwrap().1;
     let twice = format!("127.0.0.1:{port},localhost:{port}");
-    let b = worker(config("e2e-b", &twice, &db.uri_for("b"))).await;
-    let a = caller(config("e2e-a", &h.address, &db.uri_for("a"))).await;
+    let b = worker(config("e2e-b", &twice)).await;
+    let a = caller(config("e2e-a", &h.address)).await;
     registered_on(&b, &["e2e-solo"], Duration::from_secs(15)).await;
     registered_on(&a, &["e2e-solo"], Duration::from_secs(15)).await;
     // Both targets have registered by now; at most one eviction happened at start.

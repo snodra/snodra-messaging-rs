@@ -1,15 +1,17 @@
 //! The saga dispatch relay: sends what sagas recorded in `saga_dispatch` after their transactions
 //! committed, in order per saga (ADR 0021 rulings 7-11, 28-31, 34).
 //!
-//! A poll finds the sagas whose first pending entry (lowest `seq` neither dispatched nor failed)
-//! is due, oldest work first (ruling 31), claims each one with a lease (`saga_dispatch_leases`, so
-//! two service instances never dispatch one saga's entries at once) and works through its entries
+//! The saga-side outbox lives in the message store, behind [`SagaDispatchStore`]. A poll finds the
+//! sagas whose first pending entry (lowest `seq` neither dispatched nor failed) is due, oldest
+//! work first (ruling 31), claims each one with a lease (so two service instances never dispatch
+//! one saga's entries at once) and works through its entries
 //! in `seq` order; different sagas go in parallel. An ended saga's entries are dispatched like any.
 //!
 //! - An EVENT entry is inserted into the outbox and marked dispatched **in one transaction**:
-//!   exactly once. One whose payload cannot become an outbox document (not a JSON object, a
-//!   number BSON cannot hold) fails for good (`failedAt`, `INVALID`, logged at error) and the
-//!   saga's later entries continue (ruling 69).
+//!   exactly once. [`SagaDispatchStore::record`] already refuses an entry the outbox would refuse,
+//!   so one whose payload cannot become an outbox entry (not a JSON object, or one the store cannot
+//!   hold) can only be an entry recorded before that contract: as a backstop, it fails for good
+//!   (`failed_at`, `INVALID`, logged at error) and the saga's later entries continue (ruling 69).
 //! - A COMMAND entry is sent as raw bytes by wire type name ([`RawCommandSender`]; the sender owns
 //!   the no-retry rule, ruling 29) with the headers `idempotency-key` = `<sagaId>:<seq>` (the
 //!   entry's id) and `saga-id`, the entry's routing key and the correlation id of the message that
@@ -43,10 +45,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use futures::TryStreamExt;
-use mongodb::bson::{DateTime, Document, doc};
-use mongodb::options::ReturnDocument;
-use mongodb::{Client, Collection, Database};
 use tokio::sync::Semaphore;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -55,18 +53,18 @@ use tokio_util::task::TaskTracker;
 use super::clock::Clock;
 use super::failed::{FailureReason, SagaCommandFailed};
 use super::metrics::SagaMetrics;
-use super::ports::is_duplicate_key;
+use super::ports::{DispatchFailure, SagaDispatchStore};
 use super::raw::{RawCommandSender, RawOutcome};
-use super::runtime::DISPATCH_CORRELATION_HEADER;
-use super::store::{
-    DispatchKind, SAGA_DISPATCH_COLLECTION, SAGA_DISPATCH_LEASES_COLLECTION, SagaDispatchDocument,
-    SagaDispatchLeaseDocument,
-};
-use crate::context::{CURRENT, MessageContext};
+use super::runtime::{DISPATCH_CORRELATION_HEADER, DISPATCH_TRACEPARENT_HEADER};
+use super::store::{DispatchKind, SagaDispatchDocument};
+use crate::context::{CURRENT, MessageContext, valid_traceparent};
 use crate::error::MessagingError;
+use crate::event_store::headers;
+use crate::events::{EventBus, LocalEventDispatcher, dispatch::Outcome};
 use crate::hub::SendOptions;
-use crate::kafka::{EventBus, LocalEventDispatcher, dispatch::Outcome};
 use crate::retry::RetryPolicy;
+use crate::store::TxProvider;
+use crate::time::{after, rfc3339};
 use crate::types::MessageType;
 
 const STOP_JOIN: Duration = Duration::from_secs(15);
@@ -134,8 +132,8 @@ impl RelaySettings {
 
 /// See the module docs.
 pub struct SagaDispatchRelay {
-    client: Client,
-    db: Database,
+    tx: Arc<dyn TxProvider>,
+    queue: Arc<dyn SagaDispatchStore>,
     commands: Arc<dyn RawCommandSender>,
     events: EventBus,
     local: Arc<LocalEventDispatcher>,
@@ -153,9 +151,11 @@ pub struct SagaDispatchRelay {
 
 impl SagaDispatchRelay {
     #[allow(clippy::too_many_arguments)]
+    /// The relay of `queue`, appending events to the outbox of `events` in `tx`'s transactions
+    /// (one store's).
     pub fn new(
-        client: Client,
-        db: Database,
+        tx: Arc<dyn TxProvider>,
+        queue: Arc<dyn SagaDispatchStore>,
         commands: Arc<dyn RawCommandSender>,
         events: EventBus,
         local: Arc<LocalEventDispatcher>,
@@ -165,8 +165,8 @@ impl SagaDispatchRelay {
     ) -> Result<Arc<SagaDispatchRelay>, MessagingError> {
         settings.validate()?;
         Ok(Arc::new(SagaDispatchRelay {
-            client,
-            db,
+            tx,
+            queue,
             commands,
             events,
             local,
@@ -206,16 +206,8 @@ impl SagaDispatchRelay {
         Ok(())
     }
 
-    fn dispatch_collection(&self) -> Collection<SagaDispatchDocument> {
-        self.db.collection(SAGA_DISPATCH_COLLECTION)
-    }
-
-    fn leases(&self) -> Collection<SagaDispatchLeaseDocument> {
-        self.db.collection(SAGA_DISPATCH_LEASES_COLLECTION)
-    }
-
-    fn now(&self) -> DateTime {
-        self.clock.now_bson()
+    fn now(&self) -> i64 {
+        self.clock.now_ms()
     }
 
     /// One synchronous pass: hands the due failure notices and sagas to the workers
@@ -289,36 +281,14 @@ impl SagaDispatchRelay {
 
     /// The sagas whose first pending entry is due, oldest work first.
     async fn due_sagas(&self) -> Result<Vec<String>, MessagingError> {
-        let now = self.now();
-        let pipeline = vec![
-            doc! { "$match": {
-                "dispatchedAt": null,
-                "failedAt": null,
-                "sagaId": { "$nin": self.in_flight_sagas() },
-            } },
-            doc! { "$sort": { "sagaId": 1, "seq": 1 } },
-            doc! { "$group": {
-                "_id": "$sagaId",
-                "next": { "$first": "$nextAttemptAt" },
-                "since": { "$first": "$createdAt" },
-            } },
-            doc! { "$match": { "$or": [ { "next": null }, { "next": { "$lte": now } } ] } },
-            // Oldest work first: the first pending entry of each saga, by when it was recorded.
-            doc! { "$sort": { "since": 1, "_id": 1 } },
-            doc! { "$limit": self.settings.batch_size as i64 },
-        ];
-        let docs: Vec<Document> = self
-            .db
-            .collection::<Document>(SAGA_DISPATCH_COLLECTION)
-            .aggregate(pipeline)
-            .allow_disk_use(true)
-            .await?
-            .try_collect()
-            .await?;
-        Ok(docs
-            .into_iter()
-            .filter_map(|d| d.get_str("_id").ok().map(str::to_string))
-            .collect())
+        Ok(self
+            .queue
+            .due_sagas(
+                self.now(),
+                &self.in_flight_sagas(),
+                self.settings.batch_size,
+            )
+            .await?)
     }
 
     /// Works through one saga's entries while this relay holds its lease; the number of entries
@@ -335,10 +305,13 @@ impl SagaDispatchRelay {
         let mut dealt = 0;
         let outcome: Result<(), MessagingError> = async {
             while !self.stopping.is_cancelled() {
-                let Some(entry) = self.first_pending(saga_id).await? else {
+                let Some(entry) = self.next_pending(saga_id).await? else {
                     break;
                 };
-                if entry.next_attempt_at.is_some_and(|next| next > self.now()) {
+                if entry
+                    .next_attempt_at_ms
+                    .is_some_and(|next| next > self.now())
+                {
                     break;
                 }
                 if !self.renew(saga_id).await? {
@@ -371,64 +344,89 @@ impl SagaDispatchRelay {
         }
     }
 
-    /// The outbox insert and the mark, in one transaction.
+    /// The outbox append and the mark, in one transaction.
     async fn publish_event(&self, entry: &SagaDispatchDocument) -> Result<(), MessagingError> {
         let correlation = entry
             .headers
             .get(DISPATCH_CORRELATION_HEADER)
             .cloned()
             .unwrap_or_else(|| entry.id.clone());
-        let outbox = match self.events.raw_document(
+        let outbox = match self.events.raw_entry(
             &entry.type_name,
             entry.routing_key.as_deref(),
             &entry.payload,
             &correlation,
         ) {
-            Ok(outbox) => outbox,
-            // The payload can never become an outbox document: retrying would hold back the
-            // saga's later entries forever, so the entry fails for good (ruling 69).
+            // Published in the trace of the event that caused it.
+            Ok(mut outbox) => {
+                if let Some(tp) = entry
+                    .headers
+                    .get(DISPATCH_TRACEPARENT_HEADER)
+                    .and_then(|tp| valid_traceparent(tp))
+                {
+                    outbox
+                        .headers
+                        .insert(headers::TRACEPARENT.to_string(), tp.to_string());
+                }
+                outbox
+            }
+            // The payload can never become an outbox entry: retrying would hold back the saga's
+            // later entries forever, so the entry fails for good (ruling 69).
             Err(e) => return self.fail_event(entry, &e.to_string()).await,
         };
-        let mut session = self.client.start_session().await?;
-        session.start_transaction().await?;
+        let mut tx = self.tx.begin().await?;
+        // A backstop for an entry recorded before `record` refused what the outbox refuses: what
+        // the store refuses now can never be published either.
+        let refused = match self.events.publish_raw_in(outbox, &mut tx).await {
+            Err(MessagingError::InvalidMessage(why)) => Some(why),
+            Err(e) => {
+                self.tx.abort(&mut tx).await;
+                return Err(e);
+            }
+            Ok(()) => None,
+        };
+        if let Some(why) = refused {
+            self.tx.abort(&mut tx).await;
+            return self.fail_event(entry, &why).await;
+        }
         let result: Result<(), MessagingError> = async {
-            self.events.publish_raw_in(outbox, &mut session).await?;
             self.check_mark_injection()?;
-            self.dispatch_collection()
-                .update_one(
-                    doc! { "_id": &entry.id },
-                    doc! { "$set": { "dispatchedAt": self.now() } },
-                )
-                .session(&mut session)
+            self.queue
+                .mark_dispatched(&mut tx, &entry.id, self.now())
                 .await?;
-            session.commit_transaction().await?;
+            self.tx.commit(&mut tx).await?;
             Ok(())
         }
         .await;
         if result.is_err() {
-            let _ = session.abort_transaction().await;
+            self.tx.abort(&mut tx).await;
         }
         result
     }
 
-    /// Gives up an EVENT entry whose payload cannot become an outbox document: `failedAt`, the
-    /// reason `INVALID` and the message, logged at error. No failure notice: `SagaCommandFailed`
+    /// Gives up an EVENT entry whose payload cannot become an outbox entry: `failed_at`, the
+    /// reason `INVALID` and the message, logged at error and counted on
+    /// `kraken.saga.command.failures{reason=INVALID}`. No failure notice: `SagaCommandFailed`
     /// is about commands. The saga's later entries continue, as after a failed command (ruling 9).
     async fn fail_event(
         &self,
         entry: &SagaDispatchDocument,
         message: &str,
     ) -> Result<(), MessagingError> {
-        self.dispatch_collection()
-            .update_one(
-                doc! { "_id": &entry.id },
-                doc! { "$set": {
-                    "failedAt": self.now(),
-                    "failureReason": reason_name(FailureReason::Invalid),
-                    "failureMessage": message,
-                } },
+        self.queue
+            .mark_failed(
+                &entry.id,
+                &DispatchFailure {
+                    attempts: None,
+                    reason: FailureReason::Invalid,
+                    message: message.to_string(),
+                    failed_at_ms: self.now(),
+                    notice_at_ms: None,
+                },
             )
             .await?;
+        self.metrics
+            .command_failure_unhandled(&entry.type_name, FailureReason::Invalid);
         tracing::error!(
             "Saga {} event {} ({}) can never be published, it is given up: {message}",
             entry.saga_id,
@@ -449,11 +447,9 @@ impl SagaDispatchRelay {
 
     async fn mark_dispatched(&self, entry: &SagaDispatchDocument) -> Result<(), MessagingError> {
         self.check_mark_injection()?;
-        self.dispatch_collection()
-            .update_one(
-                doc! { "_id": &entry.id },
-                doc! { "$set": { "dispatchedAt": self.now() } },
-            )
+        let mut tx = self.tx.plain().await?;
+        self.queue
+            .mark_dispatched(&mut tx, &entry.id, self.now())
             .await?;
         Ok(())
     }
@@ -467,7 +463,10 @@ impl SagaDispatchRelay {
         let mut headers: HashMap<String, String> = entry
             .headers
             .iter()
-            .filter(|(k, _)| k.as_str() != DISPATCH_CORRELATION_HEADER)
+            .filter(|(k, _)| {
+                k.as_str() != DISPATCH_CORRELATION_HEADER
+                    && k.as_str() != DISPATCH_TRACEPARENT_HEADER
+            })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         headers.insert("idempotency-key".into(), entry.id.clone());
@@ -478,10 +477,17 @@ impl SagaDispatchRelay {
             headers,
             ..Default::default()
         };
-        // The correlation id of the message that caused the entry is the request's correlation;
+        // The correlation id of the message that caused the entry is the request's correlation,
+        // and its traceparent the request's trace (never a header of the send's own: reserved);
         // nothing else of a caller (no identity, no token) is in scope.
         let ctx = MessageContext {
             correlation_id: correlation,
+            headers: entry
+                .headers
+                .get(DISPATCH_TRACEPARENT_HEADER)
+                .and_then(|tp| valid_traceparent(tp))
+                .map(|tp| HashMap::from([(headers::TRACEPARENT.to_string(), tp.to_string())]))
+                .unwrap_or_default(),
             ..Default::default()
         };
         let send = CURRENT.scope(
@@ -506,7 +512,7 @@ impl SagaDispatchRelay {
                 self.mark_dispatched(entry).await?;
                 Ok(true)
             }
-            RawOutcome::Transient(message) => self.retry_later(entry, &message).await,
+            RawOutcome::Transient(message) => self.schedule_retry(entry, &message).await,
             RawOutcome::Permanent(reason, message) => {
                 self.fail(entry, reason, &message, entry.attempts).await?;
                 Ok(true)
@@ -516,7 +522,7 @@ impl SagaDispatchRelay {
 
     /// A transient failure: another attempt later, or `EXHAUSTED` when the limit is reached.
     /// False: the entry waits.
-    async fn retry_later(
+    async fn schedule_retry(
         &self,
         entry: &SagaDispatchDocument,
         error: &str,
@@ -538,17 +544,13 @@ impl SagaDispatchRelay {
                 .retry_policy()
                 .jittered_backoff(attempts as u32),
         );
-        self.dispatch_collection()
-            .update_one(
-                doc! { "_id": &entry.id },
-                doc! { "$set": { "attempts": attempts, "nextAttemptAt": next } },
-            )
-            .await?;
+        self.queue.schedule_retry(&entry.id, attempts, next).await?;
         tracing::warn!(
-            "Command {} ({}) failed attempt {attempts} of {}, next at {next}: {error}",
+            "Command {} ({}) failed attempt {attempts} of {}, next at {}: {error}",
             entry.id,
             entry.type_name,
-            self.settings.max_attempts
+            self.settings.max_attempts,
+            rfc3339(next)
         );
         Ok(false)
     }
@@ -566,18 +568,16 @@ impl SagaDispatchRelay {
     ) -> Result<(), MessagingError> {
         let now = self.now();
         let reason_text = reason_name(reason);
-        self.dispatch_collection()
-            .update_one(
-                doc! { "_id": &entry.id },
-                doc! { "$set": {
-                    "attempts": attempts,
-                    "failedAt": now,
-                    "failureReason": &reason_text,
-                    "failureMessage": message,
-                    "noticePending": true,
-                    "noticeAttempts": 0,
-                    "noticeNextAt": after(now, self.settings.lease),
-                } },
+        self.queue
+            .mark_failed(
+                &entry.id,
+                &DispatchFailure {
+                    attempts: Some(attempts),
+                    reason,
+                    message: message.to_string(),
+                    failed_at_ms: now,
+                    notice_at_ms: Some(after(now, self.settings.lease)),
+                },
             )
             .await?;
         tracing::warn!(
@@ -588,7 +588,7 @@ impl SagaDispatchRelay {
         );
         let mut failed = entry.clone();
         failed.attempts = attempts;
-        failed.failed_at = Some(now);
+        failed.failed_at_ms = Some(now);
         failed.failure_reason = Some(reason);
         failed.failure_message = Some(message.to_string());
         failed.notice_pending = Some(true);
@@ -606,16 +606,8 @@ impl SagaDispatchRelay {
         while claimed.len() < self.settings.batch_size && !self.stopping.is_cancelled() {
             let now = self.now();
             let entry = self
-                .dispatch_collection()
-                .find_one_and_update(
-                    doc! {
-                        "noticePending": true,
-                        "$or": [ { "noticeNextAt": null }, { "noticeNextAt": { "$lte": now } } ],
-                    },
-                    doc! { "$set": { "noticeNextAt": after(now, self.settings.lease) } },
-                )
-                .sort(doc! { "noticeNextAt": 1 })
-                .return_document(ReturnDocument::After)
+                .queue
+                .claim_due_notice(now, after(now, self.settings.lease))
                 .await?;
             match entry {
                 Some(entry) => claimed.push(entry),
@@ -675,7 +667,7 @@ impl SagaDispatchRelay {
             .dispatch(&dedupe, type_name, &serde_json::to_vec(&failed)?, &ctx)
             .await;
         match outcome {
-            Err(e) => return self.notice_failed(entry, &e).await,
+            Err(e) => return self.schedule_notice_retry(entry, &e).await,
             Ok(unhandled @ (Outcome::NoInterest | Outcome::Unclaimed)) => {
                 self.metrics
                     .command_failure_unhandled(&entry.type_name, reason);
@@ -700,16 +692,11 @@ impl SagaDispatchRelay {
 
     async fn clear_notice(&self, entry: &SagaDispatchDocument) -> Result<(), MessagingError> {
         self.check_notice_write_injection()?;
-        self.dispatch_collection()
-            .update_one(
-                doc! { "_id": &entry.id },
-                doc! { "$unset": { "noticePending": "", "noticeAttempts": "", "noticeNextAt": "" } },
-            )
-            .await?;
+        self.queue.clear_notice(&entry.id).await?;
         Ok(())
     }
 
-    async fn notice_failed(
+    async fn schedule_notice_retry(
         &self,
         entry: &SagaDispatchDocument,
         error: &MessagingError,
@@ -735,62 +722,41 @@ impl SagaDispatchRelay {
                 .jittered_backoff(attempts as u32),
         );
         self.check_notice_write_injection()?;
-        self.dispatch_collection()
-            .update_one(
-                doc! { "_id": &entry.id },
-                doc! { "$set": { "noticeAttempts": attempts, "noticeNextAt": next } },
-            )
+        self.queue
+            .schedule_notice_retry(&entry.id, attempts, next)
             .await?;
         tracing::warn!(
-            "Delivering SagaCommandFailed for command {} failed attempt {attempts} of {}, next at {next}: {error}",
+            "Delivering SagaCommandFailed for command {} failed attempt {attempts} of {}, next at {}: {error}",
             entry.id,
-            self.settings.max_attempts
+            self.settings.max_attempts,
+            rfc3339(next)
         );
         Ok(())
     }
 
-    async fn first_pending(
+    async fn next_pending(
         &self,
         saga_id: &str,
     ) -> Result<Option<SagaDispatchDocument>, MessagingError> {
-        Ok(self
-            .dispatch_collection()
-            .find_one(doc! { "sagaId": saga_id, "dispatchedAt": null, "failedAt": null })
-            .sort(doc! { "seq": 1 })
-            .await?)
+        Ok(self.queue.next_pending(saga_id).await?)
     }
 
     // ---- the saga's dispatch lease -----------------------------------------------------------
 
-    /// Takes the lease of `saga_id` when it is free or expired: an upsert on `{_id, until < now}`
-    /// fails on the duplicate `_id` while it is held.
+    /// Takes the lease of `saga_id` when it is free or expired.
     async fn claim(&self, saga_id: &str) -> Result<bool, MessagingError> {
         let now = self.now();
-        match self
-            .leases()
-            .find_one_and_update(
-                doc! { "_id": saga_id, "until": { "$lt": now } },
-                doc! { "$set": { "owner": &self.owner, "until": after(now, self.settings.lease) } },
-            )
-            .upsert(true)
-            .return_document(ReturnDocument::After)
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(e) if is_duplicate_key(&e) => Ok(false),
-            Err(e) => Err(e.into()),
-        }
+        Ok(self
+            .queue
+            .claim_lease(saga_id, &self.owner, now, after(now, self.settings.lease))
+            .await?)
     }
 
     async fn renew(&self, saga_id: &str) -> Result<bool, MessagingError> {
-        let result = self
-            .leases()
-            .update_one(
-                doc! { "_id": saga_id, "owner": &self.owner },
-                doc! { "$set": { "until": after(self.now(), self.settings.lease) } },
-            )
-            .await?;
-        Ok(result.matched_count == 1)
+        Ok(self
+            .queue
+            .renew_lease(saga_id, &self.owner, after(self.now(), self.settings.lease))
+            .await?)
     }
 
     /// The heartbeat of a live send: extends the lease so that it never expires under an adapter
@@ -808,11 +774,7 @@ impl SagaDispatchRelay {
     }
 
     async fn release(&self, saga_id: &str) {
-        if let Err(e) = self
-            .leases()
-            .delete_one(doc! { "_id": saga_id, "owner": &self.owner })
-            .await
-        {
+        if let Err(e) = self.queue.release_lease(saga_id, &self.owner).await {
             tracing::debug!(
                 "Could not release the dispatch lease of saga {saga_id} (it expires): {e}"
             );
@@ -860,8 +822,4 @@ fn reason_name(reason: FailureReason) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_else(|| format!("{reason:?}"))
-}
-
-fn after(now: DateTime, by: Duration) -> DateTime {
-    DateTime::from_millis(now.timestamp_millis() + by.as_millis() as i64)
 }

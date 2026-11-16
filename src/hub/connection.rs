@@ -61,7 +61,8 @@ use tonic::{Code, Status};
 use crate::error::MessagingError;
 use crate::proto::hub_client::HubClient;
 use crate::proto::{
-    self, ClientMessage, Heartbeat, Permits, Register, RegisterAck, client_message, server_message,
+    self, ClientMessage, Heartbeat, Permits, Register, RegisterAck, RequestMode, client_message,
+    server_message,
 };
 use crate::retry::{jittered, random_unit};
 use crate::security::{HubTls, SecretString};
@@ -501,6 +502,47 @@ impl std::fmt::Debug for Inbound {
     }
 }
 
+/// A hub's refusal of this instance's registration (a `Register` the hub closed the stream on
+/// with `ALREADY_EXISTS`, `INVALID_ARGUMENT`, `UNAUTHENTICATED` or `PERMISSION_DENIED`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HubRejection {
+    /// The hub's id when it registered this instance before, else the target dialled
+    /// (`host:port`): a refused `Register` carries no hub id.
+    pub hub: String,
+    /// The gRPC status code's name, e.g. `PERMISSION_DENIED`.
+    pub code: String,
+    /// The hub's message; `None` when it gave none.
+    pub description: Option<String>,
+    /// When it was refused.
+    pub at: SystemTime,
+}
+
+/// The name of a gRPC status code, as the protocol spells it.
+fn code_name(code: Code) -> String {
+    match code {
+        Code::AlreadyExists => "ALREADY_EXISTS".into(),
+        Code::InvalidArgument => "INVALID_ARGUMENT".into(),
+        Code::Unauthenticated => "UNAUTHENTICATED".into(),
+        Code::PermissionDenied => "PERMISSION_DENIED".into(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The order refusals happened in, over every connection of the process: monotonic, whatever the
+/// wall clock does (`HubRejection::at` is for display only).
+static REJECTION_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A refusal with its place in [`REJECTION_SEQ`].
+pub(crate) type Sequenced = (u64, HubRejection);
+
+/// Keeps `rejection` in `latest` unless `latest` holds a later one (by sequence).
+pub(crate) fn keep_newer(latest: &Mutex<Option<Sequenced>>, rejection: &Sequenced) {
+    let mut latest = latest.lock().unwrap();
+    if latest.as_ref().is_none_or(|(seq, _)| *seq < rejection.0) {
+        *latest = Some(rejection.clone());
+    }
+}
+
 /// A handshaken stream that accepts outgoing messages.
 struct Live {
     stream: StreamId,
@@ -518,7 +560,14 @@ pub struct HubConnection {
     live: Mutex<Option<Live>>,
     connected: AtomicBool,
     handshake: watch::Sender<Option<RegisterAck>>,
+    /// The later `Register`s (after the handshake) of the current stream: (stream, written,
+    /// acknowledged). The hub acks them in order, so the n-th written is acked once n acks came.
+    later_registers: watch::Sender<(StreamId, u64, u64)>,
     last_rejection: Mutex<Option<String>>,
+    /// The newest refusal by the hub, kept after a later acceptance.
+    latest_rejection: Mutex<Option<Sequenced>>,
+    /// The id of the hub the last handshaken stream registered with, kept once that stream ended.
+    last_hub_id: Mutex<Option<String>>,
     /// The token resolved for the stream being opened (the last one read from `token_file`); what
     /// every `Register` of the stream carries.
     token: Mutex<Option<SecretString>>,
@@ -625,6 +674,8 @@ pub(crate) struct Hooks {
     pub in_flight: Arc<AtomicUsize>,
     /// Also counts the credential refreshes written (all connections of the pool).
     pub refreshes_sent: Arc<AtomicU64>,
+    /// Also keeps the newest refusal (all connections of the pool).
+    pub latest_rejection: Arc<Mutex<Option<Sequenced>>>,
 }
 
 impl HubConnection {
@@ -638,6 +689,7 @@ impl HubConnection {
     ) -> Result<Arc<HubConnection>, MessagingError> {
         settings.check()?;
         let (handshake, _) = watch::channel(None);
+        let (later_registers, _) = watch::channel((0, 0, 0));
         let mut settings = settings;
         if settings
             .tls
@@ -660,7 +712,10 @@ impl HubConnection {
             live: Mutex::new(None),
             connected: AtomicBool::new(false),
             handshake,
+            later_registers,
             last_rejection: Mutex::new(None),
+            latest_rejection: Mutex::new(None),
+            last_hub_id: Mutex::new(None),
             token: Mutex::new(None),
             jwt: Mutex::new(None),
             presented: Mutex::new(None),
@@ -776,8 +831,45 @@ impl HubConnection {
         self.connected.load(Ordering::SeqCst)
     }
 
+    /// Why the hub refuses this instance now: the message of its latest refusal of a `Register`
+    /// (or of the access token's endpoint, when no stream could be opened); `None` once a
+    /// registration is accepted again.
     pub fn last_rejection(&self) -> Option<String> {
         self.last_rejection.lock().unwrap().clone()
+    }
+
+    /// The hub's newest refusal of a `Register`, kept after a later acceptance (replaced by a
+    /// newer refusal only); `None` while it never refused. A failure to get an access token is
+    /// not a hub's refusal and is not kept here.
+    pub fn latest_rejection(&self) -> Option<HubRejection> {
+        self.latest_rejection_sequenced().map(|(_, r)| r)
+    }
+
+    pub(crate) fn latest_rejection_sequenced(&self) -> Option<Sequenced> {
+        self.latest_rejection.lock().unwrap().clone()
+    }
+
+    fn record_rejection(&self, status: &Status) {
+        let rejection = HubRejection {
+            hub: self
+                .last_hub_id()
+                .unwrap_or_else(|| super::targets::target_id(&self.settings.address)),
+            code: code_name(status.code()),
+            description: Some(status.message().to_string()).filter(|m| !m.is_empty()),
+            at: SystemTime::now(),
+        };
+        let rejection = (REJECTION_SEQ.fetch_add(1, Ordering::SeqCst) + 1, rejection);
+        // This connection's own slot: always the one just recorded.
+        *self.latest_rejection.lock().unwrap() = Some(rejection.clone());
+        if let Some(h) = self.hooks.get() {
+            keep_newer(&h.latest_rejection, &rejection);
+        }
+    }
+
+    /// The id of the hub this connection last registered with (as [`hub_id`](Self::hub_id)),
+    /// kept after that stream ended; `None` until a first registration.
+    pub fn last_hub_id(&self) -> Option<String> {
+        self.last_hub_id.lock().unwrap().clone()
     }
 
     /// How this connection authenticates: the kind, for a JWT the expiry of the current access
@@ -919,19 +1011,37 @@ impl HubConnection {
     /// the current handshaken stream. With no types the hub stops routing to this instance there
     /// and hands its queue to other instances, while replies to requests it already forwarded
     /// still go through. `HubUnavailable` when there is no handshaken stream.
-    pub(crate) async fn reregister(&self) -> Result<(), MessagingError> {
+    pub(crate) async fn reregister(&self) -> Result<(StreamId, u64), MessagingError> {
         // One at a time: the message built last (with the types set last) is written last.
         let _order = self.reregistering.lock().await;
-        let (tx, initial) = {
+        let (tx, initial, stream) = {
             let live = self.live.lock().unwrap();
             let live = live
                 .as_ref()
                 .ok_or_else(|| MessagingError::HubUnavailable("not connected to the hub".into()))?;
-            (live.tx.clone(), live.grants.initial())
+            (live.tx.clone(), live.grants.initial(), live.stream)
         };
+        // Counted before it is written: its ack may be handled before `send` returns.
+        let ours = self.count_later_register(stream);
         tx.send(self.register(initial))
             .await
-            .map_err(|_| MessagingError::HubUnavailable("hub stream closed".into()))
+            .map_err(|_| MessagingError::HubUnavailable("hub stream closed".into()))?;
+        Ok((stream, ours))
+    }
+
+    /// Counts one more `Register` written on `stream` after its handshake: its number.
+    fn count_later_register(&self, stream: StreamId) -> u64 {
+        let mut n = 0;
+        self.later_registers.send_modify(|(s, written, acked)| {
+            if *s != stream {
+                *s = stream;
+                *written = 0;
+                *acked = 0;
+            }
+            *written += 1;
+            n = *written;
+        });
+        n
     }
 
     /// Writes a `Register` with no types to the current handshaken stream, without changing the
@@ -948,9 +1058,44 @@ impl HubConnection {
                 .ok_or_else(|| MessagingError::HubUnavailable("not connected to the hub".into()))?;
             (live.tx.clone(), live.grants.initial())
         };
+        if let Some(stream) = self.live.lock().unwrap().as_ref().map(|l| l.stream) {
+            self.count_later_register(stream);
+        }
         tx.send(self.register_with(RegisteredTypes::default(), initial))
             .await
-            .map_err(|_| MessagingError::HubUnavailable("hub stream closed".into()))
+            .map_err(|_| MessagingError::HubUnavailable("hub stream closed".into()))?;
+        Ok(())
+    }
+
+    /// The first step of a graceful shutdown (kraken-messaging's `HubLifecycle.stop`): registers
+    /// no types from now on (a stream opened later registers none either) and writes that
+    /// `Register` to the current handshaken stream, then waits at most `within` for the hub's
+    /// ack. The hub stops routing to this instance and hands its queue to other instances at
+    /// once, while replies to requests it already forwarded still go through. False when there
+    /// is no handshaken stream or the ack did not come in time.
+    pub(crate) async fn deregister_for_shutdown(&self, within: Duration) -> bool {
+        self.set_registered_types(RegisteredTypes::default());
+        let mut acks = self.later_registers.subscribe();
+        // The write too is bounded: a stalled stream must not hold the shutdown.
+        tokio::time::timeout(within, async {
+            let Ok((stream, ours)) = self.reregister().await else {
+                return false;
+            };
+            // Only the ack of this very Register counts (the n-th later ack of the stream).
+            loop {
+                {
+                    let (s, _, acked) = *acks.borrow_and_update();
+                    if s == stream && acked >= ours {
+                        return true;
+                    }
+                }
+                if acks.changed().await.is_err() {
+                    return false;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// Closes stream `stream` gracefully (half-close, then waiting for the hub, bounded) and
@@ -1104,6 +1249,7 @@ impl HubConnection {
                 wait
             } else if is_rejection(status.code()) {
                 *self.last_rejection.lock().unwrap() = Some(status.message().to_string());
+                self.record_rejection(&status);
                 let wait = jittered(max, max, random_unit());
                 let key = (status.code(), status.message().to_string());
                 if logged_rejection.as_ref() == Some(&key) {
@@ -1329,7 +1475,12 @@ impl HubConnection {
                         }
                         server_message::Message::Heartbeat(_) => last_echo = tokio::time::Instant::now(),
                         server_message::Message::Request(request) => {
-                            grants.received();
+                            // A subscription is passive: the hub spent no permit on it and no
+                            // handler runs for it, so it is neither a permit to give back nor a
+                            // handler in flight (it would stay counted for good).
+                            if request.mode != RequestMode::Subscription as i32 {
+                                grants.received();
+                            }
                             self.forward(Inbound::Request { request, reply_to: reply_to.clone() }).await?
                         }
                         server_message::Message::Reply(r) => self.forward(Inbound::Reply(r)).await?,
@@ -1699,10 +1850,21 @@ impl HubConnection {
         });
         // A registered stream is the end of any earlier rejection.
         *self.last_rejection.lock().unwrap() = None;
+        *self.last_hub_id.lock().unwrap() = Some(hub_id(ack, &self.settings.address));
         let first = self.handshake.send_replace(Some(ack.clone())).is_none();
         if first {
             self.changed();
         }
+        self.later_registers.send_modify(|(s, written, acked)| {
+            if *s != stream {
+                // The handshake of a new stream: nothing later written or acked on it yet.
+                *s = stream;
+                *written = 0;
+                *acked = 0;
+            } else if *acked < *written {
+                *acked += 1;
+            }
+        });
     }
 
     /// Asks the pool (if any) whether this stream may go live; a refusal stops the connection.
@@ -1811,6 +1973,27 @@ fn describe(status: &Status) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The latest refusal is the one recorded last, whatever the wall clock says: a clock stepped
+    /// back between two refusals must not keep the older one.
+    #[test]
+    fn the_latest_rejection_follows_the_order_of_refusals_not_the_wall_clock() {
+        let refusal = |hub: &str, at: SystemTime| HubRejection {
+            hub: hub.into(),
+            code: "PERMISSION_DENIED".into(),
+            description: None,
+            at,
+        };
+        let now = SystemTime::now();
+        let slot = Mutex::new(None);
+        keep_newer(&slot, &(1, refusal("a", now)));
+        // Recorded later, stamped earlier (the clock went back).
+        keep_newer(&slot, &(2, refusal("b", now - Duration::from_secs(3600))));
+        assert_eq!(slot.lock().unwrap().as_ref().unwrap().1.hub, "b");
+        // An older one arriving late (a lower sequence) does not replace it.
+        keep_newer(&slot, &(1, refusal("a", now + Duration::from_secs(3600))));
+        assert_eq!(slot.lock().unwrap().as_ref().unwrap().1.hub, "b");
+    }
 
     #[test]
     fn target_forms() {

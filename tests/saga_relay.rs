@@ -1,6 +1,7 @@
 //! The saga dispatch relay (S2 Task 6, ADR 0021 rulings 7-11, 28-31, 34): an ordered, after-commit
-//! relay of what sagas recorded in `saga_dispatch`, against a real MongoDB. The Rust form of the
+//! relay of what sagas recorded in `saga_dispatch`, on the in-memory message store. The Rust form of the
 //! Kotlin `SagaDispatchRelayTest`.
+#![cfg(feature = "testing")]
 
 mod support;
 
@@ -12,12 +13,10 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use kraken_messaging::context::CURRENT;
+use kraken_messaging::events::EventBus;
+use kraken_messaging::events::dispatch::{LocalEventDispatcher, NoSagas, SagaStage};
 use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::kafka::dispatch::{LocalEventDispatcher, NoSagas, SagaStage};
-use kraken_messaging::kafka::{EventBus, OutboxDocument};
-use kraken_messaging::saga::store::{
-    DispatchKind, SagaDispatchDocument, SagaDispatchLeaseDocument, SagaDocument,
-};
+use kraken_messaging::saga::store::{DispatchKind, SagaDispatchDocument, SagaDocument};
 use kraken_messaging::saga::{
     FailureReason, LocalRawCommandSender, NoopSagaMetrics, RETRYABLE_MARKER, RawCommandSender,
     RawOutcome, RelaySettings, SagaCommandFailed, SagaDefinition, SagaDispatchRelay, SagaMetrics,
@@ -26,18 +25,26 @@ use kraken_messaging::saga::{
 use kraken_messaging::{
     Command, Event, Guard, MessageContext, MessagingError, RetryPolicy, SendOptions, message_type,
 };
-use mongodb::bson::{Document, doc};
 use serde::{Deserialize, Serialize};
 use support::saga::{Store, event_ctx, state, t0};
 use tokio_util::sync::CancellationToken;
 
-macro_rules! require_docker {
-    () => {
-        if !support::docker_available() {
-            eprintln!("docker not available, skipping");
-            return;
-        }
-    };
+/// An outbox entry (the fields these tests read), its payload as JSON.
+struct OutboxDocument {
+    type_name: String,
+    key: Option<String>,
+    payload: serde_json::Value,
+    headers: HashMap<String, String>,
+}
+
+fn outbox_document(record: kraken_messaging::store::memory::OutboxRecord) -> OutboxDocument {
+    let e = record.entry;
+    OutboxDocument {
+        type_name: e.type_name,
+        key: e.key,
+        payload: serde_json::from_slice(&e.payload).expect("a JSON payload"),
+        headers: e.headers,
+    }
 }
 
 macro_rules! message {
@@ -263,6 +270,8 @@ struct Call {
     payload: String,
     headers: HashMap<String, String>,
     correlation_id: Option<String>,
+    /// The `traceparent` of the context the send ran in.
+    traceparent: Option<String>,
     retry: Option<RetryPolicy>,
     has_authorization: bool,
 }
@@ -317,6 +326,9 @@ impl RawCommandSender for ScriptedSender {
                 payload: String::from_utf8(payload).unwrap(),
                 headers: options.headers,
                 correlation_id: current.as_ref().map(|c| c.correlation_id.clone()),
+                traceparent: current
+                    .as_ref()
+                    .and_then(|c| c.headers.get("traceparent").cloned()),
                 retry: options.retry,
                 has_authorization: current.is_some_and(|c| c.authorization.is_some()),
             });
@@ -415,16 +427,15 @@ impl Rl {
         settings: RelaySettings,
     ) -> Arc<SagaDispatchRelay> {
         let dispatcher = Arc::new(LocalEventDispatcher::new(
-            self.store.client.clone(),
-            self.store.db.clone(),
+            Some(self.store.message_store()),
             Arc::clone(&self.registry),
             stage,
         ));
         SagaDispatchRelay::new(
-            self.store.client.clone(),
-            self.store.db.clone(),
+            self.store.message_store().tx(),
+            self.store.message_store().sagas().dispatch,
             commands,
-            EventBus::new(self.store.db.clone()),
+            EventBus::over(self.store.message_store().outbox()),
             dispatcher,
             self.store.clock.clock(),
             settings,
@@ -434,12 +445,17 @@ impl Rl {
     }
 
     async fn deliver<E: Event>(&self, event: &E, id: &str) {
-        use kraken_messaging::kafka::SagaStage;
+        self.deliver_with(event, id, &[]).await;
+    }
+
+    /// [`deliver`](Self::deliver) with these headers on the event besides `id` and `type`.
+    async fn deliver_with<E: Event>(&self, event: &E, id: &str, headers: &[(&str, &str)]) {
+        use kraken_messaging::events::SagaStage;
         self.runtime
             .process(
                 E::TYPE,
                 &serde_json::to_vec(event).unwrap(),
-                &event_ctx(id, E::TYPE, &[]),
+                &event_ctx(id, E::TYPE, headers),
             )
             .await
             .unwrap();
@@ -456,9 +472,11 @@ impl Rl {
 
     async fn entry(&self, id: &str) -> SagaDispatchDocument {
         self.store
-            .find::<SagaDispatchDocument>("saga_dispatch", doc! { "_id": id })
+            .dispatch()
             .await
-            .remove(0)
+            .into_iter()
+            .find(|e| e.id == id)
+            .unwrap_or_else(|| panic!("no dispatch entry {id}"))
     }
 
     async fn failures_of(&self, type_name: &str, order_id: &str) -> Vec<String> {
@@ -502,23 +520,19 @@ impl Rl {
             payload: payload.into(),
             headers: HashMap::from([("correlation-id".to_string(), format!("corr-{saga_id}"))]),
             routing_key: routing_key.map(str::to_string),
-            created_at: mongodb::bson::DateTime::from_system_time(self.store.clock.now()),
-            dispatched_at: None,
+            created_at_ms: self.store.clock.clock().now_ms(),
+            dispatched_at_ms: None,
             attempts: 0,
-            next_attempt_at: None,
-            failed_at: None,
+            next_attempt_at_ms: None,
+            failed_at_ms: None,
             failure_reason: None,
             failure_message: None,
             notice_pending: None,
             notice_attempts: None,
-            notice_next_at: None,
+            notice_next_at_ms: None,
         };
-        self.store
-            .db
-            .collection::<SagaDispatchDocument>("saga_dispatch")
-            .insert_one(entry)
-            .await
-            .unwrap();
+        // Written as stored, without the checks of `record` (an entry from before them).
+        self.store.edit(|c| c.dispatch.push(entry));
     }
 
     async fn record_charge(&self, saga_id: &str, seq: i64) {
@@ -544,7 +558,6 @@ where
 
 #[tokio::test]
 async fn entries_of_one_saga_are_dispatched_in_seq_order() {
-    require_docker!();
     let rl = Rl::start().await;
     rl.record_charge("s1", 3000).await;
     rl.record_charge("s1", 1000).await;
@@ -555,15 +568,17 @@ async fn entries_of_one_saga_are_dispatched_in_seq_order() {
     assert_eq!(rl.sender.keys(), ["s1:1000", "s1:2000", "s1:3000"]);
     assert_eq!(
         rl.store
-            .count("saga_dispatch", doc! { "dispatchedAt": null })
-            .await,
+            .dispatch()
+            .await
+            .iter()
+            .filter(|e| e.dispatched_at_ms.is_none())
+            .count(),
         0
     );
 }
 
 #[tokio::test]
 async fn the_oldest_work_is_dispatched_first_when_more_sagas_are_due_than_one_pass_takes() {
-    require_docker!();
     let rl = Rl::start().await;
     // Created in this order: the opposite of their ids.
     for (i, name) in ["h", "g", "f", "e", "d", "c", "b", "a"].iter().enumerate() {
@@ -595,7 +610,6 @@ async fn the_oldest_work_is_dispatched_first_when_more_sagas_are_due_than_one_pa
 #[tokio::test]
 async fn the_relay_sends_with_a_no_retry_policy_so_a_bus_s_own_retry_never_stacks_under_the_relays()
 {
-    require_docker!();
     let rl = Rl::start().await;
     rl.record_charge("s1", 1000).await;
 
@@ -606,7 +620,6 @@ async fn the_relay_sends_with_a_no_retry_policy_so_a_bus_s_own_retry_never_stack
 
 #[tokio::test]
 async fn entries_of_different_sagas_are_dispatched_in_parallel() {
-    require_docker!();
     let rl = Rl::start().await;
     rl.record_charge("a", 1000).await;
     rl.record_charge("b", 1000).await;
@@ -631,15 +644,17 @@ async fn entries_of_different_sagas_are_dispatched_in_parallel() {
     assert_eq!(keys, ["a:1000", "b:1000"]);
     assert_eq!(
         rl.store
-            .count("saga_dispatch", doc! { "dispatchedAt": null })
-            .await,
+            .dispatch()
+            .await
+            .iter()
+            .filter(|e| e.dispatched_at_ms.is_none())
+            .count(),
         0
     );
 }
 
 #[tokio::test]
 async fn a_saga_whose_adapter_call_hangs_does_not_hold_back_the_dispatch_of_another_saga() {
-    require_docker!();
     let rl = Rl::start().await;
     rl.record_charge("hung", 1000).await;
     let release = Arc::new(tokio::sync::Notify::new());
@@ -663,10 +678,10 @@ async fn a_saga_whose_adapter_call_hangs_does_not_hold_back_the_dispatch_of_anot
     rl.record_charge("fine", 1000).await; // becomes due while the first send is still alive
 
     await_true("the other saga to be dispatched meanwhile", || async {
-        rl.entry("fine:1000").await.dispatched_at.is_some()
+        rl.entry("fine:1000").await.dispatched_at_ms.is_some()
     })
     .await;
-    assert!(rl.entry("hung:1000").await.dispatched_at.is_none());
+    assert!(rl.entry("hung:1000").await.dispatched_at_ms.is_none());
     assert_eq!(
         rl.sender.keys(),
         ["hung:1000", "fine:1000"],
@@ -675,7 +690,7 @@ async fn a_saga_whose_adapter_call_hangs_does_not_hold_back_the_dispatch_of_anot
 
     release.notify_one();
     await_true("the released send to be marked", || async {
-        rl.entry("hung:1000").await.dispatched_at.is_some()
+        rl.entry("hung:1000").await.dispatched_at_ms.is_some()
     })
     .await;
     cancel.cancel();
@@ -685,7 +700,6 @@ async fn a_saga_whose_adapter_call_hangs_does_not_hold_back_the_dispatch_of_anot
 #[tokio::test]
 async fn the_lease_of_a_saga_is_renewed_while_its_send_is_alive_so_another_relay_does_not_take_it_over()
  {
-    require_docker!();
     let rl = Rl::start().await;
     rl.record_charge("slow", 1000).await;
     let short = RelaySettings {
@@ -714,10 +728,12 @@ async fn the_lease_of_a_saga_is_renewed_while_its_send_is_alive_so_another_relay
     await_true("the lease to be renewed to the new time", || async {
         let lease = rl
             .store
-            .find::<SagaDispatchLeaseDocument>("saga_dispatch_leases", doc! { "_id": "slow" })
-            .await
-            .remove(0);
-        lease.until > mongodb::bson::DateTime::from_system_time(rl.store.clock.now())
+            .contents()
+            .dispatch_leases
+            .into_iter()
+            .find(|(saga, _, _)| saga == "slow")
+            .expect("the lease of slow");
+        lease.2 > kraken_messaging::time::epoch_ms(rl.store.clock.now())
     })
     .await;
 
@@ -730,7 +746,7 @@ async fn the_lease_of_a_saga_is_renewed_while_its_send_is_alive_so_another_relay
 
     release.notify_one();
     await_true("the entry to be marked", || async {
-        rl.entry("slow:1000").await.dispatched_at.is_some()
+        rl.entry("slow:1000").await.dispatched_at_ms.is_some()
     })
     .await;
     cancel.cancel();
@@ -739,7 +755,6 @@ async fn the_lease_of_a_saga_is_renewed_while_its_send_is_alive_so_another_relay
 
 #[tokio::test]
 async fn a_step_in_retry_holds_back_that_sagas_later_steps_only() {
-    require_docker!();
     let rl = Rl::start().await;
     rl.record("a", 1000, "rl.First", "{}").await;
     rl.record("a", 2000, "rl.Second", "{}").await;
@@ -774,9 +789,9 @@ async fn a_step_in_retry_holds_back_that_sagas_later_steps_only() {
     );
     let first = rl.entry("a:1000").await;
     assert_eq!(first.attempts, 1);
-    assert!(first.next_attempt_at.unwrap() > mongodb::bson::DateTime::from_system_time(t0()));
-    assert!(rl.entry("a:2000").await.dispatched_at.is_none());
-    assert!(rl.entry("b:1000").await.dispatched_at.is_some());
+    assert!(first.next_attempt_at_ms.unwrap() > kraken_messaging::time::epoch_ms(t0()));
+    assert!(rl.entry("a:2000").await.dispatched_at_ms.is_none());
+    assert!(rl.entry("b:1000").await.dispatched_at_ms.is_some());
 
     relay.poll_once().await.unwrap();
     assert_eq!(rl.sender.calls().len(), 2, "still backing off");
@@ -796,12 +811,11 @@ async fn a_step_in_retry_holds_back_that_sagas_later_steps_only() {
         ["rl.First", "rl.First", "rl.Second"],
         "in order, the retried step first"
     );
-    assert!(rl.entry("a:2000").await.dispatched_at.is_some());
+    assert!(rl.entry("a:2000").await.dispatched_at_ms.is_some());
 }
 
 #[tokio::test]
 async fn an_event_entry_reaches_the_outbox_exactly_once() {
-    require_docker!();
     let rl = Rl::start().await;
     rl.record_entry(
         "s1",
@@ -817,28 +831,33 @@ async fn an_event_entry_reaches_the_outbox_exactly_once() {
 
     relay.poll_once().await.unwrap();
     assert_eq!(
-        rl.store.count("outbox", doc! {}).await,
+        rl.store.outbox().await.len(),
         0,
         "the outbox insert rolled back with the failed mark"
     );
-    assert!(rl.entry("s1:1000").await.dispatched_at.is_none());
+    assert!(rl.entry("s1:1000").await.dispatched_at_ms.is_none());
 
     relay.poll_once().await.unwrap();
     relay.poll_once().await.unwrap();
 
-    let outbox: Vec<OutboxDocument> = rl.store.all("outbox").await;
+    let outbox: Vec<OutboxDocument> = rl
+        .store
+        .outbox()
+        .await
+        .into_iter()
+        .map(outbox_document)
+        .collect();
     assert_eq!(outbox.len(), 1);
     assert_eq!(outbox[0].type_name, "rl.Announced");
     assert_eq!(outbox[0].key.as_deref(), Some("key-o1"));
-    assert_eq!(outbox[0].payload.get_str("orderId").unwrap(), "o1");
+    assert_eq!(outbox[0].payload["orderId"], "o1");
     assert_eq!(outbox[0].headers["correlationId"], "corr-s1");
-    assert!(rl.entry("s1:1000").await.dispatched_at.is_some());
+    assert!(rl.entry("s1:1000").await.dispatched_at_ms.is_some());
 }
 
 #[tokio::test]
 async fn an_event_entry_that_cannot_become_an_outbox_document_fails_for_good_and_the_sagas_later_entries_go_out()
  {
-    require_docker!();
     let rl = Rl::start().await;
     // A unit struct (null), an array and a number above i64::MAX: none is a BSON document.
     for (seq, payload) in [
@@ -865,8 +884,8 @@ async fn an_event_entry_that_cannot_become_an_outbox_document_fails_for_good_and
 
     for id in ["s9:1000", "s9:1001", "s9:1002"] {
         let entry = rl.entry(id).await;
-        assert!(entry.failed_at.is_some(), "{id} failed for good");
-        assert!(entry.dispatched_at.is_none(), "{id} was not dispatched");
+        assert!(entry.failed_at_ms.is_some(), "{id} failed for good");
+        assert!(entry.dispatched_at_ms.is_none(), "{id} was not dispatched");
         assert_eq!(entry.failure_reason, Some(FailureReason::Invalid), "{id}");
         assert!(
             entry
@@ -882,12 +901,18 @@ async fn an_event_entry_that_cannot_become_an_outbox_document_fails_for_good_and
         );
     }
     assert!(
-        rl.entry("s9:1003").await.dispatched_at.is_some(),
+        rl.entry("s9:1003").await.dispatched_at_ms.is_some(),
         "the saga's later entry went out in the same pass"
     );
-    let outbox: Vec<OutboxDocument> = rl.store.all("outbox").await;
+    let outbox: Vec<OutboxDocument> = rl
+        .store
+        .outbox()
+        .await
+        .into_iter()
+        .map(outbox_document)
+        .collect();
     assert_eq!(outbox.len(), 1);
-    assert_eq!(outbox[0].payload.get_str("orderId").unwrap(), "o9");
+    assert_eq!(outbox[0].payload["orderId"], "o9");
     let errors: Vec<_> = captured
         .lines()
         .into_iter()
@@ -895,11 +920,15 @@ async fn an_event_entry_that_cannot_become_an_outbox_document_fails_for_good_and
         .collect();
     assert_eq!(errors.len(), 3, "{errors:?}");
     assert!(errors[0].contains("s9:1000"), "{}", errors[0]);
+    assert_eq!(
+        *rl.metrics.unhandled.lock().unwrap(),
+        vec![("rl.Announced".to_string(), FailureReason::Invalid); 3],
+        "each refused event counts on kraken.saga.command.failures{{reason=INVALID}}"
+    );
 }
 
 #[tokio::test]
 async fn a_command_carries_the_idempotency_key_the_saga_id_and_the_correlation_id_of_its_cause() {
-    require_docker!();
     let rl = Rl::start().await;
     rl.deliver(
         &Start {
@@ -930,9 +959,114 @@ async fn a_command_carries_the_idempotency_key_the_saga_id_and_the_correlation_i
     );
 }
 
+const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+/// The trace floor: a command a saga dispatches is sent in the trace of the event that caused it
+/// (its valid `traceparent`, kept in the dispatch entry's headers), never as a header of its own
+/// (`traceparent` is reserved); an invalid one is not kept.
+#[tokio::test]
+async fn a_saga_command_carries_the_traceparent_of_its_cause_a_valid_one_only() {
+    let rl = Rl::start().await;
+    rl.deliver_with(
+        &Start {
+            order_id: "o1".into(),
+        },
+        "cause-1",
+        &[("traceparent", TRACEPARENT)],
+    )
+    .await;
+    rl.deliver_with(
+        &Start {
+            order_id: "o2".into(),
+        },
+        "cause-2",
+        &[("traceparent", "not-a-traceparent")],
+    )
+    .await;
+    let entry = |order: &str| {
+        let rl = &rl;
+        let order = order.to_string();
+        async move {
+            let saga = rl.saga_of("rl.Order", &order).await;
+            rl.store.dispatch_of(&saga.id).await.remove(0)
+        }
+    };
+    assert_eq!(
+        entry("o1")
+            .await
+            .headers
+            .get("traceparent")
+            .map(String::as_str),
+        Some(TRACEPARENT),
+        "kept with the entry"
+    );
+    assert_eq!(entry("o2").await.headers.get("traceparent"), None);
+
+    rl.relay().poll_once().await.unwrap();
+    rl.relay().poll_once().await.unwrap();
+
+    let calls = rl.sender.calls();
+    assert_eq!(calls.len(), 2);
+    let of = |r: &str| {
+        calls
+            .iter()
+            .find(|c| c.payload.contains(r))
+            .unwrap_or_else(|| panic!("no call for {r}"))
+    };
+    assert_eq!(of("o1").traceparent.as_deref(), Some(TRACEPARENT));
+    assert_eq!(of("o2").traceparent, None);
+    assert!(
+        calls.iter().all(|c| !c.headers.contains_key("traceparent")),
+        "never a header of the send's own (reserved)"
+    );
+}
+
+/// An event a saga publishes carries the `traceparent` recorded with its dispatch entry.
+#[tokio::test]
+async fn a_saga_event_carries_the_traceparent_recorded_with_it() {
+    let rl = Rl::start().await;
+    rl.store.edit(|c| {
+        c.dispatch.push(SagaDispatchDocument {
+            id: "s1:1000".into(),
+            saga_id: "s1".into(),
+            seq: 1000,
+            kind: DispatchKind::Event,
+            type_name: "rl.Announced".into(),
+            payload: r#"{"orderId":"o1"}"#.into(),
+            headers: HashMap::from([
+                ("correlation-id".to_string(), "corr-s1".to_string()),
+                ("traceparent".to_string(), TRACEPARENT.to_string()),
+            ]),
+            routing_key: None,
+            created_at_ms: rl.store.clock.clock().now_ms(),
+            dispatched_at_ms: None,
+            attempts: 0,
+            next_attempt_at_ms: None,
+            failed_at_ms: None,
+            failure_reason: None,
+            failure_message: None,
+            notice_pending: None,
+            notice_attempts: None,
+            notice_next_at_ms: None,
+        })
+    });
+
+    rl.relay().poll_once().await.unwrap();
+
+    let outbox: Vec<OutboxDocument> = rl
+        .store
+        .outbox()
+        .await
+        .into_iter()
+        .map(outbox_document)
+        .collect();
+    assert_eq!(outbox.len(), 1);
+    assert_eq!(outbox[0].headers["traceparent"], TRACEPARENT);
+    assert_eq!(outbox[0].headers["correlationId"], "corr-s1");
+}
+
 #[tokio::test]
 async fn a_crash_after_the_send_and_before_marking_re_sends_with_the_same_key() {
-    require_docker!();
     let rl = Rl::start().await;
     rl.record_charge("s1", 1000).await;
     let relay = rl.relay();
@@ -940,14 +1074,14 @@ async fn a_crash_after_the_send_and_before_marking_re_sends_with_the_same_key() 
 
     relay.poll_once().await.unwrap();
     assert!(
-        rl.entry("s1:1000").await.dispatched_at.is_none(),
+        rl.entry("s1:1000").await.dispatched_at_ms.is_none(),
         "the mark failed"
     );
 
     relay.poll_once().await.unwrap();
 
     assert_eq!(rl.sender.keys(), ["s1:1000", "s1:1000"]);
-    assert!(rl.entry("s1:1000").await.dispatched_at.is_some());
+    assert!(rl.entry("s1:1000").await.dispatched_at_ms.is_some());
     relay.poll_once().await.unwrap();
     assert_eq!(
         rl.sender.calls().len(),
@@ -958,7 +1092,6 @@ async fn a_crash_after_the_send_and_before_marking_re_sends_with_the_same_key() 
 
 #[tokio::test]
 async fn transient_failures_back_off_and_become_exhausted_after_the_limit() {
-    require_docker!();
     let rl = Rl::start().await;
     rl.deliver(
         &Start {
@@ -989,13 +1122,13 @@ async fn transient_failures_back_off_and_become_exhausted_after_the_limit() {
     rl.store.clock.advance(Duration::from_secs(3600));
     relay.poll_once().await.unwrap();
     assert_eq!(rl.entry(&key).await.attempts, 2);
-    assert!(rl.entry(&key).await.failed_at.is_none());
+    assert!(rl.entry(&key).await.failed_at_ms.is_none());
     rl.store.clock.advance(Duration::from_secs(3600));
     relay.poll_once().await.unwrap();
 
     assert_eq!(rl.sender.calls().len(), 3);
     assert!(
-        rl.entry(&key).await.failed_at.is_some(),
+        rl.entry(&key).await.failed_at_ms.is_some(),
         "the limit of 3 attempts is reached"
     );
     assert_eq!(
@@ -1008,7 +1141,6 @@ async fn transient_failures_back_off_and_become_exhausted_after_the_limit() {
 
 #[tokio::test]
 async fn an_adapter_failure_marked_retryable_backs_off_like_a_transient_one() {
-    require_docker!();
     let rl = Rl::start().await;
     rl.deliver(
         &Start {
@@ -1025,14 +1157,13 @@ async fn an_adapter_failure_marked_retryable_backs_off_like_a_transient_one() {
     assert_eq!(*rl.adapter.busy_calls.lock().unwrap(), ["b"]);
     let busy = rl.entry(&format!("{saga_id}:9000")).await;
     assert_eq!(busy.attempts, 1);
-    assert!(busy.failed_at.is_none(), "retried later, not failed");
+    assert!(busy.failed_at_ms.is_none(), "retried later, not failed");
     assert_eq!(rl.failures_of("rl.Order", "o1").await, Vec::<String>::new());
 }
 
 #[tokio::test]
 async fn no_handler_denied_invalid_and_failed_become_a_failure_event_at_once_and_a_saga_handling_it_receives_it()
  {
-    require_docker!();
     let rl = Rl::start().await;
     rl.deliver(
         &Start {
@@ -1067,7 +1198,7 @@ async fn no_handler_denied_invalid_and_failed_become_a_failure_event_at_once_and
         assert!(
             rl.entry(&format!("{saga_id}:{seq}"))
                 .await
-                .failed_at
+                .failed_at_ms
                 .is_some(),
             "{seq}"
         );
@@ -1100,7 +1231,6 @@ async fn no_handler_denied_invalid_and_failed_become_a_failure_event_at_once_and
 
 #[tokio::test]
 async fn a_command_whose_outcome_is_known_is_never_re_sent_while_its_failure_notice_is_retried() {
-    require_docker!();
     let rl = Rl::start_with(true).await;
     rl.deliver(
         &Start {
@@ -1124,7 +1254,7 @@ async fn a_command_whose_outcome_is_known_is_never_re_sent_while_its_failure_not
     relay.poll_once().await.unwrap();
     assert_eq!(rl.sender.calls().len(), 1);
     assert!(
-        rl.entry(&key).await.failed_at.is_some(),
+        rl.entry(&key).await.failed_at_ms.is_some(),
         "the permanent outcome is persisted before anything else can fail"
     );
     assert_eq!(rl.watcher.calls.load(Ordering::SeqCst), 1);
@@ -1170,8 +1300,11 @@ async fn a_command_whose_outcome_is_known_is_never_re_sent_while_its_failure_not
     );
     assert_eq!(
         rl.store
-            .count("saga_dispatch", doc! { "noticePending": true })
-            .await,
+            .dispatch()
+            .await
+            .iter()
+            .filter(|e| e.notice_pending == Some(true))
+            .count(),
         0
     );
 }
@@ -1179,7 +1312,6 @@ async fn a_command_whose_outcome_is_known_is_never_re_sent_while_its_failure_not
 #[tokio::test]
 async fn a_failure_notice_that_keeps_failing_is_given_up_after_the_relays_attempts_logged_at_error_and_counted()
  {
-    require_docker!();
     let rl = Rl::start_with(true).await;
     rl.deliver(
         &Start {
@@ -1226,15 +1358,17 @@ async fn a_failure_notice_that_keeps_failing_is_given_up_after_the_relays_attemp
     );
     assert_eq!(
         rl.store
-            .count("saga_dispatch", doc! { "noticePending": true })
-            .await,
+            .dispatch()
+            .await
+            .iter()
+            .filter(|e| e.notice_pending == Some(true))
+            .count(),
         0
     );
 }
 
 #[tokio::test]
 async fn an_unhandled_failure_event_is_logged_at_error_and_counted() {
-    require_docker!();
     let rl = Rl::start().await;
     rl.record("lost", 1000, "rl.Nobody", "{}").await;
     let captured = support::logs::Captured::default();
@@ -1267,13 +1401,12 @@ async fn an_unhandled_failure_event_is_logged_at_error_and_counted() {
         "no handler at all, not a missing live saga: {}",
         errors[0]
     );
-    assert!(rl.entry("lost:1000").await.failed_at.is_some());
+    assert!(rl.entry("lost:1000").await.failed_at_ms.is_some());
 }
 
 #[tokio::test]
 async fn a_failure_event_reaches_a_saga_that_handles_it_without_associating_itself_with_its_own_id()
 {
-    require_docker!();
     let rl = Rl::start().await;
     rl.deliver(
         &QuietStart {
@@ -1303,7 +1436,6 @@ async fn a_failure_event_reaches_a_saga_that_handles_it_without_associating_itse
 #[tokio::test]
 async fn a_failure_event_for_an_ended_saga_or_one_whose_type_has_no_handler_is_logged_at_error_and_counted()
  {
-    require_docker!();
     let rl = Rl::start().await;
     rl.deliver(
         &StartAndEnd {
@@ -1323,15 +1455,12 @@ async fn a_failure_event_for_an_ended_saga_or_one_whose_type_has_no_handler_is_l
     .await;
     let deaf = rl.saga_of("rl.Deaf", "d1").await;
     // The ended saga's own entries are dispatched too: take them out of the way.
-    rl.store
-        .db
-        .collection::<Document>("saga_dispatch")
-        .update_many(
-            doc! {},
-            doc! { "$set": { "dispatchedAt": mongodb::bson::DateTime::now() } },
-        )
-        .await
-        .unwrap();
+    let now = kraken_messaging::time::now_ms();
+    rl.store.edit(|c| {
+        c.dispatch
+            .iter_mut()
+            .for_each(|e| e.dispatched_at_ms = Some(now))
+    });
     rl.record(&ended.id, 9001, "rl.Nobody", r#"{"ref":"n"}"#)
         .await;
     rl.record(&deaf.id, 9001, "rl.Nobody", r#"{"ref":"n"}"#)
@@ -1373,14 +1502,13 @@ async fn a_failure_event_for_an_ended_saga_or_one_whose_type_has_no_handler_is_l
     assert!(
         rl.entry(&format!("{}:9001", ended.id))
             .await
-            .failed_at
+            .failed_at_ms
             .is_some()
     );
 }
 
 #[tokio::test]
 async fn entries_recorded_before_a_saga_ended_are_still_dispatched() {
-    require_docker!();
     let rl = Rl::start().await;
     rl.deliver(
         &StartAndEnd {
@@ -1398,7 +1526,13 @@ async fn entries_recorded_before_a_saga_ended_are_still_dispatched() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].type_name, "rl.Charge");
     assert_eq!(calls[0].payload, r#"{"ref":"ended-o9"}"#);
-    let outbox: Vec<OutboxDocument> = rl.store.all("outbox").await;
+    let outbox: Vec<OutboxDocument> = rl
+        .store
+        .outbox()
+        .await
+        .into_iter()
+        .map(outbox_document)
+        .collect();
     assert_eq!(outbox.len(), 1);
     assert_eq!(outbox[0].type_name, "rl.Announced");
     assert!(
@@ -1406,13 +1540,12 @@ async fn entries_recorded_before_a_saga_ended_are_still_dispatched() {
             .dispatch_of(&saga.id)
             .await
             .iter()
-            .all(|e| e.dispatched_at.is_some())
+            .all(|e| e.dispatched_at_ms.is_some())
     );
 }
 
 #[tokio::test]
 async fn two_relays_never_dispatch_one_sagas_entries_concurrently() {
-    require_docker!();
     let rl = Rl::start().await;
     rl.record_charge("s1", 1000).await;
     rl.record_charge("s1", 2000).await;
@@ -1450,7 +1583,7 @@ async fn two_relays_never_dispatch_one_sagas_entries_concurrently() {
     running.await.unwrap();
     assert_eq!(rl.sender.keys(), ["s1:1000", "s1:2000"]);
     assert_eq!(
-        rl.store.count("saga_dispatch_leases", doc! {}).await,
+        rl.store.contents().dispatch_leases.len(),
         0,
         "the lease is released when the saga's turn is done"
     );
@@ -1459,7 +1592,6 @@ async fn two_relays_never_dispatch_one_sagas_entries_concurrently() {
 #[tokio::test]
 async fn a_saga_command_reaches_a_handler_without_a_guard_and_is_denied_by_one_that_requires_authentication()
  {
-    require_docker!();
     let rl = Rl::start().await;
     rl.deliver(
         &Start {
@@ -1504,7 +1636,6 @@ async fn a_saga_command_reaches_a_handler_without_a_guard_and_is_denied_by_one_t
 
 #[tokio::test]
 async fn the_started_relay_stops_when_cancelled_and_waits_for_the_sends_in_flight() {
-    require_docker!();
     let rl = Rl::start().await;
     rl.record_charge("s1", 1000).await;
     let release = Arc::new(tokio::sync::Notify::new());
@@ -1536,14 +1667,13 @@ async fn the_started_relay_stops_when_cancelled_and_waits_for_the_sends_in_fligh
         .unwrap();
 
     assert!(
-        rl.entry("s1:1000").await.dispatched_at.is_some(),
+        rl.entry("s1:1000").await.dispatched_at_ms.is_some(),
         "the send in flight was marked"
     );
 }
 
 #[tokio::test]
 async fn a_failure_notice_whose_saga_handler_fails_is_parked_and_not_reported_as_unhandled() {
-    require_docker!();
     let rl = Rl::start().await;
     rl.deliver(
         &GrumpyStart {
@@ -1562,11 +1692,14 @@ async fn a_failure_notice_whose_saga_handler_fails_is_parked_and_not_reported_as
 
     assert_eq!(
         rl.store
-            .count(
-                "saga_failures",
-                doc! { "sagaType": "rl.Grumpy", "eventType": <SagaCommandFailed as kraken_messaging::MessageType>::TYPE }
-            )
-            .await,
+            .failures()
+            .await
+            .iter()
+            .filter(|f| {
+                f.saga_type == "rl.Grumpy"
+                    && f.event_type == <SagaCommandFailed as kraken_messaging::MessageType>::TYPE
+            })
+            .count(),
         1,
         "the saga got the notice and its handler failed: parked"
     );
@@ -1592,8 +1725,11 @@ async fn a_failure_notice_whose_saga_handler_fails_is_parked_and_not_reported_as
     );
     assert_eq!(
         rl.store
-            .count("saga_dispatch", doc! { "noticePending": true })
-            .await,
+            .dispatch()
+            .await
+            .iter()
+            .filter(|e| e.notice_pending == Some(true))
+            .count(),
         0
     );
 }
@@ -1601,7 +1737,6 @@ async fn a_failure_notice_whose_saga_handler_fails_is_parked_and_not_reported_as
 #[tokio::test]
 async fn a_failure_notice_whose_settling_write_fails_is_retried_on_its_own_and_the_sagas_turn_goes_on()
  {
-    require_docker!();
     let rl = Rl::start().await;
     rl.deliver(
         &Start {
@@ -1655,8 +1790,11 @@ async fn a_failure_notice_whose_settling_write_fails_is_retried_on_its_own_and_t
 
     assert_eq!(
         rl.store
-            .count("saga_dispatch", doc! { "noticePending": true })
-            .await,
+            .dispatch()
+            .await
+            .iter()
+            .filter(|e| e.notice_pending == Some(true))
+            .count(),
         0,
         "the notice came again when its claim expired and was settled"
     );

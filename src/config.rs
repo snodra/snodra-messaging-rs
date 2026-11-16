@@ -16,16 +16,17 @@ use crate::security::{HubOAuth2, HubTls, SecretString};
 pub const DEFAULT_STREAM_CREDIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// What happens to a record an event processor cannot handle (ADR 0022,
-/// `KRAKEN_KAFKA_DEAD_LETTER_MODE`, case-insensitive).
+/// `KRAKEN_EVENTS_DEAD_LETTER_MODE`, case-insensitive).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum DeadLetterMode {
     /// Parked in the `dead_letters` collection, sequenced per key, with the admin API
     /// ([`KrakenMessaging::dead_letters`](crate::KrakenMessaging::dead_letters)). The default.
     #[default]
     Collection,
-    /// Produced to `<topic>.dlt` with `kraken-dlt-*` headers; the topic belongs to the operator's
-    /// tooling (it must exist, or broker auto-creation must be on).
-    Topic,
+    /// Published to the event store's dead-letter source (`<source>.dlt`) with `kraken-dlt-*`
+    /// headers; it belongs to the operator's tooling. Needs an event store with the capability
+    /// `native-dead-letter`.
+    EventStore,
     /// Logged and skipped: nothing is kept.
     Log,
 }
@@ -35,7 +36,7 @@ impl DeadLetterMode {
     pub fn as_str(self) -> &'static str {
         match self {
             DeadLetterMode::Collection => "collection",
-            DeadLetterMode::Topic => "topic",
+            DeadLetterMode::EventStore => "event-store",
             DeadLetterMode::Log => "log",
         }
     }
@@ -43,10 +44,13 @@ impl DeadLetterMode {
     fn parse(name: &str, v: &str) -> Result<DeadLetterMode, MessagingError> {
         match v.trim().to_ascii_lowercase().as_str() {
             "collection" => Ok(DeadLetterMode::Collection),
-            "topic" => Ok(DeadLetterMode::Topic),
+            "event-store" => Ok(DeadLetterMode::EventStore),
             "log" => Ok(DeadLetterMode::Log),
+            "topic" => Err(MessagingError::InvalidMessage(format!(
+                "{name}: the mode `topic` is now `event-store`, got '{v}'"
+            ))),
             _ => Err(MessagingError::InvalidMessage(format!(
-                "{name} must be collection, topic or log, got '{v}'"
+                "{name} must be collection, event-store or log, got '{v}'"
             ))),
         }
     }
@@ -54,8 +58,8 @@ impl DeadLetterMode {
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Hub `Register.service_name`, event `source`, and the base of the event processors' Kafka
-    /// consumer groups (`<service_name>.<processor>`, `default` included).
+    /// Hub `Register.service_name`, event `source`, and the base of the event processors'
+    /// subscription names (`<service_name>.<processor>`, `default` included).
     pub service_name: String,
     /// This instance's id: its hub `Register.instance_id` and the `service.instance.id` the
     /// application gives its meter provider's resource (ADR 0026). A fresh UUID per `Config`
@@ -65,6 +69,15 @@ pub struct Config {
     /// comma-separated list of them, or one `dns:///name:port` whose addresses are re-resolved
     /// every 30 s. One address is the single-hub setup.
     pub hub_address: String,
+    /// Whether the service connects to the hubs (`KRAKEN_HUB_ENABLED`, default true). Off, it
+    /// never connects (`hub_address` must still parse, nothing dials it): events, processors,
+    /// dead letters, sagas and idempotent handlers work, and every command, query and
+    /// subscription sent fails at once with `HubUnavailable` naming the setting, those to the
+    /// service's own handlers included (a sender always goes through the hub). The saga relay
+    /// still delivers a command type this instance handles to its own handler; any other saga
+    /// command goes into the relay's retries. For tests and local runs
+    /// (`testing::InMemoryStores` turns it off).
+    pub hub_enabled: bool,
     /// How often an `InstanceStatus` goes to every hub (default 5 s, at least 1 ms).
     pub hub_status_interval: Duration,
     /// Request timeout sent as `timeout_ms` when a call sets none (`SendOptions.timeout` wins).
@@ -111,7 +124,8 @@ pub struct Config {
     /// A file holding the token (`KRAKEN_HUB_TOKEN_FILE`), for container secrets. Read at
     /// startup ([`Config::validate`]) and again on every reconnect, so a rotated secret is picked
     /// up without a restart. **It wins over `hub_token` when both are set.** Surrounding
-    /// whitespace is trimmed; an empty file is no token.
+    /// whitespace is trimmed; a file empty at startup is an error ([`Config::validate`]), one
+    /// found empty at a reconnect keeps the last token read.
     pub hub_token_file: Option<PathBuf>,
     /// TLS to the hubs (`KRAKEN_HUB_TLS=true`, with `KRAKEN_HUB_TLS_CA` and
     /// `KRAKEN_HUB_TLS_SERVER_NAME`). `None` (the default): plain text, unless an address starts
@@ -123,22 +137,34 @@ pub struct Config {
     /// provider serves every hub connection and refreshes the token before it expires. Mutually
     /// exclusive with `hub_token` / `hub_token_file` ([`Config::validate`]).
     pub hub_oauth2: Option<HubOAuth2>,
-    pub kafka_bootstrap: String,
-    pub kafka_topic: String,
+    /// The event store's source the service publishes its events to and its processors read
+    /// (`KRAKEN_EVENTS_SOURCE`, default `kraken.events`).
+    pub events_source: String,
     pub consumer_enabled: bool,
     pub consumer_max_attempts: u32,
     /// Where a record goes that an event processor cannot handle (ADR 0022;
-    /// `KRAKEN_KAFKA_DEAD_LETTER_MODE`, default `collection`).
+    /// `KRAKEN_EVENTS_DEAD_LETTER_MODE`, default `collection`).
     pub dead_letter_mode: DeadLetterMode,
-    /// How long a dead letter is kept (`KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS`, default 30 d, at
+    /// How long a dead letter is kept (`KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS`, default 30 d, at
     /// least 1 s): the TTL index on `expireAt` removes it then, which unblocks its key.
     pub dead_letter_retention: Duration,
-    /// Must name a database: `mongodb://host:27017/<service>?replicaSet=rs0`.
-    pub mongodb_uri: String,
     pub outbox_enabled: bool,
     pub outbox_poll_interval: Duration,
     pub outbox_batch_size: usize,
     pub outbox_max_attempts: u32,
+    /// How long a batch the relay claims stays its own (`KRAKEN_OUTBOX_LEASE_MS`, default 2 min):
+    /// longer than one send can take ([`OUTBOX_SEND_TIMEOUT`](crate::events::OUTBOX_SEND_TIMEOUT),
+    /// 40 s; a startup error otherwise). The relay stops a batch before its lease could run out
+    /// under a send, and its next claim renews what it still holds.
+    pub outbox_lease: Duration,
+    /// Whether `start()` prepares the message store's schema (`KRAKEN_STORE_INIT_SCHEMA`, default
+    /// true; Kotlin's `kraken.messaging.store.init-schema`): the MongoDB store's indexes, an SQL
+    /// store's tables. `false` when the schema is managed elsewhere (migrations).
+    pub store_init_schema: bool,
+    /// The retentions (`outbox_retention`, `idempotency_retention`, `sagas_*_retention`,
+    /// `deadlines_retention`, `external_calls_retention`) are the message store's to apply as it
+    /// can (ADR 0028: the MongoDB add-on's TTL indexes, built from this config); the core only
+    /// reads `dead_letter_retention` (a letter's expiry).
     pub outbox_retention: Duration,
     pub idempotency_retention: Duration,
     /// When set (with `issuer`), forwarded tokens are verified; otherwise read unverified.
@@ -188,16 +214,12 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn new(
-        service_name: &str,
-        hub_address: &str,
-        kafka_bootstrap: &str,
-        mongodb_uri: &str,
-    ) -> Config {
+    pub fn new(service_name: &str, hub_address: &str) -> Config {
         Config {
             service_name: service_name.to_string(),
             instance_id: uuid::Uuid::new_v4().to_string(),
             hub_address: hub_address.to_string(),
+            hub_enabled: true,
             hub_status_interval: Duration::from_secs(5),
             hub_request_timeout: None,
             reconnect_backoff_min: Duration::from_millis(500),
@@ -213,17 +235,17 @@ impl Config {
             hub_token_file: None,
             hub_tls: None,
             hub_oauth2: None,
-            kafka_bootstrap: kafka_bootstrap.to_string(),
-            kafka_topic: crate::kafka::EVENTS_TOPIC.to_string(),
+            events_source: crate::events::EVENTS_SOURCE.to_string(),
             consumer_enabled: true,
             consumer_max_attempts: 5,
             dead_letter_mode: DeadLetterMode::Collection,
             dead_letter_retention: Duration::from_secs(30 * 86_400),
-            mongodb_uri: mongodb_uri.to_string(),
             outbox_enabled: true,
             outbox_poll_interval: Duration::from_millis(200),
             outbox_batch_size: 100,
             outbox_max_attempts: 10,
+            outbox_lease: Duration::from_secs(120),
+            store_init_schema: true,
             outbox_retention: Duration::from_secs(7 * 86_400),
             idempotency_retention: Duration::from_secs(30 * 86_400),
             jwks_url: None,
@@ -284,16 +306,17 @@ impl Config {
         }
     }
 
-    /// `KRAKEN_SERVICE_NAME` and `KRAKEN_MONGODB_URI` are required; `KRAKEN_HUB_ADDRESS` defaults to
-    /// `static://kraken-hub:7000`, `KRAKEN_KAFKA_BOOTSTRAP` to `kafka:19092`. Optional:
-    /// `KRAKEN_INSTANCE_ID`, `KRAKEN_KAFKA_TOPIC`, `KRAKEN_JWKS_URL`, `KRAKEN_ISSUER`, `KRAKEN_HUB_REQUEST_TIMEOUT_MS`,
+    /// `KRAKEN_SERVICE_NAME` is required; `KRAKEN_HUB_ADDRESS` defaults to
+    /// `static://kraken-hub:7000`. Optional:
+    /// `KRAKEN_INSTANCE_ID`, `KRAKEN_HUB_ENABLED`, `KRAKEN_EVENTS_SOURCE`, `KRAKEN_JWKS_URL`, `KRAKEN_ISSUER`, `KRAKEN_HUB_REQUEST_TIMEOUT_MS`,
     /// `KRAKEN_HUB_STATUS_INTERVAL_MS`, `KRAKEN_RECONNECT_BACKOFF_MIN_MS`,
     /// `KRAKEN_RECONNECT_BACKOFF_MAX_MS`,
     /// `KRAKEN_MAX_CONCURRENT_HANDLERS`, `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS`,
-    /// `KRAKEN_KAFKA_DEAD_LETTER_MODE` (`collection`, `topic` or `log`),
-    /// `KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS`,
+    /// `KRAKEN_EVENTS_DEAD_LETTER_MODE` (`collection`, `event-store` or `log`),
+    /// `KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS`,
     /// `KRAKEN_OUTBOX_ENABLED`, `KRAKEN_OUTBOX_POLL_INTERVAL_MS`, `KRAKEN_OUTBOX_BATCH_SIZE`,
-    /// `KRAKEN_OUTBOX_MAX_ATTEMPTS`, `KRAKEN_FORWARD_JWT`, `KRAKEN_HUB_LOAD_FACTOR`,
+    /// `KRAKEN_OUTBOX_MAX_ATTEMPTS`, `KRAKEN_OUTBOX_LEASE_MS`, `KRAKEN_STORE_INIT_SCHEMA`,
+    /// `KRAKEN_FORWARD_JWT`, `KRAKEN_HUB_LOAD_FACTOR`,
     /// `KRAKEN_HUB_TAGS` (`k=v,k=v`), `KRAKEN_HUB_PRIORITIES` (`type=n,type=n`),
     /// `KRAKEN_HUB_RETRY_ENABLED`, `KRAKEN_HUB_RETRY_MAX_ATTEMPTS`,
     /// `KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS`, `KRAKEN_HUB_RETRY_MULTIPLIER`,
@@ -317,12 +340,16 @@ impl Config {
     /// `KRAKEN_HUB_RETRY_ENABLED=true` sets `hub_retry` to the
     /// policy the other `KRAKEN_HUB_RETRY_*` variables describe (defaults: 3 attempts, 100 ms
     /// doubling to 2 s); those are validated whether or not retry is enabled.
+    /// A removed setting still set (`KRAKEN_KAFKA_TOPIC`, `KRAKEN_KAFKA_DEAD_LETTER_MODE`,
+    /// `KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS`) is an error naming every one and its replacement,
+    /// and so is the old dead-letter mode `topic` (now `event-store`).
     pub fn from_env() -> Result<Config, MessagingError> {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
 
     /// [`Config::from_env`] over an arbitrary variable lookup (hermetic in tests).
     fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, MessagingError> {
+        removed_settings(&lookup)?;
         let required = |name: &str| {
             lookup(name)
                 .filter(|v| !v.trim().is_empty())
@@ -332,14 +359,15 @@ impl Config {
         let mut c = Config::new(
             &required("KRAKEN_SERVICE_NAME")?,
             &optional("KRAKEN_HUB_ADDRESS").unwrap_or_else(|| "static://kraken-hub:7000".into()),
-            &optional("KRAKEN_KAFKA_BOOTSTRAP").unwrap_or_else(|| "kafka:19092".into()),
-            &required("KRAKEN_MONGODB_URI")?,
         );
         if let Some(id) = optional("KRAKEN_INSTANCE_ID") {
             c.instance_id = id;
         }
-        if let Some(t) = optional("KRAKEN_KAFKA_TOPIC") {
-            c.kafka_topic = t;
+        if let Some(v) = optional("KRAKEN_HUB_ENABLED") {
+            c.hub_enabled = flag("KRAKEN_HUB_ENABLED", &v)?;
+        }
+        if let Some(t) = optional("KRAKEN_EVENTS_SOURCE") {
+            c.events_source = t;
         }
         c.jwks_url = optional("KRAKEN_JWKS_URL");
         c.issuer = optional("KRAKEN_ISSUER");
@@ -475,11 +503,11 @@ impl Config {
         if let Some(v) = optional("KRAKEN_CONSUMER_MAX_ATTEMPTS") {
             c.consumer_max_attempts = number("KRAKEN_CONSUMER_MAX_ATTEMPTS", &v)? as u32;
         }
-        if let Some(v) = optional("KRAKEN_KAFKA_DEAD_LETTER_MODE") {
-            c.dead_letter_mode = DeadLetterMode::parse("KRAKEN_KAFKA_DEAD_LETTER_MODE", &v)?;
+        if let Some(v) = optional("KRAKEN_EVENTS_DEAD_LETTER_MODE") {
+            c.dead_letter_mode = DeadLetterMode::parse("KRAKEN_EVENTS_DEAD_LETTER_MODE", &v)?;
         }
-        if let Some(v) = optional("KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS") {
-            c.dead_letter_retention = millis("KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS", &v)?;
+        if let Some(v) = optional("KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS") {
+            c.dead_letter_retention = millis("KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS", &v)?;
         }
         if let Some(v) = optional("KRAKEN_OUTBOX_ENABLED") {
             c.outbox_enabled = flag("KRAKEN_OUTBOX_ENABLED", &v)?;
@@ -492,6 +520,12 @@ impl Config {
         }
         if let Some(v) = optional("KRAKEN_OUTBOX_MAX_ATTEMPTS") {
             c.outbox_max_attempts = number("KRAKEN_OUTBOX_MAX_ATTEMPTS", &v)? as u32;
+        }
+        if let Some(v) = optional("KRAKEN_OUTBOX_LEASE_MS") {
+            c.outbox_lease = millis("KRAKEN_OUTBOX_LEASE_MS", &v)?;
+        }
+        if let Some(v) = optional("KRAKEN_STORE_INIT_SCHEMA") {
+            c.store_init_schema = flag("KRAKEN_STORE_INIT_SCHEMA", &v)?;
         }
         if let Some(v) = optional("KRAKEN_FORWARD_JWT") {
             c.forward_jwt = flag("KRAKEN_FORWARD_JWT", &v)?;
@@ -597,6 +631,13 @@ impl Config {
                 self.reconnect_backoff_min, self.reconnect_backoff_max
             )));
         }
+        if self.outbox_lease <= crate::events::OUTBOX_SEND_TIMEOUT {
+            return Err(MessagingError::InvalidMessage(format!(
+                "outbox_lease (KRAKEN_OUTBOX_LEASE_MS, {:?}) must be longer than a send ({} s)",
+                self.outbox_lease,
+                crate::events::OUTBOX_SEND_TIMEOUT.as_secs()
+            )));
+        }
         if self.hub_status_interval.is_zero() {
             return Err(MessagingError::InvalidMessage(
                 "hub_status_interval (KRAKEN_HUB_STATUS_INTERVAL_MS) must be at least 1 ms".into(),
@@ -628,17 +669,23 @@ impl Config {
             ));
         }
         if let Some(path) = &self.hub_token_file {
-            crate::security::read_token_file(path).map_err(|e| {
+            let token = crate::security::read_token_file(path).map_err(|e| {
                 MessagingError::InvalidMessage(format!(
                     "hub_token_file (KRAKEN_HUB_TOKEN_FILE) '{}' cannot be read: {e}",
                     path.display()
                 ))
             })?;
+            if token.is_none() {
+                return Err(MessagingError::InvalidMessage(format!(
+                    "hub_token_file (KRAKEN_HUB_TOKEN_FILE) '{}' is empty",
+                    path.display()
+                )));
+            }
         }
         self.validate_sagas()?;
         if self.dead_letter_retention < Duration::from_secs(1) {
             return Err(MessagingError::InvalidMessage(
-                "dead_letter_retention (KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS) must be at least 1 s"
+                "dead_letter_retention (KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS) must be at least 1 s"
                     .into(),
             ));
         }
@@ -889,6 +936,40 @@ fn pairs<T>(
     Ok(out)
 }
 
+/// Settings the library read before the event store became an add-on (ADR 0027), each with what
+/// replaced it. They are not read (no alias before v1), and one still set fails
+/// [`Config::from_env`] ([`removed_settings`]): ignored, a source or a mode would misroute events.
+/// `KRAKEN_MONGODB_URI`, also no longer read, is not here: a service may keep it for its own
+/// MongoDB client.
+const REMOVED_SETTINGS: [(&str, &str); 3] = [
+    ("KRAKEN_KAFKA_TOPIC", "KRAKEN_EVENTS_SOURCE"),
+    (
+        "KRAKEN_KAFKA_DEAD_LETTER_MODE",
+        "KRAKEN_EVENTS_DEAD_LETTER_MODE, where `topic` is now `event-store`",
+    ),
+    (
+        "KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS",
+        "KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS",
+    ),
+];
+
+/// The error for the removed settings the environment (`lookup`) still sets (blank is unset),
+/// naming every one and its replacement; `Ok` when none is set.
+fn removed_settings(lookup: &impl Fn(&str) -> Option<String>) -> Result<(), MessagingError> {
+    let set: Vec<String> = REMOVED_SETTINGS
+        .iter()
+        .filter(|(name, _)| lookup(name).is_some_and(|v| !v.trim().is_empty()))
+        .map(|(name, replacement)| format!("{name}: use {replacement}"))
+        .collect();
+    if set.is_empty() {
+        return Ok(());
+    }
+    Err(MessagingError::InvalidMessage(format!(
+        "removed settings are set; they are no longer read, unset them. {}",
+        set.join("; ")
+    )))
+}
+
 fn flag(name: &str, v: &str) -> Result<bool, MessagingError> {
     match v.trim().to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" => Ok(true),
@@ -909,14 +990,11 @@ mod tests {
     }
 
     fn try_from(vars: &[(&str, &str)]) -> Result<Config, MessagingError> {
-        let vars: Vec<(String, String)> = [
-            ("KRAKEN_SERVICE_NAME", "svc"),
-            ("KRAKEN_MONGODB_URI", "mongodb://m/db"),
-        ]
-        .iter()
-        .chain(vars)
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
+        let vars: Vec<(String, String)> = [("KRAKEN_SERVICE_NAME", "svc")]
+            .iter()
+            .chain(vars)
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         Config::from_lookup(|n| {
             vars.iter()
                 .rev()
@@ -926,7 +1004,7 @@ mod tests {
     }
 
     fn code_config() -> Config {
-        Config::new("svc", "static://hub:7000", "kafka:19092", "mongodb://m/db")
+        Config::new("svc", "static://hub:7000")
     }
 
     #[test]
@@ -1004,7 +1082,7 @@ mod tests {
 
     #[test]
     fn flow_control_routing_and_retry_defaults() {
-        let c = Config::new("svc", "static://hub:7000", "kafka:19092", "mongodb://m/db");
+        let c = Config::new("svc", "static://hub:7000");
         assert_eq!(c.hub_load_factor, 100);
         assert!(c.hub_tags.is_empty());
         assert!(c.hub_priorities.is_empty());
@@ -1128,10 +1206,6 @@ mod tests {
         ] {
             let vars = [
                 ("KRAKEN_SERVICE_NAME".to_string(), "svc".to_string()),
-                (
-                    "KRAKEN_MONGODB_URI".to_string(),
-                    "mongodb://m/db".to_string(),
-                ),
                 (name.to_string(), value.to_string()),
             ];
             let result =
@@ -1268,7 +1342,7 @@ mod tests {
 
     #[test]
     fn hub_defaults() {
-        let c = Config::new("svc", "static://hub:7000", "kafka:19092", "mongodb://m/db");
+        let c = Config::new("svc", "static://hub:7000");
         // No chosen timeout: the hub decides (per-type override or its default).
         assert_eq!(c.hub_request_timeout, None);
         // F2: the backoff is capped at 5 s.
@@ -1311,6 +1385,27 @@ mod tests {
             "the file is read per connect, not stored here"
         );
         assert!(!format!("{c:?}").contains("from-the-file"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A token file empty at startup (after trimming) fails it, naming the setting and the path,
+    /// as the other secret files; set in code, the same.
+    #[test]
+    fn an_empty_token_file_at_startup_is_an_error() {
+        let dir = secret_dir();
+        for (name, content) in [("empty", ""), ("blank", " \n\t\r\n")] {
+            let path = dir.join(name);
+            std::fs::write(&path, content).unwrap();
+            let refused = try_from(&[("KRAKEN_HUB_TOKEN_FILE", path.to_str().unwrap())]);
+            assert!(
+                matches!(&refused, Err(MessagingError::InvalidMessage(m))
+                    if m.contains("KRAKEN_HUB_TOKEN_FILE") && m.contains(path.to_str().unwrap()) && m.contains("empty")),
+                "{name}: {refused:?}"
+            );
+            let mut c = code_config();
+            c.hub_token_file = Some(path.clone());
+            assert!(c.validate().is_err(), "{name}, set in code");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1818,28 +1913,28 @@ mod tests {
     fn dead_letter_mode_and_retention_from_env() {
         for (value, mode) in [
             ("collection", DeadLetterMode::Collection),
-            ("topic", DeadLetterMode::Topic),
+            ("event-store", DeadLetterMode::EventStore),
             ("log", DeadLetterMode::Log),
-            (" TOPIC ", DeadLetterMode::Topic),
+            (" EVENT-STORE ", DeadLetterMode::EventStore),
             ("Log", DeadLetterMode::Log),
         ] {
-            let c = from(&[("KRAKEN_KAFKA_DEAD_LETTER_MODE", value)]);
+            let c = from(&[("KRAKEN_EVENTS_DEAD_LETTER_MODE", value)]);
             assert_eq!(c.dead_letter_mode, mode, "{value}");
         }
         assert_eq!(DeadLetterMode::Collection.as_str(), "collection");
-        assert_eq!(DeadLetterMode::Topic.as_str(), "topic");
+        assert_eq!(DeadLetterMode::EventStore.as_str(), "event-store");
         assert_eq!(DeadLetterMode::Log.as_str(), "log");
-        let c = from(&[("KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS", "1000")]);
+        let c = from(&[("KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS", "1000")]);
         assert_eq!(c.dead_letter_retention, Duration::from_secs(1));
     }
 
     #[test]
     fn an_unknown_mode_or_a_retention_under_one_second_is_rejected() {
         for (name, value) in [
-            ("KRAKEN_KAFKA_DEAD_LETTER_MODE", "queue"),
-            ("KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS", "999"),
-            ("KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS", "0"),
-            ("KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS", "later"),
+            ("KRAKEN_EVENTS_DEAD_LETTER_MODE", "queue"),
+            ("KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS", "999"),
+            ("KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS", "0"),
+            ("KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS", "later"),
         ] {
             let e = try_from(&[(name, value)]).unwrap_err().to_string();
             assert!(e.contains(name), "{name}={value}: {e}");
@@ -1848,6 +1943,95 @@ mod tests {
         c.dead_letter_retention = Duration::from_millis(500);
         let e = c.validate().unwrap_err().to_string();
         assert!(e.contains("dead_letter_retention"), "{e}");
-        assert!(e.contains("KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS"), "{e}");
+        assert!(e.contains("KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS"), "{e}");
+    }
+
+    #[test]
+    fn the_outbox_lease_and_the_schema_setup_default_and_come_from_env() {
+        let c = code_config();
+        assert_eq!(c.outbox_lease, Duration::from_secs(120));
+        assert!(c.store_init_schema);
+        let c = from(&[
+            ("KRAKEN_OUTBOX_LEASE_MS", "90000"),
+            ("KRAKEN_STORE_INIT_SCHEMA", "false"),
+        ]);
+        assert_eq!(c.outbox_lease, Duration::from_secs(90));
+        assert!(!c.store_init_schema);
+    }
+
+    #[test]
+    fn the_hub_can_be_turned_off() {
+        assert!(from(&[]).hub_enabled, "on by default");
+        assert!(!from(&[("KRAKEN_HUB_ENABLED", "false")]).hub_enabled);
+        assert!(try_from(&[("KRAKEN_HUB_ENABLED", "maybe")]).is_err());
+    }
+
+    #[test]
+    fn an_outbox_lease_not_longer_than_a_send_is_rejected() {
+        let e = try_from(&[("KRAKEN_OUTBOX_LEASE_MS", "40000")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("KRAKEN_OUTBOX_LEASE_MS") && e.contains("40 s"),
+            "{e}"
+        );
+        let mut c = code_config();
+        c.outbox_lease = Duration::from_secs(41);
+        assert!(c.validate().is_ok());
+    }
+
+    /// A removed setting still set fails the configuration, one message naming every offender
+    /// and its replacement (a silently ignored source or mode would misroute events);
+    /// `KRAKEN_MONGODB_URI` is not one of them (a service may read it for its own client).
+    #[test]
+    fn a_removed_setting_still_set_fails_naming_every_offender_and_its_replacement() {
+        let removed = [
+            ("KRAKEN_KAFKA_TOPIC", "orders.events"),
+            ("KRAKEN_KAFKA_DEAD_LETTER_MODE", "topic"),
+            ("KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS", "1000"),
+        ];
+        let refused = try_from(&removed);
+        let Err(MessagingError::InvalidMessage(message)) = &refused else {
+            panic!("{refused:?}");
+        };
+        for (name, replacement) in [
+            ("KRAKEN_KAFKA_TOPIC", "KRAKEN_EVENTS_SOURCE"),
+            (
+                "KRAKEN_KAFKA_DEAD_LETTER_MODE",
+                "KRAKEN_EVENTS_DEAD_LETTER_MODE",
+            ),
+            (
+                "KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS",
+                "KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS",
+            ),
+        ] {
+            assert!(
+                message.contains(name) && message.contains(replacement),
+                "{name} -> {replacement}: {message}"
+            );
+        }
+        assert_eq!(
+            message,
+            "removed settings are set; they are no longer read, unset them. \
+             KRAKEN_KAFKA_TOPIC: use KRAKEN_EVENTS_SOURCE; \
+             KRAKEN_KAFKA_DEAD_LETTER_MODE: use KRAKEN_EVENTS_DEAD_LETTER_MODE, where `topic` is now `event-store`; \
+             KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS: use KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS"
+        );
+        // One alone is refused too; blank is unset.
+        assert!(try_from(&[("KRAKEN_KAFKA_TOPIC", "t")]).is_err());
+        assert!(try_from(&[("KRAKEN_KAFKA_TOPIC", " ")]).is_ok());
+        // The service's own MongoDB URI is neither refused nor read.
+        assert!(try_from(&[("KRAKEN_MONGODB_URI", "mongodb://mongo:27017/orders")]).is_ok());
+    }
+
+    /// The v0.4.0 value `topic` of the dead-letter mode is refused naming its replacement.
+    #[test]
+    fn the_old_dead_letter_mode_topic_fails_naming_event_store() {
+        let refused = try_from(&[("KRAKEN_EVENTS_DEAD_LETTER_MODE", "topic")]);
+        assert!(
+            matches!(&refused, Err(MessagingError::InvalidMessage(m))
+                if m.contains("KRAKEN_EVENTS_DEAD_LETTER_MODE") && m.contains("`topic`") && m.contains("event-store")),
+            "{refused:?}"
+        );
     }
 }

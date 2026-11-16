@@ -57,19 +57,22 @@ macro_rules! require_docker {
     };
 }
 
-fn config(service: &str, hub: &str, kafka: &str, mongo: &str) -> Config {
-    let mut c = Config::new(service, hub, kafka, mongo);
+fn config(service: &str, hub: &str) -> Config {
+    let mut c = Config::new(service, hub);
     c.outbox_poll_interval = Duration::from_millis(100);
     c.reconnect_backoff_min = Duration::from_millis(100);
     c.reconnect_backoff_max = Duration::from_secs(2);
     c
 }
 
-/// Service B: owns `t.Ping` (replies and publishes `t.Happened`) and the guarded `t.Secret`.
-async fn start_b(cfg: Config) -> KrakenMessaging {
+/// Service B: owns `t.Ping` (replies and publishes `t.Happened`, so it has a store) and the
+/// guarded `t.Secret`.
+async fn start_b(cfg: Config, mongo: &str, kafka: &str) -> KrakenMessaging {
     let builder = KrakenMessaging::builder(cfg)
         .await
-        .expect("service b builder");
+        .expect("service b builder")
+        .store(support::mongo_store(mongo).await)
+        .event_store(support::kafka_events(kafka));
     let events = builder.events();
     builder
         .command::<Ping, _, _>(move |p, _ctx| {
@@ -101,30 +104,26 @@ async fn two_participants_round_trip() {
     let kafka = support::containers::kafka().await;
     let mongo = support::containers::mongo().await;
     let (tx, mut rx) = mpsc::channel::<Happened>(8);
-    let a = KrakenMessaging::builder(config(
-        "svc-a",
-        &hub.address,
-        &kafka.bootstrap,
-        &mongo.uri_for("a"),
-    ))
-    .await
-    .unwrap()
-    .event::<Happened, _, _>(move |e, _ctx| {
-        let tx = tx.clone();
-        async move {
-            tx.send(e).await.unwrap();
-            Ok(())
-        }
-    })
-    .start()
-    .await
-    .expect("service a starts");
-    let b = start_b(config(
-        "svc-b",
-        &hub.address,
-        &kafka.bootstrap,
+    let a = KrakenMessaging::builder(config("svc-a", &hub.address))
+        .await
+        .unwrap()
+        .store(support::mongo_store(&mongo.uri_for("a")).await)
+        .event_store(support::kafka_events(&kafka.bootstrap))
+        .event::<Happened, _, _>(move |e, _ctx| {
+            let tx = tx.clone();
+            async move {
+                tx.send(e).await.unwrap();
+                Ok(())
+            }
+        })
+        .start()
+        .await
+        .expect("service a starts");
+    let b = start_b(
+        config("svc-b", &hub.address),
         &mongo.uri_for("b"),
-    ))
+        &kafka.bootstrap,
+    )
     .await;
     assert!(
         a.await_hub(Duration::from_secs(15)).await && b.await_hub(Duration::from_secs(15)).await
@@ -169,8 +168,7 @@ async fn two_participants_round_trip() {
 async fn no_handler_is_reported() {
     require_docker!();
     let hub = support::containers::hub().await;
-    let mongo = support::containers::mongo().await;
-    let mut cfg = config("svc-a", &hub.address, "127.0.0.1:1", &mongo.uri_for("a"));
+    let mut cfg = config("svc-a", &hub.address);
     cfg.outbox_enabled = false;
     cfg.consumer_enabled = false;
     let a = KrakenMessaging::builder(cfg)
@@ -205,11 +203,11 @@ async fn permission_denied_with_signed_token() {
         .mount(&jwks)
         .await;
 
-    let mut cfg_b = config("svc-b", &hub.address, &kafka.bootstrap, &mongo.uri_for("b"));
+    let mut cfg_b = config("svc-b", &hub.address);
     cfg_b.jwks_url = Some(format!("{}/certs", jwks.uri()));
     cfg_b.issuer = Some(support::ISSUER.to_string());
-    let b = start_b(cfg_b).await;
-    let mut cfg_a = config("svc-a", &hub.address, &kafka.bootstrap, &mongo.uri_for("a"));
+    let b = start_b(cfg_b, &mongo.uri_for("b"), &kafka.bootstrap).await;
+    let mut cfg_a = config("svc-a", &hub.address);
     cfg_a.consumer_enabled = false;
     let a = KrakenMessaging::builder(cfg_a)
         .await
@@ -300,13 +298,7 @@ async fn permission_denied_with_signed_token() {
 #[tokio::test]
 async fn send_before_connected_is_hub_unavailable() {
     require_docker!();
-    let mongo = support::containers::mongo().await;
-    let mut cfg = config(
-        "svc-a",
-        "static://127.0.0.1:1",
-        "127.0.0.1:1",
-        &mongo.uri_for("a"),
-    );
+    let mut cfg = config("svc-a", "static://127.0.0.1:1");
     cfg.outbox_enabled = false;
     cfg.consumer_enabled = false;
     let a = KrakenMessaging::builder(cfg)
@@ -330,8 +322,7 @@ async fn reconnects_after_hub_restart() {
     require_docker!();
     let port = support::containers::free_port();
     let hub = support::containers::hub_on(port).await;
-    let mongo = support::containers::mongo().await;
-    let mut cfg_a = config("svc-a", &hub.address, "127.0.0.1:1", &mongo.uri_for("a"));
+    let mut cfg_a = config("svc-a", &hub.address);
     cfg_a.outbox_enabled = false;
     cfg_a.consumer_enabled = false;
     let a = KrakenMessaging::builder(cfg_a)
@@ -340,7 +331,7 @@ async fn reconnects_after_hub_restart() {
         .start()
         .await
         .unwrap();
-    let mut cfg_b = config("svc-b", &hub.address, "127.0.0.1:1", &mongo.uri_for("b"));
+    let mut cfg_b = config("svc-b", &hub.address);
     cfg_b.outbox_enabled = false;
     cfg_b.consumer_enabled = false;
     let b = KrakenMessaging::builder(cfg_b)
@@ -399,19 +390,19 @@ fn _app_is_shareable() {
 }
 
 #[tokio::test]
-async fn shutdown_is_prompt_and_builder_exposes_database() {
+async fn shutdown_is_prompt() {
     require_docker!();
     let hub = support::containers::hub().await;
-    let mongo = support::containers::mongo().await;
-    let mut cfg = config("svc-a", &hub.address, "127.0.0.1:1", &mongo.uri_for("a"));
+    let mut cfg = config("svc-a", &hub.address);
     cfg.outbox_enabled = false;
     cfg.consumer_enabled = false;
-    let builder = KrakenMessaging::builder(cfg).await.unwrap();
-    assert_eq!(builder.database().name(), "a");
-    let _client: mongodb::Client = builder.client();
-    let a = builder.start().await.unwrap();
+    let a = KrakenMessaging::builder(cfg)
+        .await
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
     assert!(a.await_hub(Duration::from_secs(15)).await);
-    assert_eq!(a.database().name(), "a");
     let started = std::time::Instant::now();
     a.shutdown().await;
     assert!(
@@ -435,10 +426,9 @@ impl Command for Stall {
 async fn shutdown_fails_outgoing_requests_in_flight_with_hub_connection_lost() {
     require_docker!();
     let hub = support::containers::hub().await;
-    let mongo = support::containers::mongo().await;
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
-    let mut cfg_b = config("svc-b", &hub.address, "127.0.0.1:1", &mongo.uri_for("b"));
+    let mut cfg_b = config("svc-b", &hub.address);
     cfg_b.outbox_enabled = false;
     cfg_b.consumer_enabled = false;
     let (s, r) = (Arc::clone(&started), Arc::clone(&release));
@@ -456,7 +446,7 @@ async fn shutdown_fails_outgoing_requests_in_flight_with_hub_connection_lost() {
         .start()
         .await
         .unwrap();
-    let mut cfg_a = config("svc-a", &hub.address, "127.0.0.1:1", &mongo.uri_for("a"));
+    let mut cfg_a = config("svc-a", &hub.address);
     cfg_a.outbox_enabled = false;
     cfg_a.consumer_enabled = false;
     let builder_a = KrakenMessaging::builder(cfg_a).await.unwrap();
@@ -491,4 +481,149 @@ async fn shutdown_fails_outgoing_requests_in_flight_with_hub_connection_lost() {
     );
     release.notify_one();
     b.shutdown().await;
+}
+
+#[derive(Serialize, Deserialize)]
+struct Drain {}
+message_type!(Drain, "t.Drain");
+impl Command for Drain {
+    type Reply = String;
+}
+
+#[derive(Serialize, Deserialize)]
+struct Who {}
+message_type!(Who, "t.Who");
+impl Command for Who {
+    type Reply = String;
+}
+
+/// An instance of `svc-d` named `name`, one handler at a time: `t.Who` answers its name, and
+/// `t.Drain` too, after `gate` opens when one is given (`started` is told when it begins).
+async fn drain_instance(
+    hub: &str,
+    name: &'static str,
+    gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Semaphore>)>,
+) -> KrakenMessaging {
+    let mut cfg = config("svc-d", hub);
+    cfg.outbox_enabled = false;
+    cfg.consumer_enabled = false;
+    cfg.max_concurrent_handlers = 1;
+    KrakenMessaging::builder(cfg)
+        .await
+        .unwrap()
+        .command::<Who, _, _>(move |_, _| async move { Ok(name.to_string()) })
+        .command::<Drain, _, _>(move |_, _| {
+            let gate = gate.clone();
+            async move {
+                if let Some((started, open)) = gate {
+                    started.notify_one();
+                    open.acquire().await.expect("the gate").forget();
+                }
+                Ok(name.to_string())
+            }
+        })
+        .start()
+        .await
+        .unwrap()
+}
+
+/// Kotlin parity (`HubLifecycle.stop`): a graceful shutdown first registers no types with the hub,
+/// so the requests the hub queued for this instance go to another instance at once, not after
+/// the handler drain (up to 10 s) and the stream's close.
+#[tokio::test]
+async fn graceful_shutdown_hands_queued_requests_to_another_instance_at_once() {
+    require_docker!();
+    let hub = support::containers::hub().await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let open = Arc::new(tokio::sync::Semaphore::new(0));
+    let a = drain_instance(
+        &hub.address,
+        "a",
+        Some((Arc::clone(&started), Arc::clone(&open))),
+    )
+    .await;
+    let b = drain_instance(&hub.address, "b", None).await;
+    let mut cfg = config("svc-caller", &hub.address);
+    cfg.outbox_enabled = false;
+    cfg.consumer_enabled = false;
+    let builder = KrakenMessaging::builder(cfg).await.unwrap();
+    let sender = builder.sender();
+    let caller = builder.start().await.unwrap();
+    for app in [&a, &b, &caller] {
+        assert!(app.await_hub(Duration::from_secs(15)).await);
+    }
+    let keyed = |key: &str| SendOptions {
+        routing_key: Some(key.to_string()),
+        timeout: Some(Duration::from_secs(30)),
+        ..Default::default()
+    };
+    // A key the hub routes to A.
+    let mut key = None;
+    for i in 0..200 {
+        let k = format!("k-{i}");
+        if sender.send_command(&Who {}, keyed(&k)).await.unwrap() == "a" {
+            key = Some(k);
+            break;
+        }
+    }
+    let key = key.expect("a key routed to instance a");
+
+    // The first takes A's only permit and waits at the gate; the next two queue at the hub for A.
+    let call = |key: String| {
+        let sender = sender.clone();
+        tokio::spawn(async move { sender.send_command(&Drain {}, keyed(&key)).await })
+    };
+    let first = call(key.clone());
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("A took the first request");
+    let queued = [call(key.clone()), call(key.clone())];
+    // Both are queued at the hub for A (its one permit is taken) before A shuts down.
+    let a_instance = a.instance_id().to_string();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let topology: serde_json::Value = reqwest::get(format!("{}/api/v1/topology", hub.http))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let queued_for_a = topology["services"]
+            .as_array()
+            .and_then(|all| all.iter().find(|s| s["serviceName"] == "svc-d"))
+            .and_then(|s| s["instances"].as_array())
+            .and_then(|all| all.iter().find(|i| i["instanceId"] == a_instance.as_str()))
+            .and_then(|i| i["queued"].as_u64())
+            .unwrap_or(0);
+        if queued_for_a >= 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never two requests queued for A: {topology}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let shutdown = tokio::spawn(a.shutdown());
+    let handed_over = std::time::Instant::now();
+    for q in queued {
+        let served = tokio::time::timeout(Duration::from_secs(3), q)
+            .await
+            .expect("a queued request served by another instance while A drains")
+            .unwrap()
+            .expect("served");
+        assert_eq!(served, "b");
+    }
+    assert!(
+        handed_over.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        handed_over.elapsed()
+    );
+    // A's handler still finishes its own request, and its reply goes through.
+    open.add_permits(1);
+    assert_eq!(first.await.unwrap().expect("A's own request"), "a");
+    shutdown.await.unwrap();
+    b.shutdown().await;
+    caller.shutdown().await;
 }

@@ -302,7 +302,11 @@ async fn the_relays_sends_carry_no_authorization() {
     let user = MessageContext {
         correlation_id: "c-9".into(),
         authorization: Some("Bearer user-token".into()),
-        headers: [("traceparent".to_string(), "00-abc-def-01".to_string())].into(),
+        headers: [(
+            "traceparent".to_string(),
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
+        )]
+        .into(),
         ..Default::default()
     };
 
@@ -322,7 +326,7 @@ async fn the_relays_sends_carry_no_authorization() {
     );
     assert_eq!(
         headers.get("traceparent").map(String::as_str),
-        Some("00-abc-def-01")
+        Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
     );
 
     // Locally: no identity, so a handler that requires authentication denies the command.
@@ -350,9 +354,43 @@ async fn the_relays_sends_carry_no_authorization() {
             open.send_raw("t.Ping", PAYLOAD.to_vec(), SendOptions::default()),
         )
         .await;
-    let (ctx, _) = &open_seen.lock().unwrap()[0];
-    assert!(ctx.authorization.is_none() && ctx.identity.is_none());
-    assert!(!ctx.headers.contains_key("authorization"));
+    {
+        let (ctx, _) = &open_seen.lock().unwrap()[0];
+        assert!(ctx.authorization.is_none() && ctx.identity.is_none());
+        assert!(!ctx.headers.contains_key("authorization"));
+    }
+
+    // An invalid traceparent is not forwarded, through the hub or locally.
+    let invalid = MessageContext {
+        correlation_id: "c-10".into(),
+        headers: [("traceparent".to_string(), "00-abc-def-01".to_string())].into(),
+        ..Default::default()
+    };
+    let outcome = CURRENT
+        .scope(
+            invalid.clone(),
+            first.send_raw("t.Elsewhere", b"{}".to_vec(), with_headers()),
+        )
+        .await;
+    assert_eq!(outcome, RawOutcome::Success);
+    let headers = &hub.requests().await[1].headers;
+    assert_eq!(
+        headers.get("correlationId").map(String::as_str),
+        Some("c-10")
+    );
+    assert!(!headers.contains_key("traceparent"), "{headers:?}");
+    CURRENT
+        .scope(
+            invalid,
+            open.send_raw("t.Ping", PAYLOAD.to_vec(), SendOptions::default()),
+        )
+        .await;
+    let (ctx, _) = &open_seen.lock().unwrap()[1];
+    assert!(
+        !ctx.headers.contains_key("traceparent"),
+        "{:?}",
+        ctx.headers
+    );
 }
 
 #[tokio::test]

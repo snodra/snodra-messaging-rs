@@ -1,7 +1,8 @@
 //! The saga runtime (S2 Task 5, ADR 0021 rulings 1, 3-6, 25, 26, 27, 33, 35, 37): one transaction
 //! per (event, saga type) with an exactly-once marker, association routing, start keys,
 //! version-checked writes, dispatch entries, deadlines and parking. The Rust form of the Kotlin
-//! `SagaRuntimeTest`, against a real MongoDB with real transactions.
+//! `SagaRuntimeTest`, on the in-memory message store and its transactions (no container).
+#![cfg(feature = "testing")]
 
 mod support;
 
@@ -9,26 +10,16 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use kraken_messaging::kafka::SagaStage;
+use kraken_messaging::events::SagaStage;
 use kraken_messaging::saga::store::{Association, DeadlineStatus, DispatchKind};
 use kraken_messaging::saga::{
     EventOutcome, FailureReason, SagaCommandFailed, SagaDefinition, SagaRetry, SagaRuntime,
     SagaType,
 };
 use kraken_messaging::{Event, MessageType, RetryPolicy};
-use mongodb::bson::doc;
 use serde::{Deserialize, Serialize};
 use support::order_saga::*;
 use support::saga::{Store, event_ctx, state, t0};
-
-macro_rules! require_docker {
-    () => {
-        if !support::docker_available() {
-            eprintln!("docker not available, skipping");
-            return;
-        }
-    };
-}
 
 fn quick_retry() -> SagaRetry {
     SagaRetry::new(RetryPolicy {
@@ -48,7 +39,10 @@ struct Rt {
 
 impl Rt {
     async fn start() -> Rt {
-        let store = Store::start().await;
+        Rt::on(Store::start().await)
+    }
+
+    fn on(store: Store) -> Rt {
         let gate = Gate::new();
         let metrics = RecordingMetrics::new();
         let runtime = Self::build(
@@ -141,14 +135,14 @@ fn bump(order_id: &str, tag: &str) -> Bump {
     }
 }
 
-fn dt(t: std::time::SystemTime) -> mongodb::bson::DateTime {
-    mongodb::bson::DateTime::from_system_time(t)
+/// Epoch milliseconds.
+fn dt(t: std::time::SystemTime) -> i64 {
+    kraken_messaging::time::epoch_ms(t)
 }
 
 #[tokio::test]
 async fn state_and_dispatched_payloads_keep_a_decimal_text_and_map_keys_with_dots_or_a_leading_dollar_exactly()
  {
-    require_docker!();
     let rt = Rt::start().await;
     let priced = rt.runtime_of(vec![price_saga()]);
     let tags = std::collections::BTreeMap::from([
@@ -200,7 +194,6 @@ async fn state_and_dispatched_payloads_keep_a_decimal_text_and_map_keys_with_dot
 
 #[tokio::test]
 async fn a_start_event_creates_an_instance_with_its_association_and_state() {
-    require_docker!();
     let rt = Rt::start().await;
 
     assert!(rt.deliver(&placed("o1")).await);
@@ -219,14 +212,13 @@ async fn a_start_event_creates_an_instance_with_its_association_and_state() {
     assert_eq!(state(&doc)["placed"], 1);
     assert!(!doc.ended);
     assert_eq!(doc.version, 0);
-    assert_eq!(doc.created_at, dt(t0()));
+    assert_eq!(doc.created_at_ms, dt(t0()));
     assert_eq!(rt.metrics.started(), ["rt.Order"]);
     assert_eq!(rt.metrics.count("rt.Order", EventOutcome::Handled), 1);
 }
 
 #[tokio::test]
 async fn a_later_event_is_routed_by_association_to_that_instance() {
-    require_docker!();
     let rt = Rt::start().await;
     rt.deliver(&placed("o2")).await;
     rt.deliver(&bump("o2", "a")).await;
@@ -239,7 +231,6 @@ async fn a_later_event_is_routed_by_association_to_that_instance() {
 
 #[tokio::test]
 async fn an_event_that_matches_an_instance_and_a_start_handler_is_handled_once_by_the_instance() {
-    require_docker!();
     let rt = Rt::start().await;
     rt.deliver(&placed("o3")).await;
     rt.deliver(&placed("o3")).await;
@@ -260,7 +251,6 @@ async fn an_event_that_matches_an_instance_and_a_start_handler_is_handled_once_b
 
 #[tokio::test]
 async fn force_new_always_creates_a_new_instance_without_a_start_key() {
-    require_docker!();
     let rt = Rt::start().await;
     rt.deliver(&Forced {
         order_id: "o4".into(),
@@ -286,8 +276,21 @@ async fn force_new_always_creates_a_new_instance_without_a_start_key() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_concurrent_start_events_for_one_key_end_in_one_instance_that_handled_both() {
-    require_docker!();
-    let rt = Rt::start().await;
+    two_start_events_race(Rt::start().await).await;
+}
+
+/// The same race on the MongoDB add-on: its write conflicts, transient transaction errors and the
+/// partial unique start-key index under two live transactions become conflicts the runtime retries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_concurrent_start_events_for_one_key_end_in_one_instance_on_mongodb() {
+    if !support::docker_available() {
+        eprintln!("docker not available, skipping");
+        return;
+    }
+    two_start_events_race(Rt::on(Store::start_mongo().await)).await;
+}
+
+async fn two_start_events_race(rt: Rt) {
     rt.gate.meet_in_pairs(2);
 
     let (a, b) = (Arc::clone(&rt.runtime), Arc::clone(&rt.runtime));
@@ -309,8 +312,20 @@ async fn two_concurrent_start_events_for_one_key_end_in_one_instance_that_handle
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_concurrent_events_for_one_instance_never_interleave_and_both_apply() {
-    require_docker!();
-    let rt = Rt::start().await;
+    two_events_race(Rt::start().await).await;
+}
+
+/// The same race on the MongoDB add-on (a write conflict on the saga's document).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_concurrent_events_for_one_instance_never_interleave_on_mongodb() {
+    if !support::docker_available() {
+        eprintln!("docker not available, skipping");
+        return;
+    }
+    two_events_race(Rt::on(Store::start_mongo().await)).await;
+}
+
+async fn two_events_race(rt: Rt) {
     rt.deliver(&placed("o6")).await;
     rt.gate.meet_in_pairs(2);
 
@@ -338,7 +353,6 @@ async fn two_concurrent_events_for_one_instance_never_interleave_and_both_apply(
 
 #[tokio::test]
 async fn associate_with_and_remove_association_with_change_routing_for_later_events() {
-    require_docker!();
     let rt = Rt::start().await;
     rt.deliver(&placed("o7")).await;
     let by_ref = |tag: &str| ByRef {
@@ -365,7 +379,6 @@ async fn associate_with_and_remove_association_with_change_routing_for_later_eve
 
 #[tokio::test]
 async fn an_ending_handler_ends_the_instance_and_cancels_its_scheduled_deadlines() {
-    require_docker!();
     let rt = Rt::start().await;
     rt.deliver(&placed("o8")).await;
     let scheduled = rt
@@ -384,21 +397,18 @@ async fn an_ending_handler_ends_the_instance_and_cancels_its_scheduled_deadlines
 
     let doc = rt.saga("o8").await;
     assert!(doc.ended);
-    assert_eq!(doc.ended_at, Some(dt(t0())));
+    assert_eq!(doc.ended_at_ms, Some(dt(t0())));
     assert_eq!(rt.log_of("o8").await, ["paid"]);
     assert!(
-        rt.store
-            .deadlines()
-            .await
-            .iter()
-            .all(|d| { d.status == DeadlineStatus::Cancelled && d.finished_at == Some(dt(t0())) })
+        rt.store.deadlines().await.iter().all(|d| {
+            d.status == DeadlineStatus::Cancelled && d.finished_at_ms == Some(dt(t0()))
+        })
     );
     assert_eq!(rt.metrics.ended(), ["rt.Order"]);
 }
 
 #[tokio::test]
 async fn end_from_code_ends_the_instance() {
-    require_docker!();
     let rt = Rt::start().await;
     rt.deliver(&placed("o9")).await;
     rt.deliver(&Finish {
@@ -413,7 +423,6 @@ async fn end_from_code_ends_the_instance() {
 
 #[tokio::test]
 async fn commands_and_events_are_recorded_in_saga_dispatch_in_call_order_and_not_sent() {
-    require_docker!();
     let rt = Rt::start().await;
     rt.deliver_as(&placed("o10"), "e-10", &[]).await;
     rt.deliver(&bump("o10", "a")).await;
@@ -448,10 +457,10 @@ async fn commands_and_events_are_recorded_in_saga_dispatch_in_call_order_and_not
     assert_eq!(entries[1].routing_key.as_deref(), Some("k-o10"));
     assert!(entries[2].payload.contains(r#""orderId":"o10-a""#));
     assert!(entries.iter().all(|e| {
-        e.dispatched_at.is_none()
-            && e.failed_at.is_none()
+        e.dispatched_at_ms.is_none()
+            && e.failed_at_ms.is_none()
             && e.attempts == 0
-            && e.created_at == dt(t0())
+            && e.created_at_ms == dt(t0())
     }));
     assert_eq!(
         entries[0].headers.get("correlation-id").map(String::as_str),
@@ -461,7 +470,6 @@ async fn commands_and_events_are_recorded_in_saga_dispatch_in_call_order_and_not
 
 #[tokio::test]
 async fn deadlines_are_recorded_with_due_time_payload_and_payload_type() {
-    require_docker!();
     let rt = Rt::start().await;
     rt.deliver(&placed("o11")).await;
 
@@ -470,7 +478,7 @@ async fn deadlines_are_recorded_with_due_time_payload_and_payload_type() {
     let timeout = deadlines.iter().find(|d| d.name == "timeout").unwrap();
     assert_eq!(timeout.saga_id, saga_id);
     assert_eq!(timeout.saga_type, "rt.Order");
-    assert_eq!(timeout.due_at, dt(t0() + Duration::from_secs(600)));
+    assert_eq!(timeout.due_at_ms, dt(t0() + Duration::from_secs(600)));
     assert_eq!(timeout.payload.as_deref(), Some(r#""p-o11""#));
     assert_eq!(timeout.status, DeadlineStatus::Scheduled);
     assert_eq!(
@@ -481,7 +489,7 @@ async fn deadlines_are_recorded_with_due_time_payload_and_payload_type() {
         Some(true)
     );
     let nudge = deadlines.iter().find(|d| d.name == "nudge").unwrap();
-    assert_eq!(nudge.due_at, dt(t0() + Duration::from_secs(2 * 3600)));
+    assert_eq!(nudge.due_at_ms, dt(t0() + Duration::from_secs(2 * 3600)));
     assert_eq!(nudge.payload.as_deref(), Some(r#"{"orderId":"o11"}"#));
     assert!(nudge.payload_type.as_deref().unwrap().contains("Nudge"));
 }
@@ -489,7 +497,6 @@ async fn deadlines_are_recorded_with_due_time_payload_and_payload_type() {
 #[tokio::test]
 async fn a_handler_error_rolls_back_the_state_the_dispatch_entries_and_the_deadlines_of_that_attempt()
  {
-    require_docker!();
     let rt = Rt::start().await;
     rt.gate.fail_first.store(1, Ordering::SeqCst); // the first attempt fails after it sent, published and scheduled
 
@@ -518,7 +525,6 @@ async fn a_handler_error_rolls_back_the_state_the_dispatch_entries_and_the_deadl
 
 #[tokio::test]
 async fn a_redelivered_event_is_skipped_by_its_marker() {
-    require_docker!();
     let rt = Rt::start().await;
     rt.deliver(&placed("o13")).await;
     rt.deliver_as(&bump("o13", "a"), "bump-1", &[]).await;
@@ -546,7 +552,6 @@ async fn a_redelivered_event_is_skipped_by_its_marker() {
 
 #[tokio::test]
 async fn an_event_no_instance_matches_and_no_start_handler_takes_is_counted_no_match() {
-    require_docker!();
     let rt = Rt::start().await;
     assert!(!rt.deliver_as(&bump("nobody", "a"), "lost-1", &[]).await);
     rt.deliver(&ByRef {
@@ -567,7 +572,6 @@ async fn an_event_no_instance_matches_and_no_start_handler_takes_is_counted_no_m
 #[tokio::test]
 async fn a_saga_type_that_fails_on_every_attempt_is_parked_while_another_saga_type_handles_the_same_event()
  {
-    require_docker!();
     let rt = Rt::start().await;
     let both = rt.runtime_of(vec![order_saga(&rt.gate), broken_saga(&rt.gate)]);
 
@@ -600,8 +604,8 @@ async fn a_saga_type_that_fails_on_every_attempt_is_parked_while_another_saga_ty
         "a handler error gets two quick attempts, not the conflict backoff"
     );
     assert!(failure.error.contains("broken on o14"), "{}", failure.error);
-    assert_eq!(failure.first_failed_at, dt(t0()));
-    assert_eq!(failure.last_failed_at, dt(t0()));
+    assert_eq!(failure.first_failed_at_ms, dt(t0()));
+    assert_eq!(failure.last_failed_at_ms, dt(t0()));
     assert!(
         rt.store.marker("saga:rt.Broken:e-14").await && rt.store.marker("saga:rt.Order:e-14").await,
         "parking writes the marker with the failure"
@@ -617,7 +621,6 @@ async fn a_saga_type_that_fails_on_every_attempt_is_parked_while_another_saga_ty
 #[tokio::test]
 async fn removing_the_start_association_frees_the_start_key_so_a_later_start_event_creates_a_new_instance()
  {
-    require_docker!();
     let rt = Rt::start().await;
     rt.deliver(&placed("o31")).await;
     assert_eq!(
@@ -657,7 +660,6 @@ async fn removing_the_start_association_frees_the_start_key_so_a_later_start_eve
 
 #[tokio::test]
 async fn a_handler_error_parks_within_well_under_a_second_after_two_attempts() {
-    require_docker!();
     let rt = Rt::start().await;
     // The real policy: 5 attempts, 200 ms doubling.
     let broken = Rt::build(
@@ -681,7 +683,6 @@ async fn a_handler_error_parks_within_well_under_a_second_after_two_attempts() {
 
 #[tokio::test]
 async fn the_handler_gets_its_saga_id_and_message_context() {
-    require_docker!();
     let rt = Rt::start().await;
     rt.deliver_as(&placed("o15"), "e-15", &[]).await;
 
@@ -700,7 +701,6 @@ async fn the_handler_gets_its_saga_id_and_message_context() {
 
 #[tokio::test]
 async fn handlers_run_inside_a_span_with_saga_type_saga_id_and_correlation_id() {
-    require_docker!();
     let rt = Rt::start().await;
     let logging = SagaDefinition::<Header>::new("rt.Logging")
         .start_on::<Note>(
@@ -736,7 +736,6 @@ async fn handlers_run_inside_a_span_with_saga_type_saga_id_and_correlation_id() 
 
 #[tokio::test]
 async fn an_association_header_routes_by_the_message_header() {
-    require_docker!();
     let rt = Rt::start().await;
     let note = |text: &str| Note { text: text.into() };
     rt.deliver_as(&note("one"), "n1", &[("x-order", "h1")])
@@ -810,7 +809,6 @@ fn failed(saga_id: &str, key: &str) -> SagaCommandFailed {
 
 #[tokio::test]
 async fn saga_command_failed_reaches_its_saga_by_saga_id_without_associating() {
-    require_docker!();
     let rt = Rt::start().await;
     let runtime = rt.runtime_of(vec![quiet_saga()]);
     deliver_to(
@@ -847,7 +845,6 @@ async fn saga_command_failed_reaches_its_saga_by_saga_id_without_associating() {
 
 #[tokio::test]
 async fn saga_command_failed_for_an_ended_saga_or_a_type_without_a_handler_is_not_applied() {
-    require_docker!();
     let rt = Rt::start().await;
     // rt.Order has no command-failed handler; rt.Quiet has one but its instance ends.
     let runtime = rt.runtime_of(vec![order_saga(&rt.gate), quiet_saga()]);
@@ -872,15 +869,12 @@ async fn saga_command_failed_for_an_ended_saga_or_a_type_without_a_handler_is_no
             .unwrap(),
         "a saga type with no handler for it: nothing applied"
     );
-    rt.store
-        .db
-        .collection::<mongodb::bson::Document>("sagas")
-        .update_one(
-            doc! { "_id": &quiet_id },
-            doc! { "$set": { "ended": true } },
-        )
-        .await
-        .unwrap();
+    rt.store.edit(|c| {
+        c.sagas
+            .iter_mut()
+            .filter(|s| s.id == quiet_id)
+            .for_each(|s| s.ended = true)
+    });
     assert!(
         !runtime
             .deliver_command_failed(
@@ -895,7 +889,6 @@ async fn saga_command_failed_for_an_ended_saga_or_a_type_without_a_handler_is_no
 
 #[tokio::test]
 async fn a_panicking_handler_is_a_handler_error_that_parks_the_event() {
-    require_docker!();
     let rt = Rt::start().await;
     let panicking = SagaDefinition::<Header>::new("rt.Panics")
         .start_on::<Note>(
@@ -920,7 +913,6 @@ async fn a_panicking_handler_is_a_handler_error_that_parks_the_event() {
 
 #[tokio::test]
 async fn one_handling_may_record_at_most_999_messages_across_all_its_handlers() {
-    require_docker!();
     let rt = Rt::start().await;
     let chatty = SagaDefinition::<Header>::new("rt.Chatty")
         .start_on::<Note>(
@@ -967,21 +959,23 @@ async fn one_handling_may_record_at_most_999_messages_across_all_its_handlers() 
     );
     assert!(rt.store.failures().await[0].error.contains("999"));
     assert_eq!(rt.store.sagas("rt.Chatty").await.len(), 0);
-    assert_eq!(rt.store.count("saga_dispatch", doc! {}).await, 0);
+    assert_eq!(rt.store.dispatch().await.len(), 0);
 }
 
 #[tokio::test]
 async fn the_clock_decides_created_at_and_deadline_due_times() {
-    require_docker!();
     let rt = Rt::start().await;
     rt.store.clock.set(t0() + Duration::from_secs(3600));
     rt.deliver(&placed("o40")).await;
 
     let doc = rt.saga("o40").await;
-    assert_eq!(doc.created_at, dt(t0() + Duration::from_secs(3600)));
+    assert_eq!(doc.created_at_ms, dt(t0() + Duration::from_secs(3600)));
     let deadlines = rt.store.deadlines().await;
     let timeout = deadlines.iter().find(|d| d.name == "timeout").unwrap();
-    assert_eq!(timeout.due_at, dt(t0() + Duration::from_secs(3600 + 600)));
+    assert_eq!(
+        timeout.due_at_ms,
+        dt(t0() + Duration::from_secs(3600 + 600))
+    );
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -1016,7 +1010,6 @@ fn handover_saga() -> SagaType {
 
 #[tokio::test]
 async fn a_start_handler_that_removes_its_own_start_association_leaves_the_start_key_free() {
-    require_docker!();
     let rt = Rt::start().await;
     let runtime = rt.runtime_of(vec![handover_saga()]);
     let placed = HandoverPlaced {

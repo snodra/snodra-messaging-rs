@@ -1,0 +1,36 @@
+[package]
+name = "kraken-messaging-sqlx"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "kraken messaging: the SQL message store on PostgreSQL and MySQL (outbox, processed events, dead letters, processor control, external calls, sagas), sharing its tables with kraken-messaging-jdbc"
+license = "MIT"
+publish = false
+
+[features]
+default = ["postgres", "mysql"]
+postgres = ["sqlx/postgres"]
+mysql = ["sqlx/mysql"]
+
+[dependencies]
+kraken-messaging-rs = { path = "../.." }
+# Pure Rust TLS (rustls with ring and the platform roots, as the core's hub client): no OpenSSL.
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "chrono"] }
+# sqlx's transaction manager (not re-exported by sqlx): the store begins and ends its transactions
+# through it, so sqlx's own nested transactions on the handler's connection are savepoints.
+sqlx-core = { version = "=0.9.0", default-features = false }
+chrono = "0.4.45"
+futures = "0.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.10.9"
+tokio = { version = "1.54.1", features = ["rt", "sync", "time", "macros"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+kraken-messaging-rs = { path = "../..", features = ["testing"] }
+tokio = { version = "1.54.1", features = ["full"] }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15.0", features = ["postgres", "mysql"] }
+uuid = { version = "1", features = ["v4"] }

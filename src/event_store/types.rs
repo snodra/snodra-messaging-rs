@@ -1,0 +1,282 @@
+//! What crosses the event-store interface: the events published, the deliveries read, the
+//! capabilities declared and the errors.
+
+use std::cmp::Ordering;
+use std::collections::HashMap;
+
+/// The headers every event carries (ADR 0027), as the event store's native metadata.
+pub mod headers {
+    /// The event's type name.
+    pub const TYPE: &str = "type";
+    /// The event's id.
+    pub const ID: &str = "id";
+    pub const CORRELATION_ID: &str = "correlationId";
+    /// When the event was recorded, RFC 3339 in UTC with milliseconds.
+    pub const TIMESTAMP: &str = "timestamp";
+    /// The publishing service's name (not the event store's source).
+    pub const SOURCE: &str = "source";
+    /// The caller's user id; empty when none.
+    pub const USER_ID: &str = "userId";
+    /// The W3C trace context of the message that caused the event.
+    pub const TRACEPARENT: &str = "traceparent";
+
+    /// The seven headers.
+    pub const ALL: [&str; 7] = [
+        TYPE,
+        ID,
+        CORRELATION_ID,
+        TIMESTAMP,
+        SOURCE,
+        USER_ID,
+        TRACEPARENT,
+    ];
+}
+
+/// The most bytes of a segment's name (hub.proto bounds: a longer one is dropped by the hub).
+pub const MAX_SEGMENT_BYTES: usize = 128;
+/// The most bytes of a position (hub.proto bounds: a longer one reads as unknown on the hub).
+pub const MAX_POSITION_BYTES: usize = 128;
+
+/// The order segments are listed in (the hub's): names of ASCII digits only by their value (any
+/// length, no overflow; equal values by their text), before every other name, which go by their
+/// bytes.
+pub fn segment_order(a: &str, b: &str) -> Ordering {
+    let decimal = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match (decimal(a), decimal(b)) {
+        (true, true) => {
+            let (x, y) = (a.trim_start_matches('0'), b.trim_start_matches('0'));
+            x.len()
+                .cmp(&y.len())
+                .then_with(|| x.cmp(y))
+                .then_with(|| a.cmp(b))
+        }
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => a.as_bytes().cmp(b.as_bytes()),
+    }
+}
+
+/// The dead-letter source of `source` (`<source>.dlt`): where the dead-letter mode `event-store`
+/// sends what a processor cannot handle, on an event store declaring
+/// [`Capability::NativeDeadLetter`].
+pub fn dead_letter_source(source: &str) -> String {
+    format!("{source}.dlt")
+}
+
+/// What an event store may offer beyond the required contract (ADR 0027); the hub and the
+/// dashboard offer only what an event store declares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Capability {
+    /// Reset to earliest, latest, a time or explicit positions: reset handlers, replay ranges
+    /// ([`SubscriptionAdmin`](super::SubscriptionAdmin)).
+    Replay,
+    /// The event browser can read it: search, one event, the sources, the subscriptions' lag,
+    /// the live tail ([`EventStore::browser`](super::EventStore::browser)).
+    Browse,
+    /// How far a subscription is behind, per segment ([`SegmentStatus::lag`]).
+    Lag,
+    /// A dead-letter source ([`dead_letter_source`]): the dead-letter mode `event-store`.
+    NativeDeadLetter,
+}
+
+impl Capability {
+    /// Every capability, in protocol order.
+    pub const ALL: [Capability; 4] = [
+        Capability::Replay,
+        Capability::Browse,
+        Capability::Lag,
+        Capability::NativeDeadLetter,
+    ];
+
+    /// The protocol's name (`ProcessorStatus.capabilities`): `replay`, `browse`, `lag`,
+    /// `native-dead-letter`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Capability::Replay => "replay",
+            Capability::Browse => "browse",
+            Capability::Lag => "lag",
+            Capability::NativeDeadLetter => "native-dead-letter",
+        }
+    }
+}
+
+impl std::fmt::Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One event the outbox relay hands the event store ([`EventStore::publish`](super::EventStore::publish)).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutgoingEvent {
+    /// The source it goes to: the service's events source, or its dead-letter source
+    /// ([`dead_letter_source`]).
+    pub source: String,
+    /// The event's id, also in header [`headers::ID`].
+    pub id: String,
+    /// The event's type name, also in header [`headers::TYPE`].
+    pub type_name: String,
+    /// The order key: events with one key reach a processor in publish order; `None` spreads
+    /// them as the event store does.
+    pub key: Option<String>,
+    /// Carried as given, as the event store's native metadata: the seven [`headers`] and any
+    /// other (a dead letter's `kraken-dlt-*`). Headers are UTF-8 text, one value per name.
+    pub headers: HashMap<String, String>,
+    /// JSON bytes, carried as given.
+    pub payload: Vec<u8>,
+}
+
+/// One event a subscription delivers.
+///
+/// `segment` and `position` are opaque strings of at most [`MAX_SEGMENT_BYTES`] and
+/// [`MAX_POSITION_BYTES`] bytes that only the event store reads (decimal numbers for the
+/// first-wave stores); the core orders two positions of one segment only through
+/// [`EventStore::compare`](super::EventStore::compare).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Delivery {
+    /// The segment of the source it was read from: a unit of order per key.
+    pub segment: String,
+    /// Its position in `segment`, which [`Subscription::ack`](super::Subscription::ack) takes.
+    pub position: String,
+    pub key: Option<String>,
+    /// The headers as published, as UTF-8 text with one value per name: a record that carries a
+    /// value that is not UTF-8 (read lossily) or a name twice (the last value wins), which the
+    /// library never publishes, is not preserved byte for byte, nor is its dead letter.
+    pub headers: HashMap<String, String>,
+    /// The payload as published.
+    pub payload: Vec<u8>,
+    /// When the event store appended it, epoch milliseconds (its own clock).
+    pub timestamp_ms: i64,
+}
+
+/// What [`Subscription::next`](super::Subscription::next) gives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubscriptionEvent {
+    /// These segments became this subscription's (in addition to the ones it has). A new
+    /// subscription's first event, empty when it holds nothing.
+    Assigned(Vec<String>),
+    /// These segments are this subscription's no longer; what it delivered of them and did not
+    /// acknowledge comes again to whichever subscription gets them. Always followed by an
+    /// `Assigned` (possibly empty), which ends the change.
+    Revoked(Vec<String>),
+    /// An event of a segment assigned to this subscription.
+    Delivery(Delivery),
+}
+
+/// A processor's subscription: every subscription of one `name` shares the events of `source`
+/// (competing instances), and each name receives every event (one per processor).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SubscriptionSpec {
+    /// `<service>.<processor>`: the name the event store knows the subscription by.
+    pub name: String,
+    /// The source read.
+    pub source: String,
+}
+
+/// One segment assigned to a subscription, as [`Subscription::segments`](super::Subscription::segments)
+/// reports it (hub.proto `SegmentStatus`, without the replay range, which is the core's).
+/// Positions as in [`Delivery`]; `None` when unknown.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SegmentStatus {
+    pub segment: String,
+    /// The next position this subscription delivers.
+    pub position: Option<String>,
+    /// The subscription's committed position (the one after its last acknowledgement).
+    pub committed: Option<String>,
+    /// The position of the next event appended to the segment.
+    pub head: Option<String>,
+    /// How many events lie between `committed` and `head` (between `position` and `head` when
+    /// nothing is committed): what is not acknowledged yet. `None` when unknown, always `None`
+    /// without [`Capability::Lag`].
+    pub lag: Option<u64>,
+}
+
+/// What an event store operation fails with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EventStoreError {
+    /// A bad argument: an unknown segment, a position the segment does not have.
+    Invalid(String),
+    /// Another instance still reads the subscription (its members), so its positions cannot move
+    /// (`CONTROL_REFUSAL_SUBSCRIBERS_ACTIVE`).
+    SubscribersActive(String),
+    /// The event store lacks the capability (`CONTROL_REFUSAL_UNSUPPORTED`).
+    Unsupported(Capability),
+    /// The event store refused the event for good (too large, not authorized, a destination it
+    /// cannot have): publishing it again cannot succeed, so the outbox relay gives it up at once.
+    Rejected(String),
+    /// The event store failed or cannot be reached; trying again may succeed.
+    Failed(String),
+}
+
+impl std::fmt::Display for EventStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EventStoreError::Invalid(why) => write!(f, "invalid: {why}"),
+            EventStoreError::SubscribersActive(members) => {
+                write!(f, "the subscription has active subscribers: {members}")
+            }
+            EventStoreError::Unsupported(capability) => {
+                write!(f, "the event store lacks the capability {capability}")
+            }
+            EventStoreError::Rejected(why) => write!(f, "rejected by the event store: {why}"),
+            EventStoreError::Failed(why) => write!(f, "event store: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for EventStoreError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capabilities_have_the_protocol_names() {
+        let names: Vec<&str> = Capability::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(names, ["replay", "browse", "lag", "native-dead-letter"]);
+        for c in Capability::ALL {
+            assert_eq!(c.to_string(), c.as_str());
+        }
+    }
+
+    #[test]
+    fn segments_order_as_the_hub_lists_them() {
+        let mut names = vec![
+            "b",
+            "+5",
+            "7",
+            "99999999999999999999999",
+            "007",
+            "18446744073709551616",
+            "10",
+            "a",
+            "0",
+            "",
+            "00",
+            "5",
+        ];
+        names.sort_by(|a, b| segment_order(a, b));
+        assert_eq!(
+            names,
+            [
+                "0",
+                "00",
+                "5",
+                "007",
+                "7",
+                "10",
+                "18446744073709551616",
+                "99999999999999999999999",
+                "",
+                "+5",
+                "a",
+                "b"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_dead_letter_source_is_the_source_with_dlt() {
+        assert_eq!(dead_letter_source("kraken.events"), "kraken.events.dlt");
+    }
+}

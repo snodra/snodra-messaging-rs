@@ -381,7 +381,7 @@ async fn no_secret_and_no_token_ever_reach_a_log_a_debug_print_or_an_error() {
             "{:?}",
             kraken_messaging::Config {
                 hub_oauth2: Some(oauth2(&idp, "svc", SECRET)),
-                ..kraken_messaging::Config::new("svc", "hub:7000", "kafka:19092", "mongodb://m/db")
+                ..kraken_messaging::Config::new("svc", "hub:7000")
             }
         ),
     ];
@@ -902,6 +902,11 @@ async fn a_token_endpoint_that_refuses_opens_no_stream_logs_one_error_and_recove
     assert!(
         rejection.contains("Invalid client credentials"),
         "{rejection}"
+    );
+    assert_eq!(
+        conn.latest_rejection(),
+        None,
+        "a token endpoint's failure is not a hub's refusal"
     );
 
     let lines: Vec<String> = captured

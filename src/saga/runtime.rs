@@ -29,14 +29,13 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use futures::future::BoxFuture;
-use mongodb::bson::DateTime;
 
 use super::clock::Clock;
 use super::context::{AssociationChange, SEQ_STRIDE, SagaContext};
 use super::definition::{ErasedHandler, SagaType};
 use super::failed::SagaCommandFailed;
 use super::metrics::{EventOutcome, SagaMetrics};
-use super::ports::{SagaPorts, StoreError, Tx};
+use super::ports::SagaPorts;
 use super::retry::SagaRetry;
 use super::store::{
     Association, DeadlineDocument, DeadlineStatus, SagaDispatchDocument, SagaDocument,
@@ -45,12 +44,15 @@ use super::store::{
 use crate::codec;
 use crate::context::MessageContext;
 use crate::error::MessagingError;
-use crate::kafka::SagaStage;
+use crate::events::SagaStage;
+use crate::store::{StoreError, Tx};
 use crate::types::MessageType;
 
 /// The header of a `saga_dispatch` entry that carries the correlation id of the message that
 /// caused it.
 pub(crate) const DISPATCH_CORRELATION_HEADER: &str = "correlation-id";
+/// The header of a dispatch entry that keeps the causing event's valid W3C `traceparent`.
+pub(crate) const DISPATCH_TRACEPARENT_HEADER: &str = "traceparent";
 
 const MAX_ERROR_LENGTH: usize = 2000;
 
@@ -391,7 +393,7 @@ impl SagaRuntime {
         retry_of: Option<&SagaFailureDocument>,
     ) -> Result<Applied, StoreError> {
         let now = self.clock.now();
-        let now_bson = DateTime::from_system_time(now);
+        let now_ms = crate::time::epoch_ms(now);
         match retry_of {
             Some(failure) => {
                 if !self.ports.failures.delete(tx, &failure.id).await? {
@@ -410,7 +412,7 @@ impl SagaRuntime {
                 }
                 self.ports
                     .markers
-                    .insert(tx, &marker, event_type, now_bson)
+                    .insert(tx, &marker, event_type, now_ms)
                     .await?;
             }
         }
@@ -517,7 +519,7 @@ impl SagaRuntime {
             return Ok(Applied::of(Kind::NoMatch));
         }
         for p in &planned {
-            self.write(tx, p, now_bson).await?;
+            self.write(tx, p, now_ms).await?;
         }
         Ok(Applied {
             kind: Kind::Handled,
@@ -618,7 +620,7 @@ impl SagaRuntime {
         claimed: &DeadlineDocument,
     ) -> Result<bool, StoreError> {
         let now = self.clock.now();
-        let now_bson = DateTime::from_system_time(now);
+        let now_ms = crate::time::epoch_ms(now);
         if self
             .ports
             .deadlines
@@ -632,7 +634,7 @@ impl SagaRuntime {
         let Some(doc) = doc.filter(|d| !d.ended) else {
             self.ports
                 .deadlines
-                .cancel(tx, &claimed.saga_id, &claimed.id, now_bson)
+                .cancel(tx, &claimed.saga_id, &claimed.id, now_ms)
                 .await?;
             return Ok(false);
         };
@@ -646,7 +648,7 @@ impl SagaRuntime {
             );
             self.ports
                 .deadlines
-                .cancel(tx, &claimed.saga_id, &claimed.id, now_bson)
+                .cancel(tx, &claimed.saga_id, &claimed.id, now_ms)
                 .await?;
             return Ok(false);
         };
@@ -692,7 +694,7 @@ impl SagaRuntime {
         if !self
             .ports
             .deadlines
-            .mark_fired(tx, &claimed.id, now_bson)
+            .mark_fired(tx, &claimed.id, now_ms)
             .await?
         {
             return Err(StoreError::Conflict(format!(
@@ -700,14 +702,14 @@ impl SagaRuntime {
                 claimed.id
             )));
         }
-        self.write(tx, &planned, now_bson).await?;
+        self.write(tx, &planned, now_ms).await?;
         if planned.doc.ended {
             self.metrics.saga_ended(t.name);
         }
         Ok(true)
     }
 
-    async fn write(&self, tx: &mut Tx, planned: &Planned, now: DateTime) -> Result<(), StoreError> {
+    async fn write(&self, tx: &mut Tx, planned: &Planned, now: i64) -> Result<(), StoreError> {
         let doc = &planned.doc;
         match planned.expected_version {
             None => self.ports.sagas.insert(tx, doc).await?,
@@ -756,7 +758,7 @@ impl SagaRuntime {
         error: &str,
         attempts: u32,
     ) -> Result<(), MessagingError> {
-        let now = self.clock.now_bson();
+        let now = self.clock.now_ms();
         let marker = marker_id(t, &ctx.message_id);
         let failure = SagaFailureDocument {
             id: format!("{}:{}", t.name, ctx.message_id),
@@ -767,8 +769,8 @@ impl SagaRuntime {
             headers: failure_headers(ctx),
             error: error.to_string(),
             attempts: attempts as i32,
-            first_failed_at: now,
-            last_failed_at: now,
+            first_failed_at_ms: now,
+            last_failed_at_ms: now,
         };
         let mut tx = self
             .ports
@@ -818,7 +820,7 @@ impl SagaRuntime {
         error: &str,
         attempts: u32,
     ) -> Result<(), MessagingError> {
-        let now = self.clock.now_bson();
+        let now = self.clock.now_ms();
         let mut tx = self
             .ports
             .tx
@@ -934,7 +936,7 @@ fn plan(
     now: SystemTime,
     start_key: Option<String>,
 ) -> Planned {
-    let now_bson = DateTime::from_system_time(now);
+    let now_ms = crate::time::epoch_ms(now);
     let effects = sctx.take_effects();
     for change in effects.associations {
         match change {
@@ -971,10 +973,10 @@ fn plan(
         associations,
         start_key,
         ended,
-        ended_at: ended.then_some(now_bson),
+        ended_at_ms: ended.then_some(now_ms),
         version,
-        created_at: doc.map_or(now_bson, |d| d.created_at),
-        updated_at: now_bson,
+        created_at_ms: doc.map_or(now_ms, |d| d.created_at_ms),
+        updated_at_ms: now_ms,
     };
     let entries = effects
         .dispatches
@@ -989,21 +991,18 @@ fn plan(
                 kind: d.kind,
                 type_name: d.type_name.to_string(),
                 payload: d.payload,
-                headers: HashMap::from([(
-                    DISPATCH_CORRELATION_HEADER.to_string(),
-                    ctx.correlation_id.clone(),
-                )]),
+                headers: dispatch_headers(ctx),
                 routing_key: d.routing_key,
-                created_at: now_bson,
-                dispatched_at: None,
+                created_at_ms: now_ms,
+                dispatched_at_ms: None,
                 attempts: 0,
-                next_attempt_at: None,
-                failed_at: None,
+                next_attempt_at_ms: None,
+                failed_at_ms: None,
                 failure_reason: None,
                 failure_message: None,
                 notice_pending: None,
                 notice_attempts: None,
-                notice_next_at: None,
+                notice_next_at_ms: None,
             }
         })
         .collect::<Vec<_>>();
@@ -1024,11 +1023,11 @@ fn plan(
                 name,
                 payload,
                 payload_type,
-                due_at: DateTime::from_system_time(due_at),
+                due_at_ms: crate::time::epoch_ms(due_at),
                 status: DeadlineStatus::Scheduled,
                 claimed_by: None,
-                claimed_until: None,
-                finished_at: None,
+                claimed_until_ms: None,
+                finished_at_ms: None,
                 correlation_id: Some(ctx.correlation_id.clone()),
             })),
             super::context::DeadlineOp::Cancel(id) => PlannedDeadline::Cancel(id),
@@ -1042,6 +1041,20 @@ fn plan(
         deadlines,
         created: doc.is_none(),
     }
+}
+
+/// The headers of a dispatch entry: the correlation id of the message that caused it and, when
+/// that message carried a valid one, its `traceparent` (the trace floor: the relay sends the
+/// command, or publishes the event, in that trace).
+fn dispatch_headers(ctx: &MessageContext) -> HashMap<String, String> {
+    let mut headers = HashMap::from([(
+        DISPATCH_CORRELATION_HEADER.to_string(),
+        ctx.correlation_id.clone(),
+    )]);
+    if let Some(tp) = ctx.traceparent() {
+        headers.insert(DISPATCH_TRACEPARENT_HEADER.to_string(), tp.to_string());
+    }
+    headers
 }
 
 /// The headers kept with a parked event: enough to rebuild its message context.

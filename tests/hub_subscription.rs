@@ -516,6 +516,42 @@ async fn a_subscription_request_registers_and_the_emitter_sends_parts_then_the_e
     a.shutdown().await;
 }
 
+/// A subscription is passive: it takes no permit at the hub and runs no handler, so it is never
+/// counted in flight (`InstanceStatus.handlers_in_flight`), neither while it is open nor after its
+/// stream is lost.
+#[tokio::test]
+async fn a_subscription_is_never_counted_in_flight() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let a = owner(&hub.address(), "svc-a", "a1", &probe).await;
+    hub.send_to_clients(subscribed("s1#1", &prices("acme")))
+        .await;
+    eventually("the subscription registered", async || {
+        a.emitter.open_subscriptions() == 1
+    })
+    .await;
+    assert_eq!(a.pool.handlers_in_flight(), 0, "an open subscription");
+    hub.drop_streams();
+    eventually("the subscription removed", async || {
+        a.emitter.open_subscriptions() == 0
+    })
+    .await;
+    assert!(a.pool.await_all_registered(Duration::from_secs(5)).await);
+    let seen = hub.statuses().len();
+    eventually("a status on the new stream", async || {
+        hub.statuses()[seen..].iter().any(|(stream, _)| *stream > 1)
+    })
+    .await;
+    let (_, status) = hub
+        .statuses()
+        .into_iter()
+        .rfind(|(stream, _)| *stream > 1)
+        .unwrap();
+    assert_eq!(status.handlers_in_flight, 0, "after its stream was lost");
+    assert_eq!(a.pool.handlers_in_flight(), 0);
+    a.shutdown().await;
+}
+
 /// `ReplyEnd.parts` is the number of parts this subscription sent (the hub's own count of
 /// relayed parts is its own business): a clean end, an error end and a shutdown end all carry it.
 #[tokio::test]

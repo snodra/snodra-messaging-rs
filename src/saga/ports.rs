@@ -1,150 +1,26 @@
-//! The persistence the saga runtime needs, as small ports: the MongoDB implementations below are
-//! the default, and the test fixture (Task 14) supplies in-memory ones. Every method takes the
-//! [`Tx`] of the attempt it runs in, so the runtime decides what commits together; an in-memory
-//! implementation ignores it ([`Tx::none`]).
+//! The persistence the saga runtime needs, as small ports, provided by the message store
+//! ([`crate::store::MessageStore::sagas`]); the test fixture supplies in-memory ones. Every method
+//! of the runtime's ports takes the [`Tx`] of the attempt it runs in, so the runtime decides what
+//! commits together; an in-memory implementation ignores it ([`Tx::none`]). [`Tx`],
+//! [`TxProvider`] and [`StoreError`] are the message store's ([`crate::store`]). Times are epoch
+//! milliseconds.
 //!
-//! A port reports a [`StoreError`]: a *conflict* (a duplicate key, a Mongo write conflict, a
-//! transient transaction error: the kind a retry resolves) apart from any other failure.
+//! A port reports a [`StoreError`]: a *conflict* (a duplicate key, a write conflict, a transient
+//! transaction error: the kind a retry resolves) apart from any other failure.
+//!
+//! The background workers have ports of their own, outside any transaction: the deadline
+//! scheduler claims due deadlines ([`DeadlineStore::claim_due`]), the dispatch relay works the
+//! saga-side outbox ([`SagaDispatchStore`]), and the statistics count live sagas
+//! ([`SagaRepository::count_live_by_type`]) and pending entries ([`SagaDispatchStore::pending`]).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures::TryStreamExt;
 use futures::future::BoxFuture;
-use mongodb::bson::{DateTime, Document, doc};
-use mongodb::error::{ErrorKind, TRANSIENT_TRANSACTION_ERROR, WriteFailure};
-use mongodb::{Client, ClientSession, Database};
 
-use super::store::{
-    DEADLINES_COLLECTION, DeadlineDocument, SAGA_DISPATCH_COLLECTION, SAGA_FAILURES_COLLECTION,
-    SAGAS_COLLECTION, SagaDispatchDocument, SagaDocument, SagaFailureDocument,
-};
-use crate::error::MessagingError;
-use crate::kafka::PROCESSED_EVENTS_COLLECTION;
-
-const WRITE_CONFLICT: i32 = 112;
-const DUPLICATE_KEY: i32 = 11000;
-
-/// What a port or a transaction fails with.
-#[derive(Debug)]
-pub enum StoreError {
-    /// A version check, a start-key or marker duplicate, a write conflict or a transient
-    /// transaction error: another writer got there first, a retry of the whole attempt resolves it.
-    Conflict(String),
-    /// Anything else (a handler's error, a store outage).
-    Failed(MessagingError),
-}
-
-impl StoreError {
-    /// The failure as the crate's error (a conflict becomes a storage error).
-    pub fn into_messaging(self) -> MessagingError {
-        match self {
-            StoreError::Conflict(message) => MessagingError::Storage(message),
-            StoreError::Failed(e) => e,
-        }
-    }
-
-    pub fn is_conflict(&self) -> bool {
-        matches!(self, StoreError::Conflict(_))
-    }
-}
-
-impl std::fmt::Display for StoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StoreError::Conflict(message) => write!(f, "conflict: {message}"),
-            StoreError::Failed(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for StoreError {}
-
-impl From<MessagingError> for StoreError {
-    fn from(e: MessagingError) -> Self {
-        StoreError::Failed(e)
-    }
-}
-
-impl From<serde_json::Error> for StoreError {
-    fn from(e: serde_json::Error) -> Self {
-        StoreError::Failed(e.into())
-    }
-}
-
-/// The server error codes a driver error carries (command, write and bulk write errors).
-fn error_codes(e: &mongodb::error::Error) -> Vec<i32> {
-    match &*e.kind {
-        ErrorKind::Command(c) => vec![c.code],
-        ErrorKind::Write(WriteFailure::WriteError(w)) => vec![w.code],
-        ErrorKind::InsertMany(m) => m
-            .write_errors
-            .iter()
-            .flatten()
-            .map(|w| w.code)
-            .chain(m.write_concern_error.iter().map(|w| w.code))
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// Whether the driver error is a duplicate key.
-pub(crate) fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
-    error_codes(e).contains(&DUPLICATE_KEY)
-}
-
-impl From<mongodb::error::Error> for StoreError {
-    fn from(e: mongodb::error::Error) -> Self {
-        let codes = error_codes(&e);
-        if e.contains_label(TRANSIENT_TRANSACTION_ERROR)
-            || codes.contains(&WRITE_CONFLICT)
-            || codes.contains(&DUPLICATE_KEY)
-        {
-            StoreError::Conflict(e.to_string())
-        } else {
-            StoreError::Failed(MessagingError::from(e))
-        }
-    }
-}
-
-/// The transaction an attempt runs in: a Mongo session (inside a transaction, or a plain one for
-/// the admin reads) or nothing at all for in-memory ports.
-pub struct Tx {
-    session: Option<ClientSession>,
-}
-
-impl Tx {
-    /// No session: for in-memory ports, which ignore it.
-    pub fn none() -> Tx {
-        Tx { session: None }
-    }
-
-    pub fn from_session(session: ClientSession) -> Tx {
-        Tx {
-            session: Some(session),
-        }
-    }
-
-    /// The session of this transaction; an error for [`Tx::none`] (a Mongo port was given an
-    /// in-memory transaction).
-    pub fn session(&mut self) -> Result<&mut ClientSession, StoreError> {
-        self.session.as_mut().ok_or_else(|| {
-            StoreError::Failed(MessagingError::Storage(
-                "a MongoDB saga port needs a transaction with a session".into(),
-            ))
-        })
-    }
-}
-
-/// Starts, commits and aborts the [`Tx`] of an attempt (Spring's `TransactionOperations`).
-pub trait TxProvider: Send + Sync {
-    /// A transaction.
-    fn begin(&self) -> BoxFuture<'_, Result<Tx, StoreError>>;
-    /// No transaction: what reads and writes outside an attempt (the admin API) run in.
-    fn plain(&self) -> BoxFuture<'_, Result<Tx, StoreError>>;
-    fn commit<'a>(&'a self, tx: &'a mut Tx) -> BoxFuture<'a, Result<(), StoreError>>;
-    /// Abandons the transaction; never fails (there is nothing left to do about it).
-    fn abort<'a>(&'a self, tx: &'a mut Tx) -> BoxFuture<'a, ()>;
-}
+use super::failed::FailureReason;
+use super::store::{DeadlineDocument, SagaDispatchDocument, SagaDocument, SagaFailureDocument};
+use crate::store::{StoreError, Tx, TxProvider};
 
 /// The `sagas` collection.
 pub trait SagaRepository: Send + Sync {
@@ -179,16 +55,10 @@ pub trait SagaRepository: Send + Sync {
         saga: &'a SagaDocument,
         expected_version: i64,
     ) -> BoxFuture<'a, Result<bool, StoreError>>;
-}
 
-/// The saga-side outbox `saga_dispatch`: where the runtime records what a saga sends (the relay
-/// reads it).
-pub trait DispatchRecorder: Send + Sync {
-    fn record<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        entries: &'a [SagaDispatchDocument],
-    ) -> BoxFuture<'a, Result<(), StoreError>>;
+    /// How many live (not ended) instances there are per saga type, outside any transaction
+    /// (the `kraken.sagas.active` gauge); a type without one is absent.
+    fn count_live_by_type(&self) -> BoxFuture<'_, Result<HashMap<String, u64>, StoreError>>;
 }
 
 /// The `deadlines` collection, as far as the runtime writes it.
@@ -212,7 +82,7 @@ pub trait DeadlineStore: Send + Sync {
         tx: &'a mut Tx,
         saga_id: &'a str,
         deadline_id: &'a str,
-        now: DateTime,
+        now_ms: i64,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// Cancels the SCHEDULED deadlines of `saga_id` named `name`.
@@ -221,7 +91,7 @@ pub trait DeadlineStore: Send + Sync {
         tx: &'a mut Tx,
         saga_id: &'a str,
         name: &'a str,
-        now: DateTime,
+        now_ms: i64,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// Cancels every SCHEDULED deadline of `saga_id`.
@@ -229,7 +99,7 @@ pub trait DeadlineStore: Send + Sync {
         &'a self,
         tx: &'a mut Tx,
         saga_id: &'a str,
-        now: DateTime,
+        now_ms: i64,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// Sets the SCHEDULED deadline `id` to FIRED; false when it was not SCHEDULED.
@@ -237,8 +107,26 @@ pub trait DeadlineStore: Send + Sync {
         &'a self,
         tx: &'a mut Tx,
         id: &'a str,
-        now: DateTime,
+        now_ms: i64,
     ) -> BoxFuture<'a, Result<bool, StoreError>>;
+
+    /// Claims the SCHEDULED deadline due first (`due_at_ms <= now_ms`) that nobody holds or
+    /// whose claim has passed (`claimed_until_ms < now_ms`), for `owner` until `claimed_until_ms`,
+    /// atomically: of two schedulers asking at once, one gets it. Outside any transaction; the
+    /// deadline as claimed, `None` when nothing is due.
+    fn claim_due<'a>(
+        &'a self,
+        owner: &'a str,
+        now_ms: i64,
+        claimed_until_ms: i64,
+    ) -> BoxFuture<'a, Result<Option<DeadlineDocument>, StoreError>>;
+
+    /// How many SCHEDULED deadlines are due (`due_at_ms <= now_ms`), per name, claimed or not
+    /// (the `kraken.deadlines.due` gauge); a name without one is absent.
+    fn count_overdue_by_name(
+        &self,
+        now_ms: i64,
+    ) -> BoxFuture<'_, Result<HashMap<String, u64>, StoreError>>;
 }
 
 /// The `saga_failures` collection: parked events.
@@ -270,7 +158,7 @@ pub trait FailureStore: Send + Sync {
         id: &'a str,
         error: &'a str,
         attempts: i32,
-        now: DateTime,
+        now_ms: i64,
     ) -> BoxFuture<'a, Result<bool, StoreError>>;
 
     /// The failures of `saga_type` (every type when `None`), oldest `lastFailedAt` first.
@@ -292,8 +180,127 @@ pub trait MarkerStore: Send + Sync {
         tx: &'a mut Tx,
         id: &'a str,
         type_name: &'a str,
-        now: DateTime,
+        now_ms: i64,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
+}
+
+/// How the relay gives an entry up ([`SagaDispatchStore::mark_failed`]): `failed_at_ms`, the reason and
+/// the message, with `attempts` when given, and a pending failure notice due at `notice_at_ms`
+/// when given (`notice_pending` true, `notice_attempts` 0): a command's failure has one, an
+/// event's none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DispatchFailure {
+    pub attempts: Option<i32>,
+    pub reason: FailureReason,
+    pub message: String,
+    pub failed_at_ms: i64,
+    pub notice_at_ms: Option<i64>,
+}
+
+/// The saga-side outbox (`saga_dispatch`) and its per-saga dispatch leases
+/// (`saga_dispatch_leases`): the runtime records what a saga sends in the saga's transaction
+/// ([`record`](Self::record)); the dispatch relay works through it. An entry is *pending* until
+/// it is dispatched or failed. Every relay operation is a write of its own, outside any
+/// transaction, but [`mark_dispatched`](Self::mark_dispatched), which joins the transaction the
+/// relay appends the event to the outbox in.
+pub trait SagaDispatchStore: Send + Sync {
+    /// Records `entries` in `tx`. An EVENT entry whose payload the outbox would refuse
+    /// ([`OutboxEntry::payload`](crate::store::OutboxEntry::payload): not a JSON object, or an
+    /// integer above `i64::MAX`) is refused with `InvalidMessage`
+    /// ([`StoreError::Failed`]): the saga's attempt fails and nothing of it commits.
+    fn record<'a>(
+        &'a self,
+        tx: &'a mut Tx,
+        entries: &'a [SagaDispatchDocument],
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// The sagas whose first pending entry (lowest `seq`) is due (`next_attempt_at_ms` absent or
+    /// `<= now_ms`), oldest first pending entry first (its `created_at_ms`, then the saga id), at
+    /// most `limit`, leaving out the sagas in `except` (in flight on this instance).
+    fn due_sagas<'a>(
+        &'a self,
+        now_ms: i64,
+        except: &'a [String],
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<String>, StoreError>>;
+
+    /// The first pending entry of `saga_id` (lowest `seq`), due or not.
+    fn next_pending<'a>(
+        &'a self,
+        saga_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<SagaDispatchDocument>, StoreError>>;
+
+    /// The entry was dispatched at `now_ms`, in `tx` (an event: with its outbox append).
+    fn mark_dispatched<'a>(
+        &'a self,
+        tx: &'a mut Tx,
+        id: &'a str,
+        now_ms: i64,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// A transient failure: `attempts` and the next attempt at `next_attempt_at_ms`.
+    fn schedule_retry<'a>(
+        &'a self,
+        id: &'a str,
+        attempts: i32,
+        next_attempt_at_ms: i64,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// Gives the entry up: see [`DispatchFailure`].
+    fn mark_failed<'a>(
+        &'a self,
+        id: &'a str,
+        failure: &'a DispatchFailure,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// Claims the pending failure notice due first (`notice_next_at_ms` absent or `<= now_ms`),
+    /// moving its `notice_next_at_ms` to `reserve_until_ms` (which reserves it for the caller),
+    /// atomically; the entry as claimed, `None` when no notice is due.
+    fn claim_due_notice<'a>(
+        &'a self,
+        now_ms: i64,
+        reserve_until_ms: i64,
+    ) -> BoxFuture<'a, Result<Option<SagaDispatchDocument>, StoreError>>;
+
+    /// The failure notice was delivered (or given up): no notice is pending any more
+    /// (`notice_pending`, `notice_attempts` and `notice_next_at_ms` cleared).
+    fn clear_notice<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// A delivery of the notice failed: `notice_attempts` and its next try at `next_at_ms`.
+    fn schedule_notice_retry<'a>(
+        &'a self,
+        id: &'a str,
+        notice_attempts: i32,
+        next_at_ms: i64,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// Takes the dispatch lease of `saga_id` for `owner` until `until_ms` when nobody holds it or
+    /// its lease has passed (`< now_ms`), atomically; false when another holder's lease runs.
+    fn claim_lease<'a>(
+        &'a self,
+        saga_id: &'a str,
+        owner: &'a str,
+        now_ms: i64,
+        until_ms: i64,
+    ) -> BoxFuture<'a, Result<bool, StoreError>>;
+
+    /// Moves the lease `owner` holds to `until_ms`; false when it holds it no longer.
+    fn renew_lease<'a>(
+        &'a self,
+        saga_id: &'a str,
+        owner: &'a str,
+        until_ms: i64,
+    ) -> BoxFuture<'a, Result<bool, StoreError>>;
+
+    /// Lets go of the lease when `owner` holds it.
+    fn release_lease<'a>(
+        &'a self,
+        saga_id: &'a str,
+        owner: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// How many entries are pending (the `kraken.saga.dispatch.pending` gauge).
+    fn pending(&self) -> BoxFuture<'_, Result<u64, StoreError>>;
 }
 
 /// The six ports together.
@@ -301,388 +308,23 @@ pub trait MarkerStore: Send + Sync {
 pub struct SagaPorts {
     pub tx: Arc<dyn TxProvider>,
     pub sagas: Arc<dyn SagaRepository>,
-    pub dispatch: Arc<dyn DispatchRecorder>,
+    pub dispatch: Arc<dyn SagaDispatchStore>,
     pub deadlines: Arc<dyn DeadlineStore>,
     pub failures: Arc<dyn FailureStore>,
     pub markers: Arc<dyn MarkerStore>,
 }
 
 impl SagaPorts {
-    /// The MongoDB implementations of all of them.
-    pub fn mongo(client: Client, db: Database) -> SagaPorts {
-        let mongo = Arc::new(MongoSagaStore { client, db });
+    /// The ports of `store`, in its transactions.
+    pub fn of(store: &dyn crate::store::MessageStore) -> SagaPorts {
+        let stores = store.sagas();
         SagaPorts {
-            tx: mongo.clone(),
-            sagas: mongo.clone(),
-            dispatch: mongo.clone(),
-            deadlines: mongo.clone(),
-            failures: mongo.clone(),
-            markers: mongo,
+            tx: store.tx(),
+            sagas: stores.sagas,
+            dispatch: stores.dispatch,
+            deadlines: stores.deadlines,
+            failures: stores.failures,
+            markers: stores.markers,
         }
-    }
-}
-
-/// The MongoDB implementation of every port.
-pub struct MongoSagaStore {
-    client: Client,
-    db: Database,
-}
-
-impl MongoSagaStore {
-    fn sagas(&self) -> mongodb::Collection<SagaDocument> {
-        self.db.collection(SAGAS_COLLECTION)
-    }
-
-    fn dispatch(&self) -> mongodb::Collection<SagaDispatchDocument> {
-        self.db.collection(SAGA_DISPATCH_COLLECTION)
-    }
-
-    fn deadlines(&self) -> mongodb::Collection<DeadlineDocument> {
-        self.db.collection(DEADLINES_COLLECTION)
-    }
-
-    fn failures(&self) -> mongodb::Collection<SagaFailureDocument> {
-        self.db.collection(SAGA_FAILURES_COLLECTION)
-    }
-
-    fn markers(&self) -> mongodb::Collection<Document> {
-        self.db.collection(PROCESSED_EVENTS_COLLECTION)
-    }
-
-    async fn cancel_where(
-        &self,
-        tx: &mut Tx,
-        mut filter: Document,
-        now: DateTime,
-    ) -> Result<(), StoreError> {
-        filter.insert("status", "SCHEDULED");
-        self.deadlines()
-            .update_many(
-                filter,
-                doc! { "$set": { "status": "CANCELLED", "finishedAt": now } },
-            )
-            .session(tx.session()?)
-            .await?;
-        Ok(())
-    }
-}
-
-impl TxProvider for MongoSagaStore {
-    fn begin(&self) -> BoxFuture<'_, Result<Tx, StoreError>> {
-        Box::pin(async move {
-            let mut session = self.client.start_session().await?;
-            session.start_transaction().await?;
-            Ok(Tx::from_session(session))
-        })
-    }
-
-    fn plain(&self) -> BoxFuture<'_, Result<Tx, StoreError>> {
-        Box::pin(async move { Ok(Tx::from_session(self.client.start_session().await?)) })
-    }
-
-    fn commit<'a>(&'a self, tx: &'a mut Tx) -> BoxFuture<'a, Result<(), StoreError>> {
-        Box::pin(async move {
-            tx.session()?.commit_transaction().await?;
-            Ok(())
-        })
-    }
-
-    fn abort<'a>(&'a self, tx: &'a mut Tx) -> BoxFuture<'a, ()> {
-        Box::pin(async move {
-            if let Some(session) = tx.session.as_mut() {
-                let _ = session.abort_transaction().await;
-            }
-        })
-    }
-}
-
-impl SagaRepository for MongoSagaStore {
-    fn find_by_id<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        id: &'a str,
-    ) -> BoxFuture<'a, Result<Option<SagaDocument>, StoreError>> {
-        Box::pin(async move {
-            Ok(self
-                .sagas()
-                .find_one(doc! { "_id": id })
-                .session(tx.session()?)
-                .await?)
-        })
-    }
-
-    fn find_live<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        type_name: &'a str,
-        key: &'a str,
-        value: &'a str,
-    ) -> BoxFuture<'a, Result<Vec<SagaDocument>, StoreError>> {
-        Box::pin(async move {
-            let session = tx.session()?;
-            let mut cursor = self
-                .sagas()
-                .find(doc! {
-                    "type": type_name,
-                    "ended": false,
-                    "associations": { "$elemMatch": { "k": key, "v": value } },
-                })
-                .session(&mut *session)
-                .await?;
-            Ok(cursor.stream(session).try_collect().await?)
-        })
-    }
-
-    fn insert<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        saga: &'a SagaDocument,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
-        Box::pin(async move {
-            self.sagas().insert_one(saga).session(tx.session()?).await?;
-            Ok(())
-        })
-    }
-
-    fn update<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        saga: &'a SagaDocument,
-        expected_version: i64,
-    ) -> BoxFuture<'a, Result<bool, StoreError>> {
-        Box::pin(async move {
-            let result = self
-                .sagas()
-                .replace_one(doc! { "_id": &saga.id, "version": expected_version }, saga)
-                .session(tx.session()?)
-                .await?;
-            Ok(result.matched_count == 1)
-        })
-    }
-}
-
-impl DispatchRecorder for MongoSagaStore {
-    fn record<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        entries: &'a [SagaDispatchDocument],
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
-        Box::pin(async move {
-            if !entries.is_empty() {
-                self.dispatch()
-                    .insert_many(entries)
-                    .session(tx.session()?)
-                    .await?;
-            }
-            Ok(())
-        })
-    }
-}
-
-impl DeadlineStore for MongoSagaStore {
-    fn insert<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        deadline: &'a DeadlineDocument,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
-        Box::pin(async move {
-            self.deadlines()
-                .insert_one(deadline)
-                .session(tx.session()?)
-                .await?;
-            Ok(())
-        })
-    }
-
-    fn find_scheduled<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        id: &'a str,
-    ) -> BoxFuture<'a, Result<Option<DeadlineDocument>, StoreError>> {
-        Box::pin(async move {
-            Ok(self
-                .deadlines()
-                .find_one(doc! { "_id": id, "status": "SCHEDULED" })
-                .session(tx.session()?)
-                .await?)
-        })
-    }
-
-    fn cancel<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        saga_id: &'a str,
-        deadline_id: &'a str,
-        now: DateTime,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
-        Box::pin(async move {
-            self.cancel_where(tx, doc! { "_id": deadline_id, "sagaId": saga_id }, now)
-                .await
-        })
-    }
-
-    fn cancel_by_name<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        saga_id: &'a str,
-        name: &'a str,
-        now: DateTime,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
-        Box::pin(async move {
-            self.cancel_where(tx, doc! { "sagaId": saga_id, "name": name }, now)
-                .await
-        })
-    }
-
-    fn cancel_all<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        saga_id: &'a str,
-        now: DateTime,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
-        Box::pin(async move { self.cancel_where(tx, doc! { "sagaId": saga_id }, now).await })
-    }
-
-    fn mark_fired<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        id: &'a str,
-        now: DateTime,
-    ) -> BoxFuture<'a, Result<bool, StoreError>> {
-        Box::pin(async move {
-            let result = self
-                .deadlines()
-                .update_one(
-                    doc! { "_id": id, "status": "SCHEDULED" },
-                    doc! { "$set": { "status": "FIRED", "finishedAt": now } },
-                )
-                .session(tx.session()?)
-                .await?;
-            Ok(result.modified_count == 1)
-        })
-    }
-}
-
-impl FailureStore for MongoSagaStore {
-    fn find<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        id: &'a str,
-    ) -> BoxFuture<'a, Result<Option<SagaFailureDocument>, StoreError>> {
-        Box::pin(async move {
-            Ok(self
-                .failures()
-                .find_one(doc! { "_id": id })
-                .session(tx.session()?)
-                .await?)
-        })
-    }
-
-    fn save<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        failure: &'a SagaFailureDocument,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
-        Box::pin(async move {
-            self.failures()
-                .replace_one(doc! { "_id": &failure.id }, failure)
-                .upsert(true)
-                .session(tx.session()?)
-                .await?;
-            Ok(())
-        })
-    }
-
-    fn delete<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        id: &'a str,
-    ) -> BoxFuture<'a, Result<bool, StoreError>> {
-        Box::pin(async move {
-            let result = self
-                .failures()
-                .delete_one(doc! { "_id": id })
-                .session(tx.session()?)
-                .await?;
-            Ok(result.deleted_count == 1)
-        })
-    }
-
-    fn failed_again<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        id: &'a str,
-        error: &'a str,
-        attempts: i32,
-        now: DateTime,
-    ) -> BoxFuture<'a, Result<bool, StoreError>> {
-        Box::pin(async move {
-            let result = self
-                .failures()
-                .update_one(
-                    doc! { "_id": id },
-                    doc! {
-                        "$inc": { "attempts": attempts },
-                        "$set": { "error": error, "lastFailedAt": now },
-                    },
-                )
-                .session(tx.session()?)
-                .await?;
-            Ok(result.matched_count == 1)
-        })
-    }
-
-    fn list<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        saga_type: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<Vec<SagaFailureDocument>, StoreError>> {
-        Box::pin(async move {
-            let filter = match saga_type {
-                Some(t) => doc! { "sagaType": t },
-                None => doc! {},
-            };
-            let session = tx.session()?;
-            let mut cursor = self
-                .failures()
-                .find(filter)
-                .sort(doc! { "lastFailedAt": 1 })
-                .session(&mut *session)
-                .await?;
-            Ok(cursor.stream(session).try_collect().await?)
-        })
-    }
-}
-
-impl MarkerStore for MongoSagaStore {
-    fn exists<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        id: &'a str,
-    ) -> BoxFuture<'a, Result<bool, StoreError>> {
-        Box::pin(async move {
-            Ok(self
-                .markers()
-                .find_one(doc! { "_id": id })
-                .session(tx.session()?)
-                .await?
-                .is_some())
-        })
-    }
-
-    fn insert<'a>(
-        &'a self,
-        tx: &'a mut Tx,
-        id: &'a str,
-        type_name: &'a str,
-        now: DateTime,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
-        Box::pin(async move {
-            self.markers()
-                .insert_one(doc! { "_id": id, "type": type_name, "processedAt": now })
-                .session(tx.session()?)
-                .await?;
-            Ok(())
-        })
     }
 }

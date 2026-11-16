@@ -16,13 +16,14 @@ use futures::TryStreamExt;
 use kraken_messaging::MessagingError;
 use kraken_messaging::config::DeadLetterMode;
 use kraken_messaging::processors::DeadLetters;
-use kraken_messaging::processors::dead_letters::{
-    DEAD_LETTERS_COLLECTION, DeadLetterDocument, DeadLetterError, DeadLetterReason,
-    DeadLetterRecord, ensure_dead_letter_indexes,
-};
-use kraken_messaging::processors::store::DeadLetterStore;
+use kraken_messaging::processors::dead_letters::{DeadLetterRecord, park};
+use kraken_messaging::store::{DeadLetter, DeadLetterError, DeadLetterReason, MessageStore};
+use kraken_messaging_mongo::documents::DeadLetterDocument;
+use kraken_messaging_mongo::{MongoIndexSettings, MongoStore};
 use mongodb::bson::{Bson, DateTime, Document, spec::BinarySubtype};
 use mongodb::{Database, IndexModel};
+
+const DEAD_LETTERS_COLLECTION: &str = "dead_letters";
 
 macro_rules! require_docker {
     () => {
@@ -56,16 +57,23 @@ fn fixture(name: &str) -> Document {
     }
 }
 
-fn read(name: &str) -> DeadLetterDocument {
-    mongodb::bson::from_document(fixture(name)).unwrap_or_else(|e| panic!("{name}: {e}"))
+/// A fixture read as the MongoDB store reads it.
+fn read(name: &str) -> DeadLetter {
+    mongodb::bson::from_document::<DeadLetterDocument>(fixture(name))
+        .unwrap_or_else(|e| panic!("{name}: {e}"))
+        .into()
 }
 
-fn at(rfc3339: &str) -> DateTime {
-    DateTime::parse_rfc3339_str(rfc3339).unwrap()
+/// Epoch milliseconds.
+fn at(rfc3339: &str) -> i64 {
+    DateTime::parse_rfc3339_str(rfc3339)
+        .unwrap()
+        .timestamp_millis()
 }
 
-fn to_doc(letter: &DeadLetterDocument) -> Document {
-    mongodb::bson::to_document(letter).unwrap()
+/// A letter as the MongoDB store writes it.
+fn to_doc(letter: &DeadLetter) -> Document {
+    mongodb::bson::to_document(&DeadLetterDocument::from(letter)).unwrap()
 }
 
 fn sorted(doc: &Document) -> Vec<(String, Bson)> {
@@ -129,18 +137,22 @@ fn the_fixtures_of_each_reason_deserialise() {
     let failed = read("handler_failed");
     assert_eq!(failed.id, "orders:kraken.events:1:42");
     assert_eq!(failed.processor, "orders");
-    assert_eq!(failed.topic, "kraken.events");
-    assert_eq!((failed.partition, failed.offset), (1, 42));
+    assert_eq!(failed.source, "kraken.events");
+    assert_eq!(
+        (failed.segment.as_str(), failed.position.as_str()),
+        ("1", "42")
+    );
     assert_eq!(failed.key.as_deref(), Some("order-7"));
     assert_eq!(failed.event_id.as_deref(), Some("evt-7"));
     assert_eq!(failed.event_type.as_deref(), Some("examples.OrderPlaced"));
     assert_eq!(failed.headers["correlationId"], "corr-7");
     assert_eq!(failed.headers["userId"], "");
     assert_eq!(
-        failed.payload.as_deref(),
-        Some(r#"{"orderId":"o-7","amount":12.30}"#)
+        to_doc(&failed).get_str("payload"),
+        Ok(r#"{"orderId":"o-7","amount":12.30}"#),
+        "the value as text"
     );
-    assert!(failed.payload_binary.is_none());
+    assert!(!to_doc(&failed).contains_key("payloadBinary"));
     assert_eq!(failed.reason, DeadLetterReason::HandlerFailed);
     assert_eq!(
         failed.error,
@@ -152,11 +164,11 @@ fn the_fixtures_of_each_reason_deserialise() {
     assert!(failed.blocked_by.is_none());
     assert!(!failed.replay, "absent is false");
     assert_eq!(failed.attempts, 5);
-    assert_eq!(failed.parked_at, at("2026-11-04T10:00:05Z"));
-    assert_eq!(failed.last_attempt_at, at("2026-11-04T10:00:05Z"));
-    assert_eq!(failed.expire_at, at("2026-12-04T10:00:05Z"));
+    assert_eq!(failed.parked_at_ms, at("2026-11-04T10:00:05Z"));
+    assert_eq!(failed.last_attempt_at_ms, at("2026-11-04T10:00:05Z"));
+    assert_eq!(failed.expire_at_ms, at("2026-12-04T10:00:05Z"));
     assert_eq!(
-        failed.payload_bytes(),
+        failed.payload,
         br#"{"orderId":"o-7","amount":12.30}"#.to_vec()
     );
 
@@ -171,22 +183,23 @@ fn the_fixtures_of_each_reason_deserialise() {
         DeadLetterError::sequenced("orders:kraken.events:1:42")
     );
     assert_eq!(sequenced.attempts, 0);
-    assert_eq!(sequenced.parked_at, at("2026-11-04T10:00:06.250Z"));
+    assert_eq!(sequenced.parked_at_ms, at("2026-11-04T10:00:06.250Z"));
 
     let binary = read("invalid_binary");
     assert_eq!(binary.reason, DeadLetterReason::Invalid);
     assert!(binary.key.is_none() && binary.event_id.is_none() && binary.event_type.is_none());
     assert_eq!(binary.headers["source"], "legacy-\u{fffd}tool");
-    assert!(binary.payload.is_none());
-    assert_eq!(binary.payload_bytes(), vec![0xff, 0x00, 0xfe]);
+    assert!(!to_doc(&binary).contains_key("payload"));
+    assert_eq!(binary.payload, vec![0xff, 0x00, 0xfe]);
     assert_eq!(
         binary.error,
         DeadLetterError::invalid("record without type header")
     );
 
     let empty = read("invalid_empty");
-    assert!(empty.payload.is_none() && empty.payload_binary.is_none());
-    assert!(empty.payload_bytes().is_empty());
+    let doc = to_doc(&empty);
+    assert!(!doc.contains_key("payload") && !doc.contains_key("payloadBinary"));
+    assert!(empty.payload.is_empty());
     assert!(empty.event_id.is_none());
 
     let blank = read("invalid_blank_headers");
@@ -197,7 +210,7 @@ fn the_fixtures_of_each_reason_deserialise() {
     let replayed = read("replayed");
     assert_eq!(replayed.reason, DeadLetterReason::HandlerFailed);
     assert!(replayed.replay);
-    assert_eq!(replayed.parked_at, at("2026-11-04T10:04:00Z"));
+    assert_eq!(replayed.parked_at_ms, at("2026-11-04T10:04:00Z"));
 }
 
 #[test]
@@ -225,13 +238,14 @@ fn record_at(
 ) -> DeadLetterRecord {
     DeadLetterRecord {
         processor: processor.into(),
-        topic: "kraken.events".into(),
-        partition,
-        offset,
-        key: key.map(<[u8]>::to_vec),
+        source: "kraken.events".into(),
+        segment: partition.to_string(),
+        position: offset.to_string(),
+        key: key.map(|k| String::from_utf8_lossy(k).into_owned()),
+        // As a delivery carries them: text, lossy UTF-8.
         headers: headers
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_vec()))
+            .map(|(k, v)| (k.to_string(), String::from_utf8_lossy(v).into_owned()))
             .collect(),
         payload: payload.to_vec(),
     }
@@ -241,7 +255,7 @@ fn record_at(
 fn a_letter_rust_parks_has_exactly_the_contracts_fields_and_types() {
     let now = at("2026-11-04T10:00:05Z");
     let retention = Duration::from_secs(30 * 86_400);
-    let failed = DeadLetterDocument::park(
+    let failed = park(
         record(
             Some(b"order-7"),
             &[
@@ -277,7 +291,7 @@ fn a_letter_rust_parks_has_exactly_the_contracts_fields_and_types() {
         ]),
     );
 
-    let sequenced = DeadLetterDocument::park(
+    let sequenced = park(
         record(Some(b"order-7"), &[("type", b"t.E"), ("id", b"e-2")], b"{}"),
         DeadLetterReason::Sequenced,
         DeadLetterError::sequenced("orders:kraken.events:1:41"),
@@ -304,7 +318,7 @@ fn a_letter_rust_parks_has_exactly_the_contracts_fields_and_types() {
     );
 
     // No key, no type or id header, a value that is not UTF-8 (and a header that is not either).
-    let binary = DeadLetterDocument::park(
+    let binary = park(
         record(None, &[("source", b"legacy-\xfftool")], &[0xff, 0x00, 0xfe]),
         DeadLetterReason::Invalid,
         DeadLetterError::invalid("record without type header"),
@@ -330,7 +344,7 @@ fn a_letter_rust_parks_has_exactly_the_contracts_fields_and_types() {
     );
 
     // An empty value: neither payload field.
-    let empty = DeadLetterDocument::park(
+    let empty = park(
         record(Some(b"k\xff"), &[("type", b"t.E")], b""),
         DeadLetterReason::Invalid,
         DeadLetterError::invalid("payload is not a JSON object"),
@@ -349,7 +363,7 @@ fn a_letter_rust_parks_has_exactly_the_contracts_fields_and_types() {
 #[test]
 fn rust_parks_each_shared_fixture_from_its_record() {
     let retention = Duration::from_secs(30 * 86_400);
-    let sequenced = DeadLetterDocument::park(
+    let sequenced = park(
         record_at(
             "orders",
             1,
@@ -365,7 +379,7 @@ fn rust_parks_each_shared_fixture_from_its_record() {
         at("2026-11-04T10:00:06.250Z"),
         retention,
     );
-    let binary = DeadLetterDocument::park(
+    let binary = park(
         record_at(
             "default",
             0,
@@ -381,7 +395,7 @@ fn rust_parks_each_shared_fixture_from_its_record() {
         at("2026-11-04T10:01:00Z"),
         retention,
     );
-    let empty = DeadLetterDocument::park(
+    let empty = park(
         record_at(
             "orders",
             2,
@@ -398,7 +412,7 @@ fn rust_parks_each_shared_fixture_from_its_record() {
         retention,
     );
     // Blank `type` and `id` headers: kept in `headers`, absent as `eventType` and `eventId`.
-    let blank = DeadLetterDocument::park(
+    let blank = park(
         record_at(
             "default",
             0,
@@ -415,9 +429,9 @@ fn rust_parks_each_shared_fixture_from_its_record() {
         retention,
     );
     // Parked while its processor replayed the record.
-    let replayed = DeadLetterDocument {
+    let replayed = DeadLetter {
         replay: true,
-        ..DeadLetterDocument::park(
+        ..park(
             record_at(
                 "orders",
                 1,
@@ -479,13 +493,13 @@ fn the_error_message_is_cut_at_2000_characters_and_a_repeated_header_keeps_its_l
         long.starts_with(&e.message[..])
             || format!("storage error: {long}").starts_with(&e.message[..])
     );
-    let letter = DeadLetterDocument::park(
+    let letter = park(
         record(None, &[("type", b"a"), ("type", b"b")], b"{}"),
         DeadLetterReason::HandlerFailed,
         e,
         None,
         1,
-        DateTime::now(),
+        kraken_messaging::time::now_ms(),
         Duration::from_secs(1),
     );
     assert_eq!(
@@ -493,10 +507,7 @@ fn the_error_message_is_cut_at_2000_characters_and_a_repeated_header_keeps_its_l
         BTreeMap::from([("type".to_string(), "b".to_string())])
     );
     assert_eq!(letter.event_type.as_deref(), Some("b"));
-    assert_eq!(
-        letter.expire_at.timestamp_millis() - letter.parked_at.timestamp_millis(),
-        1000
-    );
+    assert_eq!(letter.expire_at_ms - letter.parked_at_ms, 1000);
 }
 
 /// A document the other library wrote (each shared fixture, inserted as is) reads back through
@@ -511,7 +522,7 @@ async fn every_shared_fixture_reads_back_through_the_store_and_the_admin_api() {
     for name in FIXTURES {
         raw.insert_one(fixture(name)).await.unwrap();
     }
-    let store = DeadLetterStore::new(&db);
+    let store = MongoStore::new(client.clone(), db.clone()).dead_letters();
     for name in FIXTURES {
         let id = fixture(name).get_str("_id").unwrap().to_string();
         let letter = store
@@ -538,7 +549,7 @@ async fn every_shared_fixture_reads_back_through_the_store_and_the_admin_api() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(binary.payload_bytes(), vec![0xff, 0x00, 0xfe]);
+    assert_eq!(binary.payload, vec![0xff, 0x00, 0xfe]);
     let blank = store
         .get("default:kraken.events:0:8")
         .await
@@ -547,7 +558,7 @@ async fn every_shared_fixture_reads_back_through_the_store_and_the_admin_api() {
     assert!(blank.event_id.is_none() && blank.event_type.is_none());
 
     // The admin API's reads (list and count need no processor of this instance).
-    let admin = DeadLetters::new(db.clone(), DeadLetterMode::Collection, vec![]);
+    let admin = DeadLetters::new(Some(store), DeadLetterMode::Collection, vec![]);
     let listed = admin.list(None, 100).await.unwrap();
     assert_eq!(
         listed.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(),
@@ -566,6 +577,7 @@ async fn every_shared_fixture_reads_back_through_the_store_and_the_admin_api() {
         assert_eq!(sorted(&to_doc(letter)), sorted(&fixture(name)), "{name}");
     }
     assert_eq!(admin.count(None).await.unwrap(), 6);
+    let store = MongoStore::new(client, db).dead_letters();
     assert_eq!(
         store.head("orders", "order-7").await.unwrap().as_deref(),
         Some("orders:kraken.events:1:42")
@@ -588,8 +600,15 @@ async fn the_three_indexes_of_the_contract_exist_with_their_names_keys_and_ttl()
     let mongo = support::containers::mongo().await;
     let client = mongodb::Client::with_uri_str(&mongo.uri).await.unwrap();
     let db = client.default_database().unwrap();
-    ensure_dead_letter_indexes(&db).await.unwrap();
-    ensure_dead_letter_indexes(&db).await.unwrap(); // idempotent
+    let store = MongoStore::new(client, db.clone());
+    store
+        .ensure_indexes(&MongoIndexSettings::default())
+        .await
+        .unwrap();
+    store
+        .ensure_indexes(&MongoIndexSettings::default())
+        .await
+        .unwrap(); // idempotent
     let all = indexes(&db).await;
     let by_name = |name: &str| {
         all.iter()

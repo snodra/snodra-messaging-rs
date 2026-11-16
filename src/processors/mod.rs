@@ -1,33 +1,31 @@
-//! Named event processors (ADR 0022, P6a): each processor is its own Kafka consumer, with its own
-//! consumer group, markers, dead letters and status.
+//! Named event processors (ADR 0022, P6a): each processor is its own subscription of the event
+//! store (ADR 0027), with its own markers, dead letters and status.
 //!
-//! - Every processor's group is `<service>.<name>` and its markers `processor:<name>:<eventId>`,
-//!   `default` included.
+//! - Every processor's subscription is `<service>.<name>` (on Kafka its consumer group, the name
+//!   it always had) and its markers `processor:<name>:<eventId>`, `default` included.
 //! - The unnamed processor `default` holds the handlers registered with
 //!   [`event`](crate::KrakenMessagingBuilder::event) and the sagas.
 //! - A named processor holds the handlers registered with
 //!   [`event_in`](crate::KrakenMessagingBuilder::event_in). It runs stage 1 only (no sagas).
 //!
 //! Processor control (ADR 0023, P6b): a processor is paused and resumed on every instance, and
-//! reset to a position as a leased operation (its range replayed), through its document in
-//! `processor_control` ([`control_store`]); the hub sends the requests ([`ProcessorControl`]).
+//! reset to a position as a leased operation (its range replayed), through its state in the
+//! message store ([`ProcessorControlStore`](crate::store::ProcessorControlStore)); the hub sends
+//! the requests ([`ProcessorControl`]).
 
 use crate::error::MessagingError;
 
 mod admin;
 mod control;
-pub mod control_store;
 pub mod dead_letters;
 pub mod monitor;
 pub mod reset;
 pub mod runner;
-pub mod store;
 
 pub use admin::{DEFAULT_LIST_LIMIT, DeadLetters, RetryAllResult, RetryResult};
-pub use control::{MAX_CONTROL_TEXT_BYTES, MAX_LIST_LIMIT, ProcessorControl};
-pub use control_store::ReplayRange;
+pub use control::{MAX_CONTROL_TEXT_BYTES, MAX_LIST_LIMIT, PAUSED_LOCALLY, ProcessorControl};
 pub use monitor::ProcessorMonitor;
-pub use reset::{ResetContext, ResetTarget};
+pub use reset::ResetContext;
 pub use runner::ProcessorRunner;
 
 /// How an event handler is registered
@@ -103,9 +101,11 @@ pub fn validate_processor_name(name: &str, what: &str) -> Result<(), MessagingEr
     }
 }
 
-/// The consumer group of processor `name` when the service's group is `base`: `<base>.<name>`.
-pub fn group_id(base: &str, name: &str) -> String {
-    format!("{base}.{name}")
+/// The subscription of processor `name` of the service `service`: `<service>.<name>` (what the
+/// processor's consumer group was named before the event store became an add-on, so a deployed
+/// service keeps its groups).
+pub fn subscription_name(service: &str, name: &str) -> String {
+    format!("{service}.{name}")
 }
 
 /// The prefix of processor `name`'s markers: `processor:<name>:`.
@@ -153,9 +153,12 @@ mod tests {
     }
 
     #[test]
-    fn groups_and_markers_are_uniform_default_included() {
-        assert_eq!(group_id("service-c", "default"), "service-c.default");
-        assert_eq!(group_id("service-c", "orders"), "service-c.orders");
+    fn subscription_names_are_todays_consumer_groups_default_included() {
+        assert_eq!(
+            subscription_name("service-c", "default"),
+            "service-c.default"
+        );
+        assert_eq!(subscription_name("service-c", "orders"), "service-c.orders");
         assert_eq!(marker_prefix("default"), "processor:default:");
         assert_eq!(marker_prefix("orders"), "processor:orders:");
     }

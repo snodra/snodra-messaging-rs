@@ -1006,17 +1006,19 @@ async fn the_hub_gets_and_shows_the_processor_status() {
     pool.set_processor_status(Arc::new(|| {
         vec![proto::ProcessorStatus {
             name: "orders".into(),
-            group_id: "proto-processors.orders".into(),
-            topic: "kraken.events".into(),
+            subscription: "proto-processors.orders".into(),
+            source: "kraken.events".into(),
             state: proto::ProcessorState::ProcessorRunning as i32,
-            partitions: vec![proto::PartitionStatus {
-                partition: 0,
-                position: 10,
-                committed: 8,
-                high_watermark: 20,
+            segments: vec![proto::SegmentStatus {
+                segment: "0".into(),
+                position: "10".into(),
+                committed: "8".into(),
+                head: "20".into(),
                 lag: 12,
-                replay_until: 0,
+                replay_until: String::new(),
             }],
+            event_store: "kafka".into(),
+            capabilities: vec!["lag".into(), "replay".into()],
             dead_letter_mode: "collection".into(),
             ..Default::default()
         }]
@@ -1030,6 +1032,7 @@ async fn the_hub_gets_and_shows_the_processor_status() {
     let view = instance_view(&hub, "proto-processors").await;
     assert_eq!(view["processors"][0]["name"], "orders", "{view}");
     assert_eq!(view["processors"][0]["state"], "RUNNING", "{view}");
-    assert_eq!(view["processors"][0]["partitions"][0]["lag"], 12, "{view}");
+    assert_eq!(view["processors"][0]["segments"][0]["lag"], 12, "{view}");
+    assert_eq!(view["processors"][0]["segments"][0]["head"], "20", "{view}");
     pool.shutdown().await;
 }

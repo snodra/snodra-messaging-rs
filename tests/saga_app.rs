@@ -9,14 +9,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kraken_messaging::external::{ExternalSource, IdempotencyKey, IngressResult, TranslatedEvent};
-use kraken_messaging::saga::store::{ExternalCallDocument, ExternalCallStatus, SagaDocument};
+use kraken_messaging::external::{ExternalRecord, IdempotencyKey, IngressResult, TranslatedEvent};
+use kraken_messaging::saga::store::SagaDocument;
 use kraken_messaging::saga::{EventOutcome, ExternalOutcome};
+use kraken_messaging::store::{ExternalCall, ExternalCallStatus};
 use kraken_messaging::{
     Command, Config, Event, KrakenMessaging, MessageContext, MessagingError, message_type,
 };
+use kraken_messaging_kafka::{ExternalSource, KafkaExternalSource};
+use kraken_messaging_mongo::documents::{ExternalCallDocument, SagaDoc};
 use mongodb::bson::{Document, doc};
-use rdkafka::Message;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde::{Deserialize, Serialize};
@@ -78,8 +80,8 @@ struct Banner {
 
 const PARTNER_TOPIC: &str = "partner.printer.banner";
 
-fn config(hub: &str, kafka: &str, mongo: &str) -> Config {
-    let mut c = Config::new("svc-banner", hub, kafka, mongo);
+fn config(hub: &str) -> Config {
+    let mut c = Config::new("svc-banner", hub);
     c.outbox_poll_interval = Duration::from_millis(100);
     c.reconnect_backoff_min = Duration::from_millis(100);
     c.reconnect_backoff_max = Duration::from_secs(2);
@@ -102,13 +104,15 @@ where
 
 async fn sagas(db: &mongodb::Database) -> Vec<SagaDocument> {
     use futures::TryStreamExt;
-    db.collection::<SagaDocument>("sagas")
+    let found: Vec<SagaDoc> = db
+        .collection::<SagaDoc>("sagas")
         .find(doc! {})
         .await
         .unwrap()
         .try_collect()
         .await
-        .unwrap()
+        .unwrap();
+    found.into_iter().map(SagaDocument::from).collect()
 }
 
 fn state(saga: &SagaDocument) -> serde_json::Value {
@@ -125,12 +129,12 @@ async fn an_event_starts_a_saga_whose_command_reaches_the_idempotent_adapter_and
     let calls: Arc<Mutex<Vec<MessageContext>>> = Arc::new(Mutex::new(Vec::new()));
 
     let meter = support::metrics::TestMeter::new();
-    let builder = KrakenMessaging::builder_with_meter(
-        config(&hub.address(), &kafka.bootstrap, &mongo.uri_for("banner")),
-        meter.meter(),
-    )
-    .await
-    .unwrap();
+    let uri = mongo.uri_for("banner");
+    let builder = KrakenMessaging::builder_with_meter(config(&hub.address()), meter.meter())
+        .await
+        .unwrap()
+        .store(support::mongo_store(&uri).await)
+        .event_store(support::kafka_events(&kafka.bootstrap));
     let recorded = Arc::clone(&calls);
     let app = builder
         // No ordinary event handler: the consumer runs for the saga alone.
@@ -179,16 +183,21 @@ async fn an_event_starts_a_saga_whose_command_reaches_the_idempotent_adapter_and
         // The partner's replies on its own topic end a saga too.
         .external_source(
             "printer-banner",
-            ExternalSource {
-                properties: HashMap::from([(
-                    "topic.metadata.refresh.interval.ms".to_string(),
-                    "500".to_string(),
-                )]),
-                ..ExternalSource::new(PARTNER_TOPIC)
-            },
-            |record| {
-                let reply: serde_json::Value =
-                    serde_json::from_slice(record.payload().unwrap_or_default())?;
+            KafkaExternalSource::new(
+                "printer-banner",
+                ExternalSource {
+                    properties: HashMap::from([(
+                        "topic.metadata.refresh.interval.ms".to_string(),
+                        "500".to_string(),
+                    )]),
+                    ..ExternalSource::new(PARTNER_TOPIC)
+                },
+                "svc-banner",
+                &kafka.bootstrap,
+            )
+            .unwrap(),
+            |record: &ExternalRecord| {
+                let reply: serde_json::Value = serde_json::from_slice(&record.payload)?;
                 let event = BannerPrinted {
                     job_id: reply["jobId"].as_str().unwrap_or_default().to_string(),
                 };
@@ -208,7 +217,7 @@ async fn an_event_starts_a_saga_whose_command_reaches_the_idempotent_adapter_and
         .start()
         .await
         .unwrap();
-    let db = app.database();
+    let db = support::mongo_db(&uri).await;
     assert!(app.await_hub(Duration::from_secs(10)).await);
 
     // -- event -> saga -> relayed local command -> idempotent adapter -> deadline
@@ -239,12 +248,13 @@ async fn an_event_starts_a_saga_whose_command_reaches_the_idempotent_adapter_and
     let saga = sagas(&db).await.remove(0);
     assert_eq!(state(&saga)["timedOut"], true);
     assert_eq!(calls.lock().unwrap().len(), 1, "the command went out once");
-    let record = db
-        .collection::<ExternalCallDocument>("external_calls")
-        .find_one(doc! { "_id": &key })
-        .await
-        .unwrap()
-        .unwrap();
+    let record = ExternalCall::from(
+        db.collection::<ExternalCallDocument>("external_calls")
+            .find_one(doc! { "_id": &key })
+            .await
+            .unwrap()
+            .unwrap(),
+    );
     assert_eq!(record.status, ExternalCallStatus::Succeeded);
     eventually(
         "BannerFailed to reach the outbox",
@@ -420,50 +430,40 @@ async fn a_service_without_sagas_adapters_or_sources_builds_none_of_it() {
     require_docker!();
     let hub = FakeHub::start().await;
     let mongo = support::containers::mongo().await;
-    let app = KrakenMessaging::builder(config(
-        &hub.address(),
-        "127.0.0.1:1",
-        &mongo.uri_for("plain"),
-    ))
-    .await
-    .unwrap()
-    .command::<PrintBanner, _, _>(|_, _| async { Ok(()) })
-    .start()
-    .await
-    .unwrap();
-
-    let names = app.database().list_collection_names().await.unwrap();
-    for saga_collection in [
-        "sagas",
-        "saga_dispatch",
-        "saga_dispatch_leases",
-        "deadlines",
-        "saga_failures",
-        "external_calls",
-    ] {
-        assert!(
-            !names.contains(&saga_collection.to_string()),
-            "{saga_collection} created: {names:?}"
-        );
-    }
+    // Commands only: no store, no saga state, and the saga admin API says it has no store.
+    let app = KrakenMessaging::builder(config(&hub.address()))
+        .await
+        .unwrap()
+        .command::<PrintBanner, _, _>(|_, _| async { Ok(()) })
+        .start()
+        .await
+        .unwrap();
     assert_eq!(app.saga_stats().snapshot(), vec![]);
-    assert!(app.saga_failures().list(None).await.unwrap().is_empty());
+    let e = app.saga_failures().list(None).await.unwrap_err();
+    assert!(e.to_string().contains("need a message store"), "{e}");
     app.shutdown().await;
 
-    // Disabled sagas are not built either, even when registered.
-    let mut disabled = config(&hub.address(), "127.0.0.1:1", &mongo.uri_for("disabled"));
+    // Disabled sagas are not built, even when registered: with the schema setup turned off, the
+    // library writes nothing in the store.
+    let mut disabled = config(&hub.address());
     disabled.sagas_enabled = false;
+    disabled.store_init_schema = false;
+    let uri = mongo.uri_for("disabled");
     let app = KrakenMessaging::builder(disabled)
         .await
         .unwrap()
+        .store(support::mongo_store_bare(&uri).await)
+        .event_store(support::memory_events())
         .saga::<Banner>("app.Banner", |d| {
             d.start_on::<Shouted>("jobId", |e| Some(e.job_id.clone()), |_, _, _| Ok(()))
         })
         .start()
         .await
         .unwrap();
-    let names = app.database().list_collection_names().await.unwrap();
-    assert!(!names.contains(&"sagas".to_string()), "{names:?}");
+    let db = support::mongo_db(&uri).await;
+    let names = db.list_collection_names().await.unwrap();
+    assert!(names.is_empty(), "{names:?}");
+    assert_eq!(app.saga_stats().snapshot(), vec![]);
     // A parked event of the disabled saga is not retried: the retry is refused and it stays as it was.
     let parked = doc! {
         "_id": "app.Banner:e-1", "sagaType": "app.Banner", "eventId": "e-1",
@@ -472,7 +472,7 @@ async fn a_service_without_sagas_adapters_or_sources_builds_none_of_it() {
         "firstFailedAt": mongodb::bson::DateTime::from_millis(1_000),
         "lastFailedAt": mongodb::bson::DateTime::from_millis(2_000),
     };
-    let failures = app.database().collection::<Document>("saga_failures");
+    let failures = db.collection::<Document>("saga_failures");
     failures.insert_one(&parked).await.unwrap();
     let refused = app.saga_failures().retry("app.Banner:e-1").await;
     assert!(
@@ -488,22 +488,26 @@ async fn a_service_without_sagas_adapters_or_sources_builds_none_of_it() {
     );
     app.shutdown().await;
 
-    // An idempotent handler brings the external_calls index, and nothing of the sagas.
-    let app = KrakenMessaging::builder(config(
-        &hub.address(),
-        "127.0.0.1:1",
-        &mongo.uri_for("adapter"),
-    ))
-    .await
-    .unwrap()
-    .idempotent_command::<PrintBanner, _, _>(IdempotencyKey::default(), false, |_, _| async {
-        Ok::<(), MessagingError>(())
-    })
-    .start()
-    .await
-    .unwrap();
-    let names = app.database().list_collection_names().await.unwrap();
-    assert!(names.contains(&"external_calls".to_string()), "{names:?}");
-    assert!(!names.contains(&"sagas".to_string()), "{names:?}");
+    // An idempotent handler starts with its store and builds nothing of the sagas.
+    let uri = mongo.uri_for("adapter");
+    let mut unprepared = config(&hub.address());
+    unprepared.store_init_schema = false;
+    let app = KrakenMessaging::builder(unprepared)
+        .await
+        .unwrap()
+        .store(support::mongo_store_bare(&uri).await)
+        .idempotent_command::<PrintBanner, _, _>(IdempotencyKey::default(), false, |_, _| async {
+            Ok::<(), MessagingError>(())
+        })
+        .start()
+        .await
+        .unwrap();
+    let names = support::mongo_db(&uri)
+        .await
+        .list_collection_names()
+        .await
+        .unwrap();
+    assert!(names.is_empty(), "{names:?}");
+    assert_eq!(app.saga_stats().snapshot(), vec![]);
     app.shutdown().await;
 }

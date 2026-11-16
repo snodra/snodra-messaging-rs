@@ -9,6 +9,11 @@ publish = false
 
 [dependencies]
 kraken-messaging-rs = { path = "../.." }
+# The message store (ADR 0028): its own MongoDB database, through the MongoDB add-on.
+kraken-messaging-mongo = { path = "../../crates/kraken-messaging-mongo" }
+# The event store (ADR 0027): Kafka, through the Kafka add-on (also the printer's partner topic).
+kraken-messaging-kafka = { path = "../../crates/kraken-messaging-kafka" }
+mongodb = "3.9.1"
 tokio = { version = "1.54.1", features = ["full"] }
 futures = "0.3"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -29,5 +34,3 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "r
 [dev-dependencies]
 # SagaTestFixture (feature `testing`) for the banner saga's unit tests.
 kraken-messaging-rs = { path = "../..", features = ["testing"] }
-# A `DeadLetters` over a database that is never connected to, for the admin edge's unit tests.
-mongodb = "3.9.1"

@@ -1,6 +1,7 @@
 //! The webhook ingress and the signature verifier (S2 Task 11, ADR 0021 rulings 18, 19): the Rust
-//! form of the Kotlin `WebhookIngressTest`. The ingress runs against a real MongoDB; the verifier
-//! needs nothing.
+//! form of the Kotlin `WebhookIngressTest`. The ingress runs on the in-memory message store;
+//! the verifier needs nothing.
+#![cfg(feature = "testing")]
 
 mod support;
 
@@ -9,26 +10,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use kraken_messaging::events::LocalEventDispatcher;
 use kraken_messaging::external::webhook::{
     SECRET_HEADER, SIGNATURE_HEADER, constant_time_eq, hmac_hex, verify, verify_with,
 };
 use kraken_messaging::external::{ExternalEventIngress, IngressResult};
 use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::kafka::LocalEventDispatcher;
 use kraken_messaging::saga::{NoopSagaMetrics, SagaDefinition, SagaRetry, SagaRuntime, SagaType};
 use kraken_messaging::{Event, MessageContext, MessagingError, RetryPolicy, message_type};
-use mongodb::bson::doc;
 use serde::{Deserialize, Serialize};
 use support::saga::{Store, state, t0};
-
-macro_rules! require_docker {
-    () => {
-        if !support::docker_available() {
-            eprintln!("docker not available, skipping");
-            return;
-        }
-    };
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -113,12 +104,12 @@ impl Wh {
             Arc::new(NoopSagaMetrics),
         ));
         let dispatcher = Arc::new(LocalEventDispatcher::new(
-            store.client.clone(),
-            store.db.clone(),
+            Some(store.message_store()),
             Arc::new(registry),
             runtime,
         ));
-        let ingress = ExternalEventIngress::new(dispatcher, store.db.clone(), store.clock.clock());
+        let ingress =
+            ExternalEventIngress::new(dispatcher, Some(store.message_store()), store.clock.clock());
         Wh {
             store,
             handlers,
@@ -153,7 +144,6 @@ impl Wh {
 
 #[tokio::test]
 async fn an_accepted_webhook_event_reaches_a_saga() {
-    require_docker!();
     let wh = Wh::start().await;
     let headers = HashMap::from([
         ("x-tenant".to_string(), "acme".to_string()),
@@ -185,16 +175,15 @@ async fn an_accepted_webhook_event_reaches_a_saga() {
     assert!(wh.store.marker("saga:wh.Job:printer:evt-1").await);
     let marker = wh
         .store
-        .find::<mongodb::bson::Document>(
-            "processed_events",
-            doc! { "_id": "ingress:printer:evt-1" },
-        )
-        .await
-        .remove(0);
-    assert_eq!(marker.get_str("type").unwrap(), "wh.Hook");
+        .contents()
+        .processed
+        .into_iter()
+        .find(|m| m.id == "ingress:printer:evt-1")
+        .expect("the ingress marker");
+    assert_eq!(marker.type_name, "wh.Hook");
     assert_eq!(
-        marker.get_datetime("processedAt").unwrap().to_system_time(),
-        t0(),
+        marker.processed_at_ms,
+        kraken_messaging::time::epoch_ms(t0()),
         "the marker's time is the clock's"
     );
     // The handlers see the dedupe id, the source, the type and the given headers.
@@ -210,7 +199,6 @@ async fn an_accepted_webhook_event_reaches_a_saga() {
 
 #[tokio::test]
 async fn the_same_dedupe_key_twice_is_duplicate_and_applied_once() {
-    require_docker!();
     let wh = Wh::start().await;
 
     assert_eq!(
@@ -237,7 +225,6 @@ async fn the_same_dedupe_key_twice_is_duplicate_and_applied_once() {
 
 #[tokio::test]
 async fn a_failing_handler_fails_the_call_and_the_retry_of_the_same_key_is_accepted() {
-    require_docker!();
     let wh = Wh::start().await;
     wh.handlers.failures_left.store(1, Ordering::SeqCst);
 
@@ -276,7 +263,6 @@ async fn a_failing_handler_fails_the_call_and_the_retry_of_the_same_key_is_accep
 
 #[tokio::test]
 async fn an_event_nobody_handles_is_accepted_without_a_marker_and_blank_ids_are_refused() {
-    require_docker!();
     let wh = Wh::start().await;
 
     let result = wh
@@ -287,7 +273,7 @@ async fn an_event_nobody_handles_is_accepted_without_a_marker_and_blank_ids_are_
 
     assert_eq!(result, IngressResult::Accepted);
     assert_eq!(
-        wh.store.count("processed_events", doc! {}).await,
+        wh.store.contents().processed.len(),
         0,
         "no marker: the partner must not retry what the service never uses, and nothing is remembered"
     );

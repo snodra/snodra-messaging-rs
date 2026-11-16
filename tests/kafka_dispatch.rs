@@ -6,18 +6,21 @@ mod support;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+use kraken_messaging::store::MessageStore;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use kraken_messaging::config::DeadLetterMode;
-use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::kafka::dispatch::{
+use kraken_messaging::event_store::{SubscriptionSpec, headers};
+use kraken_messaging::events::dispatch::{
     LocalEventDispatcher, NoSagas, Outcome, SagaStage, StageOneDone,
 };
-use kraken_messaging::kafka::{
-    EventConsumer, ProcessorSettings, RecordDisposition, classify_with, ensure_indexes, headers,
+use kraken_messaging::events::{
+    EventConsumer, ProcessorSettings, RecordDisposition, classify_with,
 };
+use kraken_messaging::hub::HandlerRegistry;
 use kraken_messaging::{Event, MessageContext, MessagingError, message_type};
 use mongodb::Database;
 use mongodb::bson::doc;
@@ -144,7 +147,7 @@ impl SagaStage for RecordingStage {
 
 struct Fixture {
     db: Database,
-    client: mongodb::Client,
+    store: Arc<dyn MessageStore>,
     handlers: Arc<Mutex<Vec<String>>>,
     fail_ordinary: Arc<Mutex<Option<String>>>,
     _mongo: support::containers::MongoDb,
@@ -155,16 +158,10 @@ impl Fixture {
         let mongo = support::containers::mongo().await;
         let client = mongodb::Client::with_uri_str(&mongo.uri).await.unwrap();
         let db = client.default_database().unwrap();
-        ensure_indexes(
-            &db,
-            Duration::from_secs(86_400),
-            Duration::from_secs(86_400),
-        )
-        .await
-        .unwrap();
+        let store = support::mongo_store(&mongo.uri).await;
         Fixture {
             db,
-            client,
+            store,
             handlers: Arc::new(Mutex::new(Vec::new())),
             fail_ordinary: Arc::new(Mutex::new(None)),
             _mongo: mongo,
@@ -191,10 +188,13 @@ impl Fixture {
         Arc::new(registry)
     }
 
+    fn message_store(&self) -> Arc<dyn MessageStore> {
+        Arc::clone(&self.store)
+    }
+
     fn dispatcher(&self, stage: Arc<dyn SagaStage>, with_handler: bool) -> LocalEventDispatcher {
         LocalEventDispatcher::new(
-            self.client.clone(),
-            self.db.clone(),
+            Some(self.message_store()),
             self.registry(with_handler),
             stage,
         )
@@ -432,11 +432,12 @@ fn a_record_only_a_saga_wants_is_handled_not_skipped() {
     .into();
     let none = HandlerRegistry::new();
     assert_eq!(
-        classify_with(&hdrs, b"{}", "kraken.events", 0, 7, |_| false),
+        classify_with(&hdrs, b"{}", "kraken.events", "0", "7", |_| false),
         RecordDisposition::Skip("no handler for this type")
     );
     assert_eq!(
-        classify_with(&hdrs, b"{}", "kraken.events", 0, 7, |t| t == "t.Happened"),
+        classify_with(&hdrs, b"{}", "kraken.events", "0", "7", |t| t
+            == "t.Happened"),
         RecordDisposition::Handle {
             type_name: "t.Happened".into(),
             id: "e-1".into()
@@ -444,7 +445,7 @@ fn a_record_only_a_saga_wants_is_handled_not_skipped() {
     );
     // `classify` is `classify_with` over the registry's handlers.
     assert_eq!(
-        kraken_messaging::kafka::classify(&hdrs, b"{}", "kraken.events", 0, 7, &none),
+        kraken_messaging::events::classify(&hdrs, b"{}", "kraken.events", "0", "7", &none),
         RecordDisposition::Skip("no handler for this type")
     );
 }
@@ -458,19 +459,20 @@ async fn the_consumer_hands_a_record_only_a_saga_wants_to_the_saga_stage() {
     let consumer = EventConsumer::processor(
         ProcessorSettings {
             name: "default".into(),
-            bootstrap_servers: kafka.bootstrap.clone(),
-            group_id: "svc-saga.default".into(),
-            topic: "kraken.events".into(),
+            subscription: SubscriptionSpec {
+                name: "svc-saga.default".into(),
+                source: "kraken.events".into(),
+            },
+            events: support::kafka_events(&kafka.bootstrap),
             max_attempts: 3,
             backoff: Duration::from_millis(50),
             dead_letter_mode: DeadLetterMode::Log,
             dead_letter_retention: Duration::from_secs(86_400),
-            db: None,
+            dead_letters: None,
             metrics: kraken_messaging::metrics::Metrics::global(),
         },
         Arc::new(LocalEventDispatcher::new(
-            f.client.clone(),
-            f.db.clone(),
+            Some(f.message_store()),
             f.registry(false),
             stage.clone(),
         )),

@@ -1,6 +1,7 @@
 //! The deadline scheduler (S2 Task 7, ADR 0021 rulings 15 and 37): due deadlines fire at least
-//! once from a leased poller, against a real MongoDB. The Rust form of the Kotlin
+//! once from a leased poller, on the in-memory message store. The Rust form of the Kotlin
 //! `DeadlineSchedulerTest`.
+#![cfg(feature = "testing")]
 
 mod support;
 
@@ -8,27 +9,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use kraken_messaging::kafka::SagaStage;
+use kraken_messaging::events::SagaStage;
 use kraken_messaging::saga::store::{DeadlineDocument, DeadlineStatus, DispatchKind, SagaDocument};
 use kraken_messaging::saga::{
     DeadlineScheduler, DeadlineSettings, SagaDefinition, SagaRetry, SagaRuntime, SagaType,
 };
+use kraken_messaging::store::MessageStore;
+use kraken_messaging::time::epoch_ms;
 use kraken_messaging::{Command, Event, RetryPolicy, message_type};
-use mongodb::bson::{DateTime, doc};
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use support::order_saga::RecordingMetrics;
 use support::saga::{Store, event_ctx, state, t0};
 use tokio_util::sync::CancellationToken;
-
-macro_rules! require_docker {
-    () => {
-        if !support::docker_available() {
-            eprintln!("docker not available, skipping");
-            return;
-        }
-    };
-}
 
 macro_rules! event {
     ($name:ident, $wire:literal, { $($field:ident : $ty:ty),* $(,)? }) => {
@@ -182,7 +175,7 @@ impl Dl {
 
     fn scheduler(&self) -> Arc<DeadlineScheduler> {
         DeadlineScheduler::new(
-            self.store.db.clone(),
+            self.store.store.sagas().deadlines,
             Arc::clone(&self.runtime),
             self.store.clock.clock(),
             DeadlineSettings {
@@ -230,8 +223,11 @@ impl Dl {
 
     async fn deadlines_of(&self, saga_id: &str) -> Vec<DeadlineDocument> {
         self.store
-            .find("deadlines", doc! { "sagaId": saga_id })
+            .deadlines()
             .await
+            .into_iter()
+            .filter(|d| d.saga_id == saga_id)
+            .collect()
     }
 }
 
@@ -242,20 +238,20 @@ fn placed(order_id: &str, seconds: u64) -> Placed {
     }
 }
 
-fn dt(t: std::time::SystemTime) -> DateTime {
-    DateTime::from_system_time(t)
+/// Epoch milliseconds.
+fn dt(t: std::time::SystemTime) -> i64 {
+    epoch_ms(t)
 }
 
 #[tokio::test]
 async fn a_deadline_carries_the_correlation_id_of_the_message_that_scheduled_it_to_its_handler_and_to_the_commands_it_sends()
  {
-    require_docker!();
     let dl = Dl::start().await;
     dl.deliver_as(&placed("o40", 60), "e-40").await; // delivered with the correlation id "corr-e-40"
-    let stored: Vec<mongodb::bson::Document> = dl.store.all("deadlines").await;
+    let stored = dl.store.deadlines().await;
     assert_eq!(
-        stored[0].get_str("correlationId").unwrap(),
-        "corr-e-40",
+        stored[0].correlation_id.as_deref(),
+        Some("corr-e-40"),
         "stored with the deadline"
     );
 
@@ -277,7 +273,6 @@ async fn a_deadline_carries_the_correlation_id_of_the_message_that_scheduled_it_
 
 #[tokio::test]
 async fn a_due_deadline_fires_its_handler_once_with_its_payload() {
-    require_docker!();
     let dl = Dl::start().await;
     dl.deliver(&placed("o1", 900)).await;
     let scheduler = dl.scheduler();
@@ -296,13 +291,12 @@ async fn a_due_deadline_fires_its_handler_once_with_its_payload() {
     );
     let deadline = dl.store.deadlines().await.remove(0);
     assert_eq!(deadline.status, DeadlineStatus::Fired);
-    assert_eq!(deadline.finished_at, Some(dt(dl.store.clock.now())));
+    assert_eq!(deadline.finished_at_ms, Some(dt(dl.store.clock.now())));
     assert_eq!(*dl.metrics.fired.lock().unwrap(), ["charge-timeout"]);
 }
 
 #[tokio::test]
 async fn a_deadline_fires_after_a_restart() {
-    require_docker!();
     let dl = Dl::start().await;
     dl.deliver(&placed("o1", 60)).await;
     let _never_polled = dl.scheduler(); // a scheduler that never got to poll: its service instance stopped
@@ -315,7 +309,6 @@ async fn a_deadline_fires_after_a_restart() {
 
 #[tokio::test]
 async fn a_cancelled_deadline_never_fires() {
-    require_docker!();
     let dl = Dl::start().await;
     dl.deliver(&placed("o1", 60)).await;
     dl.deliver(&CancelOne {
@@ -335,7 +328,6 @@ async fn a_cancelled_deadline_never_fires() {
 
 #[tokio::test]
 async fn cancel_all_cancels_every_scheduled_deadline_of_that_name_for_the_saga() {
-    require_docker!();
     let dl = Dl::start().await;
     dl.deliver(&placed("o1", 60)).await;
     for (name, seconds) in [
@@ -384,7 +376,6 @@ async fn cancel_all_cancels_every_scheduled_deadline_of_that_name_for_the_saga()
 
 #[tokio::test]
 async fn a_deadline_of_an_ended_saga_is_marked_cancelled_when_found_due() {
-    require_docker!();
     let dl = Dl::start().await;
     dl.deliver(&placed("o1", 60)).await;
     dl.deliver(&Paid {
@@ -402,28 +393,29 @@ async fn a_deadline_of_an_ended_saga_is_marked_cancelled_when_found_due() {
         name: "charge-timeout".into(),
         payload: Some(r#"{"reason":"late"}"#.into()),
         payload_type: Some("dl.TimeoutPayload".into()),
-        due_at: dt(t0() + Duration::from_secs(10)),
+        due_at_ms: dt(t0() + Duration::from_secs(10)),
         status: DeadlineStatus::Scheduled,
         claimed_by: None,
-        claimed_until: None,
-        finished_at: None,
+        claimed_until_ms: None,
+        finished_at_ms: None,
         correlation_id: None,
     };
-    let collection = dl.store.db.collection::<DeadlineDocument>("deadlines");
-    collection
-        .insert_one(deadline("late", &ended.id))
-        .await
-        .unwrap();
-    collection
-        .insert_one(deadline("orphan", "no-such-saga"))
-        .await
-        .unwrap();
+    dl.store.insert_deadline(&deadline("late", &ended.id)).await;
+    dl.store
+        .insert_deadline(&deadline("orphan", "no-such-saga"))
+        .await;
 
     dl.advance(3600);
     dl.scheduler().poll_once().await.unwrap();
 
     for id in ["late", "orphan"] {
-        let found: Vec<DeadlineDocument> = dl.store.find("deadlines", doc! { "_id": id }).await;
+        let found: Vec<DeadlineDocument> = dl
+            .store
+            .deadlines()
+            .await
+            .into_iter()
+            .filter(|d| d.id == id)
+            .collect();
         assert_eq!(found[0].status, DeadlineStatus::Cancelled, "{id}");
     }
     assert_eq!(dl.fired("o1").await, 0);
@@ -432,7 +424,6 @@ async fn a_deadline_of_an_ended_saga_is_marked_cancelled_when_found_due() {
 
 #[tokio::test]
 async fn a_deadline_whose_saga_type_has_no_handler_of_that_name_is_cancelled() {
-    require_docker!();
     let dl = Dl::start().await;
     dl.deliver(&placed("o1", 600)).await;
     dl.deliver(&Schedule {
@@ -456,7 +447,6 @@ async fn a_deadline_whose_saga_type_has_no_handler_of_that_name_is_cancelled() {
 
 #[tokio::test]
 async fn an_expired_lease_makes_a_deadline_fire_again_at_least_once() {
-    require_docker!();
     let dl = Dl::start().await;
     dl.deliver(&placed("o1", 60)).await;
     dl.advance(61);
@@ -466,7 +456,7 @@ async fn an_expired_lease_makes_a_deadline_fire_again_at_least_once() {
     first.poll_once().await.unwrap();
     let stuck = dl.store.deadlines().await.remove(0);
     assert_eq!(stuck.status, DeadlineStatus::Scheduled);
-    assert!(stuck.claimed_until.is_some());
+    assert!(stuck.claimed_until_ms.is_some());
 
     dl.broken.store(false, Ordering::SeqCst);
     dl.advance(10);
@@ -486,7 +476,6 @@ async fn an_expired_lease_makes_a_deadline_fire_again_at_least_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_schedulers_fire_one_deadline_once_while_the_lease_holds() {
-    require_docker!();
     let dl = Dl::start().await;
     dl.deliver(&placed("o1", 60)).await;
     dl.advance(61);
@@ -513,7 +502,6 @@ async fn two_schedulers_fire_one_deadline_once_while_the_lease_holds() {
 
 #[tokio::test]
 async fn an_ending_deadline_handler_ends_the_saga_and_cancels_its_other_deadlines() {
-    require_docker!();
     let dl = Dl::start().await;
     dl.deliver(&placed("o1", 600)).await;
     dl.deliver(&Schedule {
@@ -528,7 +516,7 @@ async fn an_ending_deadline_handler_ends_the_saga_and_cancels_its_other_deadline
 
     let saga = dl.saga("o1").await;
     assert!(saga.ended);
-    assert_eq!(saga.ended_at, Some(dt(dl.store.clock.now())));
+    assert_eq!(saga.ended_at_ms, Some(dt(dl.store.clock.now())));
     let deadlines = dl.deadlines_of(&saga.id).await;
     let by_name = |n: &str| deadlines.iter().find(|d| d.name == n).unwrap().status;
     assert_eq!(by_name("end-now"), DeadlineStatus::Fired);
@@ -542,7 +530,6 @@ async fn an_ending_deadline_handler_ends_the_saga_and_cancels_its_other_deadline
 
 #[tokio::test]
 async fn a_deadline_handler_that_sends_commands_records_them_for_the_relay() {
-    require_docker!();
     let dl = Dl::start().await;
     dl.deliver(&placed("o1", 60)).await;
     let saga_id = dl.saga("o1").await.id;
@@ -563,14 +550,13 @@ async fn a_deadline_handler_that_sends_commands_records_them_for_the_relay() {
         "seq follows the saga's new version"
     );
     assert!(
-        entry.dispatched_at.is_none(),
+        entry.dispatched_at_ms.is_none(),
         "recorded, not sent: the relay sends it"
     );
 }
 
 #[tokio::test]
 async fn a_poll_reports_the_overdue_deadlines_it_could_not_fire() {
-    require_docker!();
     let dl = Dl::start().await;
     dl.deliver(&placed("o1", 60)).await;
     dl.advance(61);
@@ -591,7 +577,6 @@ async fn a_poll_reports_the_overdue_deadlines_it_could_not_fire() {
 
 #[tokio::test]
 async fn a_started_scheduler_fires_due_deadlines_and_stops_when_cancelled() {
-    require_docker!();
     let dl = Dl::start().await;
     dl.deliver(&placed("o1", 60)).await;
     dl.advance(61);

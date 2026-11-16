@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use kraken_messaging::hub::{ScatterOptions, SendOptions};
 use kraken_messaging::{Config, KrakenMessaging, MessagingError, Query, message_type};
 use serde::{Deserialize, Serialize};
-use support::containers::{HubContainer, HubOptions, free_port, hub_with, mongo};
+use support::containers::{HubContainer, HubOptions, hub_with};
 use tokio_stream::StreamExt;
 
 macro_rules! require_docker {
@@ -40,13 +40,12 @@ impl Query for Find {
 const IDS: [&str; 2] = ["e2e-p4a-1", "e2e-p4a-2"];
 
 async fn two_hubs() -> (HubContainer, HubContainer) {
-    let start =
-        |id: &'static str| hub_with(HubOptions::new().port(free_port()).env("KRAKEN_HUB_ID", id));
+    let start = |id: &'static str| hub_with(HubOptions::new().env("KRAKEN_HUB_ID", id));
     tokio::join!(start(IDS[0]), start(IDS[1]))
 }
 
-fn config(service: &str, hubs: &str, mongo: &str) -> Config {
-    let mut c = Config::new(service, hubs, "127.0.0.1:1", mongo);
+fn config(service: &str, hubs: &str) -> Config {
+    let mut c = Config::new(service, hubs);
     c.outbox_enabled = false;
     c.consumer_enabled = false;
     c.reconnect_backoff_min = Duration::from_millis(100);
@@ -101,16 +100,13 @@ async fn in_flight_as_sender(hub: &HubContainer, service: &str) -> u64 {
 }
 
 /// Three owners (one of `e2e-sa`, two of `e2e-sb`) and a caller, all registered on both hubs.
-async fn cluster(
-    hubs: &str,
-    db: &support::containers::MongoDb,
-) -> (Vec<KrakenMessaging>, KrakenMessaging) {
+async fn cluster(hubs: &str) -> (Vec<KrakenMessaging>, KrakenMessaging) {
     let owners = vec![
-        owner(config("e2e-sa", hubs, &db.uri_for("sa"))).await,
-        owner(config("e2e-sb", hubs, &db.uri_for("sb"))).await,
-        owner(config("e2e-sb", hubs, &db.uri_for("sb"))).await,
+        owner(config("e2e-sa", hubs)).await,
+        owner(config("e2e-sb", hubs)).await,
+        owner(config("e2e-sb", hubs)).await,
     ];
-    let c = caller(config("e2e-caller", hubs, &db.uri_for("caller"))).await;
+    let c = caller(config("e2e-caller", hubs)).await;
     for app in owners.iter().chain([&c]) {
         assert!(app.await_all_hubs(Duration::from_secs(15)).await);
     }
@@ -120,9 +116,9 @@ async fn cluster(
 #[tokio::test]
 async fn scatter_over_three_instances_of_two_owners_gets_three_parts_and_unary_reaches_them_all() {
     require_docker!();
-    let ((h1, h2), db) = tokio::join!(two_hubs(), mongo());
+    let (h1, h2) = two_hubs().await;
     let hubs = format!("{},{}", h1.address, h2.address);
-    let (owners, c) = cluster(&hubs, &db).await;
+    let (owners, c) = cluster(&hubs).await;
     let instances: BTreeSet<String> = owners.iter().map(|o| o.instance_id().to_string()).collect();
 
     // Twice, so both hubs carry one (unkeyed round-robin).
@@ -203,9 +199,9 @@ async fn scatter_over_three_instances_of_two_owners_gets_three_parts_and_unary_r
 #[tokio::test]
 async fn a_gather_whose_hub_dies_fails_with_connection_lost_and_the_next_succeeds_on_the_other() {
     require_docker!();
-    let ((h1, h2), db) = tokio::join!(two_hubs(), mongo());
+    let (h1, h2) = two_hubs().await;
     let hubs = format!("{},{}", h1.address, h2.address);
-    let (owners, c) = cluster(&hubs, &db).await;
+    let (owners, c) = cluster(&hubs).await;
     let c = Arc::new(c);
 
     let sender = Arc::clone(&c);

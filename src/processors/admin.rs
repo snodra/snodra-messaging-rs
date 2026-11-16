@@ -5,15 +5,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use mongodb::Database;
-use mongodb::bson::{DateTime, doc};
-
-use super::dead_letters::{DeadLetterDocument, DeadLetterError, DeadLetterReason};
-use super::store::{DeadLetterStore, LetterSummary};
 use crate::config::DeadLetterMode;
 use crate::error::MessagingError;
-use crate::kafka::dispatch::{FinishInTransaction, MarkerPosition, RecordDispatch, StageOneThen};
-use crate::kafka::{LocalEventDispatcher, message_context};
+use crate::events::dispatch::{FinishInTransaction, MarkerPosition, RecordDispatch, StageOneThen};
+use crate::events::{LocalEventDispatcher, message_context};
+use crate::store::{
+    DeadLetter, DeadLetterError, DeadLetterReason, DeadLetterStore, DeadLetterSummary,
+};
 
 /// The default `limit` of [`DeadLetters::list`] (Kotlin's `limit: Int = 100`).
 pub const DEFAULT_LIST_LIMIT: usize = 100;
@@ -57,22 +55,22 @@ pub struct DeadLetters {
 
 struct Inner {
     mode: DeadLetterMode,
-    store: DeadLetterStore,
+    store: Option<Arc<dyn DeadLetterStore>>,
     processors: BTreeMap<String, Arc<LocalEventDispatcher>>,
 }
 
 impl DeadLetters {
-    /// The API over `db`'s `dead_letters` for the processors this instance runs (name and its
-    /// dispatcher, whose stage 1 a retry runs). In modes `topic` and `log` every call fails.
+    /// The API over the letters in `store` (none: a service without a message store) for the processors this instance runs (name and its
+    /// dispatcher, whose stage 1 a retry runs). In modes `event-store` and `log` every call fails.
     pub fn new(
-        db: Database,
+        store: Option<Arc<dyn DeadLetterStore>>,
         mode: DeadLetterMode,
         processors: Vec<(String, Arc<LocalEventDispatcher>)>,
     ) -> DeadLetters {
         DeadLetters {
             inner: Arc::new(Inner {
                 mode,
-                store: DeadLetterStore::new(&db),
+                store,
                 processors: processors.into_iter().collect(),
             }),
         }
@@ -95,7 +93,7 @@ impl DeadLetters {
         &self,
         processor: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<DeadLetterDocument>, MessagingError> {
+    ) -> Result<Vec<DeadLetter>, MessagingError> {
         self.collection_mode()?;
         if limit < 1 {
             return Err(MessagingError::InvalidMessage(format!(
@@ -105,13 +103,13 @@ impl DeadLetters {
         if let Some(p) = processor {
             self.dispatcher(p)?;
         }
-        self.inner.store.list(processor, Some(limit)).await
+        Ok(self.store()?.list(processor, Some(limit)).await?)
     }
 
     /// The letter `id`, if it exists.
-    pub async fn get(&self, id: &str) -> Result<Option<DeadLetterDocument>, MessagingError> {
+    pub async fn get(&self, id: &str) -> Result<Option<DeadLetter>, MessagingError> {
         self.collection_mode()?;
-        let letter = self.inner.store.get(id).await?;
+        let letter = self.store()?.get(id).await?;
         if let Some(l) = &letter {
             self.dispatcher(&l.processor)?;
         }
@@ -124,7 +122,7 @@ impl DeadLetters {
         if let Some(p) = processor {
             self.dispatcher(p)?;
         }
-        self.inner.store.count(processor).await
+        Ok(self.store()?.count(processor).await?)
     }
 
     /// Retries the letter `id` once (no back-off): its processor's stage 1 (every handler of its
@@ -132,16 +130,13 @@ impl DeadLetters {
     /// (the sagas) is not re-run: it saw the record when it was parked.
     pub async fn retry(&self, id: &str) -> Result<RetryResult, MessagingError> {
         self.collection_mode()?;
-        let Some(letter) = self.inner.store.get(id).await? else {
+        let Some(letter) = self.store()?.get(id).await? else {
             return Ok(RetryResult::NotFound);
         };
         self.retry_letter(&letter).await
     }
 
-    async fn retry_letter(
-        &self,
-        letter: &DeadLetterDocument,
-    ) -> Result<RetryResult, MessagingError> {
+    async fn retry_letter(&self, letter: &DeadLetter) -> Result<RetryResult, MessagingError> {
         let dispatcher = self.dispatcher(&letter.processor)?;
         let Some(type_name) = letter
             .event_type
@@ -152,9 +147,8 @@ impl DeadLetters {
         };
         if let Some(key) = &letter.key
             && let Some(head) = self
-                .inner
-                .store
-                .earlier(&letter.processor, key, letter.offset)
+                .store()?
+                .earlier(&letter.processor, key, &letter.position)
                 .await?
         {
             return Ok(RetryResult::Blocked(head));
@@ -179,24 +173,18 @@ impl DeadLetters {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let ctx = message_context(&type_name, &dedupe_id, &headers);
-        let letters = self.inner.store.collection();
+        let letters = Arc::clone(self.store()?);
         let letter_id = letter.id.clone();
-        let finish: FinishInTransaction<'_> = Box::new(move |session| {
-            Box::pin(async move {
-                let deleted = letters
-                    .delete_one(doc! { "_id": &letter_id })
-                    .session(session)
-                    .await?;
-                Ok(deleted.deleted_count == 1)
-            })
+        let finish: FinishInTransaction<'_> = Box::new(move |tx| {
+            Box::pin(async move { Ok(letters.delete_in(tx, &letter_id).await?) })
         });
-        let payload = letter.payload_bytes();
+        let payload = letter.payload.clone();
         // The retry is the record's stage 1: its marker carries the record's position (ADR 0023).
         let position = MarkerPosition {
             processor: letter.processor.clone(),
-            topic: letter.topic.clone(),
-            partition: letter.partition,
-            offset: letter.offset,
+            source: letter.source.clone(),
+            segment: letter.segment.clone(),
+            position: letter.position.clone(),
         };
         match dispatcher
             .stage_one_then(
@@ -216,7 +204,7 @@ impl DeadLetters {
             Ok(StageOneThen::Committed) => Ok(RetryResult::Retried),
             Ok(StageOneThen::Declined) => Ok(RetryResult::NotFound),
             Ok(StageOneThen::Duplicate) => {
-                self.inner.store.delete(&letter.id).await?;
+                self.store()?.delete(&letter.id).await?;
                 Ok(RetryResult::Duplicate)
             }
             // Also a write conflict with another instance's removal of the letter, seen as an
@@ -237,9 +225,8 @@ impl DeadLetters {
         message: String,
     ) -> Result<RetryResult, MessagingError> {
         if !self
-            .inner
-            .store
-            .record_failure(id, &error, DateTime::now())
+            .store()?
+            .record_failure(id, &error, crate::time::now_ms())
             .await?
         {
             return Ok(RetryResult::NotFound);
@@ -248,7 +235,7 @@ impl DeadLetters {
         Ok(RetryResult::Failed(message))
     }
 
-    /// Retries every letter of `processor`: per key in offset order (the keys in the order of their
+    /// Retries every letter of `processor`: per key in position order (the keys in the order of their
     /// head letters' `parkedAt`, then `_id`), a key stopping at its first failure (its later
     /// letters count as blocked); then the keyless letters in `parkedAt` order; INVALID letters
     /// skipped. The run is ordered from the letters' summaries (no record is loaded); each letter
@@ -257,9 +244,9 @@ impl DeadLetters {
         self.collection_mode()?;
         self.dispatcher(processor)?;
         let mut result = RetryAllResult::default();
-        let mut keyed: BTreeMap<String, Vec<LetterSummary>> = BTreeMap::new();
+        let mut keyed: BTreeMap<String, Vec<DeadLetterSummary>> = BTreeMap::new();
         let mut keyless = Vec::new();
-        for letter in self.inner.store.summaries(processor).await? {
+        for letter in self.store()?.summaries(processor).await? {
             if letter.reason == DeadLetterReason::Invalid {
                 result.skipped += 1;
                 continue;
@@ -269,16 +256,11 @@ impl DeadLetters {
                 None => keyless.push(letter),
             }
         }
-        // Keys in the order of their head letter (lowest offset) by (`parkedAt`, `_id`).
-        let mut keyed: Vec<Vec<LetterSummary>> = keyed
-            .into_values()
-            .map(|mut letters| {
-                letters.sort_by(|a, b| (a.offset, &a.id).cmp(&(b.offset, &b.id)));
-                letters
-            })
-            .collect();
-        keyed.sort_by(|a, b| (a[0].parked_at, &a[0].id).cmp(&(b[0].parked_at, &b[0].id)));
-        keyless.sort_by(|a, b| (a.parked_at, &a.id).cmp(&(b.parked_at, &b.id)));
+        // Each key's letters in the store's order (position, then id); the keys in the order of
+        // their head letter by (`parkedAt`, `_id`).
+        let mut keyed: Vec<Vec<DeadLetterSummary>> = keyed.into_values().collect();
+        keyed.sort_by(|a, b| (a[0].parked_at_ms, &a[0].id).cmp(&(b[0].parked_at_ms, &b[0].id)));
+        keyless.sort_by(|a, b| (a.parked_at_ms, &a.id).cmp(&(b.parked_at_ms, &b.id)));
         for letters in keyed {
             let total = letters.len() as u64;
             for (done, letter) in letters.iter().enumerate() {
@@ -310,8 +292,11 @@ impl DeadLetters {
     }
 
     /// The letter of `summary` as it is now, retried; `NotFound` when it is gone.
-    async fn retry_summary(&self, summary: &LetterSummary) -> Result<RetryResult, MessagingError> {
-        match self.inner.store.get(&summary.id).await? {
+    async fn retry_summary(
+        &self,
+        summary: &DeadLetterSummary,
+    ) -> Result<RetryResult, MessagingError> {
+        match self.store()?.get(&summary.id).await? {
             Some(letter) => self.retry_letter(&letter).await,
             None => Ok(RetryResult::NotFound),
         }
@@ -321,18 +306,26 @@ impl DeadLetters {
     /// next letter.
     pub async fn discard(&self, id: &str) -> Result<bool, MessagingError> {
         self.collection_mode()?;
-        let Some(letter) = self.inner.store.get(id).await? else {
+        let Some(letter) = self.store()?.get(id).await? else {
             return Ok(false);
         };
         self.dispatcher(&letter.processor)?;
-        self.inner.store.delete(id).await
+        Ok(self.store()?.delete(id).await?)
+    }
+
+    fn store(&self) -> Result<&Arc<dyn DeadLetterStore>, MessagingError> {
+        self.inner.store.as_ref().ok_or_else(|| {
+            MessagingError::InvalidMessage(
+                "the dead letters need a message store: add .store(...)".into(),
+            )
+        })
     }
 
     fn collection_mode(&self) -> Result<(), MessagingError> {
         match self.inner.mode {
             DeadLetterMode::Collection => Ok(()),
             mode => Err(MessagingError::InvalidMessage(format!(
-                "dead letters are not kept in mode {} (KRAKEN_KAFKA_DEAD_LETTER_MODE): there is no dead-letter admin API",
+                "dead letters are not kept in mode {} (KRAKEN_EVENTS_DEAD_LETTER_MODE): there is no dead-letter admin API",
                 mode.as_str()
             ))),
         }

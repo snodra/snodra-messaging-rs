@@ -20,7 +20,7 @@ use futures::stream::BoxStream;
 use kraken_messaging::hub::SubscriptionOptions;
 use kraken_messaging::{Config, KrakenMessaging, MessagingError, SubscriptionQuery, message_type};
 use serde::{Deserialize, Serialize};
-use support::containers::{HubContainer, HubOptions, free_port, hub_with, mongo};
+use support::containers::{HubContainer, HubOptions, hub_with};
 
 macro_rules! require_docker {
     () => {
@@ -65,13 +65,12 @@ impl SubscriptionQuery for SharedPrices {
 const IDS: [&str; 2] = ["e2e-p4c-1", "e2e-p4c-2"];
 
 async fn two_hubs() -> (HubContainer, HubContainer) {
-    let start =
-        |id: &'static str| hub_with(HubOptions::new().port(free_port()).env("KRAKEN_HUB_ID", id));
+    let start = |id: &'static str| hub_with(HubOptions::new().env("KRAKEN_HUB_ID", id));
     tokio::join!(start(IDS[0]), start(IDS[1]))
 }
 
-fn config(service: &str, hubs: &str, mongo: &str) -> Config {
-    let mut c = Config::new(service, hubs, "127.0.0.1:1", mongo);
+fn config(service: &str, hubs: &str) -> Config {
+    let mut c = Config::new(service, hubs);
     c.outbox_enabled = false;
     c.consumer_enabled = false;
     c.reconnect_backoff_min = Duration::from_millis(100);
@@ -163,11 +162,11 @@ async fn rest(updates: &mut Updates) -> (Vec<Tick>, Option<MessagingError>) {
 #[tokio::test]
 async fn the_initial_result_then_the_updates_of_both_owner_instances_then_completion() {
     require_docker!();
-    let ((h1, h2), db) = tokio::join!(two_hubs(), mongo());
+    let (h1, h2) = two_hubs().await;
     let hubs = format!("{},{}", h1.address, h2.address);
-    let o1 = owner(config("e2e-prices", &hubs, &db.uri_for("o1")), 101).await;
-    let o2 = owner(config("e2e-prices", &hubs, &db.uri_for("o2")), 102).await;
-    let c = caller(config("e2e-caller", &hubs, &db.uri_for("caller"))).await;
+    let o1 = owner(config("e2e-prices", &hubs), 101).await;
+    let o2 = owner(config("e2e-prices", &hubs), 102).await;
+    let c = caller(config("e2e-caller", &hubs)).await;
     for app in [&o1, &o2, &c] {
         assert!(app.await_all_hubs(Duration::from_secs(15)).await);
     }
@@ -281,11 +280,11 @@ async fn the_initial_result_then_the_updates_of_both_owner_instances_then_comple
 #[tokio::test]
 async fn a_cancel_mid_way_reaches_every_owner_instance_and_max_results_ends_it_from_the_hub() {
     require_docker!();
-    let ((h1, h2), db) = tokio::join!(two_hubs(), mongo());
+    let (h1, h2) = two_hubs().await;
     let hubs = format!("{},{}", h1.address, h2.address);
-    let o1 = owner(config("e2e-prices", &hubs, &db.uri_for("o1")), 1).await;
-    let o2 = owner(config("e2e-prices", &hubs, &db.uri_for("o2")), 2).await;
-    let c = caller(config("e2e-caller", &hubs, &db.uri_for("caller"))).await;
+    let o1 = owner(config("e2e-prices", &hubs), 1).await;
+    let o2 = owner(config("e2e-prices", &hubs), 2).await;
+    let c = caller(config("e2e-caller", &hubs)).await;
     for app in [&o1, &o2, &c] {
         assert!(app.await_all_hubs(Duration::from_secs(15)).await);
     }
@@ -362,13 +361,13 @@ async fn a_cancel_mid_way_reaches_every_owner_instance_and_max_results_ends_it_f
 async fn an_owner_at_its_subscription_limit_fails_a_new_subscription_and_a_shutdown_ends_the_rest()
 {
     require_docker!();
-    let ((h1, h2), db) = tokio::join!(two_hubs(), mongo());
+    let (h1, h2) = two_hubs().await;
     let hubs = format!("{},{}", h1.address, h2.address);
-    let o1 = owner(config("e2e-prices", &hubs, &db.uri_for("o1")), 1).await;
-    let mut limited = config("e2e-prices", &hubs, &db.uri_for("o2"));
+    let o1 = owner(config("e2e-prices", &hubs), 1).await;
+    let mut limited = config("e2e-prices", &hubs);
     limited.hub_max_subscriptions = 1;
     let o2 = owner(limited, 2).await;
-    let c = caller(config("e2e-caller", &hubs, &db.uri_for("caller"))).await;
+    let c = caller(config("e2e-caller", &hubs)).await;
     for app in [&o1, &o2, &c] {
         assert!(app.await_all_hubs(Duration::from_secs(15)).await);
     }
@@ -428,11 +427,11 @@ async fn an_owner_at_its_subscription_limit_fails_a_new_subscription_and_a_shutd
 #[tokio::test]
 async fn a_shared_subscription_type_reaches_every_instance_of_every_owner_service() {
     require_docker!();
-    let ((h1, h2), db) = tokio::join!(two_hubs(), mongo());
+    let (h1, h2) = two_hubs().await;
     let hubs = format!("{},{}", h1.address, h2.address);
-    let a = shared_owner(config("e2e-prices-a", &hubs, &db.uri_for("a")), 1).await;
-    let b = shared_owner(config("e2e-prices-b", &hubs, &db.uri_for("b")), 2).await;
-    let c = caller(config("e2e-caller", &hubs, &db.uri_for("caller"))).await;
+    let a = shared_owner(config("e2e-prices-a", &hubs), 1).await;
+    let b = shared_owner(config("e2e-prices-b", &hubs), 2).await;
+    let c = caller(config("e2e-caller", &hubs)).await;
     for app in [&a, &b, &c] {
         assert!(app.await_all_hubs(Duration::from_secs(15)).await);
     }

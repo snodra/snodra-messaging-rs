@@ -8,6 +8,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY proto ./proto
 COPY src ./src
+COPY crates ./crates
 COPY examples ./examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \

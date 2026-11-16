@@ -1,6 +1,7 @@
 //! service-c's named event processor (P6a, ADR 0022) and the example-only admin edge around it.
 //!
-//! The `audit` processor is its own Kafka consumer, group `service-c.audit`, markers
+//! The `audit` processor is its own subscription of the event store, `service-c.audit` (on Kafka
+//! its consumer group), markers
 //! `processor:audit:<eventId>`, its own dead letters. [`Audit::failing`] is example-only: while it
 //! is on, every note whose text starts with `poison` fails (the others are handled), so the sandbox
 //! can show a record parked as a dead letter, the later records of its key parked behind it while
@@ -29,12 +30,13 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use chrono::Utc;
-use kraken_messaging::MessagingError;
-use kraken_messaging::kafka::EventBus;
-use kraken_messaging::processors::dead_letters::DeadLetterDocument;
+use kraken_messaging::event_store::ResetTarget;
+use kraken_messaging::events::EventBus;
 use kraken_messaging::processors::{
-    DEFAULT_LIST_LIMIT, DeadLetters, ResetContext, ResetTarget, RetryResult,
+    DEFAULT_LIST_LIMIT, DeadLetters, EventOptions, ResetContext, RetryResult,
 };
+use kraken_messaging::store::DeadLetter;
+use kraken_messaging::{KrakenMessagingBuilder, MessagingError};
 use serde::{Deserialize, Serialize};
 
 use crate::messages::ShoutAudit;
@@ -66,6 +68,7 @@ pub struct ResetView {
     pub ranges: Vec<RangeView>,
 }
 
+/// A range on Kafka, where a segment is a partition and a position an offset, both decimal.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct RangeView {
     pub partition: i32,
@@ -79,7 +82,7 @@ impl From<&ResetContext> for ResetView {
             ResetTarget::Earliest => "earliest".to_string(),
             ResetTarget::Latest => "latest".to_string(),
             ResetTarget::Timestamp(ms) => format!("timestamp {ms}"),
-            ResetTarget::Offsets(all) => format!(
+            ResetTarget::Positions(all) => format!(
                 "offsets {{{}}}",
                 all.iter()
                     .map(|(p, o)| format!("{p}={o}"))
@@ -94,13 +97,35 @@ impl From<&ResetContext> for ResetView {
                 .ranges
                 .iter()
                 .map(|r| RangeView {
-                    partition: r.partition,
-                    from: r.from,
-                    until: r.until,
+                    partition: r.segment.parse().expect("a Kafka partition"),
+                    from: r.from.parse().expect("a Kafka offset"),
+                    until: r.until.parse().expect("a Kafka offset"),
                 })
                 .collect(),
         }
     }
+}
+
+/// The `audit` processor's registrations on `builder`: its handler, a second handler there that a
+/// replay never runs again (P6b), and its reset handler, all reporting to `audit`.
+pub fn register(builder: KrakenMessagingBuilder, audit: &Audit) -> KrakenMessagingBuilder {
+    let (handler, notifier, resets) = (audit.clone(), audit.clone(), audit.clone());
+    builder
+        .event_in::<ShoutAudit, _, _>(PROCESSOR, move |e, _ctx| {
+            let handled = handler.handle(e);
+            async move { handled }
+        })
+        .event_with::<ShoutAudit, _, _>(
+            EventOptions::new().processor(PROCESSOR).disallow_replay(),
+            move |e, _ctx| {
+                notifier.notify(e);
+                async { Ok(()) }
+            },
+        )
+        .reset_handler(PROCESSOR, move |ctx| {
+            resets.reset(&ctx);
+            async { Ok(()) }
+        })
 }
 
 impl Audit {
@@ -193,8 +218,8 @@ pub struct LetterView {
     pub blocked_by: Option<String>,
 }
 
-impl From<DeadLetterDocument> for LetterView {
-    fn from(letter: DeadLetterDocument) -> LetterView {
+impl From<DeadLetter> for LetterView {
+    fn from(letter: DeadLetter) -> LetterView {
         LetterView {
             id: letter.id,
             processor: letter.processor,
@@ -399,13 +424,13 @@ mod tests {
     use kraken_messaging::MessageType;
     use kraken_messaging::MessagingError;
     use kraken_messaging::processors::RetryResult;
-    use kraken_messaging::processors::dead_letters::DeadLetterDocument;
+    use kraken_messaging::store::{DeadLetter, DeadLetterError, DeadLetterReason};
     use serde_json::json;
 
     use axum::extract::{RawQuery, State};
     use axum::http::StatusCode;
     use kraken_messaging::config::DeadLetterMode;
-    use kraken_messaging::kafka::EventBus;
+    use kraken_messaging::events::EventBus;
     use kraken_messaging::processors::DeadLetters;
 
     use super::{Audit, AuditHttp, LetterView, RetryView, list, param};
@@ -498,16 +523,26 @@ mod tests {
 
     #[test]
     fn a_letter_is_shown_the_way_service_b_shows_it() {
-        let letter: DeadLetterDocument = serde_json::from_value(json!({
-            "_id": "audit:kraken.events:0:8", "processor": "audit", "topic": "kraken.events",
-            "partition": 0, "offset": 8, "key": "k1", "eventType": "examples.ShoutAudit",
-            "reason": "SEQUENCED", "error": {"type": "Sequenced", "message": "an earlier letter"},
-            "blockedBy": "audit:kraken.events:0:7", "attempts": 0,
-            "parkedAt": {"$date": "2026-11-04T00:00:00Z"},
-            "lastAttemptAt": {"$date": "2026-11-04T00:00:00Z"},
-            "expireAt": {"$date": "2026-12-04T00:00:00Z"},
-        }))
-        .unwrap();
+        let letter = DeadLetter {
+            id: "audit:kraken.events:0:8".into(),
+            processor: "audit".into(),
+            source: "kraken.events".into(),
+            segment: "0".into(),
+            position: "8".into(),
+            key: Some("k1".into()),
+            event_id: None,
+            event_type: Some("examples.ShoutAudit".into()),
+            headers: Default::default(),
+            payload: Vec::new(),
+            reason: DeadLetterReason::Sequenced,
+            error: DeadLetterError::new("Sequenced", "an earlier letter"),
+            blocked_by: Some("audit:kraken.events:0:7".into()),
+            attempts: 0,
+            parked_at_ms: 1_793_750_400_000,
+            last_attempt_at_ms: 1_793_750_400_000,
+            expire_at_ms: 1_796_342_400_000,
+            replay: false,
+        };
         assert_eq!(
             serde_json::to_value(LetterView::from(letter)).unwrap(),
             json!({
@@ -522,16 +557,11 @@ mod tests {
     /// answered before any database work.
     #[tokio::test]
     async fn a_list_limit_below_one_or_not_a_number_is_a_bad_request() {
-        // Never connected to: the answer comes before any database work.
-        let client =
-            mongodb::Client::with_uri_str("mongodb://127.0.0.1:1/x?serverSelectionTimeoutMS=200")
-                .await
-                .unwrap();
-        let db = client.default_database().unwrap();
+        // No store: the answer comes before any store work.
         let http = AuditHttp {
             audit: Audit::default(),
-            events: EventBus::new(db.clone()),
-            dead_letters: DeadLetters::new(db, DeadLetterMode::Collection, vec![]),
+            events: EventBus::new(),
+            dead_letters: DeadLetters::new(None, DeadLetterMode::Collection, vec![]),
         };
         for limit in ["0", "-1", "ten"] {
             let response = list(
@@ -545,21 +575,25 @@ mod tests {
 
     #[test]
     fn a_reset_is_shown_the_way_service_b_shows_it() {
-        use kraken_messaging::processors::{ReplayRange, ResetContext, ResetTarget};
+        use kraken_messaging::event_store::{ReplayRange, ResetTarget};
+        use kraken_messaging::processors::ResetContext;
         let audit = Audit::default();
         let ctx = |target| ResetContext {
             processor: "audit".into(),
             operation_id: "op-1".into(),
             target,
             ranges: vec![ReplayRange {
-                topic: "kraken.events".into(),
-                partition: 1,
-                from: 3,
-                until: 9,
+                source: "kraken.events".into(),
+                segment: "1".into(),
+                from: "3".into(),
+                until: "9".into(),
             }],
         };
         audit.reset(&ctx(ResetTarget::Earliest));
-        audit.reset(&ctx(ResetTarget::Offsets(vec![(0, 12), (1, 3)])));
+        audit.reset(&ctx(ResetTarget::Positions(vec![
+            ("0".into(), "12".into()),
+            ("1".into(), "3".into()),
+        ])));
         audit.reset(&ctx(ResetTarget::Timestamp(1700)));
         let views = serde_json::to_value(audit.resets()).unwrap();
         assert_eq!(
@@ -586,5 +620,108 @@ mod tests {
         assert_eq!(param(&query, "on"), None, "an empty value is no value");
         assert_eq!(param(&query, "other"), None);
         assert_eq!(param(&None, "processor"), None);
+    }
+}
+
+/// The `audit` processor in the zero-infrastructure mode (`kraken_messaging::testing`): on the
+/// in-memory event store and message store, no Kafka, MongoDB or hub. What the sandbox shows with
+/// containers (`examples/smoke.sh`), as a unit test.
+#[cfg(test)]
+mod zero_infrastructure {
+    use std::time::Duration;
+
+    use chrono::Utc;
+    use kraken_messaging::KrakenMessaging;
+    use kraken_messaging::processors::RetryResult;
+    use kraken_messaging::store::DeadLetterReason;
+    use kraken_messaging::testing::InMemoryStores;
+
+    use super::{Audit, PROCESSOR, register};
+    use crate::messages::ShoutAudit;
+
+    const WITHIN: Duration = Duration::from_secs(10);
+
+    fn note(key: &str, text: &str) -> ShoutAudit {
+        ShoutAudit {
+            key: key.into(),
+            text: text.into(),
+            at: Utc::now(),
+        }
+    }
+
+    async fn handled(audit: &Audit, count: usize) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + WITHIN;
+        loop {
+            let texts: Vec<String> = audit.handled().into_iter().map(|n| n.text).collect();
+            if texts.len() >= count || tokio::time::Instant::now() >= deadline {
+                return texts;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A note the service publishes (as `POST /audit/notes` does) reaches the event store and its
+    /// `audit` processor; a poison note while failing is parked as a dead letter, holds back the
+    /// later note of its key while another key flows, and both are handled once it is retried.
+    #[tokio::test]
+    async fn the_audit_processor_runs_without_infrastructure() {
+        let stores = InMemoryStores::new();
+        let mut config = stores.config("service-c");
+        config.consumer_max_attempts = 2;
+        let audit = Audit::default();
+        let builder = stores.install(KrakenMessaging::builder(config).await.unwrap());
+        let events = builder.events();
+        let app = register(builder, &audit).start().await.unwrap();
+
+        events
+            .publish(&note("k1", "hello"), Some("k1"))
+            .await
+            .unwrap();
+        let published = stores
+            .wait_published::<ShoutAudit>(1, WITHIN)
+            .await
+            .unwrap();
+        assert_eq!(published[0].text, "hello", "the service published it");
+        assert_eq!(handled(&audit, 1).await, ["hello"]);
+
+        audit.set_failing(true);
+        stores
+            .publish(&note("k2", "poison-1"), Some("k2"))
+            .await
+            .unwrap();
+        let letters = stores.wait_dead_letters(1, WITHIN).await.unwrap();
+        assert_eq!(letters[0].processor, PROCESSOR);
+        assert_eq!(letters[0].key.as_deref(), Some("k2"));
+        assert_eq!(letters[0].reason, DeadLetterReason::HandlerFailed);
+        stores
+            .publish(&note("k2", "after"), Some("k2"))
+            .await
+            .unwrap();
+        stores
+            .publish(&note("k3", "other"), Some("k3"))
+            .await
+            .unwrap();
+        assert_eq!(handled(&audit, 2).await, ["hello", "other"]);
+        let letters = stores.wait_dead_letters(2, WITHIN).await.unwrap();
+        assert_eq!(
+            letters[1].reason,
+            DeadLetterReason::Sequenced,
+            "parked behind the poison note"
+        );
+
+        audit.set_failing(false);
+        let dead_letters = app.dead_letters();
+        for letter in letters {
+            assert_eq!(
+                dead_letters.retry(&letter.id).await.unwrap(),
+                RetryResult::Retried
+            );
+        }
+        assert_eq!(
+            handled(&audit, 4).await,
+            ["hello", "other", "poison-1", "after"]
+        );
+        assert!(stores.dead_letters().await.unwrap().is_empty());
+        app.shutdown().await;
     }
 }
