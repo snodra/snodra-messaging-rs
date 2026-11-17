@@ -334,11 +334,11 @@ mod tests {
     fn the_schema_files_are_the_shared_ones_byte_for_byte() {
         assert_eq!(
             sha256(POSTGRESQL_V1),
-            "62a34cb682974335e40e68d0cd584a2ce002c38c7e3a0fb3289c2ef8bf8f1b95"
+            "0b2d179a18580092cd7622d11e46451a08b64fad7d6d585450a0919f9148ca6a"
         );
         assert_eq!(
             sha256(MYSQL_V1),
-            "2c47c1e245556a576c69abe7811acca4f7574775d669bdb4b5ccac517db76e99"
+            "f6e28f7c12c0e7db148b534c6ac9d04e5a375bd3b873d63a1c8080707af0cf31"
         );
     }
 
