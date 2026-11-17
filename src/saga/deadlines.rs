@@ -29,7 +29,7 @@ use super::runtime::SagaRuntime;
 use super::store::DeadlineDocument;
 use crate::error::MessagingError;
 
-/// Settings of the [`DeadlineScheduler`] (`KRAKEN_DEADLINES_*`): how often it polls and how long a
+/// Settings of the [`DeadlineScheduler`] (`SNODRA_DEADLINES_*`): how often it polls and how long a
 /// claimed deadline stays reserved for the instance that claimed it, at most `batch_size`
 /// deadlines per poll.
 #[derive(Clone, Debug)]

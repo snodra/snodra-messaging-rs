@@ -361,7 +361,7 @@ impl HandlerRegistry {
     }
 
     /// Every query type served here, unary, streaming and subscription, exclusive and shared
-    /// (as kraken-messaging's `queryTypes()`).
+    /// (as snodra-messaging's `queryTypes()`).
     pub fn query_types(&self) -> Vec<String> {
         sorted(
             self.queries

@@ -1,7 +1,7 @@
 mod support;
 
-use kraken_messaging::MessagingError;
-use kraken_messaging::identity::{IdentityResolver, JwksVerifier};
+use snodra_messaging::MessagingError;
+use snodra_messaging::identity::{IdentityResolver, JwksVerifier};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -29,7 +29,7 @@ async fn valid_token_is_verified_identity() {
     let server = server_with(None).await;
     let token = support::token(
         "u-1",
-        &["kraken-user"],
+        &["snodra-user"],
         support::ISSUER,
         support::now() + 300,
     );
@@ -39,7 +39,7 @@ async fn valid_token_is_verified_identity() {
         .unwrap()
         .unwrap();
     assert_eq!(id.user_id.as_deref(), Some("u-1"));
-    assert_eq!(id.roles, vec!["kraken-user"]);
+    assert_eq!(id.roles, vec!["snodra-user"]);
     assert!(id.verified);
 }
 
@@ -74,7 +74,7 @@ async fn wrong_issuer_is_unauthenticated() {
     let token = support::token(
         "u-1",
         &[],
-        "https://other.test/realms/kraken",
+        "https://other.test/realms/snodra",
         support::now() + 300,
     );
     assert!(matches!(
@@ -134,7 +134,7 @@ async fn unknown_kid_refreshes_once_then_fails() {
 async fn token_with_audience_is_verified() {
     // Keycloak access tokens carry `aud` ("account", client ids); like Spring's JwtDecoder we do not validate it.
     let server = server_with(None).await;
-    let token = support::token_with_audience("u-3", &["kraken-user"], &["account", "service-a"]);
+    let token = support::token_with_audience("u-3", &["snodra-user"], &["account", "service-a"]);
     let id = resolver(&server)
         .resolve(Some(&format!("Bearer {token}")))
         .await

@@ -1,5 +1,5 @@
-//! End to end against the real hub image (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`) running
-//! `KRAKEN_HUB_AUTH_MODE=enforce` with JWT authentication: the test identity provider
+//! End to end against the real hub image (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`) running
+//! `SNODRA_SERVER_AUTH_MODE=enforce` with JWT authentication: the test identity provider
 //! (`support::idp`: a token endpoint on the host and ES256 keys generated at test time) issues the
 //! tokens; its JWKS is served to the hub by a small container on the same bridge network (the hub
 //! reaches it as `keycloak`; reaching the test host from a container is runtime-specific). A
@@ -10,13 +10,13 @@ mod support;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kraken_messaging::hub::{
-    HubConnection, HubSettings, Inbound, RegisteredTypes, SendOptions, Sender, TokenProvider,
-};
-use kraken_messaging::proto::{self, ClientMessage, client_message, reply};
-use kraken_messaging::{HubOAuth2, MessagingError, Query, SecretString, message_type};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use snodra_messaging::hub::{
+    HubConnection, HubSettings, Inbound, RegisteredTypes, SendOptions, Sender, TokenProvider,
+};
+use snodra_messaging::proto::{self, ClientMessage, client_message, reply};
+use snodra_messaging::{HubOAuth2, MessagingError, Query, SecretString, message_type};
 use support::containers::{
     HubContainer, HubOptions, STATIC_SERVER_PORT, StaticServer, hub_with, static_server,
 };
@@ -95,16 +95,16 @@ async fn fixture(lifetime: u64) -> Fixture {
     );
     let hub = hub_with(
         HubOptions::new()
-            .env("KRAKEN_HUB_AUTH_MODE", "enforce")
-            .env("KRAKEN_HUB_ACL_FILE", "/etc/kraken/acl.toml")
-            .env("KRAKEN_HUB_JWT_ISSUER", &idp.issuer())
+            .env("SNODRA_SERVER_AUTH_MODE", "enforce")
+            .env("SNODRA_SERVER_ACL_FILE", "/etc/snodra/acl.toml")
+            .env("SNODRA_SERVER_JWT_ISSUER", &idp.issuer())
             .env(
-                "KRAKEN_HUB_JWT_JWKS_URI",
+                "SNODRA_SERVER_JWT_JWKS_URI",
                 &format!("http://keycloak:{STATIC_SERVER_PORT}/certs"),
             )
-            .env("KRAKEN_HUB_JWT_LEEWAY", "0s")
-            .env("KRAKEN_HUB_JWT_EXPIRY_GRACE", "2s")
-            .mount(dir.dir(), "/etc/kraken")
+            .env("SNODRA_SERVER_JWT_LEEWAY", "0s")
+            .env("SNODRA_SERVER_JWT_EXPIRY_GRACE", "2s")
+            .mount(dir.dir(), "/etc/snodra")
             .host_name("keycloak", jwks.ip),
     )
     .await;
@@ -253,7 +253,7 @@ async fn a_jwt_service_registers_and_serves_a_command_from_a_token_service() {
     assert_eq!(f.idp.issued(), 1);
     assert_eq!(
         billing.conn.auth().kind,
-        kraken_messaging::hub::AuthKind::Jwt
+        snodra_messaging::hub::AuthKind::Jwt
     );
     billing.conn.shutdown().await;
     orders.conn.shutdown().await;

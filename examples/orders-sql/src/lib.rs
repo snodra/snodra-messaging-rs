@@ -1,5 +1,5 @@
-//! A small orders service on PostgreSQL with the SQL message store (kraken-messaging-sqlx), the
-//! Rust twin of kraken-messaging's `examples/orders-sql`:
+//! A small orders service on PostgreSQL with the SQL message store (snodra-messaging-sqlx), the
+//! Rust twin of snodra-messaging's `examples/orders-sql`:
 //!
 //! - `PlaceOrder` (a command, through the hub) writes the order row and appends `OrderPlaced` to
 //!   the outbox **in one transaction** of the store: both commit, or neither (a command that fails
@@ -11,13 +11,13 @@
 
 use std::sync::Arc;
 
-use kraken_messaging::store::MessageStore;
-use kraken_messaging::{Command, Event, KrakenMessagingBuilder, MessagingError, message_type};
-use kraken_messaging_sqlx::{SqlxStore, SqlxTxExt};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::store::MessageStore;
+use snodra_messaging::{Command, Event, MessagingError, SnodraMessagingBuilder, message_type};
+use snodra_messaging_sqlx::{SqlxStore, SqlxTxExt};
 use sqlx::Postgres;
 
-/// The service's own table, beside kraken's.
+/// The service's own table, beside the library's.
 pub const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS orders (\
     id VARCHAR(64) NOT NULL PRIMARY KEY, \
     item TEXT NOT NULL, \
@@ -48,7 +48,7 @@ fn storage(e: sqlx::Error) -> MessagingError {
 }
 
 /// The service's handlers on `builder`, whose store is `store`.
-pub fn handlers(builder: KrakenMessagingBuilder, store: SqlxStore) -> KrakenMessagingBuilder {
+pub fn handlers(builder: SnodraMessagingBuilder, store: SqlxStore) -> SnodraMessagingBuilder {
     let events = builder.events();
     let txs = store.tx();
     builder

@@ -3,11 +3,11 @@
 //!
 //! ```no_run
 //! # use std::sync::Arc;
-//! # use kraken_messaging::event_store::memory::MemoryEventStore;
-//! # use kraken_messaging::store::memory::MemoryStore;
-//! # use kraken_messaging::{Config, KrakenMessaging, MessagingError};
+//! # use snodra_messaging::event_store::memory::MemoryEventStore;
+//! # use snodra_messaging::store::memory::MemoryStore;
+//! # use snodra_messaging::{Config, SnodraMessaging, MessagingError};
 //! # async fn run(config: Config) -> Result<(), MessagingError> {
-//! let app = KrakenMessaging::builder(config)
+//! let app = SnodraMessaging::builder(config)
 //!     .await?
 //!     .event_store(Arc::new(MemoryEventStore::default()))
 //!     .store(Arc::new(MemoryStore::new()))

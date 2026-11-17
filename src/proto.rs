@@ -1,5 +1,5 @@
-//! gRPC types generated from `proto/hub.proto` (package `kraken.hub.v1`).
-tonic::include_proto!("kraken.hub.v1");
+//! gRPC types generated from `proto/hub.proto` (package `snodra.hub.v1`).
+tonic::include_proto!("snodra.hub.v1");
 
 // `Credentials` and its `kind` oneof are generated without `Debug` (see `build.rs`): the token and
 // the JWT must never reach a log through a `{:?}` of a `Register` or a `ClientMessage`.

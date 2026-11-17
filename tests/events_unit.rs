@@ -3,11 +3,11 @@ mod support;
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use kraken_messaging::event_store::headers;
-use kraken_messaging::events::{RecordDisposition, classify, new_outbox_entry};
-use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::{Event, Identity, MessageContext, message_type};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::event_store::headers;
+use snodra_messaging::events::{RecordDisposition, classify, new_outbox_entry};
+use snodra_messaging::hub::HandlerRegistry;
+use snodra_messaging::{Event, Identity, MessageContext, message_type};
 
 #[derive(Serialize, Deserialize)]
 struct Happened {
@@ -26,7 +26,7 @@ fn event() -> Happened {
 
 #[test]
 fn entry_matches_kotlin_shape() {
-    let before = kraken_messaging::time::now_ms();
+    let before = snodra_messaging::time::now_ms();
     let entry = new_outbox_entry(&event(), Some("k1"), None, 42).unwrap();
     assert_eq!(entry.type_name, "t.Happened");
     assert_eq!(entry.key.as_deref(), Some("k1"));
@@ -103,7 +103,7 @@ fn document_takes_correlation_and_user_from_context() {
 const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
 
 /// The trace floor forwards only a valid W3C `traceparent` (version `00`, lower-case hex,
-/// neither id all zeros), as kraken-messaging does: anything else is dropped.
+/// neither id all zeros), as snodra-messaging does: anything else is dropped.
 #[test]
 fn only_a_valid_w3c_traceparent_is_forwarded() {
     let invalid = [

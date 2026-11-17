@@ -27,9 +27,9 @@
 //! Its time bounds leave the store a second or more: a store stamps times with the application
 //! clock, and the kit never compares the host clock with a stamped time at a finer margin.
 //!
-//! # The checks and their names in kraken-messaging
+//! # The checks and their names in snodra-messaging
 //!
-//! The Kotlin kit (`MessageStoreConformanceTest` in `kraken-messaging-test`) checks the same
+//! The Kotlin kit (`MessageStoreConformanceTest` in `snodra-messaging-test`) checks the same
 //! contract; each check here, in the order it runs, with the name of its Kotlin twin (the same
 //! name in camelCase unless the row says otherwise):
 //!

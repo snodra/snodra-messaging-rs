@@ -6,17 +6,17 @@ mod support;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kraken_messaging::context::CURRENT;
-use kraken_messaging::hub::{
+use serde::{Deserialize, Serialize};
+use snodra_messaging::context::CURRENT;
+use snodra_messaging::hub::{
     HandlerRegistry, HubConnection, HubSettings, Inbound, SendOptions, Sender, SenderSettings,
 };
-use kraken_messaging::proto::{self, ErrorCode, ServerMessage, reply, server_message};
-use kraken_messaging::saga::{
+use snodra_messaging::proto::{self, ErrorCode, ServerMessage, reply, server_message};
+use snodra_messaging::saga::{
     FailureReason, LocalFirstSender, LocalRawCommandSender, RETRYABLE_MARKER, RawCommandSender,
     RawOutcome, UNKNOWN_OUTCOME_MARKER, classify_failure,
 };
-use kraken_messaging::{Command, Guard, MessageContext, MessagingError, RetryPolicy, message_type};
-use serde::{Deserialize, Serialize};
+use snodra_messaging::{Command, Guard, MessageContext, MessagingError, RetryPolicy, message_type};
 use support::fake_hub::FakeHub;
 use tokio::sync::mpsc;
 
@@ -445,15 +445,15 @@ fn remote(details: &[u8]) -> MessagingError {
 
 #[test]
 fn markers_in_error_details_classify_retryable_and_unknown_outcome() {
-    assert_eq!(RETRYABLE_MARKER, br#"{"kraken":"retryable"}"#);
-    assert_eq!(UNKNOWN_OUTCOME_MARKER, br#"{"kraken":"unknown-outcome"}"#);
+    assert_eq!(RETRYABLE_MARKER, br#"{"snodra":"retryable"}"#);
+    assert_eq!(UNKNOWN_OUTCOME_MARKER, br#"{"snodra":"unknown-outcome"}"#);
 
     assert_eq!(
         classify_failure(&remote(RETRYABLE_MARKER)),
         RawOutcome::Transient("adapter said so".into())
     );
     assert_eq!(
-        classify_failure(&remote(b"  {\"kraken\":\"retryable\"}\n")),
+        classify_failure(&remote(b"  {\"snodra\":\"retryable\"}\n")),
         RawOutcome::Transient("adapter said so".into()),
         "surrounding whitespace is ignored, as Kotlin does"
     );
@@ -462,7 +462,7 @@ fn markers_in_error_details_classify_retryable_and_unknown_outcome() {
         RawOutcome::Permanent(FailureReason::UnknownOutcome, "adapter said so".into())
     );
     // Any other details, or none, are an ordinary handler failure.
-    for details in [&b""[..], b"{}", br#"{"kraken":"other"}"#, b"retryable"] {
+    for details in [&b""[..], b"{}", br#"{"snodra":"other"}"#, b"retryable"] {
         assert_eq!(
             classify_failure(&remote(details)),
             RawOutcome::Permanent(FailureReason::Failed, "adapter said so".into())

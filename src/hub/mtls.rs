@@ -1,6 +1,6 @@
 //! The client certificate of a mutual-TLS setup (roadmap P5c, hub ADR 0020): reading and checking
 //! the certificate and key files, the identity the hub will read from the leaf (exactly one URI SAN
-//! `kraken://service/<name>`), and when to warn that it is about to expire.
+//! `snodra://service/<name>`), and when to warn that it is about to expire.
 //!
 //! Parsing is pure Rust (`x509-parser`, rustls' own PEM and key parsing), so the crate still needs
 //! no C toolchain. Nothing here logs or prints key material: errors name the file and what is wrong
@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 /// The URI SAN prefix that names a service.
-pub const SERVICE_SAN_PREFIX: &str = "kraken://service/";
+pub const SERVICE_SAN_PREFIX: &str = "snodra://service/";
 
 /// The warning threshold: the smaller of a tenth of the certificate's lifetime and this.
 pub const EXPIRY_WARNING_CAP: Duration = Duration::from_secs(24 * 60 * 60);
@@ -101,7 +101,7 @@ fn read(path: &Path, what: &str) -> Result<Vec<u8>, String> {
 
 /// Reads and checks the pair in `cert_file` and `key_file` for `service`: both files read, the
 /// certificate chain (leaf first) and the key parse, the key belongs to the leaf, and the leaf
-/// names `service` with exactly one `kraken://service/<name>` URI SAN. Expiry is not judged here
+/// names `service` with exactly one `snodra://service/<name>` URI SAN. Expiry is not judged here
 /// (see [`ClientIdentity::not_after`]).
 pub(crate) fn load(
     cert_file: &Path,
@@ -290,7 +290,7 @@ pub(crate) mod test_pki {
         pub fn service(name: &str) -> Spec {
             let now = time::OffsetDateTime::now_utc();
             Spec {
-                uris: vec![format!("kraken://service/{name}")],
+                uris: vec![format!("snodra://service/{name}")],
                 dns: vec![],
                 not_before: now - Duration::from_secs(3600),
                 not_after: now + Duration::from_secs(7 * 24 * 3600),
@@ -338,7 +338,7 @@ pub(crate) mod test_pki {
 
     impl Dir {
         pub fn new() -> Dir {
-            let dir = std::env::temp_dir().join(format!("kraken-mtls-{}", uuid::Uuid::new_v4()));
+            let dir = std::env::temp_dir().join(format!("snodra-mtls-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             Dir(dir)
         }
@@ -482,7 +482,7 @@ mod tests {
         });
         let (cert, key) = dir.pair(&none);
         let err = load(&cert, &key, "billing").unwrap_err().to_string();
-        assert!(err.contains("kraken://service/"), "{err}");
+        assert!(err.contains("snodra://service/"), "{err}");
 
         let other_uri = issue(&Spec {
             uris: vec!["spiffe://example.org/billing".into()],
@@ -494,8 +494,8 @@ mod tests {
         // Two service names, even equal ones, are refused by the hub.
         let two = issue(&Spec {
             uris: vec![
-                "kraken://service/billing".into(),
-                "kraken://service/billing".into(),
+                "snodra://service/billing".into(),
+                "snodra://service/billing".into(),
             ],
             ..Spec::service("x")
         });
@@ -507,7 +507,7 @@ mod tests {
         let mixed = issue(&Spec {
             uris: vec![
                 "spiffe://example.org/billing".into(),
-                "kraken://service/billing".into(),
+                "snodra://service/billing".into(),
             ],
             dns: vec!["billing.example".into()],
             ..Spec::service("x")
@@ -517,7 +517,7 @@ mod tests {
 
         // A name the hub would refuse (outside [A-Za-z0-9._-]).
         let odd = issue(&Spec {
-            uris: vec!["kraken://service/bill ing".into()],
+            uris: vec!["snodra://service/bill ing".into()],
             ..Spec::service("x")
         });
         let (cert, key) = dir.pair(&odd);

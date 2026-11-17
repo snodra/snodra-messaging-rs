@@ -1,4 +1,4 @@
-//! End to end against the real hub image (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`): the hub's
+//! End to end against the real hub image (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`): the hub's
 //! HTTP API, with its write token, pauses and resumes a service's named processor, resets it to
 //! `earliest` (the range replayed, the reset handler run once, the handler that disallows replay
 //! skipped) and retries its dead letter (ADR 0023).
@@ -9,14 +9,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kraken_messaging::processors::EventOptions;
-use kraken_messaging::proto::ProcessorState;
-use kraken_messaging::{Config, Event, KrakenMessaging, MessagingError, message_type};
 use rdkafka::config::ClientConfig;
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use snodra_messaging::processors::EventOptions;
+use snodra_messaging::proto::ProcessorState;
+use snodra_messaging::{Config, Event, MessagingError, SnodraMessaging, message_type};
 use support::containers::{HubOptions, hub_with};
 
 macro_rules! require_docker {
@@ -81,7 +81,7 @@ async fn call(
 async fn the_hub_pauses_resets_and_retries_a_processor_with_its_write_token() {
     require_docker!();
     let hub =
-        hub_with(HubOptions::new().env("KRAKEN_HUB_DASHBOARD_WRITE_TOKEN", WRITE_TOKEN)).await;
+        hub_with(HubOptions::new().env("SNODRA_SERVER_DASHBOARD_WRITE_TOKEN", WRITE_TOKEN)).await;
     let kafka = support::containers::kafka().await;
     let mongo = support::containers::mongo().await;
     let topic = "e2e.ctl.events";
@@ -100,7 +100,7 @@ async fn the_hub_pauses_resets_and_retries_a_processor_with_its_write_token() {
         Arc::clone(&notified),
         Arc::clone(&resets),
     );
-    let app = KrakenMessaging::builder(config)
+    let app = SnodraMessaging::builder(config)
         .await
         .unwrap()
         .store(support::mongo_store(&mongo.uri_for("ctl")).await)

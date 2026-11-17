@@ -203,7 +203,7 @@ fn integer_out_of_range(text: &str) -> Option<&str> {
 
 /// The publishing side of events: appends to the message store's outbox, inside the caller's
 /// transaction when given. Cheap to clone; every clone shares the store, bound once by
-/// [`KrakenMessagingBuilder::store`](crate::KrakenMessagingBuilder::store), so a bus taken before
+/// [`SnodraMessagingBuilder::store`](crate::SnodraMessagingBuilder::store), so a bus taken before
 /// the store was given publishes there too. Without a store every publish fails.
 #[derive(Clone)]
 pub struct EventBus {

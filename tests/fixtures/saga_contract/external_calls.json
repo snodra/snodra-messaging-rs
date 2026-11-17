@@ -1,6 +1,6 @@
 {
   "_id": "7f6c1f0e-5a53-4f3e-9a0a-1d2f6f0c9b11:3001",
-  "_class": "io.damoreira.kraken.messaging.external.ExternalCallDocument",
+  "_class": "com.damoreira.snodra.messaging.external.ExternalCallDocument",
   "status": "IN_PROGRESS",
   "reply": "{\"printed\":true}",
   "error": "{\"code\":\"HANDLER_ERROR\",\"message\":\"no paper\"}",

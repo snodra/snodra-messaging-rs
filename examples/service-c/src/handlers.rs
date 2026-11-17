@@ -2,7 +2,7 @@
 //! Rows streams.
 
 use futures::stream::BoxStream;
-use kraken_messaging::MessagingError;
+use snodra_messaging::MessagingError;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -151,7 +151,7 @@ pub fn check_addressee(own: &str, addressed: &str) -> Result<(), MessagingError>
 #[cfg(test)]
 mod tests {
     use futures::StreamExt;
-    use kraken_messaging::MessagingError;
+    use snodra_messaging::MessagingError;
 
     use super::{
         Counters, INVENTORY_COUNT, check_addressee, inventory, reverse, rows, shout,

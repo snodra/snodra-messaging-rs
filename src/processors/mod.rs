@@ -4,9 +4,9 @@
 //! - Every processor's subscription is `<service>.<name>` (on Kafka its consumer group, the name
 //!   it always had) and its markers `processor:<name>:<eventId>`, `default` included.
 //! - The unnamed processor `default` holds the handlers registered with
-//!   [`event`](crate::KrakenMessagingBuilder::event) and the sagas.
+//!   [`event`](crate::SnodraMessagingBuilder::event) and the sagas.
 //! - A named processor holds the handlers registered with
-//!   [`event_in`](crate::KrakenMessagingBuilder::event_in). It runs stage 1 only (no sagas).
+//!   [`event_in`](crate::SnodraMessagingBuilder::event_in). It runs stage 1 only (no sagas).
 //!
 //! Processor control (ADR 0023, P6b): a processor is paused and resumed on every instance, and
 //! reset to a position as a leased operation (its range replayed), through its state in the
@@ -29,7 +29,7 @@ pub use reset::ResetContext;
 pub use runner::ProcessorRunner;
 
 /// How an event handler is registered
-/// ([`event_with`](crate::KrakenMessagingBuilder::event_with)): the processor it belongs to
+/// ([`event_with`](crate::SnodraMessagingBuilder::event_with)): the processor it belongs to
 /// (`default` unless named, ADR 0022) and whether it runs again when that processor replays a
 /// range after a reset (ADR 0023; Kotlin's `@DisallowReplay`).
 ///
@@ -51,7 +51,7 @@ impl EventOptions {
         EventOptions::default()
     }
 
-    /// The named processor the handler belongs to (as [`event_in`](crate::KrakenMessagingBuilder::event_in)).
+    /// The named processor the handler belongs to (as [`event_in`](crate::SnodraMessagingBuilder::event_in)).
     pub fn processor(mut self, name: &str) -> EventOptions {
         self.processor = Some(name.to_string());
         self

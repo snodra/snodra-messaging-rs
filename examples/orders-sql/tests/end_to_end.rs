@@ -1,15 +1,15 @@
-//! `PlaceOrder` through the hub (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`): the order row and
+//! `PlaceOrder` through the hub (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`): the order row and
 //! the outbox row in one transaction, the relay publishes `OrderPlaced`, the handler confirms the
-//! order, and its marker `processor:default:<eventId>` is in `kraken_processed_events`; a command
+//! order, and its marker `processor:default:<eventId>` is in `snodra_processed_events`; a command
 //! failing after its writes leaves neither row.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use kraken_messaging::event_store::memory::MemoryEventStore;
-use kraken_messaging::{Config, KrakenMessaging, MessagingError, SendOptions};
-use kraken_messaging_sqlx::SqlxStore;
 use orders_sql::PlaceOrder;
+use snodra_messaging::event_store::memory::MemoryEventStore;
+use snodra_messaging::{Config, MessagingError, SendOptions, SnodraMessaging};
+use snodra_messaging_sqlx::SqlxStore;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -47,15 +47,15 @@ async fn count(pool: &PgPool, sql: &'static str, id: &str) -> i64 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_order_is_placed_published_and_confirmed_once() {
-    let image = std::env::var("KRAKEN_HUB_IMAGE").unwrap_or_else(|_| "kraken-hub:dev".into());
+    let image = std::env::var("SNODRA_SERVER_IMAGE").unwrap_or_else(|_| "snodra-server:dev".into());
     let (name, tag) = image.rsplit_once(':').unwrap_or((&image, "latest"));
     let hub = GenericImage::new(name, tag)
         .with_exposed_port(7000.tcp())
         .with_wait_for(WaitFor::message_on_stdout("hub listening"))
-        .with_env_var("KRAKEN_HUB_OTLP_ENDPOINT", "")
+        .with_env_var("SNODRA_SERVER_OTLP_ENDPOINT", "")
         .start()
         .await
-        .expect("hub container (build it or set KRAKEN_HUB_IMAGE)");
+        .expect("hub container (build it or set SNODRA_SERVER_IMAGE)");
     let hub_port = hub.get_host_port_ipv4(7000.tcp()).await.unwrap();
     tcp(&format!("127.0.0.1:{hub_port}")).await;
     let pg = Postgres::default().with_tag("17.7").start().await.unwrap();
@@ -75,7 +75,7 @@ async fn an_order_is_placed_published_and_confirmed_once() {
 
     let events = MemoryEventStore::default();
     let config = Config::new("orders-sql", &format!("static://127.0.0.1:{hub_port}"));
-    let builder = KrakenMessaging::builder(config.clone())
+    let builder = SnodraMessaging::builder(config.clone())
         .await
         .unwrap()
         .event_store(Arc::new(events.clone()));
@@ -119,7 +119,7 @@ async fn an_order_is_placed_published_and_confirmed_once() {
     eventually("the outbox row, sent", async || {
         count(
             &pool,
-            "SELECT COUNT(*) FROM kraken_outbox WHERE id = $1 AND sent_at IS NOT NULL",
+            "SELECT COUNT(*) FROM snodra_outbox WHERE id = $1 AND sent_at IS NOT NULL",
             &event_id,
         )
         .await
@@ -129,7 +129,7 @@ async fn an_order_is_placed_published_and_confirmed_once() {
     assert_eq!(
         count(
             &pool,
-            "SELECT COUNT(*) FROM kraken_processed_events WHERE id = $1",
+            "SELECT COUNT(*) FROM snodra_processed_events WHERE id = $1",
             &format!("processor:default:{event_id}")
         )
         .await,
@@ -163,7 +163,7 @@ async fn an_order_is_placed_published_and_confirmed_once() {
     assert_eq!(
         count(
             &pool,
-            "SELECT COUNT(*) FROM kraken_outbox WHERE event_key = $1",
+            "SELECT COUNT(*) FROM snodra_outbox WHERE event_key = $1",
             "o-2"
         )
         .await,

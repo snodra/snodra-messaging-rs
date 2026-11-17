@@ -1,4 +1,4 @@
-//! End to end with two real hubs (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`, ADR 0017) and the
+//! End to end with two real hubs (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`, ADR 0017) and the
 //! multi-hub configuration (every instance on both hubs): a scatter-gather over three instances of
 //! two services owning a shared query gets three parts, a unary query on the shared type reaches
 //! every instance of both owners, and a gather whose hub dies before its end fails with
@@ -9,9 +9,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kraken_messaging::hub::{ScatterOptions, SendOptions};
-use kraken_messaging::{Config, KrakenMessaging, MessagingError, Query, message_type};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::hub::{ScatterOptions, SendOptions};
+use snodra_messaging::{Config, MessagingError, Query, SnodraMessaging, message_type};
 use support::containers::{HubContainer, HubOptions, hub_with};
 use tokio_stream::StreamExt;
 
@@ -40,7 +40,7 @@ impl Query for Find {
 const IDS: [&str; 2] = ["e2e-p4a-1", "e2e-p4a-2"];
 
 async fn two_hubs() -> (HubContainer, HubContainer) {
-    let start = |id: &'static str| hub_with(HubOptions::new().env("KRAKEN_HUB_ID", id));
+    let start = |id: &'static str| hub_with(HubOptions::new().env("SNODRA_SERVER_ID", id));
     tokio::join!(start(IDS[0]), start(IDS[1]))
 }
 
@@ -54,9 +54,9 @@ fn config(service: &str, hubs: &str) -> Config {
 }
 
 /// An instance of `service` owning `e2e.Find` as a shared query; it answers after the delay.
-async fn owner(cfg: Config) -> KrakenMessaging {
+async fn owner(cfg: Config) -> SnodraMessaging {
     let service = cfg.service_name.clone();
-    KrakenMessaging::builder(cfg)
+    SnodraMessaging::builder(cfg)
         .await
         .unwrap()
         .shared_query::<Find, _, _>(move |q, _| {
@@ -71,8 +71,8 @@ async fn owner(cfg: Config) -> KrakenMessaging {
         .unwrap()
 }
 
-async fn caller(cfg: Config) -> KrakenMessaging {
-    KrakenMessaging::builder(cfg)
+async fn caller(cfg: Config) -> SnodraMessaging {
+    SnodraMessaging::builder(cfg)
         .await
         .unwrap()
         .start()
@@ -100,7 +100,7 @@ async fn in_flight_as_sender(hub: &HubContainer, service: &str) -> u64 {
 }
 
 /// Three owners (one of `e2e-sa`, two of `e2e-sb`) and a caller, all registered on both hubs.
-async fn cluster(hubs: &str) -> (Vec<KrakenMessaging>, KrakenMessaging) {
+async fn cluster(hubs: &str) -> (Vec<SnodraMessaging>, SnodraMessaging) {
     let owners = vec![
         owner(config("e2e-sa", hubs)).await,
         owner(config("e2e-sb", hubs)).await,

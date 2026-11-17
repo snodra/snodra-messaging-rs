@@ -9,7 +9,7 @@ use serde_json::json;
 pub const TEST_KEY_PEM: &[u8] = include_bytes!("../fixtures/test_key.pem");
 pub const OTHER_KEY_PEM: &[u8] = include_bytes!("../fixtures/other_key.pem");
 pub const JWKS_JSON: &str = include_str!("../fixtures/jwks.json");
-pub const ISSUER: &str = "https://issuer.test/realms/kraken";
+pub const ISSUER: &str = "https://issuer.test/realms/snodra";
 
 pub fn now() -> u64 {
     jsonwebtoken::get_current_timestamp()
@@ -62,7 +62,7 @@ pub fn token_with_audience(subject: &str, roles: &[&str], audience: &[&str]) -> 
 pub fn unsigned_token(subject: &str) -> String {
     let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
     let claims = URL_SAFE_NO_PAD
-        .encode(json!({"sub": subject, "realm_access": {"roles": ["kraken-admin"]}}).to_string());
+        .encode(json!({"sub": subject, "realm_access": {"roles": ["snodra-admin"]}}).to_string());
     format!("{header}.{claims}.")
 }
 
@@ -108,11 +108,11 @@ pub mod containers;
 
 /// The MongoDB message store of the database `uri` names (a client of its own), its indexes in
 /// place: what a service built on the MongoDB add-on hands the builder.
-pub async fn mongo_store(uri: &str) -> std::sync::Arc<dyn kraken_messaging::store::MessageStore> {
+pub async fn mongo_store(uri: &str) -> std::sync::Arc<dyn snodra_messaging::store::MessageStore> {
     let db = mongo_db(uri).await;
-    let store = kraken_messaging_mongo::MongoStore::new(db.client().clone(), db);
+    let store = snodra_messaging_mongo::MongoStore::new(db.client().clone(), db);
     store
-        .ensure_indexes(&kraken_messaging_mongo::MongoIndexSettings::default())
+        .ensure_indexes(&snodra_messaging_mongo::MongoIndexSettings::default())
         .await
         .expect("indexes");
     std::sync::Arc::new(store)
@@ -129,22 +129,22 @@ pub async fn mongo_db(uri: &str) -> mongodb::Database {
 
 /// A MongoDB message store whose server is never reached (the driver connects lazily): for the
 /// checks that refuse before any store call.
-pub async fn mongo_store_unreached() -> std::sync::Arc<dyn kraken_messaging::store::MessageStore> {
+pub async fn mongo_store_unreached() -> std::sync::Arc<dyn snodra_messaging::store::MessageStore> {
     let client =
         mongodb::Client::with_uri_str("mongodb://127.0.0.1:1/x?serverSelectionTimeoutMS=200")
             .await
             .expect("mongo client");
     let db = client.database("x");
-    std::sync::Arc::new(kraken_messaging_mongo::MongoStore::new(client, db))
+    std::sync::Arc::new(snodra_messaging_mongo::MongoStore::new(client, db))
 }
 
 /// The MongoDB message store of the database `uri` names, without its indexes: nothing is created
 /// in the database until the library writes there.
 pub async fn mongo_store_bare(
     uri: &str,
-) -> std::sync::Arc<dyn kraken_messaging::store::MessageStore> {
+) -> std::sync::Arc<dyn snodra_messaging::store::MessageStore> {
     let db = mongo_db(uri).await;
-    std::sync::Arc::new(kraken_messaging_mongo::MongoStore::new(
+    std::sync::Arc::new(snodra_messaging_mongo::MongoStore::new(
         db.client().clone(),
         db,
     ))
@@ -153,9 +153,9 @@ pub async fn mongo_store_bare(
 /// The Kafka event store at `bootstrap` (the Kafka add-on), as a service hands the builder.
 pub fn kafka_events(
     bootstrap: &str,
-) -> std::sync::Arc<dyn kraken_messaging::event_store::EventStore> {
+) -> std::sync::Arc<dyn snodra_messaging::event_store::EventStore> {
     std::sync::Arc::new(
-        kraken_messaging_kafka::KafkaEventStore::new(kraken_messaging_kafka::KafkaConfig::new(
+        snodra_messaging_kafka::KafkaEventStore::new(snodra_messaging_kafka::KafkaConfig::new(
             bootstrap,
         ))
         .expect("kafka event store"),
@@ -163,6 +163,6 @@ pub fn kafka_events(
 }
 
 /// The in-memory event store.
-pub fn memory_events() -> std::sync::Arc<dyn kraken_messaging::event_store::EventStore> {
-    std::sync::Arc::new(kraken_messaging::event_store::memory::MemoryEventStore::default())
+pub fn memory_events() -> std::sync::Arc<dyn snodra_messaging::event_store::EventStore> {
+    std::sync::Arc::new(snodra_messaging::event_store::memory::MemoryEventStore::default())
 }

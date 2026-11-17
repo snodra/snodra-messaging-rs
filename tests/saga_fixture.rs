@@ -8,11 +8,11 @@ use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kraken_messaging::saga::FailureReason;
-use kraken_messaging::saga::testing::SagaTestFixture;
-use kraken_messaging::{Command, Event, MessagingError, SagaDefinition, message_type};
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
+use snodra_messaging::saga::FailureReason;
+use snodra_messaging::saga::testing::SagaTestFixture;
+use snodra_messaging::{Command, Event, MessagingError, SagaDefinition, message_type};
 
 macro_rules! event {
     ($name:ident, $wire:literal, { $($field:ident : $ty:ty),* $(,)? }) => {

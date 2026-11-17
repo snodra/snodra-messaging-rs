@@ -1,4 +1,4 @@
-//! Testcontainers for the integration tests: Kafka (apache image), MongoDB replica set, kraken-hub.
+//! Testcontainers for the integration tests: Kafka (apache image), MongoDB replica set, snodra-server.
 #![allow(dead_code)]
 
 use testcontainers::core::{AccessMode, IntoContainerPort, Mount, WaitFor};
@@ -43,9 +43,10 @@ pub async fn mongo() -> MongoDb {
     }
 }
 
-/// The hub image under test: `KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`.
+/// The hub image under test: `SNODRA_SERVER_IMAGE`, default `snodra-server:dev`.
 pub fn hub_image() -> (String, String) {
-    let full = std::env::var("KRAKEN_HUB_IMAGE").unwrap_or_else(|_| "kraken-hub:dev".to_string());
+    let full =
+        std::env::var("SNODRA_SERVER_IMAGE").unwrap_or_else(|_| "snodra-server:dev".to_string());
     match full.rsplit_once(':') {
         Some((name, tag)) => (name.to_string(), tag.to_string()),
         None => (full, "latest".to_string()),
@@ -62,7 +63,7 @@ pub fn hub_image_or_fail() -> (String, String) {
         .unwrap_or(false);
     assert!(
         ok,
-        "hub image {name}:{tag} not found: run `docker build -t kraken-hub:dev .` in ../kraken-hub (or set KRAKEN_HUB_IMAGE)"
+        "hub image {name}:{tag} not found: run `docker build -t snodra-server:dev .` in ../snodra-server (or set SNODRA_SERVER_IMAGE)"
     );
     (name, tag)
 }
@@ -78,7 +79,7 @@ pub struct HubContainer {
 pub struct HubOptions {
     /// Fixed host port for gRPC, so `stop`/`start` keeps the address the clients use.
     pub port: Option<u16>,
-    /// Extra `KRAKEN_HUB_*` variables, for example `KRAKEN_HUB_TIMEOUT_OVERRIDES`.
+    /// Extra `SNODRA_SERVER_*` variables, for example `SNODRA_SERVER_TIMEOUT_OVERRIDES`.
     pub env: Vec<(String, String)>,
     /// Host directories bind-mounted read-only: (host path, container path).
     pub mounts: Vec<(String, String)>,
@@ -151,11 +152,11 @@ pub async fn hub_with(options: HubOptions) -> HubContainer {
             .with_exposed_port(7000.tcp())
             .with_exposed_port(7001.tcp())
             .with_wait_for(WaitFor::message_on_stdout("hub listening"))
-            .with_env_var("KRAKEN_HUB_HTTP_LISTEN", "0.0.0.0:7001")
-            .with_env_var("KRAKEN_HUB_OTLP_ENDPOINT", "")
+            .with_env_var("SNODRA_SERVER_HTTP_LISTEN", "0.0.0.0:7001")
+            .with_env_var("SNODRA_SERVER_OTLP_ENDPOINT", "")
             .with_env_var(
-                "KRAKEN_HUB_LOG",
-                std::env::var("KRAKEN_TEST_HUB_LOG").unwrap_or_else(|_| "info".to_string()),
+                "SNODRA_SERVER_LOG",
+                std::env::var("SNODRA_TEST_HUB_LOG").unwrap_or_else(|_| "info".to_string()),
             );
         for (k, v) in &options.env {
             image = image.with_env_var(k.clone(), v.clone());
@@ -270,8 +271,8 @@ pub async fn wait_until_reachable(address: &str) {
                 .connect()
                 .await
                 .ok()?;
-            kraken_messaging::proto::hub_client::HubClient::new(channel)
-                .topology(kraken_messaging::proto::TopologyRequest {})
+            snodra_messaging::proto::hub_client::HubClient::new(channel)
+                .topology(snodra_messaging::proto::TopologyRequest {})
                 .await
                 .ok()
         };

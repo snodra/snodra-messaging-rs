@@ -1,8 +1,8 @@
-//! Partner sources as local kraken events (ADR 0021 rulings 20, 40, 44a; ADR 0027; spec "Inbound
+//! Partner sources as local snodra events (ADR 0021 rulings 20, 40, 44a; ADR 0027; spec "Inbound
 //! 1"): the Rust form of the Kotlin external sources.
 //!
 //! Each source registered with
-//! [`KrakenMessagingBuilder::external_source`](crate::KrakenMessagingBuilder::external_source)
+//! [`SnodraMessagingBuilder::external_source`](crate::SnodraMessagingBuilder::external_source)
 //! comes from an [`ExternalSourceProvider`] (an event-store add-on's, for example the Kafka
 //! add-on's `KafkaExternalSource` for a partner's topic), whatever the service's own event store
 //! is, and gets a task of its own (one subscription: a partner source is read in order). Every
@@ -82,7 +82,7 @@ pub trait ExternalSourceProvider: Send + Sync {
     fn subscribe(&self) -> BoxFuture<'_, Result<Box<dyn Subscription>, EventStoreError>>;
 }
 
-/// What a partner record became: a kraken event (its wire type and JSON) and, optionally, the key
+/// What a partner record became: a Snodra event (its wire type and JSON) and, optionally, the key
 /// the partner's own id gives it. Two records with the same dedupe key are applied once.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TranslatedEvent {
@@ -116,7 +116,7 @@ impl TranslatedEvent {
     }
 }
 
-/// Turns a partner record into a kraken event: `Ok(None)` ignores the record, an error retries it
+/// Turns a partner record into a Snodra event: `Ok(None)` ignores the record, an error retries it
 /// (as the processors do) and then skips it. Kotlin's `ExternalRecordTranslator` bean.
 pub type Translator =
     Arc<dyn Fn(&ExternalRecord) -> Result<Option<TranslatedEvent>, MessagingError> + Send + Sync>;
@@ -179,7 +179,7 @@ pub struct ExternalSources {
 impl ExternalSources {
     /// Checks every source ([`validate_source`], no two of one name); nothing connects before
     /// [`start`](Self::start). `max_attempts` invocations per record in all
-    /// (`KRAKEN_CONSUMER_MAX_ATTEMPTS`), `backoff` between them.
+    /// (`SNODRA_CONSUMER_MAX_ATTEMPTS`), `backoff` between them.
     pub fn new(
         sources: Vec<SourceRegistration>,
         dispatcher: Arc<LocalEventDispatcher>,

@@ -1,0 +1,36 @@
+[package]
+name = "snodra-messaging-rabbitmq"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Snodra messaging: the RabbitMQ Streams event store (super stream publish, single active consumer subscriptions, reset, lag, the dead-letter stream, the event browser)"
+license = "MIT"
+publish = false
+
+[dependencies]
+snodra-messaging-rs = { path = "../.." }
+# The stream protocol client (pure Rust, TLS through rustls). Its raw `Client` is used, not its
+# `Environment` consumers and producers: see the crate docs for why.
+rabbitmq-stream-client = "=0.11.0"
+rabbitmq-stream-protocol = "=0.11.0"
+# The client's hash routing (murmur3 x86_32, seed 104729), computed here per event.
+murmur3 = "0.5.2"
+# The management HTTP API (optional at run time): who reads a subscription now.
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+# The process's TLS provider, installed when none is (TLS to RabbitMQ only).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+futures = "0.3"
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+tracing = "0.1.44"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+snodra-messaging-rs = { path = "../..", features = ["testing"] }
+tokio = { version = "1.54.1", features = ["full", "test-util"] }
+testcontainers = "0.27"
+# The end-to-end test's messages.
+serde = { version = "1.0.229", features = ["derive"] }
+# A fake management API.
+wiremock = "0.6.5"

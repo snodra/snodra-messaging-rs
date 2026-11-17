@@ -1,4 +1,4 @@
-//! Saga, deadline and external wiring on the builder (S2 Task 13): through `KrakenMessaging`
+//! Saga, deadline and external wiring on the builder (S2 Task 13): through `SnodraMessaging`
 //! alone, an event on Kafka starts a saga, the relay delivers its command to this service's own
 //! idempotent adapter, a deadline fires, a webhook event reaches a saga, and a service that
 //! registers none of it builds none of it. Mongo + Kafka + the in-process fake hub.
@@ -9,19 +9,19 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kraken_messaging::external::{ExternalRecord, IdempotencyKey, IngressResult, TranslatedEvent};
-use kraken_messaging::saga::store::SagaDocument;
-use kraken_messaging::saga::{EventOutcome, ExternalOutcome};
-use kraken_messaging::store::{ExternalCall, ExternalCallStatus};
-use kraken_messaging::{
-    Command, Config, Event, KrakenMessaging, MessageContext, MessagingError, message_type,
-};
-use kraken_messaging_kafka::{ExternalSource, KafkaExternalSource};
-use kraken_messaging_mongo::documents::{ExternalCallDocument, SagaDoc};
 use mongodb::bson::{Document, doc};
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::external::{ExternalRecord, IdempotencyKey, IngressResult, TranslatedEvent};
+use snodra_messaging::saga::store::SagaDocument;
+use snodra_messaging::saga::{EventOutcome, ExternalOutcome};
+use snodra_messaging::store::{ExternalCall, ExternalCallStatus};
+use snodra_messaging::{
+    Command, Config, Event, MessageContext, MessagingError, SnodraMessaging, message_type,
+};
+use snodra_messaging_kafka::{ExternalSource, KafkaExternalSource};
+use snodra_messaging_mongo::documents::{ExternalCallDocument, SagaDoc};
 use support::fake_hub::FakeHub;
 
 macro_rules! require_docker {
@@ -130,7 +130,7 @@ async fn an_event_starts_a_saga_whose_command_reaches_the_idempotent_adapter_and
 
     let meter = support::metrics::TestMeter::new();
     let uri = mongo.uri_for("banner");
-    let builder = KrakenMessaging::builder_with_meter(config(&hub.address()), meter.meter())
+    let builder = SnodraMessaging::builder_with_meter(config(&hub.address()), meter.meter())
         .await
         .unwrap()
         .store(support::mongo_store(&uri).await)
@@ -378,7 +378,7 @@ async fn an_event_starts_a_saga_whose_command_reaches_the_idempotent_adapter_and
     );
     assert!(app.saga_failures().list(None).await.unwrap().is_empty());
     // -- and so did the meter, with the same names and labels
-    use kraken_messaging::saga::stats::{
+    use snodra_messaging::saga::stats::{
         DEADLINES_FIRED, EXTERNAL_CALLS, SAGA_DISPATCH_PENDING, SAGAS_ACTIVE, SAGAS_ENDED,
         SAGAS_STARTED,
     };
@@ -431,7 +431,7 @@ async fn a_service_without_sagas_adapters_or_sources_builds_none_of_it() {
     let hub = FakeHub::start().await;
     let mongo = support::containers::mongo().await;
     // Commands only: no store, no saga state, and the saga admin API says it has no store.
-    let app = KrakenMessaging::builder(config(&hub.address()))
+    let app = SnodraMessaging::builder(config(&hub.address()))
         .await
         .unwrap()
         .command::<PrintBanner, _, _>(|_, _| async { Ok(()) })
@@ -449,7 +449,7 @@ async fn a_service_without_sagas_adapters_or_sources_builds_none_of_it() {
     disabled.sagas_enabled = false;
     disabled.store_init_schema = false;
     let uri = mongo.uri_for("disabled");
-    let app = KrakenMessaging::builder(disabled)
+    let app = SnodraMessaging::builder(disabled)
         .await
         .unwrap()
         .store(support::mongo_store_bare(&uri).await)
@@ -492,7 +492,7 @@ async fn a_service_without_sagas_adapters_or_sources_builds_none_of_it() {
     let uri = mongo.uri_for("adapter");
     let mut unprepared = config(&hub.address());
     unprepared.store_init_schema = false;
-    let app = KrakenMessaging::builder(unprepared)
+    let app = SnodraMessaging::builder(unprepared)
         .await
         .unwrap()
         .store(support::mongo_store_bare(&uri).await)

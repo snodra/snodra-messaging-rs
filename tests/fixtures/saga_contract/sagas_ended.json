@@ -1,6 +1,6 @@
 {
   "_id": "0b9a8c52-77a1-4d5b-8f0e-52c7d1e0a001",
-  "_class": "io.damoreira.kraken.messaging.saga.SagaDocument",
+  "_class": "com.damoreira.snodra.messaging.saga.SagaDocument",
   "type": "PaymentSaga",
   "state": "{}",
   "associations": [],

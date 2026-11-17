@@ -7,11 +7,11 @@ mod support;
 
 use std::time::Duration;
 
-use kraken_messaging::proto::{self, reply, server_message};
-use kraken_messaging::{
-    Command, Config, Event, KrakenMessaging, KrakenMessagingBuilder, Query, message_type,
-};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::proto::{self, reply, server_message};
+use snodra_messaging::{
+    Command, Config, Event, Query, SnodraMessaging, SnodraMessagingBuilder, message_type,
+};
 use support::fake_hub::FakeHub;
 
 macro_rules! require_docker {
@@ -54,13 +54,13 @@ struct Tally {
 }
 
 /// A builder that has not touched the network, with no store.
-async fn builder(hub: &str) -> KrakenMessagingBuilder {
+async fn builder(hub: &str) -> SnodraMessagingBuilder {
     let mut config = Config::new("store-required", hub);
     config.outbox_enabled = false;
-    KrakenMessaging::builder(config).await.unwrap()
+    SnodraMessaging::builder(config).await.unwrap()
 }
 
-async fn refused(builder: KrakenMessagingBuilder) -> String {
+async fn refused(builder: SnodraMessagingBuilder) -> String {
     match builder.start().await {
         Ok(_) => panic!("start() accepted a service that needs a store without one"),
         Err(e) => e.to_string(),
@@ -196,7 +196,7 @@ async fn start_prepares_the_store_schema_unless_turned_off() {
         let mut config = Config::new("store-required", "127.0.0.1:1");
         config.outbox_enabled = false;
         config.store_init_schema = init;
-        KrakenMessaging::builder(config)
+        SnodraMessaging::builder(config)
             .await
             .unwrap()
             .store(support::mongo_store_bare(&uri).await)
@@ -250,11 +250,11 @@ async fn start_prepares_the_store_schema_unless_turned_off() {
 }
 
 /// A builder with a MongoDB store that is never reached and no event store.
-async fn builder_without_event_store(hub: &str) -> KrakenMessagingBuilder {
+async fn builder_without_event_store(hub: &str) -> SnodraMessagingBuilder {
     let mut config = Config::new("event-store-required", hub);
     config.outbox_enabled = false;
     config.store_init_schema = false;
-    KrakenMessaging::builder(config)
+    SnodraMessaging::builder(config)
         .await
         .unwrap()
         .store(support::mongo_store_unreached().await)
@@ -336,12 +336,12 @@ async fn publishing_without_event_store_fails() {
 async fn dead_letter_mode_event_store_needs_the_capability() {
     let mut config = Config::new("event-store-required", "127.0.0.1:1");
     config.store_init_schema = false;
-    config.dead_letter_mode = kraken_messaging::config::DeadLetterMode::EventStore;
+    config.dead_letter_mode = snodra_messaging::config::DeadLetterMode::EventStore;
     let events = std::sync::Arc::new(support::event_store::Log::new(vec![
-        kraken_messaging::event_store::Capability::Replay,
+        snodra_messaging::event_store::Capability::Replay,
     ]));
     let message = refused(
-        KrakenMessaging::builder(config)
+        SnodraMessaging::builder(config)
             .await
             .unwrap()
             .store(support::mongo_store_unreached().await)
@@ -358,8 +358,8 @@ async fn dead_letter_mode_event_store_needs_the_capability() {
 /// The in-memory stores warn at startup that they are not durable; another store does not.
 #[tokio::test]
 async fn the_in_memory_stores_warn_that_they_are_not_durable() {
-    use kraken_messaging::event_store::memory::MemoryEventStore;
-    use kraken_messaging::store::memory::MemoryStore;
+    use snodra_messaging::event_store::memory::MemoryEventStore;
+    use snodra_messaging::store::memory::MemoryStore;
     let logs = support::logs::Captured::default();
     let _guard = logs.install();
     let warned = |text: &str| {

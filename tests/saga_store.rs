@@ -1,6 +1,6 @@
 //! The storage contract of ADR 0021 for sagas (S2) in the MongoDB message store: the documents of
 //! `sagas`, `saga_dispatch`, `saga_dispatch_leases`, `deadlines`, `saga_failures` and
-//! `external_calls` (`kraken_messaging_mongo::documents`, read back into the core's records), and
+//! `external_calls` (`snodra_messaging_mongo::documents`, read back into the core's records), and
 //! their indexes.
 //! The fixtures in `tests/fixtures/saga_contract` are written by hand from the ADR's table, in the
 //! shape Spring Data writes them (`_class` included); Rust writes no `_class` and no nulls.
@@ -10,20 +10,20 @@ mod support;
 use std::time::Duration;
 
 use futures::TryStreamExt;
-use kraken_messaging::saga::FailureReason;
-use kraken_messaging::saga::store::{
-    Association, DeadlineDocument, DeadlineStatus, DispatchKind, SagaDispatchDocument,
-    SagaDocument, SagaFailureDocument,
-};
-use kraken_messaging::store::{ExternalCall, ExternalCallStatus};
-use kraken_messaging_mongo::documents::{
-    DeadlineDoc, DispatchDoc, ExternalCallDocument, FailureDoc, LeaseDoc, SagaDoc,
-};
-use kraken_messaging_mongo::{MongoIndexSettings, MongoStore};
 use mongodb::bson::{Bson, DateTime, Document, doc};
 use mongodb::{Database, IndexModel};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use snodra_messaging::saga::FailureReason;
+use snodra_messaging::saga::store::{
+    Association, DeadlineDocument, DeadlineStatus, DispatchKind, SagaDispatchDocument,
+    SagaDocument, SagaFailureDocument,
+};
+use snodra_messaging::store::{ExternalCall, ExternalCallStatus};
+use snodra_messaging_mongo::documents::{
+    DeadlineDoc, DispatchDoc, ExternalCallDocument, FailureDoc, LeaseDoc, SagaDoc,
+};
+use snodra_messaging_mongo::{MongoIndexSettings, MongoStore};
 
 macro_rules! require_docker {
     () => {

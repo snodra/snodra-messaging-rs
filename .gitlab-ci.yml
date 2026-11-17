@@ -22,14 +22,14 @@ fmt:
   script:
     - cargo fmt --all -- --check
 
-# proto/hub.proto must stay byte-identical to the umbrella's kraken/protocol/hub.proto.
+# proto/hub.proto must stay byte-identical to snodra-server's proto/hub.proto (the source of truth).
+# The server repository is public: clone it anonymously, no deploy token.
 proto-sync:
   stage: check
   script:
-    - git config --global url."https://${KRAKEN_UMBRELLA_DEPLOY_USER}:${KRAKEN_UMBRELLA_DEPLOY_TOKEN}@${CI_SERVER_HOST}/kraken-org/kraken.git".insteadOf "https://${CI_SERVER_HOST}/kraken-org/kraken.git"
-    - rm -rf "$CI_PROJECT_DIR/../kraken"
-    - git -c url."https://${KRAKEN_UMBRELLA_DEPLOY_USER}:${KRAKEN_UMBRELLA_DEPLOY_TOKEN}@${CI_SERVER_HOST}/kraken-org/kraken.git".insteadOf="https://${CI_SERVER_HOST}/kraken-org/kraken.git" clone --depth 1 "https://${CI_SERVER_HOST}/kraken-org/kraken.git" "$CI_PROJECT_DIR/../kraken"
-    - KRAKEN_PROTO_SYNC_REQUIRED=true KRAKEN_PROTO_SOURCE="$CI_PROJECT_DIR/../kraken/protocol/hub.proto" bash scripts/check-proto-sync.sh
+    - rm -rf "$CI_PROJECT_DIR/../snodra-server"
+    - git clone --depth 1 "https://gitlab.damoreira.ml/snodra/snodra-server.git" "$CI_PROJECT_DIR/../snodra-server"
+    - SNODRA_PROTO_SYNC_REQUIRED=true SNODRA_PROTO_SOURCE="$CI_PROJECT_DIR/../snodra-server/proto/hub.proto" bash scripts/check-proto-sync.sh
 
 clippy:
   stage: check
@@ -40,7 +40,7 @@ test:
   stage: test
   before_script:
     - echo "$HARBOR_PASSWORD" | docker login -u "$HARBOR_USERNAME" --password-stdin "$HARBOR_HOST"
-    - docker pull "$KRAKEN_HUB_IMAGE"
+    - docker pull "$SNODRA_SERVER_IMAGE"
   script:
     - cargo test --workspace --all-features -- --test-threads=1
 
@@ -106,7 +106,7 @@ release:
         exit 0
       fi
       if ! git rev-parse "$NEXT" >/dev/null 2>&1; then
-        git config user.name "kraken-org CI"
+        git config user.name "snodra CI"
         git config user.email "ci@damoreira.ml"
         git tag -a "$NEXT" -m "$CI_PROJECT_NAME $NEXT"
         git push "$CI_REPOSITORY_URL" "$NEXT"
@@ -116,8 +116,8 @@ release:
       sed -i.bak -E 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
       rm -f Cargo.toml.bak
       cargo package --no-verify --allow-dirty
-      CRATE_FILE="target/package/kraken-messaging-rs-$VERSION.crate"
-      PKG_URL="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/kraken-messaging-rs/$VERSION/kraken-messaging-rs-$VERSION.crate"
+      CRATE_FILE="target/package/snodra-messaging-rs-$VERSION.crate"
+      PKG_URL="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/snodra-messaging-rs/$VERSION/snodra-messaging-rs-$VERSION.crate"
       curl --silent --fail-with-body --show-error \
         --header "JOB-TOKEN: $CI_JOB_TOKEN" \
         --upload-file "$CRATE_FILE" \
@@ -127,7 +127,7 @@ release:
         --arg tag "$NEXT" \
         --arg desc "Rust crate release $VERSION." \
         --arg crate_url "$PKG_URL" \
-        --arg crate_name "kraken-messaging-rs-$VERSION.crate" \
+        --arg crate_name "snodra-messaging-rs-$VERSION.crate" \
         '{
           name: $name,
           tag_name: $tag,

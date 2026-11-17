@@ -1,4 +1,4 @@
-//! End to end with two real hubs (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`, ADR 0017) and the
+//! End to end with two real hubs (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`, ADR 0017) and the
 //! multi-hub configuration (every instance on both hubs): one service streams 1 000 rows under a
 //! credit window of 8 and another collects them all in order (the stream pins one instance and one
 //! hub, which count it in flight until the end); a stream dropped mid-way is cancelled at the hub
@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use kraken_messaging::hub::StreamOptions;
-use kraken_messaging::{Config, KrakenMessaging, MessagingError, StreamingQuery, message_type};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::hub::StreamOptions;
+use snodra_messaging::{Config, MessagingError, SnodraMessaging, StreamingQuery, message_type};
 use support::containers::{HubContainer, HubOptions, hub_with};
 use tokio_stream::StreamExt;
 
@@ -44,7 +44,7 @@ impl StreamingQuery for Export {
 const IDS: [&str; 2] = ["e2e-p4b-1", "e2e-p4b-2"];
 
 async fn two_hubs() -> (HubContainer, HubContainer) {
-    let start = |id: &'static str| hub_with(HubOptions::new().env("KRAKEN_HUB_ID", id));
+    let start = |id: &'static str| hub_with(HubOptions::new().env("SNODRA_SERVER_ID", id));
     tokio::join!(start(IDS[0]), start(IDS[1]))
 }
 
@@ -92,8 +92,8 @@ impl Drop for Watched {
 }
 
 /// The owner of `e2e.Export`: streams the rows, each naming this instance.
-async fn exporter(cfg: Config, probe: Arc<Probe>) -> KrakenMessaging {
-    KrakenMessaging::builder(cfg)
+async fn exporter(cfg: Config, probe: Arc<Probe>) -> SnodraMessaging {
+    SnodraMessaging::builder(cfg)
         .await
         .unwrap()
         .streaming_query::<Export, _, _, _>(move |q, ctx| {
@@ -120,8 +120,8 @@ async fn exporter(cfg: Config, probe: Arc<Probe>) -> KrakenMessaging {
         .unwrap()
 }
 
-async fn caller(cfg: Config) -> KrakenMessaging {
-    KrakenMessaging::builder(cfg)
+async fn caller(cfg: Config) -> SnodraMessaging {
+    SnodraMessaging::builder(cfg)
         .await
         .unwrap()
         .start()

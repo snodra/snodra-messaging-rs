@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
-use kraken_messaging::saga::{EventOutcome, SagaDefinition, SagaMetrics, SagaType};
-use kraken_messaging::{Command, Event, MessagingError, message_type};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::saga::{EventOutcome, SagaDefinition, SagaMetrics, SagaType};
+use snodra_messaging::{Command, Event, MessagingError, message_type};
 
 use super::saga::t0;
 

@@ -5,8 +5,8 @@
 //!
 //! ```no_run
 //! # use std::time::Duration;
-//! # use kraken_messaging::testing::InMemoryStores;
-//! # use kraken_messaging::{Event, KrakenMessaging, MessagingError, message_type};
+//! # use snodra_messaging::testing::InMemoryStores;
+//! # use snodra_messaging::{Event, SnodraMessaging, MessagingError, message_type};
 //! # #[derive(serde::Serialize, serde::Deserialize)]
 //! # struct OrderPlaced { order: String }
 //! # message_type!(OrderPlaced, "orders.OrderPlaced");
@@ -18,7 +18,7 @@
 //! # async fn run() -> Result<(), MessagingError> {
 //! let stores = InMemoryStores::new();
 //! let app = stores
-//!     .install(KrakenMessaging::builder(stores.config("orders")).await?)
+//!     .install(SnodraMessaging::builder(stores.config("orders")).await?)
 //!     // the service's own registrations
 //!     .event::<OrderPlaced, _, _>(|_placed, _ctx| async { Ok(()) })
 //!     .start()
@@ -40,7 +40,7 @@
 
 use std::time::Duration;
 
-use crate::app::KrakenMessagingBuilder;
+use crate::app::SnodraMessagingBuilder;
 use crate::config::Config;
 use crate::error::MessagingError;
 use crate::event_store::memory::MemoryEventStore;
@@ -52,7 +52,7 @@ use crate::store::{DeadLetter, MessageStore};
 use crate::types::Event;
 
 /// The `source` header of the events [`InMemoryStores::publish`] publishes: "another service".
-pub const TEST_PUBLISHER: &str = "kraken-test";
+pub const TEST_PUBLISHER: &str = "snodra-test";
 
 /// How often the waits look again.
 const LOOK_AGAIN: Duration = Duration::from_millis(10);
@@ -99,7 +99,7 @@ impl InMemoryStores {
     /// paused time (`#[tokio::test(start_paused = true)]`, `tokio::time::advance`) moves the
     /// outbox leases and claims, the saga deadlines and every time the library stamps. A later
     /// `.clock(..)` on the builder replaces it.
-    pub fn install(&self, builder: KrakenMessagingBuilder) -> KrakenMessagingBuilder {
+    pub fn install(&self, builder: SnodraMessagingBuilder) -> SnodraMessagingBuilder {
         builder
             .store(std::sync::Arc::new(self.store.clone()))
             .event_store(std::sync::Arc::new(self.events.clone()))

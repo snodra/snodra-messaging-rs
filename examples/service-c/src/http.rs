@@ -10,7 +10,7 @@
 //!   while it is in flight (or unknown).
 //! - `GET /greetings/{name}/count`: service-b's `examples.CountGreetings` through the hub, the
 //!   sandbox's call from Rust to Kotlin (`{"name","count"}`; 502 with the error when it fails). The
-//!   examples smoke uses it for the Rust side of `kraken_hub_client_request_duration_seconds`.
+//!   examples smoke uses it for the Rust side of `snodra_hub_client_request_duration_seconds`.
 
 use axum::Router;
 use axum::body::Bytes;
@@ -18,9 +18,9 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use kraken_messaging::SendOptions;
-use kraken_messaging::external::ExternalEventIngress;
-use kraken_messaging::hub::Sender;
+use snodra_messaging::SendOptions;
+use snodra_messaging::external::ExternalEventIngress;
+use snodra_messaging::hub::Sender;
 use std::sync::Arc;
 
 use crate::banner::BannerOutcomes;

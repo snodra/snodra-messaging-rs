@@ -1,13 +1,13 @@
 //! What the saga runtime, relay and scheduler report: a trait. The application's is
 //! [`OtelSagaMetrics`](super::OtelSagaMetrics) (the meter and the [`SagaStats`](super::SagaStats)
-//! behind `KrakenMessaging::saga_stats()`, ADR 0026); [`NoopSagaMetrics`] reports nothing. Every
+//! behind `SnodraMessaging::saga_stats()`, ADR 0026); [`NoopSagaMetrics`] reports nothing. Every
 //! method has an empty default so hooks can be added without breaking implementations.
 
 use std::collections::HashMap;
 
 use super::failed::FailureReason;
 
-/// The result of one (event, saga type) handling (`kraken_saga_events_total{type,outcome}`).
+/// The result of one (event, saga type) handling (`snodra_saga_events_total{type,outcome}`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EventOutcome {
     Handled,
@@ -16,7 +16,7 @@ pub enum EventOutcome {
     Parked,
 }
 
-/// How one call of an idempotent handler ended (`kraken_external_calls_total{handler,outcome}`).
+/// How one call of an idempotent handler ended (`snodra_external_calls_total{handler,outcome}`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ExternalOutcome {
     /// The body ran and succeeded.
@@ -54,7 +54,7 @@ pub trait SagaMetrics: Send + Sync {
     fn deadline_fired(&self, _name: &str) {}
 
     /// The SCHEDULED deadlines past their due time after a scheduler poll, per deadline name
-    /// (empty when none): `kraken_deadlines_due{name}`.
+    /// (empty when none): `snodra_deadlines_due{name}`.
     fn deadlines_overdue(&self, _by_name: &HashMap<String, u64>) {}
 
     /// How one call of the idempotent handler `handler` (its message's wire type name) ended.
@@ -62,7 +62,7 @@ pub trait SagaMetrics: Send + Sync {
 
     /// A `SagaCommandFailed` for `command_type` reached no saga or handler (or could not be
     /// delivered), or a saga event of that type was refused by the outbox (`INVALID`): logged at
-    /// error, `kraken_saga_command_failures_total`.
+    /// error, `snodra_saga_command_failures_total`.
     fn command_failure_unhandled(&self, _command_type: &str, _reason: FailureReason) {}
 }
 

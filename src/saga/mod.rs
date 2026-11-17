@@ -2,7 +2,7 @@
 //! `saga`, `deadline` and `external` packages, over the message store's saga ports.
 //!
 //! A saga is registered on the builder with a closure-based definition
-//! ([`KrakenMessagingBuilder::saga`](crate::KrakenMessagingBuilder::saga)); its handlers are
+//! ([`SnodraMessagingBuilder::saga`](crate::SnodraMessagingBuilder::saga)); its handlers are
 //! synchronous closures that only record what they want done on a [`SagaContext`] (the runtime
 //! does the I/O after the saga's transaction committed).
 

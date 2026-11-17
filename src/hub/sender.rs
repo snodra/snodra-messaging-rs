@@ -187,7 +187,7 @@ pub struct SenderSettings {
     pub priorities: HashMap<String, i32>,
     /// Default retry policy (`Config.hub_retry`); `None` (the default): no retry.
     pub retry: Option<RetryPolicy>,
-    /// What every command and query call is timed on (`kraken.hub.client.request.duration`);
+    /// What every command and query call is timed on (`snodra.hub.client.request.duration`);
     /// [`Metrics::global`] by default.
     pub metrics: Metrics,
 }
@@ -949,7 +949,7 @@ impl Sender {
     }
 
     /// Decodes the reply of a call started at `started` and times the call with its final outcome
-    /// (`kraken.hub.client.request.duration`; a reply that does not decode is
+    /// (`snodra.hub.client.request.duration`; a reply that does not decode is
     /// [`DECODE_FAILED`]). A call its caller dropped records nothing.
     fn decoded<R: DeserializeOwned + 'static>(
         &self,
@@ -1343,7 +1343,7 @@ impl Sender {
     /// [`stream`](Self::stream) as a `'static` stream: it holds a clone of this `Arc<Sender>`
     /// instead of a borrow, so it can be returned (an HTTP streaming body) or moved into a
     /// spawned task. Same open, items, credits, endings, retry and drop guard; the sender lives
-    /// at least as long as the stream (`KrakenMessaging::sender()` is the app's `Arc`).
+    /// at least as long as the stream (`SnodraMessaging::sender()` is the app's `Arc`).
     pub async fn stream_owned<Q: StreamingQuery>(
         self: &Arc<Self>,
         query: &Q,

@@ -8,13 +8,13 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kraken_messaging::proto::{ProcessorState, ProcessorStatus};
-use kraken_messaging::{Config, Event, KrakenMessaging, KrakenMessagingBuilder, message_type};
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::proto::{ProcessorState, ProcessorStatus};
+use snodra_messaging::{Config, Event, SnodraMessaging, SnodraMessagingBuilder, message_type};
 use support::fake_hub::FakeHub;
 use tokio::sync::Semaphore;
 
@@ -41,8 +41,8 @@ async fn builder(
     kafka: &str,
     mongo: &str,
     topic: &str,
-) -> KrakenMessagingBuilder {
-    KrakenMessaging::builder(config(service, hub, topic))
+) -> SnodraMessagingBuilder {
+    SnodraMessaging::builder(config(service, hub, topic))
         .await
         .unwrap()
         .store(support::mongo_store(mongo).await)
@@ -97,7 +97,7 @@ async fn produce(bootstrap: &str, topic: &str, from: u32, to: u32) {
     }
 }
 
-fn default_of(app: &KrakenMessaging) -> ProcessorStatus {
+fn default_of(app: &SnodraMessaging) -> ProcessorStatus {
     app.processors()
         .into_iter()
         .find(|p| p.name == "default")
@@ -158,7 +158,7 @@ async fn the_lag_of_records_produced_while_stopped_shows_while_the_handler_is_bu
     let held = Arc::clone(&gate);
     let meter = support::metrics::TestMeter::new();
     let app =
-        KrakenMessaging::builder_with_meter(config("svc-st", &hub.address(), topic), meter.meter())
+        SnodraMessaging::builder_with_meter(config("svc-st", &hub.address(), topic), meter.meter())
             .await
             .unwrap()
             .store(support::mongo_store(&uri).await)
@@ -185,21 +185,21 @@ async fn the_lag_of_records_produced_while_stopped_shows_while_the_handler_is_bu
     // The gauges read the same status.
     assert_eq!(
         meter.value(
-            kraken_messaging::metrics::PROCESSOR_LAG,
+            snodra_messaging::metrics::PROCESSOR_LAG,
             &[("processor", "default"), ("segment", "0")]
         ),
         Some(5.0)
     );
     assert_eq!(
         meter.value(
-            kraken_messaging::metrics::PROCESSOR_STATE,
+            snodra_messaging::metrics::PROCESSOR_STATE,
             &[("processor", "default"), ("state", "running")]
         ),
         Some(1.0)
     );
     assert_eq!(
         meter.value(
-            kraken_messaging::metrics::DEAD_LETTERS,
+            snodra_messaging::metrics::DEAD_LETTERS,
             &[("processor", "default")]
         ),
         Some(0.0)
@@ -243,7 +243,7 @@ async fn the_segments_follow_a_reassignment() {
             .await
             .unwrap()
     };
-    let partitions = |app: &KrakenMessaging| -> Vec<String> {
+    let partitions = |app: &SnodraMessaging| -> Vec<String> {
         default_of(app)
             .segments
             .iter()

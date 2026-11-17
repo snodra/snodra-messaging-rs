@@ -1,6 +1,6 @@
 {
   "_id": "7f6c1f0e-5a53-4f3e-9a0a-1d2f6f0c9b11",
-  "_class": "io.damoreira.kraken.messaging.saga.SagaDispatchLeaseDocument",
+  "_class": "com.damoreira.snodra.messaging.saga.SagaDispatchLeaseDocument",
   "owner": "relay-instance-1",
   "until": {"$date": "2026-11-03T10:06:30Z"}
 }

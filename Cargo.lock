@@ -2027,120 +2027,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kraken-messaging-kafka"
-version = "0.1.0"
-dependencies = [
- "futures",
- "kraken-messaging-mongo",
- "kraken-messaging-rs",
- "mongodb",
- "rdkafka",
- "serde_json",
- "testcontainers",
- "testcontainers-modules",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "kraken-messaging-mongo"
-version = "0.1.0"
-dependencies = [
- "futures",
- "kraken-messaging-rs",
- "mongodb",
- "serde",
- "serde_json",
- "testcontainers",
- "testcontainers-modules",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "kraken-messaging-rabbitmq"
-version = "0.1.0"
-dependencies = [
- "futures",
- "kraken-messaging-rs",
- "murmur3",
- "rabbitmq-stream-client",
- "rabbitmq-stream-protocol",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "testcontainers",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "kraken-messaging-rs"
-version = "0.1.0"
-dependencies = [
- "base64 0.23.1",
- "chrono",
- "futures",
- "jsonwebtoken",
- "kraken-messaging-kafka",
- "kraken-messaging-mongo",
- "mongodb",
- "opentelemetry",
- "opentelemetry_sdk",
- "prost",
- "prost-build",
- "rcgen",
- "rdkafka",
- "reqwest",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "testcontainers",
- "testcontainers-modules",
- "thiserror",
- "time",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "wiremock",
- "x509-parser",
-]
-
-[[package]]
-name = "kraken-messaging-sqlx"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "futures",
- "kraken-messaging-rs",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "sqlx-core",
- "testcontainers",
- "testcontainers-modules",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2696,9 +2582,9 @@ dependencies = [
 name = "orders-sql"
 version = "0.1.0"
 dependencies = [
- "kraken-messaging-rs",
- "kraken-messaging-sqlx",
  "serde",
+ "snodra-messaging-rs",
+ "snodra-messaging-sqlx",
  "sqlx",
  "testcontainers",
  "testcontainers-modules",
@@ -3807,9 +3693,6 @@ dependencies = [
  "axum",
  "chrono",
  "futures",
- "kraken-messaging-kafka",
- "kraken-messaging-mongo",
- "kraken-messaging-rs",
  "mongodb",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -3817,6 +3700,9 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "snodra-messaging-kafka",
+ "snodra-messaging-mongo",
+ "snodra-messaging-rs",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3931,6 +3817,120 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "snodra-messaging-kafka"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "mongodb",
+ "rdkafka",
+ "serde_json",
+ "snodra-messaging-mongo",
+ "snodra-messaging-rs",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "snodra-messaging-mongo"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "mongodb",
+ "serde",
+ "serde_json",
+ "snodra-messaging-rs",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "snodra-messaging-rabbitmq"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "murmur3",
+ "rabbitmq-stream-client",
+ "rabbitmq-stream-protocol",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "snodra-messaging-rs",
+ "testcontainers",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "snodra-messaging-rs"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "chrono",
+ "futures",
+ "jsonwebtoken",
+ "mongodb",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "prost",
+ "prost-build",
+ "rcgen",
+ "rdkafka",
+ "reqwest",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "snodra-messaging-kafka",
+ "snodra-messaging-mongo",
+ "testcontainers",
+ "testcontainers-modules",
+ "thiserror",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "wiremock",
+ "x509-parser",
+]
+
+[[package]]
+name = "snodra-messaging-sqlx"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "snodra-messaging-rs",
+ "sqlx",
+ "sqlx-core",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

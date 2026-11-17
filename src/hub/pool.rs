@@ -371,7 +371,7 @@ impl HubPool {
     }
 
     /// Turns the pool off before [`start`](Self::start): it never connects, and a send fails at
-    /// once with `HubUnavailable` naming `KRAKEN_HUB_ENABLED`.
+    /// once with `HubUnavailable` naming `SNODRA_SERVER_ENABLED`.
     pub fn turn_off(&self) {
         self.off.store(true, Ordering::SeqCst);
     }
@@ -379,7 +379,7 @@ impl HubPool {
     /// What a send fails with when no hub took it.
     fn unavailable(&self) -> MessagingError {
         MessagingError::HubUnavailable(if self.off.load(Ordering::SeqCst) {
-            "the hub is turned off (KRAKEN_HUB_ENABLED=false, Config::hub_enabled): nothing is \
+            "the hub is turned off (SNODRA_SERVER_ENABLED=false, Config::hub_enabled): nothing is \
              sent to other services"
                 .into()
         } else {
@@ -441,7 +441,7 @@ impl HubPool {
         }
     }
 
-    /// True once every hub of the pool confirmed the registration (kraken-messaging's
+    /// True once every hub of the pool confirmed the registration (snodra-messaging's
     /// `HubConnections.awaitRegistered`): there is at least one connection, and every connection still in use
     /// (not a closed duplicate, not draining) has a handshaken stream. With `dns:///`, the hubs of
     /// the latest resolution. False at once when the pool is turned off.
@@ -491,17 +491,17 @@ impl HubPool {
     }
 
     /// The credential refreshes (`ClientMessage.credentials`) written to any hub so far
-    /// (`kraken_hub_client_credentials_refreshes_sent_total`).
+    /// (`snodra_hub_client_credentials_refreshes_sent_total`).
     pub fn credentials_refreshes_sent(&self) -> u64 {
         self.refreshes_sent.load(Ordering::Relaxed)
     }
 
     /// Registers the hub client gauges and counters on `metrics` (ADR 0026), read from memory
-    /// when the meter collects, while the pool lives: `kraken.hub.client.connected.hubs` (the
-    /// live hubs), `kraken.hub.client.handlers.in.flight` ([`handlers_in_flight`]),
-    /// `kraken.hub.client.credentials.refreshes.sent`, and with OAuth2
-    /// `kraken.hub.client.token.fetches{result}`, with a client certificate
-    /// `kraken.hub.client.certificate.rotations`.
+    /// when the meter collects, while the pool lives: `snodra.hub.client.connected.hubs` (the
+    /// live hubs), `snodra.hub.client.handlers.in.flight` ([`handlers_in_flight`]),
+    /// `snodra.hub.client.credentials.refreshes.sent`, and with OAuth2
+    /// `snodra.hub.client.token.fetches{result}`, with a client certificate
+    /// `snodra.hub.client.certificate.rotations`.
     ///
     /// [`handlers_in_flight`]: Self::handlers_in_flight
     pub fn observe(pool: &Arc<HubPool>, metrics: &Metrics) {
@@ -827,7 +827,7 @@ impl HubPool {
             ..self.settings.clone()
         };
         // `dns:///name:port` resolves to `ip:port`, and tonic would check the certificate against
-        // the IP. Check it against the DNS name unless `server_name` says otherwise (kraken-messaging
+        // the IP. Check it against the DNS name unless `server_name` says otherwise (snodra-messaging
         // does the same).
         if let (HubTargets::Dns { host, .. }, Some(tls)) = (&self.targets, settings.tls.as_mut())
             && tls
@@ -905,7 +905,7 @@ impl HubPool {
     }
 
     /// Fewer hubs now than when some live stream offered its permits: that stream is topped up to
-    /// `ceil(max / N)` (shared with kraken-messaging). More hubs: nothing (permits are never
+    /// `ceil(max / N)` (shared with snodra-messaging). More hubs: nothing (permits are never
     /// revoked; the local concurrency guard stays the total).
     fn top_up(&self) {
         let share = permit_share(self.settings.max_concurrent_handlers, self.hubs(None));

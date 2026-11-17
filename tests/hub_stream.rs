@@ -13,14 +13,14 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use futures::stream::BoxStream;
-use kraken_messaging::hub::{
+use serde::{Deserialize, Serialize};
+use snodra_messaging::hub::{
     Dispatcher, HandlerRegistry, HubPool, HubSettings, Inbound, RegisteredTypes, Sender,
     SenderSettings, StreamOptions,
 };
-use kraken_messaging::identity::{Guard, IdentityResolver};
-use kraken_messaging::proto::{self, ErrorCode, ServerMessage, server_message};
-use kraken_messaging::{Command, MessagingError, Query, RetryPolicy, StreamingQuery, message_type};
-use serde::{Deserialize, Serialize};
+use snodra_messaging::identity::{Guard, IdentityResolver};
+use snodra_messaging::proto::{self, ErrorCode, ServerMessage, server_message};
+use snodra_messaging::{Command, MessagingError, Query, RetryPolicy, StreamingQuery, message_type};
 use support::fake_hub::FakeHub;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
@@ -225,7 +225,7 @@ fn settings(address: &str, max_handlers: usize) -> HubSettings {
 }
 
 /// An instance of `service` on the hubs of `address` serving `registry` with `max_handlers`
-/// permits, wired as `KrakenMessaging` wires it: requests to the dispatcher, `Flow` and `Cancel`
+/// permits, wired as `SnodraMessaging` wires it: requests to the dispatcher, `Flow` and `Cancel`
 /// to its running handlers, everything else to the sender.
 async fn node_with(
     address: &str,
@@ -424,7 +424,7 @@ fn end_code(end: &proto::ReplyEnd) -> Option<ErrorCode> {
         .map(|e| ErrorCode::try_from(e.code).unwrap())
 }
 
-// Handler side, driven by messages the fake hub pushes as kraken-hub would.
+// Handler side, driven by messages the fake hub pushes as snodra-server would.
 
 #[tokio::test]
 async fn a_streaming_handler_sends_parts_under_credit_then_the_end() {

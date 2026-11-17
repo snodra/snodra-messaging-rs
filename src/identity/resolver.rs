@@ -50,7 +50,7 @@ impl IdentityResolver {
             None => {
                 if !self.warned.swap(true, Ordering::Relaxed) {
                     tracing::warn!(
-                        "forwarded identities are trusted without verification: no KRAKEN_JWKS_URL configured"
+                        "forwarded identities are trusted without verification: no SNODRA_JWKS_URL configured"
                     );
                 }
                 Ok(Some(Identity::from_claims(

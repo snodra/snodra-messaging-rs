@@ -3,14 +3,14 @@ name = "orders-sql"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
-description = "kraken example: a small orders service on PostgreSQL with the SQL message store (kraken-messaging-sqlx)"
+description = "Snodra example: a small orders service on PostgreSQL with the SQL message store (snodra-messaging-sqlx)"
 license = "MIT"
 publish = false
 
 [dependencies]
-kraken-messaging-rs = { path = "../.." }
+snodra-messaging-rs = { path = "../.." }
 # The message store (ADR 0028): the service's own PostgreSQL database, through the SQL add-on.
-kraken-messaging-sqlx = { path = "../../crates/kraken-messaging-sqlx", default-features = false, features = ["postgres"] }
+snodra-messaging-sqlx = { path = "../../crates/snodra-messaging-sqlx", default-features = false, features = ["postgres"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres"] }
 tokio = { version = "1.54.1", features = ["full"] }
 serde = { version = "1.0.229", features = ["derive"] }

@@ -1,22 +1,22 @@
-//! In-process stand-in for kraken-hub: records registrations, answers every `Register` with a
+//! In-process stand-in for snodra-server: records registrations, answers every `Register` with a
 //! `RegisterAck` (before the echo of the heartbeat that follows it; `set_ack(None)` withholds it,
 //! a hub that never confirms the registration). Permits and InstanceStatus messages are recorded
 //! per stream. It echoes heartbeats, can drop streams, reject a registration, push requests to clients and answer
 //! their requests.
 //!
-//! Like kraken-hub, a `Register` for an instance id that another open stream holds replaces that
+//! Like snodra-server, a `Register` for an instance id that another open stream holds replaces that
 //! stream's session: the older stream is ended (its forwarded requests can no longer be answered)
 //! unless `set_replace_sessions(false)`. A stream that ends while it holds the session removes the
 //! instance. Registrations and stream ends are logged in order ([`FakeHub::events`]).
 //!
-//! Permit accounting like kraken-hub (it never holds requests back, it only counts): a first
+//! Permit accounting like snodra-server (it never holds requests back, it only counts): a first
 //! `Register` with `initial_permits = 0` ends the stream with `INVALID_ARGUMENT` "Register.
 //! initial_permits must be at least 1"; otherwise the stream holds that many permits
 //! ([`FakeHub::permits_held`]); each request pushed to it spends one, each `Permits` adds `count`,
 //! never past the stream's cap. The cap starts at `initial_permits` and a `Permits.grant` above it
 //! raises it first (never lowers it).
 //!
-//! Scatter-gather like kraken-hub (ADR 0017): a `Request` with `mode = SCATTER_GATHER` goes to
+//! Scatter-gather like snodra-server (ADR 0017): a `Request` with `mode = SCATTER_GATHER` goes to
 //! every stream whose `Register` lists the type in `query_types` or
 //! `shared_query_types` (ordered by service, then instance id) as a unary request `<id>#<n>`; each
 //! answer goes back to the sender as a `ReplyPart` in arrival order, then one `ReplyEnd` once every
@@ -27,7 +27,7 @@
 //! "invalid request: unknown request mode N". A gather that ends early (`max_results`, the
 //! deadline, the sender gone) sends `Cancel{<id>#<n>, reason}` to each still-outstanding target.
 //!
-//! Streaming like kraken-hub (ADR 0017, P4b): a `Request` with `mode = STREAMING`: a command
+//! Streaming like snodra-server (ADR 0017, P4b): a `Request` with `mode = STREAMING`: a command
 //! `INVALID_REQUEST`, no owner `NO_HANDLER`, a duplicate id `INVALID_REQUEST`; else one owner
 //! instance (round-robin over them, by service then instance id) gets
 //! `Request{<id>#1, mode = STREAMING, initial_credit (0 reads as 64), max_results 0}`. Its
@@ -42,7 +42,7 @@
 //! `HANDLER_DISCONNECTED`, the sender leaving cancels the handler (`"sender disconnected"`).
 //! Client-sent parts, ends, flows and cancels are recorded per stream.
 //!
-//! Subscriptions like kraken-hub (ADR 0017, P4c): a `Request` with `mode = SUBSCRIPTION`: a
+//! Subscriptions like snodra-server (ADR 0017, P4c): a `Request` with `mode = SUBSCRIPTION`: a
 //! command `INVALID_REQUEST`, no owner `NO_HANDLER`, a duplicate id `INVALID_REQUEST`, a target
 //! already serving `set_max_subscriptions_per_instance` (1024) subscriptions
 //! `RESOURCE_EXHAUSTED`. Else every instance listing the type (by service, then instance id) gets
@@ -64,7 +64,7 @@
 //! was the last (`HANDLER_DISCONNECTED`). `set_subscription_max_duration(Some(d))` ends one open
 //! longer with `CANCELLED "max subscription duration (<d>) exceeded"`. No idle timeout.
 
-//! Access control like kraken-hub (ADR 0018, P5a): `set_auth(mode, &[(token, Acl)])`. In `Enforce`
+//! Access control like snodra-server (ADR 0018, P5a): `set_auth(mode, &[(token, Acl)])`. In `Enforce`
 //! the first `Register` of a stream must carry a token the table knows (else the stream is closed
 //! with `UNAUTHENTICATED`), the service name must be the entry's (else `PERMISSION_DENIED`) and
 //! every command, query and shared query type must match its `handle` patterns (else
@@ -96,8 +96,8 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use kraken_messaging::proto::hub_server::{Hub, HubServer};
-use kraken_messaging::proto::{self, ClientMessage, ServerMessage, client_message, server_message};
+use snodra_messaging::proto::hub_server::{Hub, HubServer};
+use snodra_messaging::proto::{self, ClientMessage, ServerMessage, client_message, server_message};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio_stream::StreamExt;
@@ -116,7 +116,7 @@ type HalfClose = (
 /// A subscription target: (stream number, service, instance, outbound).
 type Target = (usize, String, String, Outbound);
 
-/// The ack a default kraken-hub sends.
+/// The ack a default snodra-server sends.
 pub fn default_ack() -> proto::RegisterAck {
     proto::RegisterAck {
         hub_id: "fake-hub".into(),
@@ -227,7 +227,7 @@ async fn deliver(msgs: Vec<(Outbound, ServerMessage)>) {
     }
 }
 
-/// `KRAKEN_HUB_AUTH_MODE` of the fake hub.
+/// `SNODRA_SERVER_AUTH_MODE` of the fake hub.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthMode {
     Off,
@@ -852,7 +852,7 @@ impl State {
             Some(reject(
                 ErrorCode::ResourceExhausted,
                 &format!(
-                    "handler instance {instance} already serves {max} subscription{} (KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE)",
+                    "handler instance {instance} already serves {max} subscription{} (SNODRA_SERVER_MAX_SUBSCRIPTIONS_PER_INSTANCE)",
                     if max == 1 { "" } else { "s" }
                 ),
             ))
@@ -2194,21 +2194,21 @@ impl FakeHub {
         }
     }
 
-    /// Updates held per subscription while its sender owes credit (default 256, as kraken-hub).
+    /// Updates held per subscription while its sender owes credit (default 256, as snodra-server).
     pub fn set_subscription_buffer(&self, updates: usize) {
         self.state
             .subscription_buffer
             .store(updates, Ordering::SeqCst);
     }
 
-    /// Subscription targets one handler instance serves at once (default 1024, as kraken-hub).
+    /// Subscription targets one handler instance serves at once (default 1024, as snodra-server).
     pub fn set_max_subscriptions_per_instance(&self, max: usize) {
         self.state
             .max_subscriptions_per_instance
             .store(max, Ordering::SeqCst);
     }
 
-    /// `KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION` (default `None`: unlimited) for subscriptions
+    /// `SNODRA_SERVER_MAX_SUBSCRIPTION_DURATION` (default `None`: unlimited) for subscriptions
     /// opened from now on.
     pub fn set_subscription_max_duration(&self, max: Option<Duration>) {
         *self.state.subscription_max_duration.lock().unwrap() = max;
@@ -2231,7 +2231,7 @@ impl FakeHub {
     }
 
     /// Update targets still serving, over every open subscription (the hub's
-    /// `kraken_hub_subscriptions_open` summed over the instances).
+    /// `snodra_hub_subscriptions_open` summed over the instances).
     pub fn subscription_targets_open(&self) -> usize {
         self.state
             .subscriptions
@@ -2248,7 +2248,7 @@ impl FakeHub {
     }
 
     /// Whether idle streams and unanswered initial subscription requests end with `TIMEOUT`
-    /// (default `true`, as kraken-hub); `false` is a hub that never ends them, so the client's
+    /// (default `true`, as snodra-server); `false` is a hub that never ends them, so the client's
     /// local guard is what fires.
     pub fn set_stream_timeouts(&self, on: bool) {
         self.state.stream_timeouts.store(on, Ordering::SeqCst);
@@ -2446,7 +2446,7 @@ impl FakeHub {
     }
 
     /// Whether a `Register` for an instance id held by another open stream ends that stream (the
-    /// default, as kraken-hub does) or both streams stay (`false`).
+    /// default, as snodra-server does) or both streams stay (`false`).
     pub fn set_replace_sessions(&self, on: bool) {
         self.state.replace_sessions.store(on, Ordering::SeqCst);
     }

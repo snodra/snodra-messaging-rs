@@ -1,6 +1,6 @@
 {
   "_id": "7f6c1f0e-5a53-4f3e-9a0a-1d2f6f0c9b11:3002",
-  "_class": "io.damoreira.kraken.messaging.saga.SagaDispatchDocument",
+  "_class": "com.damoreira.snodra.messaging.saga.SagaDispatchDocument",
   "sagaId": "7f6c1f0e-5a53-4f3e-9a0a-1d2f6f0c9b11",
   "seq": {"$numberLong": "3002"},
   "kind": "EVENT",

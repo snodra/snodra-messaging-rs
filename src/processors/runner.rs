@@ -40,7 +40,7 @@ use crate::time::{after, now_ms as now, rfc3339};
 pub const CONTROL_POLL: Duration = Duration::from_secs(5);
 /// How often the executing instance extends its own lease while `reset_execute` runs.
 pub const LEASE_KEEP: Duration = Duration::from_secs(10);
-/// For how long at most it does (the hub's default `KRAKEN_HUB_RESET_TIMEOUT`): an execute that
+/// For how long at most it does (the hub's default `SNODRA_SERVER_RESET_TIMEOUT`): an execute that
 /// hangs longer lets the lease pass, so the other instances consume again.
 pub const LEASE_KEEP_MAX: Duration = Duration::from_secs(120);
 /// For how long at least an operation that ended here (finished, aborted, its lease passed or its

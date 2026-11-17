@@ -20,10 +20,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kraken_messaging::SagaDefinition;
-use kraken_messaging::saga::FailureReason;
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
+use snodra_messaging::SagaDefinition;
+use snodra_messaging::saga::FailureReason;
 
 use crate::messages::{BannerFailed, BannerPrinted, PollBannerJob, PrintBanner, TextShouted};
 
@@ -173,8 +173,8 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use chrono::Utc;
-    use kraken_messaging::saga::FailureReason;
-    use kraken_messaging::saga::testing::SagaTestFixture;
+    use snodra_messaging::saga::FailureReason;
+    use snodra_messaging::saga::testing::SagaTestFixture;
 
     use super::{Banner, BannerOutcomes, POLL_EVERY, SAGA, TIMEOUT, banner_saga, job_id_of};
     use crate::messages::{BannerFailed, BannerPrinted, PollBannerJob, PrintBanner, TextShouted};

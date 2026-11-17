@@ -1,8 +1,8 @@
 //! Wire types shared with the Kotlin `examples-api` (same names, same fields, same `@MessageType`s).
 
 use chrono::{DateTime, Utc};
-use kraken_messaging::{Command, Event, Query, StreamingQuery, SubscriptionQuery, message_type};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::{Command, Event, Query, StreamingQuery, SubscriptionQuery, message_type};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Shout {
@@ -240,7 +240,7 @@ impl Event for ShoutAudit {}
 #[cfg(test)]
 mod tests {
     use super::{Counter, CounterChanged, IncrementCounter, OpenSubscriptions, WatchCounter};
-    use kraken_messaging::MessageType;
+    use snodra_messaging::MessageType;
 
     #[test]
     fn the_counter_types_use_the_wire_names_and_fields_of_the_kotlin_examples_api() {

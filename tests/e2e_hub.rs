@@ -1,14 +1,14 @@
-//! End to end against the real kraken-hub image, Kafka and MongoDB.
+//! End to end against the real snodra-server image, Kafka and MongoDB.
 mod support;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use kraken_messaging::hub::SendOptions;
-use kraken_messaging::identity::Guard;
-use kraken_messaging::{Command, Config, Event, KrakenMessaging, MessagingError, message_type};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::hub::SendOptions;
+use snodra_messaging::identity::Guard;
+use snodra_messaging::{Command, Config, Event, MessagingError, SnodraMessaging, message_type};
 use tokio::sync::mpsc;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -67,8 +67,8 @@ fn config(service: &str, hub: &str) -> Config {
 
 /// Service B: owns `t.Ping` (replies and publishes `t.Happened`, so it has a store) and the
 /// guarded `t.Secret`.
-async fn start_b(cfg: Config, mongo: &str, kafka: &str) -> KrakenMessaging {
-    let builder = KrakenMessaging::builder(cfg)
+async fn start_b(cfg: Config, mongo: &str, kafka: &str) -> SnodraMessaging {
+    let builder = SnodraMessaging::builder(cfg)
         .await
         .expect("service b builder")
         .store(support::mongo_store(mongo).await)
@@ -91,7 +91,7 @@ async fn start_b(cfg: Config, mongo: &str, kafka: &str) -> KrakenMessaging {
             }
         })
         .command::<Secret, _, _>(|_, _| async move { Ok(()) })
-        .requires::<Secret>(Guard::role("kraken-admin"))
+        .requires::<Secret>(Guard::role("snodra-admin"))
         .start()
         .await
         .expect("service b starts")
@@ -104,7 +104,7 @@ async fn two_participants_round_trip() {
     let kafka = support::containers::kafka().await;
     let mongo = support::containers::mongo().await;
     let (tx, mut rx) = mpsc::channel::<Happened>(8);
-    let a = KrakenMessaging::builder(config("svc-a", &hub.address))
+    let a = SnodraMessaging::builder(config("svc-a", &hub.address))
         .await
         .unwrap()
         .store(support::mongo_store(&mongo.uri_for("a")).await)
@@ -171,7 +171,7 @@ async fn no_handler_is_reported() {
     let mut cfg = config("svc-a", &hub.address);
     cfg.outbox_enabled = false;
     cfg.consumer_enabled = false;
-    let a = KrakenMessaging::builder(cfg)
+    let a = SnodraMessaging::builder(cfg)
         .await
         .unwrap()
         .start()
@@ -209,7 +209,7 @@ async fn permission_denied_with_signed_token() {
     let b = start_b(cfg_b, &mongo.uri_for("b"), &kafka.bootstrap).await;
     let mut cfg_a = config("svc-a", &hub.address);
     cfg_a.consumer_enabled = false;
-    let a = KrakenMessaging::builder(cfg_a)
+    let a = SnodraMessaging::builder(cfg_a)
         .await
         .unwrap()
         .start()
@@ -231,7 +231,7 @@ async fn permission_denied_with_signed_token() {
 
     let user = support::token(
         "u-1",
-        &["kraken-user"],
+        &["snodra-user"],
         support::ISSUER,
         support::now() + 300,
     );
@@ -253,7 +253,7 @@ async fn permission_denied_with_signed_token() {
 
     let admin = support::token(
         "u-1",
-        &["kraken-admin"],
+        &["snodra-admin"],
         support::ISSUER,
         support::now() + 300,
     );
@@ -272,7 +272,7 @@ async fn permission_denied_with_signed_token() {
         support::OTHER_KEY_PEM,
         Some("k1"),
         "u-1",
-        &["kraken-admin"],
+        &["snodra-admin"],
         support::ISSUER,
         support::now() + 300,
     );
@@ -301,7 +301,7 @@ async fn send_before_connected_is_hub_unavailable() {
     let mut cfg = config("svc-a", "static://127.0.0.1:1");
     cfg.outbox_enabled = false;
     cfg.consumer_enabled = false;
-    let a = KrakenMessaging::builder(cfg)
+    let a = SnodraMessaging::builder(cfg)
         .await
         .unwrap()
         .start()
@@ -325,7 +325,7 @@ async fn reconnects_after_hub_restart() {
     let mut cfg_a = config("svc-a", &hub.address);
     cfg_a.outbox_enabled = false;
     cfg_a.consumer_enabled = false;
-    let a = KrakenMessaging::builder(cfg_a)
+    let a = SnodraMessaging::builder(cfg_a)
         .await
         .unwrap()
         .start()
@@ -334,7 +334,7 @@ async fn reconnects_after_hub_restart() {
     let mut cfg_b = config("svc-b", &hub.address);
     cfg_b.outbox_enabled = false;
     cfg_b.consumer_enabled = false;
-    let b = KrakenMessaging::builder(cfg_b)
+    let b = SnodraMessaging::builder(cfg_b)
         .await
         .unwrap()
         .command::<Nobody, _, _>(|_, _| async move { Ok(()) })
@@ -386,7 +386,7 @@ async fn reconnects_after_hub_restart() {
 fn _assert_send_sync<T: Send + Sync>() {}
 #[allow(dead_code)]
 fn _app_is_shareable() {
-    _assert_send_sync::<Arc<KrakenMessaging>>();
+    _assert_send_sync::<Arc<SnodraMessaging>>();
 }
 
 #[tokio::test]
@@ -396,7 +396,7 @@ async fn shutdown_is_prompt() {
     let mut cfg = config("svc-a", &hub.address);
     cfg.outbox_enabled = false;
     cfg.consumer_enabled = false;
-    let a = KrakenMessaging::builder(cfg)
+    let a = SnodraMessaging::builder(cfg)
         .await
         .unwrap()
         .start()
@@ -432,7 +432,7 @@ async fn shutdown_fails_outgoing_requests_in_flight_with_hub_connection_lost() {
     cfg_b.outbox_enabled = false;
     cfg_b.consumer_enabled = false;
     let (s, r) = (Arc::clone(&started), Arc::clone(&release));
-    let b = KrakenMessaging::builder(cfg_b)
+    let b = SnodraMessaging::builder(cfg_b)
         .await
         .unwrap()
         .command::<Stall, _, _>(move |_, _| {
@@ -449,7 +449,7 @@ async fn shutdown_fails_outgoing_requests_in_flight_with_hub_connection_lost() {
     let mut cfg_a = config("svc-a", &hub.address);
     cfg_a.outbox_enabled = false;
     cfg_a.consumer_enabled = false;
-    let builder_a = KrakenMessaging::builder(cfg_a).await.unwrap();
+    let builder_a = SnodraMessaging::builder(cfg_a).await.unwrap();
     let sender = builder_a.sender();
     let a = builder_a.start().await.unwrap();
     assert!(
@@ -503,12 +503,12 @@ async fn drain_instance(
     hub: &str,
     name: &'static str,
     gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Semaphore>)>,
-) -> KrakenMessaging {
+) -> SnodraMessaging {
     let mut cfg = config("svc-d", hub);
     cfg.outbox_enabled = false;
     cfg.consumer_enabled = false;
     cfg.max_concurrent_handlers = 1;
-    KrakenMessaging::builder(cfg)
+    SnodraMessaging::builder(cfg)
         .await
         .unwrap()
         .command::<Who, _, _>(move |_, _| async move { Ok(name.to_string()) })
@@ -546,7 +546,7 @@ async fn graceful_shutdown_hands_queued_requests_to_another_instance_at_once() {
     let mut cfg = config("svc-caller", &hub.address);
     cfg.outbox_enabled = false;
     cfg.consumer_enabled = false;
-    let builder = KrakenMessaging::builder(cfg).await.unwrap();
+    let builder = SnodraMessaging::builder(cfg).await.unwrap();
     let sender = builder.sender();
     let caller = builder.start().await.unwrap();
     for app in [&a, &b, &caller] {

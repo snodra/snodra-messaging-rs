@@ -1,4 +1,4 @@
-//! The hub protocol against the real hub image (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`):
+//! The hub protocol against the real hub image (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`):
 //!
 //! - The `RegisterAck` carries the configured values, per-type timeout overrides apply to requests
 //!   sent with `timeout_ms` 0, a request lost with the stream is `HubConnectionLost`, one never
@@ -21,13 +21,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use kraken_messaging::hub::{
+use serde::{Deserialize, Serialize};
+use snodra_messaging::hub::{
     CLIENT_VERSION, HubConnection, HubPool, HubSettings, Inbound, PERMIT_FLUSH_AFTER,
     RegisteredTypes, SendOptions, Sender, SenderSettings,
 };
-use kraken_messaging::proto::{self, ClientMessage, client_message, reply};
-use kraken_messaging::{Command, MessagingError, Query, RetryPolicy, message_type};
-use serde::{Deserialize, Serialize};
+use snodra_messaging::proto::{self, ClientMessage, client_message, reply};
+use snodra_messaging::{Command, MessagingError, Query, RetryPolicy, message_type};
 use support::containers::{HubContainer, HubOptions, free_port, hub_with, wait_until_reachable};
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt};
@@ -148,8 +148,8 @@ async fn the_ack_carries_the_configured_values_and_type_overrides_apply() {
     require_docker!();
     let hub = hub_with(
         HubOptions::new()
-            .env("KRAKEN_HUB_ID", "proto-hub")
-            .env("KRAKEN_HUB_TIMEOUT_OVERRIDES", "proto.Slow=1500"),
+            .env("SNODRA_SERVER_ID", "proto-hub")
+            .env("SNODRA_SERVER_TIMEOUT_OVERRIDES", "proto.Slow=1500"),
     )
     .await;
     let b = peer(&hub.address, "proto-b", &["proto.Fast", "proto.Slow"]).await;
@@ -747,7 +747,8 @@ async fn a_single_permit_goes_back_at_once_so_a_burst_is_not_paced_by_the_timer(
 #[tokio::test]
 async fn a_full_queue_is_handler_busy_and_a_retried_command_gets_through() {
     require_docker!();
-    let hub = hub_with(HubOptions::new().env("KRAKEN_HUB_QUEUE_CAPACITY_PER_INSTANCE", "1")).await;
+    let hub =
+        hub_with(HubOptions::new().env("SNODRA_SERVER_QUEUE_CAPACITY_PER_INSTANCE", "1")).await;
     let b = flow_peer(&hub.address, "flow-b", true, 1, no_retry()).await;
     let a = flow_peer(&hub.address, "flow-a", false, 256, no_retry()).await;
     let gated = || {
@@ -822,7 +823,7 @@ async fn retry_never_repeats_a_handler_error_or_a_timed_out_command() {
     // The hub ends both hang types after 300 ms, well inside the 3 s budget the caller chooses, so
     // only the classification can stop a retry (a query is retried, a command is not).
     let hub = hub_with(HubOptions::new().env(
-        "KRAKEN_HUB_TIMEOUT_OVERRIDES",
+        "SNODRA_SERVER_TIMEOUT_OVERRIDES",
         "flow.Hang=300,flow.HangQuery=300",
     ))
     .await;
@@ -937,13 +938,13 @@ async fn queued_requests_are_served_by_priority() {
 
 // ---- Status reports ----
 
-/// One target through a `HubPool` (what `KrakenMessaging` uses) behaves as the single-hub client:
+/// One target through a `HubPool` (what `SnodraMessaging` uses) behaves as the single-hub client:
 /// round trips work, the hub is known by its id, and `InstanceStatus` reports reach the hub, which
 /// shows them in its topology.
 #[tokio::test]
 async fn a_single_target_pool_reports_its_status_to_the_hub() {
     require_docker!();
-    let hub = hub_with(HubOptions::new().env("KRAKEN_HUB_ID", "status-hub")).await;
+    let hub = hub_with(HubOptions::new().env("SNODRA_SERVER_ID", "status-hub")).await;
     let tap = PermitTap::start(&hub.address).await;
     let b = peer(&hub.address, "proto-b", &["proto.Fast"]).await;
     let (tx, mut rx) = mpsc::channel::<Inbound>(64);

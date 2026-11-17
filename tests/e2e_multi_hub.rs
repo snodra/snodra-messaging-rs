@@ -1,4 +1,4 @@
-//! End to end with two real hubs (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`, ADR 0016): every
+//! End to end with two real hubs (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`, ADR 0016): every
 //! instance registers on both, reports its connected hubs to both, spreads unkeyed requests over
 //! both, survives one hub stopping mid-traffic and is back on it within the backoff cap once it
 //! restarts, and moves a stopped hub's permits to the other one (`Permits.grant`) without revoking
@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use kraken_messaging::hub::SendOptions;
-use kraken_messaging::{Command, Config, KrakenMessaging, MessagingError, message_type};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::hub::SendOptions;
+use snodra_messaging::{Command, Config, MessagingError, SnodraMessaging, message_type};
 use support::containers::{HubContainer, HubOptions, free_port, hub_with, wait_until_reachable};
 
 macro_rules! require_docker {
@@ -43,8 +43,13 @@ const REJOIN_WITHIN: Duration = Duration::from_secs(12);
 
 /// Two hubs with fixed ids, on fixed host ports (a restart keeps the address).
 async fn two_hubs() -> (HubContainer, HubContainer) {
-    let start =
-        |id: &'static str| hub_with(HubOptions::new().port(free_port()).env("KRAKEN_HUB_ID", id));
+    let start = |id: &'static str| {
+        hub_with(
+            HubOptions::new()
+                .port(free_port())
+                .env("SNODRA_SERVER_ID", id),
+        )
+    };
     tokio::join!(start(IDS[0]), start(IDS[1]))
 }
 
@@ -58,8 +63,8 @@ fn config(service: &str, hubs: &str) -> Config {
 }
 
 /// The handler side: `e2e.Work` takes 20 ms.
-async fn worker(cfg: Config) -> KrakenMessaging {
-    KrakenMessaging::builder(cfg)
+async fn worker(cfg: Config) -> SnodraMessaging {
+    SnodraMessaging::builder(cfg)
         .await
         .unwrap()
         .command::<Work, _, _>(|_, _| async move {
@@ -71,8 +76,8 @@ async fn worker(cfg: Config) -> KrakenMessaging {
         .unwrap()
 }
 
-async fn caller(cfg: Config) -> KrakenMessaging {
-    KrakenMessaging::builder(cfg)
+async fn caller(cfg: Config) -> SnodraMessaging {
+    SnodraMessaging::builder(cfg)
         .await
         .unwrap()
         .start()
@@ -81,7 +86,7 @@ async fn caller(cfg: Config) -> KrakenMessaging {
 }
 
 /// Waits (bounded by `limit`) until the app is registered on exactly `ids`; returns how long it took.
-async fn registered_on(app: &KrakenMessaging, ids: &[&str], limit: Duration) -> Duration {
+async fn registered_on(app: &SnodraMessaging, ids: &[&str], limit: Duration) -> Duration {
     let started = Instant::now();
     loop {
         let mut now = app.hub_ids();
@@ -384,7 +389,7 @@ async fn one_hub_reached_through_two_targets_keeps_the_instance_registered() {
     let h = hub_with(
         HubOptions::new()
             .port(free_port())
-            .env("KRAKEN_HUB_ID", "e2e-solo"),
+            .env("SNODRA_SERVER_ID", "e2e-solo"),
     )
     .await;
     let port = h.address.rsplit_once(':').unwrap().1;

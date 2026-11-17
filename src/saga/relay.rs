@@ -70,7 +70,7 @@ use crate::types::MessageType;
 const STOP_JOIN: Duration = Duration::from_secs(15);
 const MIN_RENEW_PERIOD: Duration = Duration::from_millis(10);
 
-/// Settings of the [`SagaDispatchRelay`] (`KRAKEN_SAGAS_RELAY_*`): how often it polls, how long a
+/// Settings of the [`SagaDispatchRelay`] (`SNODRA_SAGAS_RELAY_*`): how often it polls, how long a
 /// saga's dispatch lease holds, and the transient retry of a command (up to `max_attempts`
 /// attempts in all, then `EXHAUSTED`, with `initial_backoff` growing by `multiplier` up to
 /// `max_backoff`). `parallelism` sagas are dispatched at a time, at most `batch_size` of them per
@@ -406,7 +406,7 @@ impl SagaDispatchRelay {
 
     /// Gives up an EVENT entry whose payload cannot become an outbox entry: `failed_at`, the
     /// reason `INVALID` and the message, logged at error and counted on
-    /// `kraken.saga.command.failures{reason=INVALID}`. No failure notice: `SagaCommandFailed`
+    /// `snodra.saga.command.failures{reason=INVALID}`. No failure notice: `SagaCommandFailed`
     /// is about commands. The saga's later entries continue, as after a failed command (ruling 9).
     async fn fail_event(
         &self,

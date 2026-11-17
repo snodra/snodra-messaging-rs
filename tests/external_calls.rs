@@ -9,25 +9,25 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kraken_messaging::events::dispatch::{LocalEventDispatcher, NoSagas};
-use kraken_messaging::events::{EventBus, SagaStage};
-use kraken_messaging::external::{
+use serde::{Deserialize, Serialize};
+use snodra_messaging::events::dispatch::{LocalEventDispatcher, NoSagas};
+use snodra_messaging::events::{EventBus, SagaStage};
+use snodra_messaging::external::{
     ExternalCallSettings, ExternalCalls, ExternalCallsHandle, IdempotencyKey,
 };
-use kraken_messaging::hub::{Dispatcher, HandlerRegistry};
-use kraken_messaging::identity::IdentityResolver;
-use kraken_messaging::proto::{ErrorCode, Reply, Request, RequestKind, reply};
-use kraken_messaging::saga::store::{DispatchKind, SagaDispatchDocument};
-use kraken_messaging::saga::{
+use snodra_messaging::hub::{Dispatcher, HandlerRegistry};
+use snodra_messaging::identity::IdentityResolver;
+use snodra_messaging::proto::{ErrorCode, Reply, Request, RequestKind, reply};
+use snodra_messaging::saga::store::{DispatchKind, SagaDispatchDocument};
+use snodra_messaging::saga::{
     ExternalOutcome, FailureReason, LocalRawCommandSender, NoopSagaMetrics, RETRYABLE_MARKER,
     RawCommandSender, RawOutcome, RelaySettings, SagaCommandFailed, SagaDefinition,
     SagaDispatchRelay, SagaMetrics, SagaRetry, SagaRuntime, SagaType, UNKNOWN_OUTCOME_MARKER,
     classify_failure,
 };
-use kraken_messaging::store::{ExternalCall, ExternalCallStatus, MessageStore};
-use kraken_messaging::time::epoch_ms;
-use kraken_messaging::{Command, Event, MessagingError, RetryPolicy, SendOptions, message_type};
-use serde::{Deserialize, Serialize};
+use snodra_messaging::store::{ExternalCall, ExternalCallStatus, MessageStore};
+use snodra_messaging::time::epoch_ms;
+use snodra_messaging::{Command, Event, MessagingError, RetryPolicy, SendOptions, message_type};
 use support::saga::{Store, event_ctx, state, t0};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -833,7 +833,7 @@ impl Harness {
             .dispatch()
             .await
             .into_iter()
-            .find(|e| e.kind == kraken_messaging::saga::store::DispatchKind::Command)
+            .find(|e| e.kind == snodra_messaging::saga::store::DispatchKind::Command)
             .unwrap()
     }
 }

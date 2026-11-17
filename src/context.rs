@@ -64,7 +64,7 @@ impl MessageContext {
 
 /// `value` when it is a valid W3C `traceparent` of version `00`: `00-<32 hex>-<16 hex>-<2 hex>`,
 /// lower case, neither the trace id nor the parent id all zeros. The trace floor forwards no
-/// other value (kraken-messaging's `Traceparents.valid`).
+/// other value (snodra-messaging's `Traceparents.valid`).
 pub fn valid_traceparent(value: &str) -> Option<&str> {
     let hex = |part: &str, len: usize| {
         part.len() == len && part.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))

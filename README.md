@@ -1,38 +1,46 @@
 <p align="center">
-  <img alt="kraken messaging mascot" src="https://gitlab.damoreira.ml/kraken-org/kraken/-/raw/main/docs/assets/brand/svg/kraken-messaging.svg" width="160">
+  <img alt="Snodra mascot" src="docs/assets/brand/svg/snodra.svg" width="160">
 </p>
 
-<h1 align="center">kraken-messaging-rs</h1>
+<h1 align="center">Snodra Messaging (Rust)</h1>
 
 <p align="center">
-  The Rust counterpart of kraken-messaging: hub client, events through the outbox to an event store, idempotent event processors, sagas, JWT identity, one builder.
+  Messaging for Rust services: commands and queries through Snodra Server, events through an event store with the
+  message store's outbox, idempotent event processors, sagas, JWT identity, one builder.
 </p>
 
 <p align="center">
-  <a href="https://gitlab.damoreira.ml/kraken-org/kraken-messaging-rs/-/pipelines"><img alt="pipeline" src="https://gitlab.damoreira.ml/kraken-org/kraken-messaging-rs/badges/main/pipeline.svg"></a>
-  <a href="https://gitlab.damoreira.ml/kraken-org/kraken-messaging-rs/-/releases"><img alt="release" src="https://gitlab.damoreira.ml/kraken-org/kraken-messaging-rs/-/badges/release.svg"></a>
+  <a href="https://gitlab.damoreira.ml/snodra/snodra-messaging-rs/-/pipelines"><img alt="pipeline" src="https://gitlab.damoreira.ml/snodra/snodra-messaging-rs/badges/main/pipeline.svg"></a>
+  <a href="https://gitlab.damoreira.ml/snodra/snodra-messaging-rs/-/releases"><img alt="release" src="https://gitlab.damoreira.ml/snodra/snodra-messaging-rs/-/badges/release.svg"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-1.99.1-000000?logo=rust&logoColor=white">
   <img alt="crate" src="https://img.shields.io/badge/crate-git%20dependency-dea584?logo=rust&logoColor=white">
-  <a href="https://gitlab.damoreira.ml/kraken-org/kraken/-/tree/main/docs"><img alt="kraken docs" src="https://img.shields.io/badge/kraken-umbrella%20docs-0B5FFF"></a>
+  <img alt="tonic" src="https://img.shields.io/badge/tonic-gRPC-244c5a">
+  <a href="https://snodra.damoreira.com/"><img alt="Snodra docs" src="https://img.shields.io/badge/docs-snodra.damoreira.com-0B5FFF"></a>
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-green"></a>
 </p>
 
 ---
 
-The Rust counterpart of the Kotlin `kraken-messaging` starter. A service built on it is
-indistinguishable from a Kotlin one in front of the hub and on the event store: same protocol
+The Rust counterpart of the Kotlin `snodra-messaging` starter. A service built on it is
+indistinguishable from a Kotlin one in front of the server and on the event store: same protocol
 (`proto/hub.proto`), same event records (source `kraken.events` by default), same JSON shapes, same error codes. Its state (the outbox,
 the processed events, the dead letters, the processor control, the external calls and the sagas) lives in the service's
 own database through a message store add-on (ADR 0028): `.store(...)` on the builder; its events go to an event store add-on
 (ADR 0027): `.event_store(...)`.
 
+**Formerly kraken.** Snodra Messaging (Rust) is the renamed `kraken-messaging-rs`: the same design, the same event topic
+(`kraken.events`) and the same stored records, with new crate names, imports, settings and metrics. See
+[Moving from v0.5.1](#moving-from-v051) for the old → new mapping.
+
+Design, wire protocol, testing and repository conventions: the [Snodra docs](https://snodra.damoreira.com/).
+
 | Crate | What it is |
 |---|---|
-| `kraken-messaging-rs` (this directory, lib `kraken_messaging`) | the core: hub client, handlers, outbox relay, event processors, sagas, the store interfaces, the in-memory stores and the conformance kits |
-| `crates/kraken-messaging-mongo` | the MongoDB message store: the same collections and documents as the Kotlin library's (see [The MongoDB message store](#the-mongodb-message-store)) |
-| `crates/kraken-messaging-sqlx` | the SQL message store on PostgreSQL 13+ or MySQL 8.0.17+ (features `postgres`, `mysql`): the same tables as the Kotlin `kraken-messaging-jdbc` (see [The SQL message store](#the-sql-message-store)) |
-| `crates/kraken-messaging-kafka` | the Kafka event store, and partner topics as external sources (see [The Kafka event store](#the-kafka-event-store)) |
-| `crates/kraken-messaging-rabbitmq` | the RabbitMQ Streams event store (see [The RabbitMQ Streams event store](#the-rabbitmq-streams-event-store)) |
+| `snodra-messaging-rs` (this directory, lib `snodra_messaging`) | the core: hub client, handlers, outbox relay, event processors, sagas, the store interfaces, the in-memory stores and the conformance kits |
+| `crates/snodra-messaging-mongo` | the MongoDB message store: the same collections and documents as the Kotlin library's (see [The MongoDB message store](#the-mongodb-message-store)) |
+| `crates/snodra-messaging-sqlx` | the SQL message store on PostgreSQL 13+ or MySQL 8.0.17+ (features `postgres`, `mysql`): the same tables as the Kotlin `snodra-messaging-jdbc` (see [The SQL message store](#the-sql-message-store)) |
+| `crates/snodra-messaging-kafka` | the Kafka event store, and partner topics as external sources (see [The Kafka event store](#the-kafka-event-store)) |
+| `crates/snodra-messaging-rabbitmq` | the RabbitMQ Streams event store (see [The RabbitMQ Streams event store](#the-rabbitmq-streams-event-store)) |
 
 | Capability | Where |
 |---|---|
@@ -49,12 +57,12 @@ own database through a message store add-on (ADR 0028): `.store(...)` on the bui
 | Named event processors (own subscription, markers, status), dead letters with an admin API | `event_in`, `app.dead_letters()`, `app.processors()` (see [Event processors](#event-processors), [Dead letters](#dead-letters)) |
 | Processor control from the hub: pause, resume, reset (replay) with reset handlers, dead letters | `event_with` + `EventOptions::disallow_replay`, `reset_handler`, `app.processor_control()` (see [Processor control](#processor-control)) |
 | Identity from the forwarded JWT: JWKS verification or unverified parsing; handler guards | `identity::{IdentityResolver, JwksVerifier, Guard}` |
-| Sagas and deadlines on the Kotlin starter's records, the relay, parked events | `KrakenMessagingBuilder::saga`, `saga::SagaContext`, `app.saga_failures()` (see [Sagas](#sagas)) |
+| Sagas and deadlines on the Kotlin starter's records, the relay, parked events | `SnodraMessagingBuilder::saga`, `saga::SagaContext`, `app.saga_failures()` (see [Sagas](#sagas)) |
 | Idempotent adapters, partner sources (read by an event-store add-on), webhooks; saga statistics | `idempotent_command`, `external_source`, `app.ingress()`, `external::webhook::verify`, `app.saga_stats()` |
 | A saga test fixture (feature `testing`) | `saga::testing::SagaTestFixture` |
 | In-memory event store and message store: tests, local runs and demos with no infrastructure | `event_store::memory::MemoryEventStore`, `store::memory::MemoryStore`, `testing::InMemoryStores` (feature `testing`; see [In-memory stores](#in-memory-stores)) |
-| Metrics through the OpenTelemetry API (outbox, consumed events, processors, hub client, sagas); the application installs the provider | `metrics`, `KrakenMessaging::builder_with_meter`, `saga::OtelSagaMetrics` (see [Metrics](#metrics)) |
-| One builder wiring all of it from `KRAKEN_*` variables | `KrakenMessaging`, `Config` |
+| Metrics through the OpenTelemetry API (outbox, consumed events, processors, hub client, sagas); the application installs the provider | `metrics`, `SnodraMessaging::builder_with_meter`, `saga::OtelSagaMetrics` (see [Metrics](#metrics)) |
+| One builder wiring all of it from `SNODRA_*` variables | `SnodraMessaging`, `Config` |
 
 ## Table of contents
 
@@ -74,6 +82,7 @@ own database through a message store add-on (ADR 0028): `.store(...)` on the bui
 - [The SQL message store](#the-sql-message-store)
 - [The Kafka event store](#the-kafka-event-store)
 - [The RabbitMQ Streams event store](#the-rabbitmq-streams-event-store)
+- [Moving from v0.5.1](#moving-from-v051)
 - [Moving from v0.4.0](#moving-from-v040)
 - [Security](#security)
 - [Metrics](#metrics)
@@ -86,8 +95,8 @@ own database through a message store add-on (ADR 0028): `.store(...)` on the bui
 ## Usage
 
 ```rust
-use kraken_messaging::{Command, Config, Event, KrakenMessaging, MessagingError, Query, SendOptions, message_type};
-use kraken_messaging::identity::Guard;
+use snodra_messaging::{Command, Config, Event, SnodraMessaging, MessagingError, Query, SendOptions, message_type};
+use snodra_messaging::identity::Guard;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Shout { text: String }
@@ -104,9 +113,9 @@ impl Event for TextShouted {}
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The two add-ons (any message store and any event store will do; see their sections).
-    let store = kraken_messaging_mongo::MongoStore::new(client, db);  // the service's own database
-    let event_store = kraken_messaging_kafka::KafkaEventStore::new(kraken_messaging_kafka::KafkaConfig::from_env())?;
-    let builder = KrakenMessaging::builder(Config::from_env()?).await?
+    let store = snodra_messaging_mongo::MongoStore::new(client, db);  // the service's own database
+    let event_store = snodra_messaging_kafka::KafkaEventStore::new(snodra_messaging_kafka::KafkaConfig::from_env())?;
+    let builder = SnodraMessaging::builder(Config::from_env()?).await?
         .store(std::sync::Arc::new(store))                           // outbox, markers, sagas, dead letters
         .event_store(std::sync::Arc::new(event_store));              // where events go and come from
     let events = builder.events();                                   // capture what handlers need
@@ -120,7 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(Shouted { text })
             }
         })
-        .requires::<Shout>(Guard::role("kraken-user"))              // optional, like @RequiresAuthentication
+        .requires::<Shout>(Guard::role("snodra-user"))              // optional, like @RequiresAuthentication
         .start()                                                      // registers in the background
         .await?;
     app.await_hub(std::time::Duration::from_secs(30)).await;
@@ -156,41 +165,41 @@ it (kept in the dispatch entry's headers); one sent by a deadline handler carrie
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `KRAKEN_SERVICE_NAME` | required | hub `service_name`, base of every processor's subscription name (`<service>.<processor>`, `default` included), event `source` header |
-| `KRAKEN_INSTANCE_ID` | a fresh UUID per `Config` | `Config.instance_id`: the hub `Register.instance_id`, and the `service.instance.id` the application gives its meter provider (see [Metrics](#metrics)); unique among the service's instances (a pod name, for example) |
-| `KRAKEN_HUB_ADDRESS` | `static://kraken-hub:7000` | the hub's gRPC target (`static://` optional), a comma-separated list of them, or one `dns:///name:port` re-resolved every 30 s (see [Multiple hubs](#multiple-hubs)); one target is the single-hub setup |
-| `KRAKEN_HUB_ENABLED` | true | `Config.hub_enabled`: `false` never connects to a hub (the address must still parse): events, processors, dead letters, sagas and idempotent handlers work, and every command, query and subscription sent fails at once with `HubUnavailable`, those to the service's own handlers included (a sender always goes through the hub); the saga relay still delivers a command type the instance handles to its own handler, and any other saga command goes into the relay's retries. For tests and local runs (see [In-memory stores](#in-memory-stores)) |
-| `KRAKEN_HUB_STATUS_INTERVAL_MS` | 5000 | how often `InstanceStatus` goes to every hub (at least 1) |
-| `KRAKEN_EVENTS_SOURCE` | `kraken.events` | the event store's source the service publishes to and its processors read (what a source is on each event store: its add-on's section) |
-| `KRAKEN_JWKS_URL`, `KRAKEN_ISSUER` | unset | set both to verify forwarded tokens (RS256, `exp`, `iss`); unset = read signed tokens unverified, warned once |
-| `KRAKEN_HUB_REQUEST_TIMEOUT_MS` | unset | default request timeout, sent as `timeout_ms` (`SendOptions.timeout` wins per call). Unset: the hub gets `timeout_ms = 0` and applies its per-type override or its default (5 s). `0` counts as unset (here and for `SendOptions.timeout`) |
-| `KRAKEN_RECONNECT_BACKOFF_MIN_MS` / `_MAX_MS` | 500 / 5000 | exponential, each wait ±20 % jitter and never above the max (at the max: 80-100 % of it); back to the min once a connect reached the handshake; the min and the max must each be at least 1 ms and the max not below the min (a startup error otherwise) |
-| `KRAKEN_MAX_CONCURRENT_HANDLERS` | 256 | handlers run at once, at least 1 (`0` is rejected at startup, also when set in code: `Config::validate`); also the permits offered to the hubs (`Register.initial_permits`), which queue further requests for this instance |
-| `KRAKEN_HUB_LOAD_FACTOR` | 100 | `Register.load_factor`: relative capacity; weights this instance's share of keyed commands and its load score. A non-negative integer (a negative value is rejected at startup); `0` is sent as is and read as 100 by the hub |
-| `KRAKEN_HUB_TAGS` | none | `Register.tags`, `k=v,k=v`: unkeyed requests prefer instances whose tags match more of the sender's tags |
-| `KRAKEN_HUB_PRIORITIES` | none | default `Request.priority` per outgoing type, `type=n,type=n` (higher first while the target's queue at the hub is not empty); `SendOptions.priority` wins |
-| `KRAKEN_HUB_RETRY_ENABLED` | false | caller-side retry of transient failures (see Retry): `true` sets `Config.hub_retry` to the policy the variables below describe, `false` leaves it `None` (no retry unless a call sets `SendOptions.retry`, which wins per call) |
-| `KRAKEN_HUB_RETRY_MAX_ATTEMPTS` | 3 | attempts in total, the first included; at least 1 (`0` is rejected at startup, also while retry is disabled) |
-| `KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS`, `_MULTIPLIER`, `_MAX_BACKOFF_MS` | 100, 2, 2000 | wait before the second attempt, growth factor (a finite number >= 1, else rejected at startup), cap of one wait; each wait is jittered by ±20 % and never above the cap (at the cap: 80-100 % of it), like the reconnect backoff |
-| `KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS` | 600000 | how long a streaming query handler waits for credit before it ends its stream with `TIMEOUT` "no credit within <d>" and releases its permits (see [Streaming queries](#streaming-queries)); the default is the hub's default `KRAKEN_HUB_MAX_STREAM_DURATION` (10 min); at least 1 (`0` is rejected at startup, also when set in code) |
-| `KRAKEN_HUB_MAX_SUBSCRIPTIONS` | 1024 | the most subscription queries this instance serves at once (see [Subscription queries](#subscription-queries)): a subscription request beyond it is refused with `ReplyEnd{error = RESOURCE_EXHAUSTED}` `subscription limit (N) reached`, which the subscriber sees as `HandlerBusy`; subscriptions hold no handler permit, so this is their only bound here; the hub has its own per-instance limit (`KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE`, 1024); at least 1 (`0` is rejected at startup, also when set in code) |
-| `KRAKEN_HUB_TOKEN` | none | the static access token sent in `Register.credentials.token` on every hub stream (`Config.hub_token`, a `SecretString` whose `Debug` prints `"***"`); needed when the hub runs `KRAKEN_HUB_AUTH_MODE=enforce`, ignored by a hub in `off` mode; an empty value is no token; never logged (see [Security](#security)) |
-| `KRAKEN_HUB_TOKEN_FILE` | none | a file holding the token, for container secrets (`Config.hub_token_file`); read at startup (an unreadable file, or one empty after trimming its surrounding whitespace, is a startup error naming the setting and the path) and again before every reconnect, so a rotated secret needs no restart; **wins over `KRAKEN_HUB_TOKEN` when both are set**; a file found empty at a reconnect keeps the last token read |
-| `KRAKEN_HUB_OAUTH2_TOKEN_URI` | none | turns JWT authentication on (`Config.hub_oauth2`): the Keycloak token endpoint, e.g. `https://keycloak/realms/kraken/protocol/openid-connect/token`; needs a client secret and excludes `KRAKEN_HUB_TOKEN` / `KRAKEN_HUB_TOKEN_FILE` (both set is a startup error); see [Authenticating with a JWT](#authenticating-with-a-jwt-keycloak-client-credentials) |
-| `KRAKEN_HUB_OAUTH2_CLIENT_ID` | `KRAKEN_SERVICE_NAME` | the Keycloak client id; it must be the service name (the hub checks the token's `azp` against it) |
-| `KRAKEN_HUB_OAUTH2_CLIENT_SECRET`, `KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE` | none | the client secret (`SecretString`, never logged), or a file holding it, **which wins** and is re-read on every token fetch so a rotated secret applies without a restart; one of them is required with the token URI |
-| `KRAKEN_HUB_OAUTH2_SCOPE`, `KRAKEN_HUB_OAUTH2_CA` | none | the `scope` sent with the grant (space-separated as sent); a PEM file with extra root certificates for an `https://` token endpoint, added to the platform roots (not the hub CA of `KRAKEN_HUB_TLS_CA`) |
-| `KRAKEN_HUB_TLS` | `false` | `true` makes every hub channel TLS (`Config.hub_tls = Some(HubTls { .. })`), for a static list and for `dns:///`; needed when the hub sets `KRAKEN_HUB_TLS_CERT`. An `https://` address turns TLS on by itself (system roots) |
-| `KRAKEN_HUB_TLS_CA` | none (system roots) | PEM file with the CA that signs the hub's certificate (`HubTls.ca_file`), re-read on every connect; needs `KRAKEN_HUB_TLS=true` |
-| `KRAKEN_HUB_TLS_SERVER_NAME` | the host of the address (for `dns:///name:port`, `name`) | the name the hub's certificate must carry, also sent as SNI (`HubTls.server_name`); needs `KRAKEN_HUB_TLS=true` |
-| `KRAKEN_HUB_TLS_CLIENT_CERT`, `KRAKEN_HUB_TLS_CLIENT_KEY` | none | the client certificate chain (leaf first) and its PKCS#8 PEM private key for mutual TLS (`HubTls.client_cert_file`, `HubTls.client_key_file`); both or neither; **they turn TLS on** like `KRAKEN_HUB_TLS=true` (`KRAKEN_HUB_TLS=false` next to them is an error); exclude `KRAKEN_HUB_TOKEN*` and `KRAKEN_HUB_OAUTH2_*` (one credential kind per service; a startup error naming both); the files are checked at startup. See [Authenticating with a client certificate](#authenticating-with-a-client-certificate-mtls) |
-| `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS` | true, 5 | one consumer per [event processor](#event-processors) with handlers (`default` also for sagas alone); the attempts and the 1 s backoff are shared by every processor |
-| `KRAKEN_EVENTS_DEAD_LETTER_MODE` | `collection` | where a record a processor cannot handle goes (see [Dead letters](#dead-letters)): `collection` (the message store's dead letters, sequenced per key, admin API), `event-store` (the event store's `<source>.dlt`; needs the capability `native-dead-letter`) or `log` (logged and skipped); case-insensitive, anything else is a startup error (v0.4.0's `topic` names its replacement `event-store`) |
-| `KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS` | 2592000000 (30 d) | how long a letter is kept (`expire_at` = `parked_at` + this; the message store removes it then, which unblocks its key); at least 1000 (a startup error otherwise, also when set in code) |
-| `KRAKEN_OUTBOX_ENABLED`, `KRAKEN_OUTBOX_POLL_INTERVAL_MS`, `KRAKEN_OUTBOX_BATCH_SIZE`, `KRAKEN_OUTBOX_MAX_ATTEMPTS` | true, 200, 100, 10 | |
-| `KRAKEN_OUTBOX_LEASE_MS` | 120000 | how long a batch the relay claims stays its own; longer than a send (40 s), else a startup error. A batch stops before its lease could run out under a send; the next claim renews what the relay still holds |
-| `KRAKEN_STORE_INIT_SCHEMA` | true | `start()` prepares the message store's schema (its add-on's own: indexes, tables), with the retentions of this table; `false` when it is managed elsewhere |
-| `KRAKEN_FORWARD_JWT` | true | |
+| `SNODRA_SERVICE_NAME` | required | hub `service_name`, base of every processor's subscription name (`<service>.<processor>`, `default` included), event `source` header |
+| `SNODRA_INSTANCE_ID` | a fresh UUID per `Config` | `Config.instance_id`: the hub `Register.instance_id`, and the `service.instance.id` the application gives its meter provider (see [Metrics](#metrics)); unique among the service's instances (a pod name, for example) |
+| `SNODRA_SERVER_ADDRESS` | `static://snodra-server:7000` | the hub's gRPC target (`static://` optional), a comma-separated list of them, or one `dns:///name:port` re-resolved every 30 s (see [Multiple hubs](#multiple-hubs)); one target is the single-hub setup |
+| `SNODRA_SERVER_ENABLED` | true | `Config.hub_enabled`: `false` never connects to a hub (the address must still parse): events, processors, dead letters, sagas and idempotent handlers work, and every command, query and subscription sent fails at once with `HubUnavailable`, those to the service's own handlers included (a sender always goes through the hub); the saga relay still delivers a command type the instance handles to its own handler, and any other saga command goes into the relay's retries. For tests and local runs (see [In-memory stores](#in-memory-stores)) |
+| `SNODRA_SERVER_STATUS_INTERVAL_MS` | 5000 | how often `InstanceStatus` goes to every hub (at least 1) |
+| `SNODRA_EVENTS_SOURCE` | `kraken.events` | the event store's source the service publishes to and its processors read (what a source is on each event store: its add-on's section) |
+| `SNODRA_JWKS_URL`, `SNODRA_ISSUER` | unset | set both to verify forwarded tokens (RS256, `exp`, `iss`); unset = read signed tokens unverified, warned once |
+| `SNODRA_SERVER_REQUEST_TIMEOUT_MS` | unset | default request timeout, sent as `timeout_ms` (`SendOptions.timeout` wins per call). Unset: the hub gets `timeout_ms = 0` and applies its per-type override or its default (5 s). `0` counts as unset (here and for `SendOptions.timeout`) |
+| `SNODRA_RECONNECT_BACKOFF_MIN_MS` / `_MAX_MS` | 500 / 5000 | exponential, each wait ±20 % jitter and never above the max (at the max: 80-100 % of it); back to the min once a connect reached the handshake; the min and the max must each be at least 1 ms and the max not below the min (a startup error otherwise) |
+| `SNODRA_MAX_CONCURRENT_HANDLERS` | 256 | handlers run at once, at least 1 (`0` is rejected at startup, also when set in code: `Config::validate`); also the permits offered to the hubs (`Register.initial_permits`), which queue further requests for this instance |
+| `SNODRA_SERVER_LOAD_FACTOR` | 100 | `Register.load_factor`: relative capacity; weights this instance's share of keyed commands and its load score. A non-negative integer (a negative value is rejected at startup); `0` is sent as is and read as 100 by the hub |
+| `SNODRA_SERVER_TAGS` | none | `Register.tags`, `k=v,k=v`: unkeyed requests prefer instances whose tags match more of the sender's tags |
+| `SNODRA_SERVER_PRIORITIES` | none | default `Request.priority` per outgoing type, `type=n,type=n` (higher first while the target's queue at the hub is not empty); `SendOptions.priority` wins |
+| `SNODRA_SERVER_RETRY_ENABLED` | false | caller-side retry of transient failures (see Retry): `true` sets `Config.hub_retry` to the policy the variables below describe, `false` leaves it `None` (no retry unless a call sets `SendOptions.retry`, which wins per call) |
+| `SNODRA_SERVER_RETRY_MAX_ATTEMPTS` | 3 | attempts in total, the first included; at least 1 (`0` is rejected at startup, also while retry is disabled) |
+| `SNODRA_SERVER_RETRY_INITIAL_BACKOFF_MS`, `_MULTIPLIER`, `_MAX_BACKOFF_MS` | 100, 2, 2000 | wait before the second attempt, growth factor (a finite number >= 1, else rejected at startup), cap of one wait; each wait is jittered by ±20 % and never above the cap (at the cap: 80-100 % of it), like the reconnect backoff |
+| `SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS` | 600000 | how long a streaming query handler waits for credit before it ends its stream with `TIMEOUT` "no credit within <d>" and releases its permits (see [Streaming queries](#streaming-queries)); the default is the hub's default `SNODRA_SERVER_MAX_STREAM_DURATION` (10 min); at least 1 (`0` is rejected at startup, also when set in code) |
+| `SNODRA_SERVER_MAX_SUBSCRIPTIONS` | 1024 | the most subscription queries this instance serves at once (see [Subscription queries](#subscription-queries)): a subscription request beyond it is refused with `ReplyEnd{error = RESOURCE_EXHAUSTED}` `subscription limit (N) reached`, which the subscriber sees as `HandlerBusy`; subscriptions hold no handler permit, so this is their only bound here; the hub has its own per-instance limit (`SNODRA_SERVER_MAX_SUBSCRIPTIONS_PER_INSTANCE`, 1024); at least 1 (`0` is rejected at startup, also when set in code) |
+| `SNODRA_SERVER_TOKEN` | none | the static access token sent in `Register.credentials.token` on every hub stream (`Config.hub_token`, a `SecretString` whose `Debug` prints `"***"`); needed when the hub runs `SNODRA_SERVER_AUTH_MODE=enforce`, ignored by a hub in `off` mode; an empty value is no token; never logged (see [Security](#security)) |
+| `SNODRA_SERVER_TOKEN_FILE` | none | a file holding the token, for container secrets (`Config.hub_token_file`); read at startup (an unreadable file, or one empty after trimming its surrounding whitespace, is a startup error naming the setting and the path) and again before every reconnect, so a rotated secret needs no restart; **wins over `SNODRA_SERVER_TOKEN` when both are set**; a file found empty at a reconnect keeps the last token read |
+| `SNODRA_SERVER_OAUTH2_TOKEN_URI` | none | turns JWT authentication on (`Config.hub_oauth2`): the Keycloak token endpoint, e.g. `https://keycloak/realms/snodra/protocol/openid-connect/token`; needs a client secret and excludes `SNODRA_SERVER_TOKEN` / `SNODRA_SERVER_TOKEN_FILE` (both set is a startup error); see [Authenticating with a JWT](#authenticating-with-a-jwt-keycloak-client-credentials) |
+| `SNODRA_SERVER_OAUTH2_CLIENT_ID` | `SNODRA_SERVICE_NAME` | the Keycloak client id; it must be the service name (the hub checks the token's `azp` against it) |
+| `SNODRA_SERVER_OAUTH2_CLIENT_SECRET`, `SNODRA_SERVER_OAUTH2_CLIENT_SECRET_FILE` | none | the client secret (`SecretString`, never logged), or a file holding it, **which wins** and is re-read on every token fetch so a rotated secret applies without a restart; one of them is required with the token URI |
+| `SNODRA_SERVER_OAUTH2_SCOPE`, `SNODRA_SERVER_OAUTH2_CA` | none | the `scope` sent with the grant (space-separated as sent); a PEM file with extra root certificates for an `https://` token endpoint, added to the platform roots (not the hub CA of `SNODRA_SERVER_TLS_CA`) |
+| `SNODRA_SERVER_TLS` | `false` | `true` makes every hub channel TLS (`Config.hub_tls = Some(HubTls { .. })`), for a static list and for `dns:///`; needed when the hub sets `SNODRA_SERVER_TLS_CERT`. An `https://` address turns TLS on by itself (system roots) |
+| `SNODRA_SERVER_TLS_CA` | none (system roots) | PEM file with the CA that signs the hub's certificate (`HubTls.ca_file`), re-read on every connect; needs `SNODRA_SERVER_TLS=true` |
+| `SNODRA_SERVER_TLS_SERVER_NAME` | the host of the address (for `dns:///name:port`, `name`) | the name the hub's certificate must carry, also sent as SNI (`HubTls.server_name`); needs `SNODRA_SERVER_TLS=true` |
+| `SNODRA_SERVER_TLS_CLIENT_CERT`, `SNODRA_SERVER_TLS_CLIENT_KEY` | none | the client certificate chain (leaf first) and its PKCS#8 PEM private key for mutual TLS (`HubTls.client_cert_file`, `HubTls.client_key_file`); both or neither; **they turn TLS on** like `SNODRA_SERVER_TLS=true` (`SNODRA_SERVER_TLS=false` next to them is an error); exclude `SNODRA_SERVER_TOKEN*` and `SNODRA_SERVER_OAUTH2_*` (one credential kind per service; a startup error naming both); the files are checked at startup. See [Authenticating with a client certificate](#authenticating-with-a-client-certificate-mtls) |
+| `SNODRA_CONSUMER_ENABLED`, `SNODRA_CONSUMER_MAX_ATTEMPTS` | true, 5 | one consumer per [event processor](#event-processors) with handlers (`default` also for sagas alone); the attempts and the 1 s backoff are shared by every processor |
+| `SNODRA_EVENTS_DEAD_LETTER_MODE` | `collection` | where a record a processor cannot handle goes (see [Dead letters](#dead-letters)): `collection` (the message store's dead letters, sequenced per key, admin API), `event-store` (the event store's `<source>.dlt`; needs the capability `native-dead-letter`) or `log` (logged and skipped); case-insensitive, anything else is a startup error (v0.4.0's `topic` names its replacement `event-store`) |
+| `SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS` | 2592000000 (30 d) | how long a letter is kept (`expire_at` = `parked_at` + this; the message store removes it then, which unblocks its key); at least 1000 (a startup error otherwise, also when set in code) |
+| `SNODRA_OUTBOX_ENABLED`, `SNODRA_OUTBOX_POLL_INTERVAL_MS`, `SNODRA_OUTBOX_BATCH_SIZE`, `SNODRA_OUTBOX_MAX_ATTEMPTS` | true, 200, 100, 10 | |
+| `SNODRA_OUTBOX_LEASE_MS` | 120000 | how long a batch the relay claims stays its own; longer than a send (40 s), else a startup error. A batch stops before its lease could run out under a send; the next claim renews what the relay still holds |
+| `SNODRA_STORE_INIT_SCHEMA` | true | `start()` prepares the message store's schema (its add-on's own: indexes, tables), with the retentions of this table; `false` when it is managed elsewhere |
+| `SNODRA_FORWARD_JWT` | true | |
 
 ## Semantics worth knowing
 
@@ -228,7 +237,7 @@ it (kept in the dispatch entry's headers); one sent by a deadline handler carrie
   instance of one service share one store. The service keeps its own database handles: the store is built from them,
   and a transaction passed to `events.publish_in` must be the store's (a handler's own writes go through the store's
   transaction, `EventContext.tx`). `start()` hands the store the builder's clock and prepares its schema
-  (`KRAKEN_STORE_INIT_SCHEMA`).
+  (`SNODRA_STORE_INIT_SCHEMA`).
 - **Verified identity** checks signature, `exp`, `nbf` and `iss`; `aud` is not validated (Keycloak sets it, Spring's
   decoder ignores it too). A JWKS outage is `UNAUTHENTICATED` for the caller, never an internal error with a URL.
 - **Shutdown** first registers no types with every hub and waits for the acks (at most 1 s), so each hub hands the requests it queued for this instance to the other instances at once (as the Kotlin starter does), then drains in-flight handlers (10 s bound; their replies still go through), closes every hub stream, fails this instance's outgoing requests still in flight with `HubConnectionLost`, stops the publisher and the consumer.
@@ -236,9 +245,9 @@ it (kept in the dispatch entry's headers); one sent by a deadline handler carrie
   confirmed by at least one hub (requests can then be sent; before that they fail with
   `HubUnavailable`); `await_all_hubs(timeout)` waits until every hub confirmed it (with
   `dns:///`: every address of the latest resolution; a second target of a hub already reached does
-  not count). `app.hub_ids()` lists the hubs registered on now. kraken-messaging (Kotlin) differs
+  not count). `app.hub_ids()` lists the hubs registered on now. snodra-messaging (Kotlin) differs
   here: its `HubConnections.awaitRegistered` waits for every hub, like `await_all_hubs`.
-- **Handshake**: `Register` carries `client_version = kraken-messaging-rs/<version>`. The hub answers
+- **Handshake**: `Register` carries `client_version = snodra-messaging-rs/<version>`. The hub answers
   every `Register` with a `RegisterAck` (before it echoes the heartbeat that follows), which
   completes the handshake: the client then heartbeats at the announced interval (3 s; the hub
   evicts after 10 s; 3 s before the ack too) and sends `timeout_ms = 0` unless a timeout was
@@ -256,8 +265,8 @@ it (kept in the dispatch entry's headers); one sent by a deadline handler carrie
   grants or 50 ms after the first unsent one. Requests that arrive before the ack follow the same
   rule.
 - **SendOptions**: `routing_key`, `timeout`, `authorization`, `priority` (else
-  `KRAKEN_HUB_PRIORITIES` for the type, else 0) and `retry` (else `Config.hub_retry`, from
-  `KRAKEN_HUB_RETRY_*`). A `RetryPolicy` is in force as written: `RetryPolicy::default()` is 3
+  `SNODRA_SERVER_PRIORITIES` for the type, else 0) and `retry` (else `Config.hub_retry`, from
+  `SNODRA_SERVER_RETRY_*`). A `RetryPolicy` is in force as written: `RetryPolicy::default()` is 3
   attempts, 100 ms doubling to 2 s; `Some(RetryPolicy::NONE)` (one attempt) switches a configured
   policy off for one call. A policy with `max_attempts: 0` fails the call with `InvalidMessage`
   before anything is sent (`Config::validate` rejects it at startup).
@@ -283,8 +292,8 @@ it (kept in the dispatch entry's headers); one sent by a deadline handler carrie
 High availability without hub-to-hub traffic ([ADR 0016](../kraken/docs/adr/0016-multi-hub-ha-without-hub-to-hub-traffic.md)):
 every instance registers on every hub, and the client picks a hub per request.
 
-- **Targets.** `KRAKEN_HUB_ADDRESS=static://hub:7000,hub-2:7000` lists the hubs (blanks and
-  repeats of the same target are ignored). `KRAKEN_HUB_ADDRESS=dns:///kraken-hub:7000` connects to
+- **Targets.** `SNODRA_SERVER_ADDRESS=static://hub:7000,hub-2:7000` lists the hubs (blanks and
+  repeats of the same target are ignored). `SNODRA_SERVER_ADDRESS=dns:///snodra-server:7000` connects to
   every address the name resolves to, as `ip:port`, of one family only: the IPv4 addresses when
   there is any, else the IPv6 ones (a dual-stack name lists each hub twice, and two streams of one
   instance on one hub replace each other). It is resolved at start and every 30 s: a new address gets a
@@ -301,7 +310,7 @@ every instance registers on every hub, and the client picks a hub per request.
   kept connection reconnects once, and the hub drops the instance until it is back (well under a
   second with the default backoff). A hub whose ack carries an empty `hub_id` (a real hub always
   names itself) is known by its target as `host:port`, the `static://` or `http(s)://` prefix stripped
-  (`hub::target_id`, the same rule as kraken-messaging); a resolved address is `ip:port`.
+  (`hub::target_id`, the same rule as snodra-messaging); a resolved address is `ip:port`.
 - **Routing.** An unkeyed request goes round-robin over the hubs whose stream is acknowledged
   (reconnecting hubs are skipped). A request with a `routing_key` goes to the live hub with the
   highest rendezvous score, so a key keeps its hub while the hubs are stable and only the keys of a
@@ -321,7 +330,7 @@ every instance registers on every hub, and the client picks a hub per request.
   before the client noticed) goes to the next hub in the same order with the same request id: it
   was never sent. So does one still waiting in the stream's outbound buffer (up to 256 messages)
   when the stream drops: the transport never took it, so it was never written (as in
-  kraken-messaging). `HubUnavailable` means no hub took it. A request the transport had already
+  snodra-messaging). `HubUnavailable` means no hub took it. A request the transport had already
   taken fails with `HubConnectionLost` when its stream drops (outcome unknown: it may be on the
   wire); the retry policy then decides (queries are retried, commands are not). Replies go on the stream the request arrived on.
 - **`NO_HANDLER` failover.** A unary send (a command or a point query; not a scatter-gather,
@@ -345,8 +354,8 @@ every instance registers on every hub, and the client picks a hub per request.
   so flapping hubs never inflate the permits. A joining or returning hub offers `ceil(max / N)`
   afresh. Permits are never revoked when N grows; the local concurrency limit stays
   `max_concurrent_handlers` over all hubs, so a hub may briefly hold more permits than this
-  instance runs at once, and the extra requests wait locally (same rule as kraken-messaging).
-- **Status.** Every `KRAKEN_HUB_STATUS_INTERVAL_MS` the instance sends `InstanceStatus` to every
+  instance runs at once, and the extra requests wait locally (same rule as snodra-messaging).
+- **Status.** Every `SNODRA_SERVER_STATUS_INTERVAL_MS` the instance sends `InstanceStatus` to every
   hub: `connected_hub_ids` (the acknowledged hubs), `handlers_in_flight` (handlers running over all
   hubs; a subscription runs no handler and is not counted) and the [event processors](#event-processors)' status. Each hub shows the report in its topology
   (`connectedHubIds`, `statusAgeMs`) and its dashboard flags instances missing a hub.
@@ -356,14 +365,14 @@ every instance registers on every hub, and the client picks a hub per request.
 ## Scatter-gather
 
 Shared query types and scatter-gather queries ([ADR 0017](../kraken/docs/adr/0017-query-modes-and-shared-query-types.md)),
-the counterpart of kraken-messaging's `scatterGather` and `@QueryHandler(shared = true)`.
+the counterpart of snodra-messaging's `scatterGather` and `@QueryHandler(shared = true)`.
 
 ```rust
-use kraken_messaging::hub::{ScatterOptions, ScatterPart, ScatterResult};
+use snodra_messaging::hub::{ScatterOptions, ScatterPart, ScatterResult};
 
 // Handler side: several services may own Search. A per-target request has the id `<id>#<n>`
 // and is served like any query.
-let app = KrakenMessaging::builder(config).await?
+let app = SnodraMessaging::builder(config).await?
     .shared_query::<Search, _, _>(|q, ctx| async move { Ok(Hits { .. }) })
     .start().await?;
 
@@ -371,7 +380,7 @@ let app = KrakenMessaging::builder(config).await?
 let result: ScatterResult<Hits> = app.queries().scatter_gather(&Search { term }, ScatterOptions {
     timeout: Some(Duration::from_secs(2)), // the whole gather; else Config.hub_request_timeout, else the hub's
     max_results: 0,                        // end after this many successful parts (0: all targets)
-    priority: None,                        // else KRAKEN_HUB_PRIORITIES for the type, else 0
+    priority: None,                        // else SNODRA_SERVER_PRIORITIES for the type, else 0
 }).await?;
 for ScatterPart { service, instance, outcome } in result.parts { /* arrival order */ }
 let (failed, timed_out) = (result.failed, result.timed_out);
@@ -383,7 +392,7 @@ while let Some(part) = parts.next().await { let part = part?; /* ... */ }
 
 | API | Signature |
 |---|---|
-| Register a shared query | `KrakenMessagingBuilder::shared_query::<Q, F, Fut>(handler) -> Self` (also `HandlerRegistry::shared_query`) |
+| Register a shared query | `SnodraMessagingBuilder::shared_query::<Q, F, Fut>(handler) -> Self` (also `HandlerRegistry::shared_query`) |
 | Registered types | `HandlerRegistry::query_types()` (every query, exclusive and shared), `exclusive_query_types()`, `shared_query_types()`; `registered_types() -> RegisteredTypes { commands, queries (exclusive), shared_queries }` is what the `Register` announces |
 | Gather | `Sender::scatter_gather<Q: Query>(&self, &Q, ScatterOptions) -> Result<ScatterResult<Q::Reply>, MessagingError>` |
 | Stream | `Sender::scatter_gather_stream<Q: Query>(&self, &Q, ScatterOptions) -> impl Stream<Item = Result<ScatterPart<Q::Reply>, MessagingError>>` |
@@ -423,11 +432,11 @@ while let Some(part) = parts.next().await { let part = part?; /* ... */ }
 
 A query whose result is a flow of items from one instance of one owner, under the caller's
 back-pressure ([ADR 0017, P4b](../kraken/docs/adr/0017-query-modes-and-shared-query-types.md)),
-the counterpart of kraken-messaging's streaming query API.
+the counterpart of snodra-messaging's streaming query API.
 
 ```rust
 use futures::StreamExt;
-use kraken_messaging::{StreamOptions, StreamingQuery};
+use snodra_messaging::{StreamOptions, StreamingQuery};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Export { since: chrono::DateTime<chrono::Utc> }
@@ -438,7 +447,7 @@ impl StreamingQuery for Export { type Item = Row; }
 
 // Handler side: return any `Stream<Item = Result<Row, MessagingError>>`; it is pulled at most
 // one item ahead of the sender's credit. An `Err` item ends the stream with that error.
-let app = KrakenMessaging::builder(config).await?
+let app = SnodraMessaging::builder(config).await?
     .streaming_query::<Export, _, _, _>(|q, ctx| async move { Ok(rows_since(q.since)) })
     // .shared_streaming_query::<Search, _, _, _>(..)   // many services may own it
     .start().await?;
@@ -447,7 +456,7 @@ let app = KrakenMessaging::builder(config).await?
 let mut rows = app.queries().stream(&Export { since }, StreamOptions {
     timeout: None,         // idle timeout (hub-side, reset by every part); else Config.hub_request_timeout, else the hub's
     max_results: 0,        // end after this many items (the hub cancels the handler); 0: no limit
-    priority: None,        // else KRAKEN_HUB_PRIORITIES for the type, else 0
+    priority: None,        // else SNODRA_SERVER_PRIORITIES for the type, else 0
     initial_credit: 64,    // the credit window; half of it is refilled every time half was consumed
 }).await?;
 while let Some(row) = rows.next().await { let row = row?; /* in the handler's order */ }
@@ -461,10 +470,10 @@ tokio::spawn(async move { rows.try_for_each(|row| async { Ok(()) }).await });
 | API | Signature |
 |---|---|
 | Trait | `trait StreamingQuery: MessageType + Serialize + DeserializeOwned + Send + Sync + 'static { type Item: Serialize + DeserializeOwned + Send + 'static; }` |
-| Register a handler | `KrakenMessagingBuilder::streaming_query::<Q, F, Fut, S>(handler) -> Self` and `shared_streaming_query` (also on `HandlerRegistry`), with `F: Fn(Q, MessageContext) -> Fut`, `Fut: Future<Output = Result<S, MessagingError>>`, `S: Stream<Item = Result<Q::Item, MessagingError>> + Send + 'static` (a `BoxStream` fits) |
+| Register a handler | `SnodraMessagingBuilder::streaming_query::<Q, F, Fut, S>(handler) -> Self` and `shared_streaming_query` (also on `HandlerRegistry`), with `F: Fn(Q, MessageContext) -> Fut`, `Fut: Future<Output = Result<S, MessagingError>>`, `S: Stream<Item = Result<Q::Item, MessagingError>> + Send + 'static` (a `BoxStream` fits) |
 | Registered types | `HandlerRegistry::streaming_query_types()` (exclusive and shared); `registered_types() -> RegisteredTypes { commands, queries, shared_queries, streaming_queries }`: `streaming_queries` are the exclusive streaming types, announced in `Register.query_types` with `queries`; a shared streaming type is in `shared_queries` like any shared query (the hub does not tell a streaming type from a unary one: the mode is the sender's choice) |
 | Stream | `Sender::stream<Q: StreamingQuery>(&self, &Q, StreamOptions) -> Result<BoxStream<'_, Result<Q::Item, MessagingError>>, MessagingError>` (`async`): the stream borrows the sender |
-| Owned stream | `Sender::stream_owned<Q: StreamingQuery>(self: &Arc<Self>, &Q, StreamOptions) -> Result<BoxStream<'static, Result<Q::Item, MessagingError>>, MessagingError>` (`async`): the stream holds a clone of the `Arc<Sender>`, so it can be returned or moved into a task; `KrakenMessaging::sender()` (and the builder's `sender()`) is that `Arc`. Same behaviour otherwise |
+| Owned stream | `Sender::stream_owned<Q: StreamingQuery>(self: &Arc<Self>, &Q, StreamOptions) -> Result<BoxStream<'static, Result<Q::Item, MessagingError>>, MessagingError>` (`async`): the stream holds a clone of the `Arc<Sender>`, so it can be returned or moved into a task; `SnodraMessaging::sender()` (and the builder's `sender()`) is that `Arc`. Same behaviour otherwise |
 | Options | `StreamOptions { timeout: Option<Duration>, max_results: u32, priority: Option<i32>, initial_credit: u32 }` (`Default`: `initial_credit` 64, `hub::DEFAULT_CREDIT`; 0 reads as 64) |
 | Errors | `MessagingError::NoHandler`, `InvalidMessage`, `Timeout`, `RemoteHandler`, `HandlerDisconnected`, `HandlerBusy`, `Cancelled` (the hub's max stream duration), `HubUnavailable`, `HubConnectionLost`, `Serialization` |
 
@@ -498,7 +507,7 @@ tokio::spawn(async move { rows.try_for_each(|row| async { Ok(()) }).await });
 - **Endings.** The stream ends on the hub's `ReplyEnd`; with an error it is the last item, mapped
   like a unary error of that code: `Timeout` (the idle timeout, from the forward and reset by every
   part), `RemoteHandler` (the handler's `Err` item, or a part beyond the credit: `InvalidMessage`),
-  `HandlerDisconnected` (the handler left), `Cancelled` (`KRAKEN_HUB_MAX_STREAM_DURATION`). A hub
+  `HandlerDisconnected` (the handler left), `Cancelled` (`SNODRA_SERVER_MAX_STREAM_DURATION`). A hub
   stream lost after the first item is `HubConnectionLost`, a part that does not decode
   `Serialization` (the handler is cancelled). The sender checks for lost parts (the hub drops a
   part it could not buffer within 5 s): `seq` must run 1, 2, 3, ... in arrival order and a clean
@@ -520,7 +529,7 @@ tokio::spawn(async move { rows.try_for_each(|row| async { Ok(()) }).await });
   its handler is aborted as well (the hub forgot the stream with the session; it would wait for
   credit for ever), while a unary handler runs on with its reply dropped. A handler
   that waits for credit longer than `Config.hub_stream_credit_timeout`
-  (`KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS`, 10 min: the hub's default maximum stream duration)
+  (`SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS`, 10 min: the hub's default maximum stream duration)
   ends its stream with `ReplyEnd{error = TIMEOUT "no credit within <d>"}`: a hub that forgot the
   stream (a race, a lost `Flow` or `Cancel`) cannot leak the handler task. The handler
   permit (`max_concurrent_handlers`, and the hub's) is held for the whole stream and released on
@@ -537,11 +546,11 @@ tokio::spawn(async move { rows.try_for_each(|row| async { Ok(()) }).await });
 
 A query whose result is an initial value followed by the updates every owner instance pushes,
 until the subscriber cancels or the owners complete ([ADR 0017, P4c](../kraken/docs/adr/0017-query-modes-and-shared-query-types.md)),
-the counterpart of kraken-messaging's subscription query API.
+the counterpart of snodra-messaging's subscription query API.
 
 ```rust
 use futures::StreamExt;
-use kraken_messaging::{SubscriptionOptions, SubscriptionQuery};
+use snodra_messaging::{SubscriptionOptions, SubscriptionQuery};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Prices { symbol: String }
@@ -554,7 +563,7 @@ impl SubscriptionQuery for Prices { type Initial = Quote; type Update = Tick; }
 
 // Handler side: the handler answers the initial result; the updates are pushed through the
 // emitter by whatever changes the data. Capture the emitter before `start()`.
-let builder = KrakenMessaging::builder(config).await?;
+let builder = SnodraMessaging::builder(config).await?;
 let emitter = builder.emitter();
 let app = builder
     .subscription_query::<Prices, _, _>(|q, ctx| async move { Ok(latest_quote(&q.symbol).await?) })
@@ -570,7 +579,7 @@ emitter.complete_exceptionally::<Prices>(|_| true, &MessagingError::Storage("fee
 let sub = app.sender().subscribe(&Prices { symbol: "ACME".into() }, SubscriptionOptions {
     timeout: None,        // the initial result's timeout (queue wait + handler); else Config.hub_request_timeout, else the hub's
     max_results: 0,       // end after this many updates (the initial result does not count); 0: no limit
-    priority: None,       // the initial request's; else KRAKEN_HUB_PRIORITIES for the type, else 0
+    priority: None,       // the initial request's; else SNODRA_SERVER_PRIORITIES for the type, else 0
     initial_credit: 64,   // the credit window; half of it is refilled every time half was consumed
 }).await?;
 println!("{}", sub.initial.price);
@@ -582,13 +591,13 @@ while let Some(update) = updates.next().await { let tick = update?; /* in the hu
 | API | Signature |
 |---|---|
 | Trait | `trait SubscriptionQuery: MessageType + Serialize + DeserializeOwned + Send + Sync + 'static { type Initial: Serialize + DeserializeOwned + Send + 'static; type Update: Serialize + DeserializeOwned + Send + 'static; }` |
-| Register a handler | `KrakenMessagingBuilder::subscription_query::<Q, F, Fut>(handler) -> Self` and `shared_subscription_query` (also on `HandlerRegistry`), with `F: Fn(Q, MessageContext) -> Fut`, `Fut: Future<Output = Result<Q::Initial, MessagingError>>`: the handler answers the initial result |
+| Register a handler | `SnodraMessagingBuilder::subscription_query::<Q, F, Fut>(handler) -> Self` and `shared_subscription_query` (also on `HandlerRegistry`), with `F: Fn(Q, MessageContext) -> Fut`, `Fut: Future<Output = Result<Q::Initial, MessagingError>>`: the handler answers the initial result |
 | Registered types | `HandlerRegistry::subscription_query_types()` (exclusive and shared); `registered_types()` has `subscription_queries`, the exclusive ones, announced in `Register.query_types` with `queries`; a shared subscription type is in `shared_queries` like any shared query |
-| Emitter | `QueryUpdateEmitter` (`Clone`): `emit<Q: SubscriptionQuery>(&self, filter: impl Fn(&Q) -> bool, update: &Q::Update)`, `complete<Q>(&self, filter)`, `complete_exceptionally<Q>(&self, filter, error: &MessagingError)`. From `KrakenMessagingBuilder::emitter()` (to capture in handlers and in the code that changes the data) or `KrakenMessaging::emitter()`; also `open_subscriptions()` |
+| Emitter | `QueryUpdateEmitter` (`Clone`): `emit<Q: SubscriptionQuery>(&self, filter: impl Fn(&Q) -> bool, update: &Q::Update)`, `complete<Q>(&self, filter)`, `complete_exceptionally<Q>(&self, filter, error: &MessagingError)`. From `SnodraMessagingBuilder::emitter()` (to capture in handlers and in the code that changes the data) or `SnodraMessaging::emitter()`; also `open_subscriptions()` |
 | Subscribe | `Sender::subscribe<Q: SubscriptionQuery>(self: &Arc<Self>, &Q, SubscriptionOptions) -> Result<Subscription<Q>, MessagingError>` (`async`): owned, like `stream_owned` (`app.sender()` is the `Arc`); there is no borrowed variant |
 | Result | `Subscription<Q> { initial: Q::Initial, updates: BoxStream<'static, Result<Q::Update, MessagingError>> }` with `cancel(self)` |
 | Options | `SubscriptionOptions { timeout: Option<Duration>, max_results: u32, priority: Option<i32>, initial_credit: u32 }` (`Default`: `initial_credit` 64, `hub::DEFAULT_CREDIT`; 0 reads as 64; retry: `Config.hub_retry`) |
-| Handler limit | `Config.hub_max_subscriptions` (`KRAKEN_HUB_MAX_SUBSCRIPTIONS`, 1024; `Dispatcher::max_subscriptions` when wired by hand) |
+| Handler limit | `Config.hub_max_subscriptions` (`SNODRA_SERVER_MAX_SUBSCRIPTIONS`, 1024; `Dispatcher::max_subscriptions` when wired by hand) |
 | Errors | `MessagingError::NoHandler`, `InvalidMessage`, `Timeout`, `RemoteHandler`, `HandlerDisconnected`, `HandlerBusy`, `Cancelled` (the hub's max duration), `HubUnavailable`, `HubConnectionLost`, `Serialization` |
 
 - **Who is asked.** A subscription goes to one hub (unkeyed round-robin), which asks every live
@@ -632,7 +641,7 @@ while let Some(update) = updates.next().await { let tick = update?; /* in the hu
   back.
 - **Credits and the hub's buffer.** The credit is `initial_credit` plus every `Flow`; the
   initial result takes one, every update one. Updates beyond it wait at the hub, up to
-  `KRAKEN_HUB_SUBSCRIPTION_BUFFER` (256) per subscription; one more ends the subscription with
+  `SNODRA_SERVER_SUBSCRIPTION_BUFFER` (256) per subscription; one more ends the subscription with
   `ReplyEnd{RESOURCE_EXHAUSTED}`, which `updates` yields as its last item `HandlerBusy` (the
   hub's message, "subscriber buffer (256) exceeded", is logged at debug: the variant carries
   the type). Nothing is relayed to the owners: updates are pushed, and a consumer that falls
@@ -647,12 +656,12 @@ while let Some(update) = updates.next().await { let tick = update?; /* in the hu
   at its limit refuses its subscription with `ReplyEnd{RESOURCE_EXHAUSTED}` and the hub ends the
   whole subscription with it (the error is the call's, or comes right after the initial
   result). The hub itself refuses a subscription whose target already serves
-  `KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE` (1024), before anything is sent.
+  `SNODRA_SERVER_MAX_SUBSCRIPTIONS_PER_INSTANCE` (1024), before anything is sent.
 - **Endings.** `updates` ends when the last owner instance completed cleanly or `max_results`
   updates were relayed (the hub then cancels the owners); an error is its last item, mapped like
   a unary error of that code: `RemoteHandler` (an owner's `complete_exceptionally`),
   `HandlerDisconnected` (the last owner left), `HandlerBusy` (the buffer), `Cancelled`
-  (`KRAKEN_HUB_MAX_SUBSCRIPTION_DURATION`, off by default), `HubConnectionLost` (the hub stream
+  (`SNODRA_SERVER_MAX_SUBSCRIPTION_DURATION`, off by default), `HubConnectionLost` (the hub stream
   was lost), `Serialization` (an update that does not decode; the subscription is cancelled).
   There is no idle timeout and no local guard on updates: a quiet subscription is not a broken
   one. The only local guard is on the initial result (the hub's bound plus 1 s, as for a
@@ -666,7 +675,7 @@ while let Some(update) = updates.next().await { let tick = update?; /* in the hu
   forgets the request: the hub cancels every owner instance, which removes the subscription.
   The owners also drop a subscription on a hub `Cancel` (the subscriber left, `max_results`, the
   buffer, the hub's limits) and every subscription that arrived on a hub stream that was lost
-  (the hub forgot it with the session). A shutdown (`KrakenMessaging::shutdown`) completes the
+  (the hub forgot it with the session). A shutdown (`SnodraMessaging::shutdown`) completes the
   subscriptions served here with a clean `ReplyEnd`, best effort and bounded to 2 s.
 - **Retry.** `Config.hub_retry` applies until the initial result, for the same errors as a unary
   query (`HubUnavailable`, `NoHandler`, `HandlerBusy`, `HandlerDisconnected`, `Timeout`,
@@ -695,9 +704,9 @@ what they want done on the `SagaContext`; the runtime writes the state, the reco
 in one transaction, and the relay sends them after the commit, in order, with the idempotency key `<sagaId>:<seq>`.
 
 ```rust
-use kraken_messaging::SagaDefinition;
-use kraken_messaging::external::{ExternalRecord, IdempotencyKey, TranslatedEvent};
-use kraken_messaging_kafka::{ExternalSource, KafkaExternalSource}; // the partner's topic, read by the Kafka add-on
+use snodra_messaging::SagaDefinition;
+use snodra_messaging::external::{ExternalRecord, IdempotencyKey, TranslatedEvent};
+use snodra_messaging_kafka::{ExternalSource, KafkaExternalSource}; // the partner's topic, read by the Kafka add-on
 use serde::de::IgnoredAny;
 
 #[derive(Default, Serialize, Deserialize)]   // stored as its serde_json text; must round-trip from Default
@@ -725,7 +734,7 @@ fn banner_saga(d: SagaDefinition<Banner>) -> SagaDefinition<Banner> {
 
 let kafka = KafkaConfig::from_env();
 let partner = KafkaExternalSource::new("printer-banner", ExternalSource::new("printer.banner.events"), "service-c", &kafka.bootstrap_servers)?;
-let app = KrakenMessaging::builder(Config::from_env()?).await?
+let app = SnodraMessaging::builder(Config::from_env()?).await?
     .store(Arc::new(store))
     .event_store(Arc::new(KafkaEventStore::new(kafka)?))
     .saga("examples.Banner", banner_saga)
@@ -745,7 +754,7 @@ let app = KrakenMessaging::builder(Config::from_env()?).await?
     .await?;
 
 // A webhook: verify the raw body, then hand the event to the ingress (applied once per dedupe key).
-if !kraken_messaging::external::webhook::verify(&secret, None, &headers, &body) { return 401; }
+if !snodra_messaging::external::webhook::verify(&secret, None, &headers, &body) { return 401; }
 app.ingress().accept("printer-banner", &n.delivery_id, &BannerPrinted { job_id: n.job_id }, &HashMap::new()).await?;
 ```
 
@@ -765,13 +774,13 @@ start key, also from the start handler), `end()`, `send(&command, routing_key)`,
 `schedule_at(time, name, payload)` (both return the deadline id), `cancel(id)`, `cancel_all(name)`; at most 999 messages per
 handling of an instance. A published event must serialize to a JSON object the outbox takes (not a unit struct, no
 integer above `i64::MAX`, at most JSON depth 100; `store::check_outbox_payload`): anything else fails the handler with `InvalidMessage` naming the
-event (the relay counts one recorded before as `kraken_saga_command_failures_total{reason="INVALID"}` and gives it up). A handler gets no `Sender` or `EventBus`, and **must not capture one**: it would send inside the
+event (the relay counts one recorded before as `snodra_saga_command_failures_total{reason="INVALID"}` and gives it up). A handler gets no `Sender` or `EventBus`, and **must not capture one**: it would send inside the
 saga's transaction, for a state that may roll back, with no order, retry or idempotency key.
 
 **Handlers block.** A saga handler runs on the consumer's task and holds a tokio worker and the segment while it runs:
 keep it to recording. A panic is a handler error: two attempts, then the event is parked in `saga_failures`
 (`app.saga_failures()`: `list(type)`, `retry(id)`, `retry_all(type)`, `discard(id)`). A retry of an event whose saga type
-does not run in this service (not registered, or `KRAKEN_SAGAS_ENABLED=false`) is refused with `InvalidMessage` and
+does not run in this service (not registered, or `SNODRA_SAGAS_ENABLED=false`) is refused with `InvalidMessage` and
 writes nothing: the event keeps its error and attempts until the type runs again (`retry_all` of such a type: "its
 parked events (N) are left as they were"; with nothing parked it returns 0, as in Kotlin).
 
@@ -792,20 +801,20 @@ service without sagas):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `KRAKEN_SAGAS_ENABLED` | true | `false` with sagas registered: a warning, and no runtime, relay or scheduler |
-| `KRAKEN_SAGAS_MAX_ATTEMPTS` | 5 | attempts of one (event, saga type) on conflicts before it is parked (200 ms doubling to 5 s); a handler error gets two |
-| `KRAKEN_SAGAS_ENDED_RETENTION_MS` | 30 d | retention of ended sagas |
-| `KRAKEN_SAGAS_DISPATCH_RETENTION_MS` | 7 d | retention of dispatched saga dispatch entries |
-| `KRAKEN_SAGAS_FAILED_RETENTION_MS` | 30 d | retention of what failed for good: saga dispatch entries given up on (from their failure) and parked saga events (from their last failure, moved on by a retry that fails again); at least 1000 ms |
-| `KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS` | 500 | how often the relay looks for recorded entries |
-| `KRAKEN_SAGAS_RELAY_LEASE_MS` | 30000 | one saga's dispatch lease, renewed while a send runs |
-| `KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS` | 10 | attempts of a command on transient failures before `EXHAUSTED` |
-| `KRAKEN_SAGAS_RELAY_INITIAL_BACKOFF_MS`, `_MAX_BACKOFF_MS` | 1000, 5 min | the relay's backoff (doubling) |
-| `KRAKEN_DEADLINES_POLL_INTERVAL_MS` | 1000 | how often due deadlines are looked for |
-| `KRAKEN_DEADLINES_LEASE_MS` | 30000 | how long a claimed deadline stays reserved (at least once) |
-| `KRAKEN_DEADLINES_RETENTION_MS` | 7 d | retention of fired and cancelled deadlines |
-| `KRAKEN_EXTERNAL_CALLS_LEASE_MS` | 5 min | how long an `IN_PROGRESS` call may take before its outcome is unknown |
-| `KRAKEN_EXTERNAL_CALLS_RETENTION_MS` | 30 d | retention of the external call records |
+| `SNODRA_SAGAS_ENABLED` | true | `false` with sagas registered: a warning, and no runtime, relay or scheduler |
+| `SNODRA_SAGAS_MAX_ATTEMPTS` | 5 | attempts of one (event, saga type) on conflicts before it is parked (200 ms doubling to 5 s); a handler error gets two |
+| `SNODRA_SAGAS_ENDED_RETENTION_MS` | 30 d | retention of ended sagas |
+| `SNODRA_SAGAS_DISPATCH_RETENTION_MS` | 7 d | retention of dispatched saga dispatch entries |
+| `SNODRA_SAGAS_FAILED_RETENTION_MS` | 30 d | retention of what failed for good: saga dispatch entries given up on (from their failure) and parked saga events (from their last failure, moved on by a retry that fails again); at least 1000 ms |
+| `SNODRA_SAGAS_RELAY_POLL_INTERVAL_MS` | 500 | how often the relay looks for recorded entries |
+| `SNODRA_SAGAS_RELAY_LEASE_MS` | 30000 | one saga's dispatch lease, renewed while a send runs |
+| `SNODRA_SAGAS_RELAY_MAX_ATTEMPTS` | 10 | attempts of a command on transient failures before `EXHAUSTED` |
+| `SNODRA_SAGAS_RELAY_INITIAL_BACKOFF_MS`, `_MAX_BACKOFF_MS` | 1000, 5 min | the relay's backoff (doubling) |
+| `SNODRA_DEADLINES_POLL_INTERVAL_MS` | 1000 | how often due deadlines are looked for |
+| `SNODRA_DEADLINES_LEASE_MS` | 30000 | how long a claimed deadline stays reserved (at least once) |
+| `SNODRA_DEADLINES_RETENTION_MS` | 7 d | retention of fired and cancelled deadlines |
+| `SNODRA_EXTERNAL_CALLS_LEASE_MS` | 5 min | how long an `IN_PROGRESS` call may take before its outcome is unknown |
+| `SNODRA_EXTERNAL_CALLS_RETENTION_MS` | 30 d | retention of the external call records |
 
 Partner sources (`external_source(name, provider, translator)`, the provider an event-store add-on's, e.g. the Kafka
 add-on's `KafkaExternalSource`; an empty or reserved name or two sources of one name fail `start()`) and the webhook
@@ -820,15 +829,15 @@ scheduler and the sampler first (at most 20 s for the three together), then the 
 dispatch lease then lets another instance (or this one, restarted) send the command again with the same key. For a
 command delivered to a local idempotent adapter, abandoning the send drops the adapter's future mid-call, so its
 `external_calls` record stays `IN_PROGRESS`: the re-send is answered "in progress" (retryable, the relay backs off) until
-the record's lease ends (`KRAKEN_EXTERNAL_CALLS_LEASE_MS`, 5 min), and then, without `external_idempotent`, the outcome is
+the record's lease ends (`SNODRA_EXTERNAL_CALLS_LEASE_MS`, 5 min), and then, without `external_idempotent`, the outcome is
 unknown and the saga gets `SagaCommandFailed` with `UNKNOWN_OUTCOME` (with the default settings; a relay whose attempts
 run out first reports `EXHAUSTED`). With `external_idempotent` the call is run again after the lease. **Keep an adapter's
 I/O timeouts under 15 s**, so its calls finish (or fail cleanly) within a deploy's shutdown.
 
 **Statistics.** `app.saga_stats()` has the Kotlin meters as counters and gauges with the same names and labels
-(`kraken.sagas.started{type}`, `kraken.sagas.ended{type}`, `kraken.saga.events{type,outcome}`,
-`kraken.deadlines.fired{name}`, `kraken.deadlines.due{name}`, `kraken.external.calls{handler,outcome}`,
-`kraken.saga.command.failures{type,reason}`, `kraken.sagas.active{type}`, `kraken.saga.dispatch.pending`): typed reads
+(`snodra.sagas.started{type}`, `snodra.sagas.ended{type}`, `snodra.saga.events{type,outcome}`,
+`snodra.deadlines.fired{name}`, `snodra.deadlines.due{name}`, `snodra.external.calls{handler,outcome}`,
+`snodra.saga.command.failures{type,reason}`, `snodra.sagas.active{type}`, `snodra.saga.dispatch.pending`): typed reads
 (`started`, `ended`, `events`, `deadlines_fired`, `deadlines_due`, `external_calls`, `command_failures`, `active`,
 `dispatch_pending`) and `snapshot()`; the same values are exported on the meter (see [Metrics](#metrics)). The two
 database-counted gauges are sampled every 15 s. While a saga
@@ -841,11 +850,11 @@ crate's own runtime (no event store, message store or hub):
 
 ```toml
 [dev-dependencies]
-kraken-messaging-rs = { path = "../kraken-messaging-rs", features = ["testing"] }
+snodra-messaging-rs = { path = "../snodra-messaging-rs", features = ["testing"] }
 ```
 
 ```rust
-use kraken_messaging::saga::testing::SagaTestFixture;
+use snodra_messaging::saga::testing::SagaTestFixture;
 
 #[test]
 fn a_silent_printer_fails_the_banner_after_30_seconds() {
@@ -884,10 +893,10 @@ The behaviour is ADR 0021's rulings 1 to 46; where Rust differs, the S2 ruling s
   `IN_PROGRESS` until the lease, a panicking one is `FAILED`; an unbound `ExternalCallsHandle` fails at call time (Kotlin
   checks at startup).
 - A partner translator is a closure returning `Result<Option<TranslatedEvent>, _>`; `InvalidMessage` skips the record at once.
-- Configuration is `KRAKEN_*` environment variables (milliseconds); partner sources and the webhook secret are set in code.
+- Configuration is `SNODRA_*` environment variables (milliseconds); partner sources and the webhook secret are set in code.
 - Metrics go through the OpenTelemetry API (no Micrometer), with the same series; the logging keys are a `tracing` span's fields.
 - A deadline's `payloadType` is `std::any::type_name` of its payload (Kotlin: the `@MessageType` name or the FQCN).
-- `SagaTestFixture` is in the crate behind a feature (Kotlin: `kraken-messaging-test`) and panics instead of throwing.
+- `SagaTestFixture` is in the crate behind a feature (Kotlin: `snodra-messaging-test`) and panics instead of throwing.
 
 ## Event processors
 
@@ -898,7 +907,7 @@ never holds another. The event store spreads a processor's segments (its units o
 over the service's instances.
 
 ```rust,ignore
-let app = KrakenMessaging::builder(config).await?
+let app = SnodraMessaging::builder(config).await?
     .event::<OrderPlaced, _, _>(|e, ctx| async move { /* default */ Ok(()) })
     .event_in::<OrderPlaced, _, _>("projections", |e, ctx| async move { /* its own subscription */ Ok(()) })
     .event_in::<OrderShipped, _, _>("projections", |e, ctx| async move { Ok(()) })
@@ -916,7 +925,7 @@ let app = KrakenMessaging::builder(config).await?
 - **One event type in several processors**: each gets every record and handles it in its own
   transaction with its own marker; a failure in one does not touch the other.
 - **A processor starts only when it has handlers** (`default` also when only sagas run there) and
-  `KRAKEN_CONSUMER_ENABLED` is not `false`. Attempts and back-off are the shared consumer settings.
+  `SNODRA_CONSUMER_ENABLED` is not `false`. Attempts and back-off are the shared consumer settings.
 - **A broken subscription** (its `next` fails) is closed and taken again after a backoff (1 s
   doubling to 30 s, reset after a delivery or a stable period); the error shows on the status.
 - **Other entry points** (partner sources, the webhook ingress, the relay's `SagaCommandFailed`
@@ -940,14 +949,14 @@ rollout).
 
 ### Status
 
-Every status interval (`KRAKEN_HUB_STATUS_INTERVAL_MS`, 5 s) each instance reports one
+Every status interval (`SNODRA_SERVER_STATUS_INTERVAL_MS`, 5 s) each instance reports one
 `ProcessorStatus` per started processor to every hub (in its `InstanceStatus`). The hub shows them in its topology,
 `GET /api/v1/processors` and the dashboard's Processors page. `app.processors()` returns the same
 list locally. The status fields are the protocol's of this release: a hub of an earlier release cannot read them.
 
 | Field | Source |
 |---|---|
-| `name`, `subscription`, `source` | the processor, its subscription's name (`<service>.<processor>`) and the source it reads (`KRAKEN_EVENTS_SOURCE`) |
+| `name`, `subscription`, `source` | the processor, its subscription's name (`<service>.<processor>`) and the source it reads (`SNODRA_EVENTS_SOURCE`) |
 | `event_store`, `capabilities` | the event store's name (`kafka`, `rabbitmq-streams`, `memory` or a third-party add-on's) and what it offers (`replay`, `browse`, `lag`, `native-dead-letter`) |
 | `state` | STOPPED while its consumer does not run (stopping, out of its subscription for a [reset](#reset-and-replay), with `operation_id`, or its reader ended by a panic until the processor is started again); else PAUSED while [paused](#pause-and-resume); else FAILING for 60 s after a record exhausted its attempts, a letter could not be parked (or published to the dead-letter source), or the subscription reported an error; else STARTING before the first assignment and between a revoke and the next assign (an empty assignment counts: such an instance is RUNNING); else RUNNING |
 | `segments` | the segments assigned to this instance, in the event store's segment order; per segment `position` (the next position this instance will process; empty when unknown), `committed` (the subscription's committed position; empty when none), `head` (the position of the next event written; empty when unknown), `lag` (between `committed` and `head`, between `position` and `head` without a commit; -1 unknown; never negative) and `replay_until`. Positions are the event store's opaque strings. The subscription keeps them current itself (never a blocking call); the processor copies them every second and after every acknowledgement |
@@ -960,13 +969,13 @@ list locally. The status fields are the protocol's of this release: a hub of an 
 
 ## Dead letters
 
-A record a processor cannot handle is kept, not lost (ADR 0022). `KRAKEN_EVENTS_DEAD_LETTER_MODE`
+A record a processor cannot handle is kept, not lost (ADR 0022). `SNODRA_EVENTS_DEAD_LETTER_MODE`
 chooses where it goes:
 
 | Mode | What happens | Sequenced per key | Admin API |
 |---|---|---|---|
 | `collection` (default) | parked in the message store's dead letters, then the record is acknowledged | yes | `app.dead_letters()` |
-| `event-store` | published to the event store's dead-letter source `<source>.dlt` (same key and payload, the original headers plus `kraken-dlt-processor`, `kraken-dlt-reason`, `kraken-dlt-error` (`<type>: <message>`, at most 2000 characters), `kraken-dlt-original-topic`, `-partition`, `-offset`, which carry the source, segment and position); the record is acknowledged once the event store accepted it. Needs the capability `native-dead-letter` (a startup error otherwise); the destination must exist (see the add-on's section) | no | none (the destination is the operator's) |
+| `event-store` | published to the event store's dead-letter source `<source>.dlt` (same key and payload, the original headers plus `snodra-dlt-processor`, `snodra-dlt-reason`, `snodra-dlt-error` (`<type>: <message>`, at most 2000 characters), `snodra-dlt-original-topic`, `-partition`, `-offset`, which carry the source, segment and position); the record is acknowledged once the event store accepted it. Needs the capability `native-dead-letter` (a startup error otherwise); the destination must exist (see the add-on's section) | no | none (the destination is the operator's) |
 | `log` | logged and skipped | no | none |
 
 **Reasons** (per processor, stage 1 only; saga failures keep `saga_failures`):
@@ -991,13 +1000,13 @@ segment stays assigned). Sequencing keeps an in-memory set of the parked keys of
 segments this instance holds (loaded on every assignment, added to on every park); a record
 whose key is in the set is confirmed against the store first, and a miss (another instance
 retried or discarded the letters) removes the key and handles the record normally. **A letter that
-expires** (`KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS`, 30 d; the store removes it at `expire_at_ms`)
+expires** (`SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS`, 30 d; the store removes it at `expire_at_ms`)
 **unblocks its key**.
 
 ### The admin API
 
 ```rust,ignore
-use kraken_messaging::processors::{RetryResult, DEFAULT_LIST_LIMIT};
+use snodra_messaging::processors::{RetryResult, DEFAULT_LIST_LIMIT};
 
 let letters = app.dead_letters();
 for letter in letters.list(Some("projections"), DEFAULT_LIST_LIMIT).await? { /* parked_at, then id */ }
@@ -1115,9 +1124,9 @@ not "nothing changed"**: their effects stay, and the message says what else happ
 `...; reset handlers ran (2), 37 markers deleted, positions not moved: retry the reset`.
 
 ```rust,ignore
-use kraken_messaging::processors::{EventOptions, ResetContext};
+use snodra_messaging::processors::{EventOptions, ResetContext};
 
-KrakenMessaging::builder(config).await?
+SnodraMessaging::builder(config).await?
     .event_in::<OrderPlaced, _, _>("projections", |e, ctx| async move { /* replayed */ Ok(()) })
     // Never runs again in a replay: an effect outside the service (Kotlin's @DisallowReplay).
     .event_with::<OrderPlaced, _, _>(
@@ -1157,10 +1166,10 @@ local runs and single-process demos: no broker, no database, no container. A ser
 by code, as for any store; they are never a fallback for a missing one.
 
 ```rust
-use kraken_messaging::event_store::memory::MemoryEventStore;
-use kraken_messaging::store::memory::MemoryStore;
+use snodra_messaging::event_store::memory::MemoryEventStore;
+use snodra_messaging::store::memory::MemoryStore;
 
-let app = KrakenMessaging::builder(config).await?
+let app = SnodraMessaging::builder(config).await?
     .event_store(Arc::new(MemoryEventStore::default()))
     .store(Arc::new(MemoryStore::new()))
     /* handlers */
@@ -1180,7 +1189,7 @@ let app = KrakenMessaging::builder(config).await?
   segments `0` to `n-1` (`MemoryEventStoreConfig::segments`, 4 by default, 1 to 1024); a key goes
   to segment `FNV-1a 64(key) mod n` (the Kotlin library's too), so a key's events keep their order;
   events without a key go round the segments from `0`. It declares `replay`, `browse` and `lag` (its browser serves the
-  `kraken.events.*` queries), not `native-dead-letter`: dead letters stay in the message store
+  `snodra.events.*` queries), not `native-dead-letter`: dead letters stay in the message store
   (mode `collection`). A segment moves to another instance only once the one holding it let it go.
   Its events are stamped with `Clock::tokio()` unless configured otherwise.
 - **The message store** (`store::memory`) has real transactions: what a handler writes in its
@@ -1203,7 +1212,7 @@ letters:
 ```rust
 let stores = InMemoryStores::new();
 let app = stores
-    .install(KrakenMessaging::builder(stores.config("orders")).await?)
+    .install(SnodraMessaging::builder(stores.config("orders")).await?)
     .event::<OrderPlaced, _, _>(place_order)
     .start()
     .await?;
@@ -1213,7 +1222,7 @@ assert!(stores.processed(&event_id)); // the event's processed marker is committ
 let letters = stores.dead_letters().await?;
 ```
 
-`stores.config(..)` turns the hub off (`Config::hub_enabled = false`, `KRAKEN_HUB_ENABLED=false`
+`stores.config(..)` turns the hub off (`Config::hub_enabled = false`, `SNODRA_SERVER_ENABLED=false`
 in any service): nothing connects, and every command, query and subscription fails at once with
 `HubUnavailable` naming the setting, those to the service's own handlers included (a sender
 always goes through the hub); the saga relay still delivers a command type the instance handles
@@ -1226,7 +1235,7 @@ processor this way (`src/audit.rs`).
 
 ## The MongoDB message store
 
-The crate `kraken-messaging-mongo` (`crates/`) keeps the message store in the service's own MongoDB
+The crate `snodra-messaging-mongo` (`crates/`) keeps the message store in the service's own MongoDB
 database, in the collections and with the document fields the library has always written and the
 Kotlin library writes (`outbox`, `processed_events`, `dead_letters`, `processor_control`,
 `external_calls`, `sagas`, `saga_dispatch`, `saga_dispatch_leases`, `deadlines`, `saga_failures`;
@@ -1235,12 +1244,12 @@ Rust instance share one database. Transactions are MongoDB sessions: **the datab
 replica set** (a single-node one will do).
 
 ```rust,ignore
-use kraken_messaging_mongo::{MongoStore, MongoTxExt};
+use snodra_messaging_mongo::{MongoStore, MongoTxExt};
 
 // The service builds its client and picks its database; the add-on reads no setting of its own.
 let client = mongodb::Client::with_uri_str(&uri).await?;
 let db = client.default_database().expect("the URI names a database");
-let app = KrakenMessaging::builder(config).await?
+let app = SnodraMessaging::builder(config).await?
     .store(Arc::new(MongoStore::new(client, db)))
     .event_store(events)
     .event::<OrderPlaced, _, _>(|e, ctx| async move {
@@ -1257,8 +1266,8 @@ let app = KrakenMessaging::builder(config).await?
   starts the sessions. Nothing connects before `start()`.
 - **`MongoTxExt::session`** gives a handler the `ClientSession` of the transaction it runs in
   (`ctx.tx.lock().await.session()`); it panics on a transaction of another store.
-- **Indexes**: `start()` creates them unless `KRAKEN_STORE_INIT_SCHEMA=false`, the TTL indexes with
-  the retentions of the `Config` (`KRAKEN_*_RETENTION_MS`); `MongoStore::ensure_indexes(&MongoIndexSettings)`
+- **Indexes**: `start()` creates them unless `SNODRA_STORE_INIT_SCHEMA=false`, the TTL indexes with
+  the retentions of the `Config` (`SNODRA_*_RETENTION_MS`); `MongoStore::ensure_indexes(&MongoIndexSettings)`
   does it by hand. Expiry is MongoDB's TTL monitor (about every 60 s).
 - **Times** the store stamps itself (an outbox entry's `sentAt`, `failedAt` and lease) are the
   application's clock (the builder's), never the database's.
@@ -1275,21 +1284,21 @@ let app = KrakenMessaging::builder(config).await?
   `{ topic, partition, from, until }` (numbers when they are decimal, as Kafka's are, strings
   otherwise).
 
-Tests: `crates/kraken-messaging-mongo/tests/conformance.rs` runs the message-store conformance kit
+Tests: `crates/snodra-messaging-mongo/tests/conformance.rs` runs the message-store conformance kit
 on a MongoDB replica set container; the core's container-backed tests run on it too.
 
 ## The SQL message store
 
-The crate `kraken-messaging-sqlx` (`crates/`, on `sqlx`) keeps the message store in the service's own PostgreSQL (13 or
+The crate `snodra-messaging-sqlx` (`crates/`, on `sqlx`) keeps the message store in the service's own PostgreSQL (13 or
 later, feature `postgres`) or MySQL (8.0.17 or later, InnoDB, a STRICT `sql_mode`, feature `mysql`) database, in the tables
-the Kotlin module `kraken-messaging-jdbc` writes, with the same values and meanings: a Kotlin service and a Rust service can
-share one database. The schema files (`db/kraken/<dialect>/V1__kraken.sql`) are the Kotlin module's, byte for byte.
+the Kotlin module `snodra-messaging-jdbc` writes, with the same values and meanings: a Kotlin service and a Rust service can
+share one database. The schema files (`db/snodra/<dialect>/V1__snodra.sql`) are the Kotlin module's, byte for byte.
 One database (or schema) holds one logical service: its instances, Kotlin or Rust; two different services keep separate
 ones (markers, processor control, dead letters and claims carry no service name).
 
 ```rust
 let pool = sqlx::postgres::PgPoolOptions::new().max_connections(10).connect(&url).await?;
-let app = KrakenMessaging::builder(config).await?
+let app = SnodraMessaging::builder(config).await?
     .store(Arc::new(SqlxStore::postgres(pool).with_settings(SqlxSettings::from_env()?)))
     .event_store(events)
     // the service's handlers; a handler writes its rows in the transaction of the message it handles:
@@ -1298,14 +1307,14 @@ let app = KrakenMessaging::builder(config).await?
     .await?;
 ```
 
-Its settings (`KRAKEN_STORE_SQL_NOTIFY`, `KRAKEN_STORE_SQL_PURGE_INTERVAL_MS`), the schema and its version rule, the
+Its settings (`SNODRA_STORE_SQL_NOTIFY`, `SNODRA_STORE_SQL_PURGE_INTERVAL_MS`), the schema and its version rule, the
 minimum versions, transactions, the PostgreSQL wake-up, the purge and the limits are in
-[crates/kraken-messaging-sqlx/README.md](crates/kraken-messaging-sqlx/README.md); `examples/orders-sql` is a small service
+[crates/snodra-messaging-sqlx/README.md](crates/snodra-messaging-sqlx/README.md); `examples/orders-sql` is a small service
 on it.
 
 ## The Kafka event store
 
-The crate `kraken-messaging-kafka` (`crates/`, on `rdkafka`, librdkafka built from source) is the
+The crate `snodra-messaging-kafka` (`crates/`, on `rdkafka`, librdkafka built from source) is the
 event store on Apache Kafka, with the layout on the wire the Kotlin starter writes: a source is a
 topic (`kraken.events` by default), a segment a partition, a position an offset (both in decimal),
 a processor's subscription its consumer group `<service>.<processor>`; the event's headers are the
@@ -1313,10 +1322,10 @@ record's headers, its key the record's key, its payload the record's value. It d
 capabilities: `replay`, `lag`, `browse` and `native-dead-letter` (`<topic>.dlt`).
 
 ```rust,ignore
-use kraken_messaging_kafka::{KafkaConfig, KafkaEventStore};
+use snodra_messaging_kafka::{KafkaConfig, KafkaEventStore};
 
-let kafka = KafkaConfig::from_env();               // KRAKEN_KAFKA_BOOTSTRAP, KRAKEN_KAFKA_PROPERTY_*
-let app = KrakenMessaging::builder(config).await?
+let kafka = KafkaConfig::from_env();               // SNODRA_KAFKA_BOOTSTRAP, SNODRA_KAFKA_PROPERTY_*
+let app = SnodraMessaging::builder(config).await?
     .event_store(Arc::new(KafkaEventStore::new(kafka)?))
     .store(store)
     /* handlers */
@@ -1326,8 +1335,8 @@ let app = KrakenMessaging::builder(config).await?
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `KRAKEN_KAFKA_BOOTSTRAP` | `kafka:19092` | the bootstrap servers (`bootstrap.servers`); a blank value is the default |
-| `KRAKEN_KAFKA_PROPERTY_<NAME>` | none | one librdkafka property for every client the store creates (`partitioner`, a producer property, for the producer only): `<NAME>` in lower case, `_` for `.` and `__` for a literal `_` (`KRAKEN_KAFKA_PROPERTY_SECURITY_PROTOCOL=SASL_SSL` is `security.protocol`, `KRAKEN_KAFKA_PROPERTY_SASL_MECHANISM=SCRAM-SHA-512` is `sasl.mechanism`, `KRAKEN_KAFKA_PROPERTY_LOG__LEVEL=6` is `log_level`); values never appear in `Debug` output or logs |
+| `SNODRA_KAFKA_BOOTSTRAP` | `kafka:19092` | the bootstrap servers (`bootstrap.servers`); a blank value is the default |
+| `SNODRA_KAFKA_PROPERTY_<NAME>` | none | one librdkafka property for every client the store creates (`partitioner`, a producer property, for the producer only): `<NAME>` in lower case, `_` for `.` and `__` for a literal `_` (`SNODRA_KAFKA_PROPERTY_SECURITY_PROTOCOL=SASL_SSL` is `security.protocol`, `SNODRA_KAFKA_PROPERTY_SASL_MECHANISM=SCRAM-SHA-512` is `sasl.mechanism`, `SNODRA_KAFKA_PROPERTY_LOG__LEVEL=6` is `log_level`); values never appear in `Debug` output or logs |
 
 - **`KafkaConfig`**: `KafkaConfig::new(bootstrap)` or `from_env()`, then `property` (every client),
   `producer_property`, `consumer_property` (they override the environment's for their clients; a
@@ -1335,14 +1344,14 @@ let app = KrakenMessaging::builder(config).await?
   topics and bounds). The keys the store sets itself (`bootstrap.servers`, `group.id`,
   `enable.auto.commit`, the deserializers) are refused when the store or browser opens.
 - **TLS** (`security.protocol` `SSL` or `SASL_SSL`) needs the cargo feature **`ssl`** of the crate
-  (`kraken-messaging-kafka = { ..., features = ["ssl"] }`), which builds librdkafka with a vendored,
+  (`snodra-messaging-kafka = { ..., features = ["ssl"] }`), which builds librdkafka with a vendored,
   statically linked OpenSSL (no system OpenSSL at run time, so a distroless image works). Without
   it a configuration asking for TLS is refused when the store or browser opens, naming the feature.
 - **Partitions follow the Java client.** The producer sets librdkafka's
   `partitioner=murmur2_random` (`DEFAULT_PARTITIONER`), the Java client's default (murmur2 of the
   key, positive, modulo the partition count; an event without a key on a random partition), so one
   key from a Kotlin and a Rust publisher lands on one partition and keeps its order across both.
-  `KRAKEN_KAFKA_PROPERTY_PARTITIONER` (which goes to the producer only, not to the consumers) or
+  `SNODRA_KAFKA_PROPERTY_PARTITIONER` (which goes to the producer only, not to the consumers) or
   `producer_property("partitioner", ..)` chooses another.
 - **Publishing** is the idempotent producer (`enable.idempotence`), one send in at most 40 s
   (`SEND_TIMEOUT`); a record too large, a topic that cannot exist or a refused authorization is
@@ -1360,7 +1369,7 @@ let app = KrakenMessaging::builder(config).await?
 - **Dead-letter mode `event-store`** produces to `<topic>.dlt`: the topic must exist, or broker
   auto-creation must be on.
 - **`KafkaBrowser::open(&config)`** builds the event browser alone (no producer): what a program
-  that only reads the event store needs, e.g. the `kraken-event-browser` binary. `KafkaEventStore::browser()`
+  that only reads the event store needs, e.g. the `snodra-event-browser` binary. `KafkaEventStore::browser()`
   is the same browser inside a store; it never joins a consumer group of its own.
 - **Partner topics** as external sources: `KafkaExternalSource::new(name, ExternalSource::new(topic),
   service_name, &kafka.bootstrap_servers)?` is a provider for `builder.external_source(name, provider,
@@ -1369,24 +1378,24 @@ let app = KrakenMessaging::builder(config).await?
   (never one of the fixed keys); its records are acknowledged after the core dispatched them, and
   their dedupe id is `<name>:<partition>:<offset>` unless the translation carries a key.
 
-Tests: `crates/kraken-messaging-kafka/tests/conformance.rs` runs the event-store conformance kit on
+Tests: `crates/snodra-messaging-kafka/tests/conformance.rs` runs the event-store conformance kit on
 `apache/kafka`; `tests/browser.rs` the browser; `tests/partitioner.rs` pins keys to the partitions
 the Java client gives them.
 
 ## The RabbitMQ Streams event store
 
-The crate `kraken-messaging-rabbitmq` (`crates/`) is the event store on **RabbitMQ 3.13 or later
+The crate `snodra-messaging-rabbitmq` (`crates/`) is the event store on **RabbitMQ 3.13 or later
 with the stream plugin** (`rabbitmq_stream`), through the stream protocol (port 5552, 5551 with
-TLS). It reads and writes the same streams as the Kotlin module `kraken-messaging-rabbitmq`; its
+TLS). It reads and writes the same streams as the Kotlin module `snodra-messaging-rabbitmq`; its
 crate docs give the whole layout on the wire.
 
 ```rust,ignore
-use kraken_messaging_rabbitmq::{RabbitConfig, RabbitEventStore};
+use snodra_messaging_rabbitmq::{RabbitConfig, RabbitEventStore};
 
 // `open` asks the management API (when configured) once: it must answer, and with its metrics
 // off no reset is offered. `new` connects nothing and asks nothing.
 let events = RabbitEventStore::open(RabbitConfig::from_env()?).await?;
-let app = KrakenMessaging::builder(config).await?
+let app = SnodraMessaging::builder(config).await?
     .event_store(Arc::new(events))
     .store(store)
     /* handlers */
@@ -1416,7 +1425,7 @@ routing: the same partition as the Java client's), unkeyed events by their id; a
 broker spreads the partitions over the instances; offsets are tracked on the server under that
 name; headers are AMQP application properties; dead letters go to the stream `<source>.dlt`.
 `browse`, `lag` and `native-dead-letter` are always declared; **`replay` only with the
-management API** (`KRAKEN_RABBITMQ_MANAGEMENT_URL`, plugin `rabbitmq_stream_management`): a reset
+management API** (`SNODRA_RABBITMQ_MANAGEMENT_URL`, plugin `rabbitmq_stream_management`): a reset
 is refused while an instance reads the processor, and only the management API can tell. Without
 it, a reset is answered `UNSUPPORTED`. The management API lists a consumer only after its next
 metrics collection (about every 5 s): an instance in another process that subscribed within the
@@ -1425,30 +1434,30 @@ always counted), so stop every instance and wait a few seconds before a reset.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `KRAKEN_RABBITMQ_HOSTS` | `rabbitmq` | nodes to connect to first, `host` or `host:port`, comma-separated, tried in order (then each stream's leader as the broker advertises it) |
-| `KRAKEN_RABBITMQ_PORT` | 5552 (5551 with TLS) | the port of a host given without one |
-| `KRAKEN_RABBITMQ_VIRTUAL_HOST` | `/` | |
-| `KRAKEN_RABBITMQ_USERNAME` | `guest` | |
-| `KRAKEN_RABBITMQ_PASSWORD` / `_PASSWORD_FILE` | `guest` | the password, or a file holding it (the file wins when both are set, as for the core's `_FILE` settings; surrounding whitespace is trimmed, and a file empty after that is a startup error); never logged |
-| `KRAKEN_RABBITMQ_TLS` | false | TLS (rustls, no OpenSSL) to every node |
-| `KRAKEN_RABBITMQ_TLS_CA_FILE` | none | PEM CA certificates the nodes are verified against; required with TLS (the store never connects unverified) |
-| `KRAKEN_RABBITMQ_LOAD_BALANCER` | false | the hosts are a load balancer: connect through it until it lands on the node needed |
-| `KRAKEN_RABBITMQ_CONFIRM_TIMEOUT_MS` | 30000 | the longest a publish waits for the broker's confirm; a connection that confirms nothing in time is replaced |
-| `KRAKEN_RABBITMQ_OFFSET_STORE_MESSAGES` | 10000 | a processor stores its position every so many acknowledgements... |
-| `KRAKEN_RABBITMQ_OFFSET_STORE_INTERVAL_MS` | 5000 | ...or this often, whichever first, and always when a partition moves away and at shutdown (every stored position is an entry in the stream) |
-| `KRAKEN_RABBITMQ_MANAGEMENT_URL` | none | the management API (`http://rabbitmq:15672`, no credentials in the URL): declares `replay`, shows live subscriptions; metrics collection must be on (neither `management.disable_stats` nor `management_agent.disable_metrics_collector`) |
-| `KRAKEN_RABBITMQ_MANAGEMENT_USERNAME` / `_PASSWORD` / `_PASSWORD_FILE` | the stream user's | the management API's own login; its password file wins over its password, too |
-| `KRAKEN_RABBITMQ_MANAGEMENT_CA_FILE` | none | PEM CA certificates of an `https` management API |
-| `KRAKEN_RABBITMQ_KNOWN_SUBSCRIPTIONS` | none | subscription names the event browser's lag view always lists |
+| `SNODRA_RABBITMQ_HOSTS` | `rabbitmq` | nodes to connect to first, `host` or `host:port`, comma-separated, tried in order (then each stream's leader as the broker advertises it) |
+| `SNODRA_RABBITMQ_PORT` | 5552 (5551 with TLS) | the port of a host given without one |
+| `SNODRA_RABBITMQ_VIRTUAL_HOST` | `/` | |
+| `SNODRA_RABBITMQ_USERNAME` | `guest` | |
+| `SNODRA_RABBITMQ_PASSWORD` / `_PASSWORD_FILE` | `guest` | the password, or a file holding it (the file wins when both are set, as for the core's `_FILE` settings; surrounding whitespace is trimmed, and a file empty after that is a startup error); never logged |
+| `SNODRA_RABBITMQ_TLS` | false | TLS (rustls, no OpenSSL) to every node |
+| `SNODRA_RABBITMQ_TLS_CA_FILE` | none | PEM CA certificates the nodes are verified against; required with TLS (the store never connects unverified) |
+| `SNODRA_RABBITMQ_LOAD_BALANCER` | false | the hosts are a load balancer: connect through it until it lands on the node needed |
+| `SNODRA_RABBITMQ_CONFIRM_TIMEOUT_MS` | 30000 | the longest a publish waits for the broker's confirm; a connection that confirms nothing in time is replaced |
+| `SNODRA_RABBITMQ_OFFSET_STORE_MESSAGES` | 10000 | a processor stores its position every so many acknowledgements... |
+| `SNODRA_RABBITMQ_OFFSET_STORE_INTERVAL_MS` | 5000 | ...or this often, whichever first, and always when a partition moves away and at shutdown (every stored position is an entry in the stream) |
+| `SNODRA_RABBITMQ_MANAGEMENT_URL` | none | the management API (`http://rabbitmq:15672`, no credentials in the URL): declares `replay`, shows live subscriptions; metrics collection must be on (neither `management.disable_stats` nor `management_agent.disable_metrics_collector`) |
+| `SNODRA_RABBITMQ_MANAGEMENT_USERNAME` / `_PASSWORD` / `_PASSWORD_FILE` | the stream user's | the management API's own login; its password file wins over its password, too |
+| `SNODRA_RABBITMQ_MANAGEMENT_CA_FILE` | none | PEM CA certificates of an `https` management API |
+| `SNODRA_RABBITMQ_KNOWN_SUBSCRIPTIONS` | none | subscription names the event browser's lag view always lists |
 
-The source and its dead-letter source are the core's settings (`KRAKEN_EVENTS_SOURCE`,
+The source and its dead-letter source are the core's settings (`SNODRA_EVENTS_SOURCE`,
 `<source>.dlt`), as for every event store.
 
 **Wire rules shared with the Kotlin module** (the crate docs give the whole layout): a
 processor's stored position is the **next offset to read** (never the "last processed" offset:
 a reset to 0 must be expressible), a consumer with none starts at the first offset; every
-consumer carries the property `kraken-member`; producers **never** use sub-entry batching or
-compression on kraken streams.
+consumer carries the property `snodra-member`; producers **never** use sub-entry batching or
+compression on snodra streams.
 
 **Limits, and what differs from Kafka:**
 
@@ -1469,7 +1478,7 @@ compression on kraken streams.
   event at a time (the relay publishes sequentially), so the relay's rate is one confirm round
   trip per event: the latency to the stream's leader and the broker's write time decide it
   (about 1 700 events/s against a local broker; consuming reaches about 6 700/s). A publisher
-  connection that confirms nothing within `KRAKEN_RABBITMQ_CONFIRM_TIMEOUT_MS` (30 s) is
+  connection that confirms nothing within `SNODRA_RABBITMQ_CONFIRM_TIMEOUT_MS` (30 s) is
   replaced. An event over the 1 MiB frame, or refused for access, is given up at once.
 - After a crash up to 10 000 events or 5 s per partition are delivered again (the position is
   stored periodically; the processed-event markers skip them), and the event browser's lag view
@@ -1482,23 +1491,116 @@ compression on kraken streams.
   refresh, then up to three 10 s request bounds) and closed in ~20 s more (positions flushed, consumers unsubscribed);
   a broker answering slower than 10 s fails every request (subscriptions are taken again after the backoff, the relay
   retries), nothing is lost.
-- The management API is one URL (`KRAKEN_RABBITMQ_MANAGEMENT_URL`): with it configured, `open` fails while that node
+- The management API is one URL (`SNODRA_RABBITMQ_MANAGEMENT_URL`): with it configured, `open` fails while that node
   is down, even when the rest of the cluster is healthy. Put the API behind a load balancer, or use `new` (it declares
   `replay` without asking).
 - The event browser's lag view lists the subscriptions this process subscribed, the ones the
-  management API shows reading, and `KRAKEN_RABBITMQ_KNOWN_SUBSCRIPTIONS` (the stream protocol
+  management API shows reading, and `SNODRA_RABBITMQ_KNOWN_SUBSCRIPTIONS` (the stream protocol
   cannot list the names with a stored offset).
 - The client's TLS uses the process's rustls provider: the add-on installs `ring` when none is
   installed.
 
-Tests: `crates/kraken-messaging-rabbitmq/tests/conformance.rs` runs the event-store conformance kit
+Tests: `crates/snodra-messaging-rabbitmq/tests/conformance.rs` runs the event-store conformance kit
 on `rabbitmq:4.4.0-management` (stream and management plugins), with and without the management
 API; `tests/offsets.rs` pins the offset-tracking rules; `tests/throughput.rs` measures publishing
 and consuming 10 000 events; `tests/e2e.rs` runs a service of two instances against the hub image
 (outbox, competing instances, pause and resume, a reset through the hub, a dead letter in the
 dead-letter stream).
 
+## Moving from v0.5.1
+
+v0.5.1 was the last release under the old name (`kraken-messaging-rs`). This is a clean cut: there are no aliases,
+and the server and the Kotlin library must move with it — the protocol package changed (`kraken.hub.v1` →
+`snodra.hub.v1`), so a client and a server of different protocol versions do not talk.
+
+1. **Crates.** The workspace packages and their library names:
+
+   | v0.5.1 | Now |
+   |---|---|
+   | `kraken-messaging-rs` (lib `kraken_messaging`) | `snodra-messaging-rs` (lib `snodra_messaging`) |
+   | `kraken-messaging-kafka` (lib `kraken_messaging_kafka`) | `snodra-messaging-kafka` (lib `snodra_messaging_kafka`) |
+   | `kraken-messaging-mongo` (lib `kraken_messaging_mongo`) | `snodra-messaging-mongo` (lib `snodra_messaging_mongo`) |
+   | `kraken-messaging-sqlx` (lib `kraken_messaging_sqlx`) | `snodra-messaging-sqlx` (lib `snodra_messaging_sqlx`) |
+   | `kraken-messaging-rabbitmq` (lib `kraken_messaging_rabbitmq`) | `snodra-messaging-rabbitmq` (lib `snodra_messaging_rabbitmq`) |
+
+   The git URLs move from `https://gitlab.damoreira.ml/kraken-org/kraken-messaging-rs.git` to
+   `https://gitlab.damoreira.ml/snodra/snodra-messaging-rs.git`.
+
+2. **Code.** Rename the imports (`use kraken_messaging::…` → `use snodra_messaging::…`, and the add-ons
+   likewise) and the two public types: `KrakenMessaging` → `SnodraMessaging`, `KrakenMessagingBuilder` →
+   `SnodraMessagingBuilder`. Nothing else in the API changed.
+
+   ```toml
+   snodra-messaging-rs    = { git = "https://gitlab.damoreira.ml/snodra/snodra-messaging-rs.git", tag = "vX.Y.Z" }
+   snodra-messaging-mongo = { git = "https://gitlab.damoreira.ml/snodra/snodra-messaging-rs.git", tag = "vX.Y.Z" }
+   snodra-messaging-kafka = { git = "https://gitlab.damoreira.ml/snodra/snodra-messaging-rs.git", tag = "vX.Y.Z" }
+   ```
+
+3. **Environment.** Every `KRAKEN_*` variable is `SNODRA_*`, and the hub client's `KRAKEN_HUB_*` variables are the
+   server's own names, `SNODRA_SERVER_*` (there is no alias; the [settings table](#configuration-configfromenv) is
+   the current list):
+
+   | v0.5.1 | Now |
+   |---|---|
+   | `KRAKEN_SERVICE_NAME`, `KRAKEN_INSTANCE_ID` | `SNODRA_SERVICE_NAME`, `SNODRA_INSTANCE_ID` |
+   | `KRAKEN_HUB_ADDRESS`, `KRAKEN_HUB_ENABLED` | `SNODRA_SERVER_ADDRESS`, `SNODRA_SERVER_ENABLED` |
+   | `KRAKEN_HUB_TOKEN`, `KRAKEN_HUB_TOKEN_FILE` | `SNODRA_SERVER_TOKEN`, `SNODRA_SERVER_TOKEN_FILE` |
+   | `KRAKEN_HUB_TLS`, `_TLS_CA`, `_TLS_SERVER_NAME` | `SNODRA_SERVER_TLS`, `_TLS_CA`, `_TLS_SERVER_NAME` |
+   | `KRAKEN_HUB_TLS_CLIENT_CERT`, `_TLS_CLIENT_KEY` | `SNODRA_SERVER_TLS_CLIENT_CERT`, `_TLS_CLIENT_KEY` |
+   | `KRAKEN_HUB_OAUTH2_*` (token URI, client id, secret, secret file, scope, CA) | `SNODRA_SERVER_OAUTH2_*` |
+   | `KRAKEN_HUB_REQUEST_TIMEOUT_MS`, `KRAKEN_HUB_STATUS_INTERVAL_MS` | `SNODRA_SERVER_REQUEST_TIMEOUT_MS`, `SNODRA_SERVER_STATUS_INTERVAL_MS` |
+   | `KRAKEN_HUB_RETRY_*` (enabled, attempts, backoffs, multiplier) | `SNODRA_SERVER_RETRY_*` |
+   | `KRAKEN_HUB_PRIORITIES`, `KRAKEN_HUB_TAGS`, `KRAKEN_HUB_LOAD_FACTOR` | `SNODRA_SERVER_PRIORITIES`, `SNODRA_SERVER_TAGS`, `SNODRA_SERVER_LOAD_FACTOR` |
+   | `KRAKEN_HUB_MAX_SUBSCRIPTIONS`, `KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS` | `SNODRA_SERVER_MAX_SUBSCRIPTIONS`, `SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS` |
+   | `KRAKEN_HUB_IMAGE` (test hub image) | `SNODRA_SERVER_IMAGE` (default `snodra-server:dev`) |
+   | `KRAKEN_EVENTS_*` | `SNODRA_EVENTS_*` |
+   | `KRAKEN_OUTBOX_*`, `KRAKEN_CONSUMER_*`, `KRAKEN_STORE_*` | `SNODRA_OUTBOX_*`, `SNODRA_CONSUMER_*`, `SNODRA_STORE_*` |
+   | `KRAKEN_SAGAS_*`, `KRAKEN_DEADLINES_*`, `KRAKEN_EXTERNAL_CALLS_*` | `SNODRA_SAGAS_*`, `SNODRA_DEADLINES_*`, `SNODRA_EXTERNAL_CALLS_*` |
+   | `KRAKEN_KAFKA_*`, `KRAKEN_RABBITMQ_*` | `SNODRA_KAFKA_*`, `SNODRA_RABBITMQ_*` |
+   | `KRAKEN_JWKS_URL`, `KRAKEN_ISSUER`, `KRAKEN_FORWARD_JWT` | `SNODRA_JWKS_URL`, `SNODRA_ISSUER`, `SNODRA_FORWARD_JWT` |
+   | `KRAKEN_MAX_CONCURRENT_HANDLERS`, `KRAKEN_RECONNECT_BACKOFF_*` | `SNODRA_MAX_CONCURRENT_HANDLERS`, `SNODRA_RECONNECT_BACKOFF_*` |
+   | `KRAKEN_MONGODB_URI`, `KRAKEN_OTLP_ENDPOINT` | `SNODRA_MONGODB_URI`, `SNODRA_OTLP_ENDPOINT` |
+
+   The client version announced to the hub is `snodra-messaging-rs/<version>` (it was
+   `kraken-messaging-rs/<version>`), and the default hub address is `static://snodra-server:7000`.
+
+4. **Metrics.** Every instrument is `snodra_*`: `snodra_outbox_pending`, `snodra_outbox_oldest_age_seconds`,
+   `snodra_outbox_published_total`, `snodra_events_consumed_total`, `snodra_event_handler_duration_seconds`,
+   `snodra_processor_lag{processor,segment}`, `snodra_processor_state`, `snodra_dead_letters`,
+   `snodra_sagas_*`, `snodra_deadlines_*`, `snodra_external_calls_total`. The hub client's series are
+   `snodra_hub_client_*` (request duration, handlers in flight, connected hubs, token fetches, certificate
+   rotations, credential refreshes); the server's own are `snodra_hub_*` (for example
+   `snodra_hub_processor_state`, `snodra_hub_auth_violations_total`). Update dashboards, alerts and recording
+   rules.
+
+5. **Wire and data.** The server speaks `snodra.hub.v1`. Beyond the package name:
+   - The reserved query types are `snodra.events.Search`, `snodra.events.Get`, `snodra.events.Sources`,
+     `snodra.events.Lag` and `snodra.events.Tail`; an ACL namespace is `snodra.events.`.
+   - The mTLS SAN scheme is `snodra://service/<name>`.
+   - The webhook headers are `X-Snodra-Webhook-Secret` and `X-Snodra-Signature`.
+   - A record published to the event store's dead-letter source carries `snodra-dlt-*` headers
+     (`snodra-dlt-processor`, `-reason`, `-error`, `-original-topic`, `-original-partition`, `-original-offset`).
+   - `SagaCommandFailed` is the wire type `snodra.SagaCommandFailed`, and the retryable/unknown-outcome failure
+     markers in an error's details are `{"snodra":"retryable"}` and `{"snodra":"unknown-outcome"}`.
+   - A RabbitMQ Streams subscription marks its consumer with the `snodra-member` property.
+   - **Kept as they are:** the event source/topic `kraken.events`, its dead-letter topic `kraken.events.dlt`, the
+     source-derived stream/segment names (`kraken.events-N`), the dead-letter and marker ids that embed the topic
+     (`orders:kraken.events:1:42`), the MongoDB collections and document fields, the consumer groups
+     (`<service>.<processor>`) and every stored value. Existing event-store and MongoDB data needs no migration.
+
+6. **SQL message store.** The SQL tables follow the Kotlin twin: `snodra_outbox`, `snodra_processed_events`,
+   `snodra_dead_letters`, `snodra_processor_control`, `snodra_external_calls`, `snodra_sagas`,
+   `snodra_saga_associations`, `snodra_saga_dispatch`, `snodra_saga_dispatch_leases`, `snodra_deadlines`,
+   `snodra_saga_failures` and `snodra_schema`; the schema directory is `db/snodra` and the versioned file is
+   `V1__snodra.sql`. The notify channel is `snodra_outbox` and the MySQL schema lock `snodra_schema`; the
+   PostgreSQL advisory lock key ('KRKN' 'SCHM') is unchanged, so a Kotlin and a Rust instance still contend on
+   the same lock. Every column, index and stored value is unchanged: rename the tables (and the Flyway history
+   location) or migrate the data before switching a service.
+
 ## Moving from v0.4.0
+
+The names in this section are today's; at the time of v0.4.0 they were the `kraken-*` ones (see
+[Moving from v0.5.1](#moving-from-v051)).
 
 v0.4.0 had Kafka and MongoDB built in; both are now add-ons a service chooses in code (ADR 0027,
 ADR 0028). The data stays readable without a migration on MongoDB and Kafka: the collection names
@@ -1510,20 +1612,20 @@ the marker ids (`processor:<name>:<eventId>`), the topic `kraken.events`, the co
 driver the service now builds its client with:
 
 ```toml
-kraken-messaging-rs    = { git = "https://gitlab.damoreira.ml/kraken-org/kraken-messaging-rs.git", tag = "vX.Y.Z" }
-kraken-messaging-mongo = { git = "https://gitlab.damoreira.ml/kraken-org/kraken-messaging-rs.git", tag = "vX.Y.Z" }
-kraken-messaging-kafka = { git = "https://gitlab.damoreira.ml/kraken-org/kraken-messaging-rs.git", tag = "vX.Y.Z" }
+snodra-messaging-rs    = { git = "https://gitlab.damoreira.ml/snodra/snodra-messaging-rs.git", tag = "vX.Y.Z" }
+snodra-messaging-mongo = { git = "https://gitlab.damoreira.ml/snodra/snodra-messaging-rs.git", tag = "vX.Y.Z" }
+snodra-messaging-kafka = { git = "https://gitlab.damoreira.ml/snodra/snodra-messaging-rs.git", tag = "vX.Y.Z" }
 mongodb = "3.9.1"
 ```
 
 **The builder.** The service builds both stores and hands them over:
 
 ```rust,ignore
-let client = mongodb::Client::with_uri_str(&std::env::var("KRAKEN_MONGODB_URI")?).await?; // the service's own, now
+let client = mongodb::Client::with_uri_str(&std::env::var("SNODRA_MONGODB_URI")?).await?; // the service's own, now
 let db = client.default_database().expect("the URI names a database");
-let app = KrakenMessaging::builder(Config::from_env()?).await?
-    .store(Arc::new(kraken_messaging_mongo::MongoStore::new(client, db)))
-    .event_store(Arc::new(kraken_messaging_kafka::KafkaEventStore::new(kraken_messaging_kafka::KafkaConfig::from_env())?))
+let app = SnodraMessaging::builder(Config::from_env()?).await?
+    .store(Arc::new(snodra_messaging_mongo::MongoStore::new(client, db)))
+    .event_store(Arc::new(snodra_messaging_kafka::KafkaEventStore::new(snodra_messaging_kafka::KafkaConfig::from_env())?))
     /* handlers as before */
     .start()
     .await?;
@@ -1535,18 +1637,18 @@ let app = KrakenMessaging::builder(Config::from_env()?).await?
   fields `kafka_bootstrap`, `kafka_topic` and `mongodb_uri` are gone (`events_source` replaces
   `kafka_topic`; the servers are the Kafka add-on's `KafkaConfig`, the database the service's own
   client).
-- `KrakenMessaging::client()` / `database()` and `KrakenMessagingBuilder::client()` / `database()`
+- `SnodraMessaging::client()` / `database()` and `SnodraMessagingBuilder::client()` / `database()`
   are gone: the service keeps the client it built the store from.
 - The module `kafka` is `events` (`EventBus`, `OutboxPublisher`, `EventConsumer`, `classify`, the
   dispatch types); `kafka::headers` is `event_store::headers`; `kafka::ensure_indexes` is
-  `MongoStore::ensure_indexes` (or `KRAKEN_STORE_INIT_SCHEMA`); `OutboxDocument` and
+  `MongoStore::ensure_indexes` (or `SNODRA_STORE_INIT_SCHEMA`); `OutboxDocument` and
   `new_outbox_document` are `store::OutboxEntry` and `events::new_outbox_entry`.
 - `EventContext.session` (a `ClientSession`) is `EventContext.tx` (`Arc<Mutex<store::Tx>>`): a
   handler's own MongoDB writes take `MongoTxExt::session` (`ctx.tx.lock().await.session()`), and
   `events.publish_in(&event, key, &mut tx)` takes the store's `Tx`.
 - `builder.external_source(name, ExternalSource, translator)` is
   `builder.external_source(name, provider, translator)`; `ExternalSource` moved to
-  `kraken_messaging_kafka`, and the provider is `KafkaExternalSource::new(name, source, service_name,
+  `snodra_messaging_kafka`, and the provider is `KafkaExternalSource::new(name, source, service_name,
   &kafka.bootstrap_servers)?` (see [The Kafka event store](#the-kafka-event-store)).
 
 **Settings** renamed, with no alias. One still set fails `Config::from_env` with one message naming
@@ -1555,19 +1657,19 @@ old dead-letter mode `topic` fails naming `event-store`:
 
 | v0.4.0 | Now |
 |---|---|
-| `KRAKEN_KAFKA_TOPIC` | `KRAKEN_EVENTS_SOURCE` |
-| `KRAKEN_KAFKA_DEAD_LETTER_MODE` (`collection`, `topic`, `log`) | `KRAKEN_EVENTS_DEAD_LETTER_MODE` (`collection`, `event-store`, `log`) |
-| `KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS` | `KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS` |
-| `KRAKEN_MONGODB_URI` (required) | not read by the library, and not refused: the service builds its MongoDB client itself and may keep reading this variable for it |
-| `KRAKEN_KAFKA_BOOTSTRAP` | unchanged, now read by `KafkaConfig::from_env` (same default `kafka:19092`) |
+| `SNODRA_KAFKA_TOPIC` | `SNODRA_EVENTS_SOURCE` |
+| `SNODRA_KAFKA_DEAD_LETTER_MODE` (`collection`, `topic`, `log`) | `SNODRA_EVENTS_DEAD_LETTER_MODE` (`collection`, `event-store`, `log`) |
+| `SNODRA_KAFKA_DEAD_LETTER_RETENTION_MS` | `SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS` |
+| `SNODRA_MONGODB_URI` (required) | not read by the library, and not refused: the service builds its MongoDB client itself and may keep reading this variable for it |
+| `SNODRA_KAFKA_BOOTSTRAP` | unchanged, now read by `KafkaConfig::from_env` (same default `kafka:19092`) |
 
-New settings: `KRAKEN_HUB_ENABLED`, `KRAKEN_OUTBOX_LEASE_MS`, `KRAKEN_STORE_INIT_SCHEMA` (core);
-`KRAKEN_KAFKA_PROPERTY_<NAME>` (Kafka add-on); the RabbitMQ (`KRAKEN_RABBITMQ_*`) and SQL
-(`KRAKEN_STORE_SQL_*`) add-ons' own.
+New settings: `SNODRA_SERVER_ENABLED`, `SNODRA_OUTBOX_LEASE_MS`, `SNODRA_STORE_INIT_SCHEMA` (core);
+`SNODRA_KAFKA_PROPERTY_<NAME>` (Kafka add-on); the RabbitMQ (`SNODRA_RABBITMQ_*`) and SQL
+(`SNODRA_STORE_SQL_*`) add-ons' own.
 
 **Behaviour to plan for:**
 
-- **Metrics**: `kraken_processor_lag` is labelled `segment` (was `partition`; same values on
+- **Metrics**: `snodra_processor_lag` is labelled `segment` (was `partition`; same values on
   Kafka); dashboards and alerts that name the label change.
 - **Status**: the processor status is the protocol's new shape (`subscription`, `source`,
   `segments[]`, `event_store`, `capabilities`): the hub must be of the matching release.
@@ -1579,16 +1681,16 @@ New settings: `KRAKEN_HUB_ENABLED`, `KRAKEN_OUTBOX_LEASE_MS`, `KRAKEN_STORE_INIT
 ## Security
 
 Access control and TLS for the hub connection (roadmap P5a, hub ADR 0018). Everything here is opt-in
-and the hub decides: against a hub in `KRAKEN_HUB_AUTH_MODE=off` (the default) the token is ignored
+and the hub decides: against a hub in `SNODRA_SERVER_AUTH_MODE=off` (the default) the token is ignored
 and nothing changes.
 
-**Token.** Set `KRAKEN_HUB_TOKEN` (or `Config.hub_token`) to the service's static token. It is sent in
+**Token.** Set `SNODRA_SERVER_TOKEN` (or `Config.hub_token`) to the service's static token. It is sent in
 `Register.credentials.token` of every stream to every hub, and nowhere else. It is never logged:
 `Config`'s and `HubSettings`' `Debug` print `"***"`, and the error and log lines about it carry the
 path or the code, not the value. An empty token is no token. Generate one per service with
-`openssl rand -hex 32`; the hub's ACL holds only its SHA-256 (`kraken-hub acl hash -`).
+`openssl rand -hex 32`; the hub's ACL holds only its SHA-256 (`snodra-server acl hash -`).
 
-**Token file.** `KRAKEN_HUB_TOKEN_FILE` (or `Config.hub_token_file`) names a file with the token, the
+**Token file.** `SNODRA_SERVER_TOKEN_FILE` (or `Config.hub_token_file`) names a file with the token, the
 way container secrets arrive (`/run/secrets/...`). It is read at startup (unreadable, or empty after
 trimming its surrounding whitespace, is a startup error naming the setting and the path, `Config::validate`) and **again before every reconnect**: rotate the secret, and the next
 attempt uses it, no restart. If both settings are set **the file wins**. If the file cannot be read
@@ -1627,26 +1729,26 @@ with `Error{PERMISSION_DENIED}` before anything is routed, in every mode. It sur
 `stream` and `subscribe`, and is **never retried** (`Config.hub_retry` does not apply). A handler
 that returns `AccessDenied` replies `PERMISSION_DENIED`.
 
-**TLS.** `KRAKEN_HUB_TLS=true` (`Config.hub_tls`) makes the channel TLS: rustls through tonic, the
+**TLS.** `SNODRA_SERVER_TLS=true` (`Config.hub_tls`) makes the channel TLS: rustls through tonic, the
 `ring` provider like the hub, TLS 1.2 and 1.3, for every address form (a static list, `dns:///`; an
-`https://` address turns it on by itself). Without `KRAKEN_HUB_TLS_CA` the platform's root certificates
+`https://` address turns it on by itself). Without `SNODRA_SERVER_TLS_CA` the platform's root certificates
 are trusted; with it, that PEM file's CA is (re-read on every connect, so a CA rotation needs no
-restart). `KRAKEN_HUB_TLS_SERVER_NAME` sets the name the certificate must carry and the SNI, for a
+restart). `SNODRA_SERVER_TLS_SERVER_NAME` sets the name the certificate must carry and the SNI, for a
 hub reached by an address that is not in its certificate. With `dns:///name:port` the certificate is
-checked against **`name`** (the DNS host, not the `ip:port` it resolves to; as kraken-messaging does)
-unless `KRAKEN_HUB_TLS_SERVER_NAME` is set, which wins; a static `host:port` is checked against its
+checked against **`name`** (the DNS host, not the `ip:port` it resolves to; as snodra-messaging does)
+unless `SNODRA_SERVER_TLS_SERVER_NAME` is set, which wins; a static `host:port` is checked against its
 host. If the application installs its own
 process-wide rustls provider, tonic uses that one. For a client certificate (mutual TLS) see
 [Authenticating with a client certificate](#authenticating-with-a-client-certificate-mtls).
 
 A mismatch is a clear log line, not a hang: plain text to a TLS hub (which drops anything that is not
-a TLS handshake) logs `hub stream closed; reconnecting ... set hub_tls / KRAKEN_HUB_TLS=true`, and TLS
+a TLS handshake) logs `hub stream closed; reconnecting ... set hub_tls / SNODRA_SERVER_TLS=true`, and TLS
 to a plain-text hub or a certificate the CA does not vouch for logs `TLS to the hub failed: does it
 serve TLS, and does its certificate match hub_tls ca_file and server_name?` with the cause.
 
 ```bash
-KRAKEN_HUB_TOKEN_FILE=/run/secrets/orders-hub-token \
-KRAKEN_HUB_TLS=true KRAKEN_HUB_TLS_CA=/etc/kraken/ca.pem KRAKEN_HUB_TLS_SERVER_NAME=kraken-hub
+SNODRA_SERVER_TOKEN_FILE=/run/secrets/orders-hub-token \
+SNODRA_SERVER_TLS=true SNODRA_SERVER_TLS_CA=/etc/snodra/ca.pem SNODRA_SERVER_TLS_SERVER_NAME=snodra-server
 ```
 
 ### Authenticating with a JWT (Keycloak client credentials)
@@ -1658,19 +1760,19 @@ grants) whose **client id is the service name**: the hub checks the token's `azp
 `Register.service_name` and takes the rights from its `[[service]]` ACL table of that name. Then set
 
 ```bash
-KRAKEN_HUB_OAUTH2_TOKEN_URI=https://keycloak/realms/kraken/protocol/openid-connect/token \
-KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE=/run/secrets/orders-client-secret   # client id defaults to the service name
+SNODRA_SERVER_OAUTH2_TOKEN_URI=https://keycloak/realms/snodra/protocol/openid-connect/token \
+SNODRA_SERVER_OAUTH2_CLIENT_SECRET_FILE=/run/secrets/orders-client-secret   # client id defaults to the service name
 ```
 
 (`Config.hub_oauth2 = Some(HubOAuth2 { token_uri, client_id, client_secret, .. })` in code; the
-variables are in the table above.) One `TokenProvider` per `KrakenMessaging` fetches the token with
+variables are in the table above.) One `TokenProvider` per `SnodraMessaging` fetches the token with
 the `client_credentials` grant (`client_secret_basic`: id and secret form-urlencoded, then base64,
 RFC 6749 2.3.1; 10 s timeout; response capped at 1 MiB; `token_type` must be `Bearer`; a missing
 `expires_in` means 60 s, with one warning) and every hub connection shares it: N hubs, one token,
 one fetch, concurrent connects wait for it. A token is used while more than its margin remains
 (20 % of its lifetime, at least 5 s, at most half of it) and is then replaced in the background,
 not on demand; on every handshaken stream the new token is sent as `ClientMessage.credentials`, so
-the session outlives the token (the hub closes a JWT session `KRAKEN_HUB_JWT_EXPIRY_GRACE`, 30 s,
+the session outlives the token (the hub closes a JWT session `SNODRA_SERVER_JWT_EXPIRY_GRACE`, 30 s,
 after `exp` otherwise); a stream still waiting for its ack sends it right after the ack. A failed
 background refresh keeps the current token and retries after 1 s, 2 s ... 30 s.
 
@@ -1681,7 +1783,7 @@ at least every 5 s to look at the wall clock again. A stream the hub ends with `
 `Register` or refresh refused, or a later close: "token expired", "unknown signing key", "credentials
 expired") retires the access token it presented (its `Register`'s, or the last refresh it sent; a newer token fetched meanwhile is kept): it is never handed out again, `hub_auth()` shows no token expiry until a new one is fetched, and a new one is fetched by the background refresh at its next wake (within 5 s) or by the next stream (reconnecting at the normal backoff), whichever comes first; `PERMISSION_DENIED`
 (wrong `azp`, no ACL entry) does not, because a new token would not help and the IdP is not to be
-hammered. `KrakenMessaging::shutdown()` closes the provider (`TokenProvider::close`): the refresh loop
+hammered. `SnodraMessaging::shutdown()` closes the provider (`TokenProvider::close`): the refresh loop
 ends and no further request reaches the IdP even if a `Sender` is still held.
 
 If no token can be had (the endpoint answers 401 `invalid_client`, is unreachable or misbehaves) the
@@ -1693,21 +1795,21 @@ answers `UNAVAILABLE` "jwks not loaded yet": an ordinary retry, not a logged rej
 
 The client secret and the tokens never appear in logs, errors or `Debug` output (an endpoint that echoes the
 `Authorization` header or the secret in its error text has them masked as `***`). For what is
-running, `KrakenMessaging::hub_auth()` (also `HubPool::auth()`, `HubConnection::auth()`) gives the
+running, `SnodraMessaging::hub_auth()` (also `HubPool::auth()`, `HubConnection::auth()`) gives the
 `AuthKind` (`none`, `token`, `jwt`), the current token's expiry, the last token fetch error and
 `token_fetches`, the fetch counts by result (`ok`, `http_error`, `oauth_error`, `io_error`,
 `bad_response`; also `TokenProvider::stats()`); `hub_credentials_refreshes_sent()` counts the
-refreshes written; the same counts are exported as `kraken_hub_client_token_fetches_total{result}`
-and `kraken_hub_client_credentials_refreshes_sent_total` (see [Metrics](#metrics)). A static token
+refreshes written; the same counts are exported as `snodra_hub_client_token_fetches_total{result}`
+and `snodra_hub_client_credentials_refreshes_sent_total` (see [Metrics](#metrics)). A static token
 session whose
-`KRAKEN_HUB_TOKEN_FILE` changes also sends a refresh (checked once per heartbeat) on its handshaken
+`SNODRA_SERVER_TOKEN_FILE` changes also sends a refresh (checked once per heartbeat) on its handshaken
 streams, so a token rotation needs no reconnect.
 
 `http://` token URIs are accepted (the sandbox uses `http://keycloak:8080`) with one warning unless the
 host is loopback or a single-label name: the secret then crosses the network in the clear.
 
-Differences from the Kotlin starter: the Rust configuration has no relaxed `KRAKEN_MESSAGING_*`
-binding (only `KRAKEN_HUB_OAUTH2_*`), no `/env` redaction layer to extend (`SecretString` prints
+Differences from the Kotlin starter: the Rust configuration has no relaxed `SNODRA_MESSAGING_*`
+binding (only `SNODRA_SERVER_OAUTH2_*`), no `/env` redaction layer to extend (`SecretString` prints
 `"***"`).
 
 ### Authenticating with a client certificate (mTLS)
@@ -1718,26 +1820,26 @@ certificate in the TLS handshake of the hub connection, and the hub reads the se
 it. No secret crosses the wire and no identity provider is in the path. Set
 
 ```bash
-KRAKEN_HUB_TLS_CLIENT_CERT=/etc/kraken/orders.pem \
-KRAKEN_HUB_TLS_CLIENT_KEY=/etc/kraken/orders.key \
-KRAKEN_HUB_TLS_CA=/etc/kraken/ca.pem            # the CA of the hub's certificate (see TLS above)
+SNODRA_SERVER_TLS_CLIENT_CERT=/etc/snodra/orders.pem \
+SNODRA_SERVER_TLS_CLIENT_KEY=/etc/snodra/orders.key \
+SNODRA_SERVER_TLS_CA=/etc/snodra/ca.pem            # the CA of the hub's certificate (see TLS above)
 ```
 
 (`Config.hub_tls = Some(HubTls { client_cert_file, client_key_file, .. })` in code.) Setting them turns
-TLS on, as `KRAKEN_HUB_TLS=true` does. The key is PKCS#8 PEM (`BEGIN PRIVATE KEY`, what `openssl req
+TLS on, as `SNODRA_SERVER_TLS=true` does. The key is PKCS#8 PEM (`BEGIN PRIVATE KEY`, what `openssl req
 -newkey` writes); EC (`BEGIN EC PRIVATE KEY`) and RSA PEM keys work as well, without a promise. A PKCS#8
 EC key that lacks its public key (some tools write it that way) is refused at startup with the
 conversion to run: `openssl pkcs8 -topk8 -nocrypt -in key.pem -out key.pkcs8.pem`, or generate a new
 key with openssl.
 
-**The SAN rule.** The leaf must carry **exactly one URI SAN `kraken://service/<name>`**, `<name>` being
-the service name (`KRAKEN_SERVICE_NAME`; 1 to 128 characters of `[A-Za-z0-9._-]`), and, if it has an
+**The SAN rule.** The leaf must carry **exactly one URI SAN `snodra://service/<name>`**, `<name>` being
+the service name (`SNODRA_SERVICE_NAME`; 1 to 128 characters of `[A-Za-z0-9._-]`), and, if it has an
 extended key usage at all, `clientAuth`. DNS names and other URIs on it are ignored; none, or two
 service names (even equal ones), is `PERMISSION_DENIED` at the hub. The hub's `[[service]]` table of
 that name gives the rights, as for a JWT. How to issue one (`openssl`, cert-manager) is in
 [06-security.md](../kraken/docs/06-security.md#mtls-mode).
 
-**What is checked, and when.** At startup (`Config::validate`, so also `KrakenMessaging::builder`): both
+**What is checked, and when.** At startup (`Config::validate`, so also `SnodraMessaging::builder`): both
 files, no static token and no OAuth2 next to it, both files readable and holding a certificate and a
 key, the key belonging to the leaf, the leaf naming exactly this service, the leaf not yet expired.
 Each is a startup error that names the file and the problem (never the key). A certificate and a
@@ -1800,13 +1902,13 @@ attempts back off. When the certificate in use has less than a tenth
 of its lifetime (or 24 h, whichever is smaller) left and the files hold no other, one `warn` per
 certificate says so.
 
-**Status.** `KrakenMessaging::hub_auth()` (also `HubPool::auth()`, `HubConnection::auth()`) reports
+**Status.** `SnodraMessaging::hub_auth()` (also `HubPool::auth()`, `HubConnection::auth()`) reports
 `AuthKind::Certificate` (`"certificate"`) and `certificate: Some(CertificateStatus { service,
 fingerprint, not_after, rotations })`: the first 8 hex characters of the SHA-256 of the leaf presented
 (what the hub's logs and `/api/v1/topology` show), its `notAfter`, and how many times the presented certificate
 changed since the first one. Logs name a certificate by that fingerprint and the service only; the
 key is never read into a log, an error or a `Debug` print. The rotations are also exported as
-`kraken_hub_client_certificate_rotations_total` (see [Metrics](#metrics)).
+`snodra_hub_client_certificate_rotations_total` (see [Metrics](#metrics)).
 
 **A client without a certificate against a `required` hub** fails at the transport, not as a
 rejection: with TLS 1.3 the client learns that its certificate was refused only when the stream opens,
@@ -1816,21 +1918,21 @@ off as for any outage, at `warn` then `debug`. A hub in `optional` mode takes th
 token or JWT.
 
 Differences from the Kotlin starter: the settings are `HubTls.client_cert_file` / `client_key_file`
-(`KRAKEN_HUB_TLS_CLIENT_CERT` / `_KEY`) and there is no relaxed `KRAKEN_MESSAGING_*` binding; rotation
+(`SNODRA_SERVER_TLS_CLIENT_CERT` / `_KEY`) and there is no relaxed `SNODRA_MESSAGING_*` binding; rotation
 is run by the `HubPool` (a `HubConnection` used on its own re-reads the files on reconnect only); the
-rotation count is in `CertificateStatus` (and `kraken_hub_client_certificate_rotations_total`).
+rotation count is in `CertificateStatus` (and `snodra_hub_client_certificate_rotations_total`).
 
-**Turning it on: permissive first.** (1) Run the hub with `KRAKEN_HUB_AUTH_MODE=permissive` and the
-ACL; it logs and counts every violation (`kraken_hub_auth_violations_total`) and refuses nothing;
+**Turning it on: permissive first.** (1) Run the hub with `SNODRA_SERVER_AUTH_MODE=permissive` and the
+ACL; it logs and counts every violation (`snodra_hub_auth_violations_total`) and refuses nothing;
 (2) give the services their token (and TLS, once the hub has a certificate); (3) when the hub's log
 and metric show no violation, switch it to `enforce`. A service without a token against an `enforce` hub is refused
 and shows up as the `UNAUTHENTICATED` rejection above.
 
 Tested in `tests/hub_auth.rs` and `tests/hub_tls.rs` against the in-process fake hub (which implements
-the hub's modes and codes), and in `tests/e2e_auth.rs` against `kraken-hub:dev` (`KRAKEN_HUB_IMAGE`)
+the hub's modes and codes), and in `tests/e2e_auth.rs` against `snodra-server:dev` (`SNODRA_SERVER_IMAGE`)
 running `enforce` with an ACL file and a TLS certificate generated at test time. JWT authentication is tested in
 `tests/hub_jwt.rs` (a test OAuth2 token endpoint in `tests/support/idp.rs`, with ES256 keys generated
-at test time, and the fake hub, which accepts a JWT without verifying it and records refreshes) and in `tests/e2e_jwt.rs` against `kraken-hub:dev` (`KRAKEN_HUB_IMAGE`) in
+at test time, and the fake hub, which accepts a JWT without verifying it and records refreshes) and in `tests/e2e_jwt.rs` against `snodra-server:dev` (`SNODRA_SERVER_IMAGE`) in
 `enforce` with a `[[service]]` ACL entry, 2 s expiry grace and no leeway: the JWKS is served to the
 hub by a small container (the official `busybox` image's `httpd`) on the bridge network and tokens live 6 s, so the session
 surviving past `exp` plus the grace proves the refresh.
@@ -1839,7 +1941,7 @@ Client certificates are tested in `tests/hub_mtls.rs` against the in-process fak
 client certificates against a CA generated at test time and records what each stream presented (the
 rollover order, one hub at a time and deregistering first, the 10 s wait for handlers, a trickle of
 requests with no failure across two hubs, invalid pairs, the expiry warning, no key material in logs),
-and in `tests/e2e_mtls.rs` against `kraken-hub:dev` in `enforce` with `KRAKEN_HUB_TLS_CLIENT_AUTH=required`
+and in `tests/e2e_mtls.rs` against `snodra-server:dev` in `enforce` with `SNODRA_SERVER_TLS_CLIENT_AUTH=required`
 (two hubs for the rotation; a certificate that lives 8 s for the hub's `notAfter` close). The hub's own
 server certificate is issued by the same CA with the client usage too, so its `--health-check`, which
 presents the hub's own pair under `required`, stays healthy.
@@ -1847,9 +1949,9 @@ presents the hub's own pair under `required`, stays healthy.
 ## Metrics
 
 The library records its metrics through the OpenTelemetry metrics API (`opentelemetry` 0.33, ADR 0026); the
-application installs the meter provider (the SDK and an exporter, e.g. OTLP to otel-lgtm). `KrakenMessaging::builder`
-records on `opentelemetry::global::meter("kraken-messaging-rs")` **as the global provider is when it runs**, so install
-the provider first; `KrakenMessaging::builder_with_meter(config, meter)` takes a meter instead (tests read one back
+application installs the meter provider (the SDK and an exporter, e.g. OTLP to otel-lgtm). `SnodraMessaging::builder`
+records on `opentelemetry::global::meter("snodra-messaging-rs")` **as the global provider is when it runs**, so install
+the provider first; `SnodraMessaging::builder_with_meter(config, meter)` takes a meter instead (tests read one back
 from the SDK's in-memory exporter). With no provider installed the global meter is the API's no-op one: nothing is
 recorded, no gauge callback runs, a measurement costs a virtual call.
 
@@ -1869,11 +1971,11 @@ let provider = SdkMeterProvider::builder()
     .with_periodic_exporter(MetricExporter::builder().with_tonic().with_endpoint("http://otel-lgtm:4317").build()?)
     .build();
 opentelemetry::global::set_meter_provider(provider.clone()); // before the builder
-let app = KrakenMessaging::builder(config).await? /* ... */ .start().await?;
+let app = SnodraMessaging::builder(config).await? /* ... */ .start().await?;
 // ... at exit, after app.shutdown(): provider.shutdown() exports what is pending.
 ```
 
-`examples/service-c` does exactly this when `KRAKEN_OTLP_ENDPOINT` is set (`src/telemetry.rs`). The resource is the
+`examples/service-c` does exactly this when `SNODRA_OTLP_ENDPOINT` is set (`src/telemetry.rs`). The resource is the
 identity of every series: `service.name` the service name and `service.instance.id` the instance id the hub sees
 (`Config.instance_id`), which Prometheus turns into `job` and `instance`; set no `service.namespace` (it changes `job`).
 The data points carry no instance label of their own.
@@ -1888,39 +1990,39 @@ with an event-store or message-store call in a callback.
 
 An instance that stops (a restart, a crash) exports nothing more, and Prometheus keeps a gauge series that stops at its last
 value for 5 minutes (OTLP carries no staleness markers), so a dead instance would still look connected, running or busy.
-The kraken dashboards therefore read the library gauges as `last_over_time(<gauge>[$instance_seen])` (`$instance_seen`
+The Snodra dashboards therefore read the library gauges as `last_over_time(<gauge>[$instance_seen])` (`$instance_seen`
 3 m by default, like the hub dashboard's `$hub_seen`): a series without a sample in that window drops out. Queries of your
 own should do the same; the export interval (the OpenTelemetry SDK's default 60 s, `OTEL_METRIC_EXPORT_INTERVAL`; the
 sandbox's 5 s) must stay well under the window.
 
 | Series (Prometheus) | Type | Labels | Meaning |
 |---|---|---|---|
-| `kraken_outbox_pending` | gauge | — | outbox entries neither sent nor failed, as the relay's last poll saw them (the batch, or a count of all of them behind a full batch); only where the relay runs, every instance reports the same store: aggregate with `max by (job)` |
-| `kraken_outbox_oldest_age_seconds` | gauge | — | age of the oldest of them now, 0 when none |
-| `kraken_outbox_published_total` | counter | `outcome` (`ok`, `failed`) | publish attempts (`failed`: any attempt that did not publish, retried or given up) |
-| `kraken_events_consumed_total` | counter | `processor`, `type`, `outcome` | one per record and processor at its final outcome there: `handled` (stage 1 ran, and in `default` the saga stage; or only the saga stage for a type only sagas handle), `duplicate` (the marker was there and no saga stage ran, or the record's letter was there already), `skipped` (the processor does not handle the type), `parked` (taken by the dead letters, the store's or the event store's `<source>.dlt`: `HANDLER_FAILED`, `INVALID`, `SEQUENCED`), `failed` (given up without a letter: mode `log`, or the saga stage failed for good); a redelivery or a stop mid-attempts counts nothing |
-| `kraken_event_handler_duration_seconds` | histogram | `processor`, `type` | every stage-1 run of a consumed record (marker transaction with the handlers; failures and duplicate markers included; not the saga stage, back-offs, skipped, `SEQUENCED` or `INVALID` records, partner sources, webhooks, letter retries) |
-| `kraken_processor_lag` | gauge | `processor`, `segment` | the lag of each segment assigned to this instance whose lag is known, as the processor status; a segment that leaves the assignment (or whose processor goes) reads 0 once, then disappears, and one whose lag is unknown has no series. Prometheus keeps a series that stops at its last value for 5 minutes, so dashboards take the `max` per segment before summing: `sum by (job, processor) (max by (job, processor, segment) (kraken_processor_lag))` |
-| `kraken_processor_state` | gauge | `processor`, `state` | 1 for the processor's state now, 0 for the others (`starting`, `running`, `paused`, `failing`, `stopped`, as the hub's `kraken_hub_processor_state`) |
-| `kraken_dead_letters` | gauge | `processor` | the processor's letters as last sampled (every 30 s and after a park); 0 in modes `event-store` and `log` |
-| `kraken_hub_client_request_duration_seconds` | histogram | `kind` (`command`, `query`), `type`, `outcome` | every command or query call through the hub (and the saga relay's commands), from the call to its result, retries included; `outcome`: `ok`, `no_handler`, `timeout`, `handler_disconnected`, `handler_error`, `invalid_request` (also a reply that does not decode), `resource_exhausted`, `cancelled`, `denied`, `unavailable` (no live hub, or the connection broke), `error` (also a request that cannot be encoded); local dispatch, scatter-gather, streams and subscriptions are not timed, nor a call its caller dropped |
-| `kraken_hub_client_handlers_in_flight` | gauge | — | requests from the hubs being handled or waiting for a handler permit, over all hubs |
-| `kraken_hub_client_connected_hubs` | gauge | — | hubs with an acknowledged stream (not rolling over) |
-| `kraken_hub_client_token_fetches_total` | counter | `result` (`ok`, `http_error`, `oauth_error`, `io_error`, `bad_response`) | access token fetches (with `KRAKEN_HUB_OAUTH2_*` only) |
-| `kraken_hub_client_certificate_rotations_total` | counter | — | client certificate pairs adopted after the first (with a client certificate only) |
-| `kraken_hub_client_credentials_refreshes_sent_total` | counter | — | `ClientMessage.credentials` written to the hubs |
-| `kraken_sagas_started_total`, `kraken_sagas_ended_total` | counter | `type` | saga instances started, ended, per saga type |
-| `kraken_saga_events_total` | counter | `type`, `outcome` (`handled`, `no_match`, `conflict`, `parked`) | events handled by a saga type |
-| `kraken_deadlines_fired_total` | counter | `name` | deadlines whose handler ran |
-| `kraken_deadlines_due` | gauge | `name` | scheduled deadlines past their due time after the scheduler's last poll |
-| `kraken_external_calls_total` | counter | `handler`, `outcome` (`succeeded`, `replayed`, `failed`, `retryable`, `unknown`) | idempotent handler calls (`handler`: the message's wire type) |
-| `kraken_saga_command_failures_total` | counter | `type`, `reason` (`FailureReason`, e.g. `NO_HANDLER`) | `SagaCommandFailed` notices nobody handled (no saga instance took it and no ordinary handler handles it, or its delivery was given up; one a saga's handler failed on is parked in `saga_failures` instead), and saga events the outbox refuses (reason `INVALID`) |
-| `kraken_sagas_active` | gauge | `type` | live saga instances (sampled every 15 s) |
-| `kraken_saga_dispatch_pending` | gauge | — | `saga_dispatch` entries neither dispatched nor failed (sampled every 15 s) |
+| `snodra_outbox_pending` | gauge | — | outbox entries neither sent nor failed, as the relay's last poll saw them (the batch, or a count of all of them behind a full batch); only where the relay runs, every instance reports the same store: aggregate with `max by (job)` |
+| `snodra_outbox_oldest_age_seconds` | gauge | — | age of the oldest of them now, 0 when none |
+| `snodra_outbox_published_total` | counter | `outcome` (`ok`, `failed`) | publish attempts (`failed`: any attempt that did not publish, retried or given up) |
+| `snodra_events_consumed_total` | counter | `processor`, `type`, `outcome` | one per record and processor at its final outcome there: `handled` (stage 1 ran, and in `default` the saga stage; or only the saga stage for a type only sagas handle), `duplicate` (the marker was there and no saga stage ran, or the record's letter was there already), `skipped` (the processor does not handle the type), `parked` (taken by the dead letters, the store's or the event store's `<source>.dlt`: `HANDLER_FAILED`, `INVALID`, `SEQUENCED`), `failed` (given up without a letter: mode `log`, or the saga stage failed for good); a redelivery or a stop mid-attempts counts nothing |
+| `snodra_event_handler_duration_seconds` | histogram | `processor`, `type` | every stage-1 run of a consumed record (marker transaction with the handlers; failures and duplicate markers included; not the saga stage, back-offs, skipped, `SEQUENCED` or `INVALID` records, partner sources, webhooks, letter retries) |
+| `snodra_processor_lag` | gauge | `processor`, `segment` | the lag of each segment assigned to this instance whose lag is known, as the processor status; a segment that leaves the assignment (or whose processor goes) reads 0 once, then disappears, and one whose lag is unknown has no series. Prometheus keeps a series that stops at its last value for 5 minutes, so dashboards take the `max` per segment before summing: `sum by (job, processor) (max by (job, processor, segment) (snodra_processor_lag))` |
+| `snodra_processor_state` | gauge | `processor`, `state` | 1 for the processor's state now, 0 for the others (`starting`, `running`, `paused`, `failing`, `stopped`, as the hub's `snodra_hub_processor_state`) |
+| `snodra_dead_letters` | gauge | `processor` | the processor's letters as last sampled (every 30 s and after a park); 0 in modes `event-store` and `log` |
+| `snodra_hub_client_request_duration_seconds` | histogram | `kind` (`command`, `query`), `type`, `outcome` | every command or query call through the hub (and the saga relay's commands), from the call to its result, retries included; `outcome`: `ok`, `no_handler`, `timeout`, `handler_disconnected`, `handler_error`, `invalid_request` (also a reply that does not decode), `resource_exhausted`, `cancelled`, `denied`, `unavailable` (no live hub, or the connection broke), `error` (also a request that cannot be encoded); local dispatch, scatter-gather, streams and subscriptions are not timed, nor a call its caller dropped |
+| `snodra_hub_client_handlers_in_flight` | gauge | — | requests from the hubs being handled or waiting for a handler permit, over all hubs |
+| `snodra_hub_client_connected_hubs` | gauge | — | hubs with an acknowledged stream (not rolling over) |
+| `snodra_hub_client_token_fetches_total` | counter | `result` (`ok`, `http_error`, `oauth_error`, `io_error`, `bad_response`) | access token fetches (with `SNODRA_SERVER_OAUTH2_*` only) |
+| `snodra_hub_client_certificate_rotations_total` | counter | — | client certificate pairs adopted after the first (with a client certificate only) |
+| `snodra_hub_client_credentials_refreshes_sent_total` | counter | — | `ClientMessage.credentials` written to the hubs |
+| `snodra_sagas_started_total`, `snodra_sagas_ended_total` | counter | `type` | saga instances started, ended, per saga type |
+| `snodra_saga_events_total` | counter | `type`, `outcome` (`handled`, `no_match`, `conflict`, `parked`) | events handled by a saga type |
+| `snodra_deadlines_fired_total` | counter | `name` | deadlines whose handler ran |
+| `snodra_deadlines_due` | gauge | `name` | scheduled deadlines past their due time after the scheduler's last poll |
+| `snodra_external_calls_total` | counter | `handler`, `outcome` (`succeeded`, `replayed`, `failed`, `retryable`, `unknown`) | idempotent handler calls (`handler`: the message's wire type) |
+| `snodra_saga_command_failures_total` | counter | `type`, `reason` (`FailureReason`, e.g. `NO_HANDLER`) | `SagaCommandFailed` notices nobody handled (no saga instance took it and no ordinary handler handles it, or its delivery was given up; one a saga's handler failed on is parked in `saga_failures` instead), and saga events the outbox refuses (reason `INVALID`) |
+| `snodra_sagas_active` | gauge | `type` | live saga instances (sampled every 15 s) |
+| `snodra_saga_dispatch_pending` | gauge | — | `saga_dispatch` entries neither dispatched nor failed (sampled every 15 s) |
 
 The saga series are exported by `OtelSagaMetrics`, which the runtime, relay, deadline scheduler and idempotent handlers
-report to; it also keeps `app.saga_stats()`. The instrument names are constants in `kraken_messaging::metrics` and
-`kraken_messaging::saga::stats`.
+report to; it also keeps `app.saga_stats()`. The instrument names are constants in `snodra_messaging::metrics` and
+`snodra_messaging::saga::stats`.
 
 ## Build and test
 
@@ -1933,10 +2035,10 @@ cargo test --workspace --all-features -- --test-threads=1   # as CI; the in-memo
 Most tests run on the in-memory stores (see [In-memory stores](#in-memory-stores)) and need no
 container. The integration tests that pin the add-ons' own behaviour, and the end-to-end tests,
 start Kafka (`apache/kafka`), MongoDB (replica set), RabbitMQ (`rabbitmq:4.4.0-management`), PostgreSQL
-(`postgres:17.7`), MySQL (`mysql:8.4.7`) and `kraken-hub:dev` with testcontainers. The hub image is built from the
-sibling repo: `docker build -t kraken-hub:dev .` in `../kraken-hub` (override with `KRAKEN_HUB_IMAGE`); every
+(`postgres:17.7`), MySQL (`mysql:8.4.7`) and `snodra-server:dev` with testcontainers. The hub image is built from the
+sibling repo: `docker build -t snodra-server:dev .` in `../snodra-server` (override with `SNODRA_SERVER_IMAGE`); every
 end-to-end test runs that one image, which must speak this release's protocol (the store-neutral processor status and
-the event-browser queries): build it from the matching kraken-hub commit, the hub and this library ship together. Run
+the event-browser queries): build it from the matching snodra-server commit, the hub and this library ship together. Run
 the container-backed suites one at a time (`--test-threads=1`, as CI does): suites that start containers at once collide
 on host ports. `tests/e2e_protocol.rs` covers the handshake, timeouts,
 reconnect, flow control and status reports against it; `tests/e2e_multi_hub.rs`,
@@ -1947,8 +2049,8 @@ the container); `tests/hub_pool.rs` runs
 the multi-hub rules against in-process fake hubs. Without Docker the integration tests print a notice and skip; with Docker but no hub
 image they fail with the build command. On Rancher Desktop export
 `DOCKER_HOST=unix://$HOME/.rd/docker.sock` first. A unit test and `scripts/check-proto-sync.sh` (CI
-job `proto-sync`) check that `proto/hub.proto` is byte-identical to `../kraken/protocol/hub.proto`
-whenever the umbrella checkout exists.
+job `proto-sync`) check that `proto/hub.proto` is byte-identical to `../snodra-server/proto/hub.proto`
+whenever that checkout exists.
 
 ## Example
 
@@ -1973,7 +2075,7 @@ shell runner that has Rust, `protoc`, Docker and buildx installed (no job image,
 flowchart LR
     subgraph check
       fmt["fmt<br/>cargo fmt --check"]
-      sync["proto-sync<br/>hub.proto = umbrella's"]
+      sync["proto-sync<br/>hub.proto = server's"]
       clippy["clippy<br/>--workspace --all-targets --all-features -D warnings"]
     end
     check --> test["test<br/>cargo test --workspace --all-features"] --> release["release · main only<br/>tag vX.Y.Z, crate, GitLab release"]
@@ -1982,9 +2084,9 @@ flowchart LR
 | Stage | Job | Runs | What it does |
 |---|---|---|---|
 | check | `fmt` | always | `cargo fmt --all -- --check` |
-| check | `proto-sync` | always | clones the umbrella repo `kraken` and checks that `proto/hub.proto` is byte-identical to its `protocol/hub.proto` (`scripts/check-proto-sync.sh`, required) |
+| check | `proto-sync` | always | clones the public `snodra-server` repository anonymously and checks that `proto/hub.proto` is byte-identical to its `proto/hub.proto` (`scripts/check-proto-sync.sh`, required) |
 | check | `clippy` | always | `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
-| test | `test` | always | logs in to Harbor, pulls `$KRAKEN_HUB_IMAGE`, then `cargo test --workspace --all-features -- --test-threads=1` (the container-backed suites run one at a time; `TESTCONTAINERS_RYUK_DISABLED=true`) |
+| test | `test` | always | logs in to Harbor, pulls `$SNODRA_SERVER_IMAGE`, then `cargo test --workspace --all-features -- --test-threads=1` (the container-backed suites run one at a time; `TESTCONTAINERS_RYUK_DISABLED=true`) |
 | release | `release` | default branch only | the next version from the conventional commits since the last `v*` tag (`feat` minor, a `!` or `BREAKING CHANGE` major, else patch; `RELEASE_VERSION` or `SEMVER_BUMP` override, `DRY_RUN=true` stops before tagging), pushes the tag, packages the core crate (`cargo package`) into the project's generic package registry and creates the GitLab release linking it |
 
 Services depend on the crates by git tag (see [Moving from v0.4.0](#moving-from-v040)). The root `Dockerfile` is not

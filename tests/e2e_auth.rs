@@ -1,5 +1,5 @@
-//! End to end against the real hub image (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`) running
-//! `KRAKEN_HUB_AUTH_MODE=enforce` with an ACL file and a TLS certificate, both generated at test
+//! End to end against the real hub image (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`) running
+//! `SNODRA_SERVER_AUTH_MODE=enforce` with an ACL file and a TLS certificate, both generated at test
 //! time and mounted in (nothing is checked in): a service with the right token registers over TLS
 //! and serves a query from a second service, a wrong token is refused with `UNAUTHENTICATED`, a
 //! token used for the wrong service or type is refused with `PERMISSION_DENIED`, a send outside the
@@ -11,13 +11,13 @@ mod support;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kraken_messaging::hub::{
-    HubConnection, HubSettings, Inbound, RegisteredTypes, SendOptions, Sender,
-};
-use kraken_messaging::proto::{self, ClientMessage, client_message, reply};
-use kraken_messaging::{HubTls, MessagingError, Query, SecretString, message_type};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use snodra_messaging::hub::{
+    HubConnection, HubSettings, Inbound, RegisteredTypes, SendOptions, Sender,
+};
+use snodra_messaging::proto::{self, ClientMessage, client_message, reply};
+use snodra_messaging::{HubTls, MessagingError, Query, SecretString, message_type};
 use support::containers::{HubContainer, HubOptions, hub_with};
 use support::logs::Captured;
 use support::pki::{Pki, TempDir};
@@ -105,7 +105,7 @@ impl Fixture {
 /// `billing.*` only.
 async fn fixture() -> Fixture {
     let dir = TempDir::new();
-    let pki = Pki::new("kraken test CA");
+    let pki = Pki::new("snodra test CA");
     let (cert, key) = pki.server(&[]);
     let ca = dir.write("ca.pem", &pki.ca_pem);
     dir.write("hub-cert.pem", &cert);
@@ -118,11 +118,11 @@ async fn fixture() -> Fixture {
     );
     let hub = hub_with(
         HubOptions::new()
-            .env("KRAKEN_HUB_AUTH_MODE", "enforce")
-            .env("KRAKEN_HUB_ACL_FILE", "/etc/kraken/acl.toml")
-            .env("KRAKEN_HUB_TLS_CERT", "/etc/kraken/hub-cert.pem")
-            .env("KRAKEN_HUB_TLS_KEY", "/etc/kraken/hub-key.pem")
-            .mount(dir.dir(), "/etc/kraken"),
+            .env("SNODRA_SERVER_AUTH_MODE", "enforce")
+            .env("SNODRA_SERVER_ACL_FILE", "/etc/snodra/acl.toml")
+            .env("SNODRA_SERVER_TLS_CERT", "/etc/snodra/hub-cert.pem")
+            .env("SNODRA_SERVER_TLS_KEY", "/etc/snodra/hub-key.pem")
+            .mount(dir.dir(), "/etc/snodra"),
     )
     .await;
     Fixture {
@@ -361,7 +361,7 @@ async fn plain_text_against_the_tls_hub_fails_cleanly() {
     // Not a hang: the hint is logged within a few seconds. The first failure can be a refused
     // connect (the host-mapped port not forwarding yet) that carries no hint, so wait for the
     // hint itself, not for the first "hub stream closed".
-    while !captured.text().contains("KRAKEN_HUB_TLS=true") {
+    while !captured.text().contains("SNODRA_SERVER_TLS=true") {
         assert!(
             started.elapsed() < Duration::from_secs(15),
             "no hint logged: {}",
@@ -378,7 +378,7 @@ async fn plain_text_against_the_tls_hub_fails_cleanly() {
 #[tokio::test]
 async fn a_hub_in_mode_off_ignores_the_token_a_client_sends() {
     require_docker!();
-    let hub = hub_with(HubOptions::new().env("KRAKEN_HUB_AUTH_MODE", "off")).await;
+    let hub = hub_with(HubOptions::new().env("SNODRA_SERVER_AUTH_MODE", "off")).await;
     // Tokens no hub knows (one shaped like a JWT): `off` reads no credential, so both register.
     let billing = peer(
         &hub.address,
