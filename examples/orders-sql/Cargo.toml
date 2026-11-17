@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
 description = "Snodra example: a small orders service on PostgreSQL with the SQL message store (snodra-messaging-sqlx)"
-license = "MIT"
+license = "Apache-2.0"
 publish = false
 
 [dependencies]
