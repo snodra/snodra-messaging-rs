@@ -10,10 +10,9 @@
 </p>
 
 <p align="center">
-  <a href="https://gitlab.damoreira.ml/snodra/snodra-messaging-rs/-/pipelines"><img alt="pipeline" src="https://gitlab.damoreira.ml/snodra/snodra-messaging-rs/badges/main/pipeline.svg"></a>
-  <a href="https://gitlab.damoreira.ml/snodra/snodra-messaging-rs/-/releases"><img alt="release" src="https://gitlab.damoreira.ml/snodra/snodra-messaging-rs/-/badges/release.svg"></a>
+  <a href="https://github.com/snodra/snodra-messaging-rs/actions/workflows/ci.yml"><img alt="ci" src="https://github.com/snodra/snodra-messaging-rs/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://crates.io/crates/snodra-messaging-rs"><img alt="crates.io" src="https://img.shields.io/crates/v/snodra-messaging-rs"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-1.99.1-000000?logo=rust&logoColor=white">
-  <img alt="crate" src="https://img.shields.io/badge/crate-git%20dependency-dea584?logo=rust&logoColor=white">
   <img alt="tonic" src="https://img.shields.io/badge/tonic-gRPC-244c5a">
   <a href="https://snodra.damoreira.com/"><img alt="Snodra docs" src="https://img.shields.io/badge/docs-snodra.damoreira.com-0B5FFF"></a>
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-green"></a>
@@ -1523,17 +1522,16 @@ and the server and the Kotlin library must move with it — the protocol package
    | `kraken-messaging-sqlx` (lib `kraken_messaging_sqlx`) | `snodra-messaging-sqlx` (lib `snodra_messaging_sqlx`) |
    | `kraken-messaging-rabbitmq` (lib `kraken_messaging_rabbitmq`) | `snodra-messaging-rabbitmq` (lib `snodra_messaging_rabbitmq`) |
 
-   The git URLs move from `https://gitlab.damoreira.ml/kraken-org/kraken-messaging-rs.git` to
-   `https://gitlab.damoreira.ml/snodra/snodra-messaging-rs.git`.
+   The crates move from a git dependency to **crates.io**: `cargo add snodra-messaging-rs@0.6`.
 
 2. **Code.** Rename the imports (`use kraken_messaging::…` → `use snodra_messaging::…`, and the add-ons
    likewise) and the two public types: `KrakenMessaging` → `SnodraMessaging`, `KrakenMessagingBuilder` →
    `SnodraMessagingBuilder`. Nothing else in the API changed.
 
    ```toml
-   snodra-messaging-rs    = { git = "https://gitlab.damoreira.ml/snodra/snodra-messaging-rs.git", tag = "vX.Y.Z" }
-   snodra-messaging-mongo = { git = "https://gitlab.damoreira.ml/snodra/snodra-messaging-rs.git", tag = "vX.Y.Z" }
-   snodra-messaging-kafka = { git = "https://gitlab.damoreira.ml/snodra/snodra-messaging-rs.git", tag = "vX.Y.Z" }
+   snodra-messaging-rs    = "0.6"
+   snodra-messaging-mongo = "0.6"
+   snodra-messaging-kafka = "0.6"
    ```
 
 3. **Environment.** Every `KRAKEN_*` variable is `SNODRA_*`, and the hub client's `KRAKEN_HUB_*` variables are the
@@ -1608,13 +1606,13 @@ and document fields, the outbox layout, the dead-letter ids (`<processor>:<topic
 the marker ids (`processor:<name>:<eventId>`), the topic `kraken.events`, the consumer groups
 `<service>.<processor>` and the record headers are unchanged. There are no compatibility aliases.
 
-**Dependencies.** Add the two add-ons from the same repository and tag as the core, and the MongoDB
-driver the service now builds its client with:
+**Dependencies.** Add the two add-ons at the core's version from crates.io, and the MongoDB driver the
+service now builds its client with:
 
 ```toml
-snodra-messaging-rs    = { git = "https://gitlab.damoreira.ml/snodra/snodra-messaging-rs.git", tag = "vX.Y.Z" }
-snodra-messaging-mongo = { git = "https://gitlab.damoreira.ml/snodra/snodra-messaging-rs.git", tag = "vX.Y.Z" }
-snodra-messaging-kafka = { git = "https://gitlab.damoreira.ml/snodra/snodra-messaging-rs.git", tag = "vX.Y.Z" }
+snodra-messaging-rs    = "0.6"
+snodra-messaging-mongo = "0.6"
+snodra-messaging-kafka = "0.6"
 mongodb = "3.9.1"
 ```
 
@@ -2068,8 +2066,9 @@ image. `examples/README.md` lists both.
 
 ## CI/CD pipeline
 
-Defined in [`.gitlab-ci.yml`](.gitlab-ci.yml). Pipelines run for merge requests and for the default branch only, on a
-shell runner that has Rust, `protoc`, Docker and buildx installed (no job image, no services).
+Defined in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (every push and pull request) and
+[`.github/workflows/release.yml`](.github/workflows/release.yml) (tags `v*`), on GitHub-hosted Ubuntu runners with the
+toolchain from `rust-toolchain.toml` and `protoc` 29.
 
 ```mermaid
 flowchart LR
@@ -2078,25 +2077,33 @@ flowchart LR
       sync["proto-sync<br/>hub.proto = server's"]
       clippy["clippy<br/>--workspace --all-targets --all-features -D warnings"]
     end
-    check --> test["test<br/>cargo test --workspace --all-features"] --> release["release · main only<br/>tag vX.Y.Z, crate, GitLab release"]
+    check --> test["test<br/>cargo test --workspace --all-features"] --> release["release · tag v* only<br/>crates.io + GitHub release"]
 ```
 
-| Stage | Job | Runs | What it does |
+| Workflow | Job | Runs | What it does |
 |---|---|---|---|
-| check | `fmt` | always | `cargo fmt --all -- --check` |
-| check | `proto-sync` | always | clones the public `snodra-server` repository anonymously and checks that `proto/hub.proto` is byte-identical to its `proto/hub.proto` (`scripts/check-proto-sync.sh`, required) |
-| check | `clippy` | always | `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
-| test | `test` | always | logs in to Harbor, pulls `$SNODRA_SERVER_IMAGE`, then `cargo test --workspace --all-features -- --test-threads=1` (the container-backed suites run one at a time; `TESTCONTAINERS_RYUK_DISABLED=true`) |
-| release | `release` | default branch only | the next version from the conventional commits since the last `v*` tag (`feat` minor, a `!` or `BREAKING CHANGE` major, else patch; `RELEASE_VERSION` or `SEMVER_BUMP` override, `DRY_RUN=true` stops before tagging), pushes the tag, packages the core crate (`cargo package`) into the project's generic package registry and creates the GitLab release linking it |
+| `ci` | `fmt` | every push and pull request | `cargo fmt --all -- --check` |
+| `ci` | `proto-sync` | every push and pull request | clones the public `snodra/snodra-server` (`vars.SNODRA_SERVER_REF`, default `main`) and checks that `proto/hub.proto` is byte-identical to its `proto/hub.proto` (`scripts/check-proto-sync.sh`, required) |
+| `ci` | `clippy` | every push and pull request | `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
+| `ci` | `test` | every push and pull request | `cargo test --workspace --all-features -- --test-threads=1`; the container-backed suites use the runner's Docker |
+| `release` | `publish` | tags `v*` only | asserts the tag equals the `Cargo.toml` version, publishes the core and then the four add-ons to crates.io, then creates the GitHub release |
 
-Services depend on the crates by git tag (see [Moving from v0.4.0](#moving-from-v040)). The root `Dockerfile` is not
-built by CI: it builds the core crate in a clean image (`docker build .`), to check that the crate builds outside a
-developer machine; the sandbox compose builds `examples/service-c` from source.
+Releases are cut deliberately:
+
+```sh
+git switch main && git pull
+git tag vX.Y.Z && git push origin vX.Y.Z
+```
+
+Services take their dependencies from **crates.io** (`cargo add snodra-messaging-rs@0.6`), so no git access, no deploy
+token and no private registry are involved. The root `Dockerfile` is not built by CI: it builds the core crate in a clean
+image (`docker build .`), to check that the crate builds outside a developer machine; the sandbox compose builds
+`examples/service-c` from source.
 
 ## Contributing
 
-Branches `feat/<topic>`, `fix/<topic>`, `chore/<topic>` off `main`, merged by merge request with a
-green pipeline; conventional commit messages. Design changes go to the umbrella repo first.
+Branches `feat/<topic>`, `fix/<topic>`, `chore/<topic>` off `main`, merged by pull request with a
+green workflow; conventional commit messages. Design changes go to the umbrella repo first.
 Conventions: [`../kraken/docs/04-repositories.md`](../kraken/docs/04-repositories.md).
 
 ## License

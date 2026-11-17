@@ -1,14 +1,18 @@
 [package]
 name = "snodra-messaging-kafka"
-version = "0.1.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.99"
 description = "Snodra messaging: the Kafka event store (publish, subscriptions, reset, lag, dead-letter topics, the event browser) and partner Kafka topics"
 license = "MIT"
-publish = false
+repository = "https://github.com/snodra/snodra-messaging-rs"
+homepage = "https://snodra.damoreira.com/"
+documentation = "https://docs.rs/snodra-messaging-kafka"
+keywords = ["kafka","event-store","messaging","events"]
+categories = ["database"]
 
 [dependencies]
-snodra-messaging-rs = { path = "../.." }
+snodra-messaging-rs = { path = "../..", version = "0.6.0" }
 # librdkafka built from source (cmake), with zstd: records any Kafka client compressed (a Java
 # client's compression.type=zstd too) can be read.
 rdkafka = { version = "0.39.0", features = ["cmake-build", "zstd"] }
@@ -24,7 +28,7 @@ uuid = { version = "1", features = ["v4"] }
 ssl = ["rdkafka/ssl-vendored"]
 
 [dev-dependencies]
-snodra-messaging-rs = { path = "../..", features = ["testing"] }
+snodra-messaging-rs = { path = "../..", version = "0.6.0", features = ["testing"] }
 snodra-messaging-mongo = { path = "../snodra-messaging-mongo" }
 mongodb = "3.9.1"
 tokio = { version = "1.54.1", features = ["full", "test-util"] }
