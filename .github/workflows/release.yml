@@ -51,7 +51,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           publish_crate() {
             crate="$1"
-            if curl -fsS "https://crates.io/api/v1/crates/$crate/$VERSION" >/dev/null 2>&1; then
+            if curl -fsS -A "snodra-release" "https://crates.io/api/v1/crates/$crate/$VERSION" >/dev/null 2>&1; then
               echo "$crate $VERSION is already on crates.io"
               return 0
             fi
