@@ -3,16 +3,16 @@ name = "service-c"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
-description = "kraken example service C: handles Shout and Reverse, co-owns Inventory, the streaming Rows and the subscription WatchCounter, owns IncrementCounter, publishes text events, logs GreetingDelivered, prints every shout as a banner through a saga, runs the named event processor audit with a dead-letter admin API"
-license = "MIT"
+description = "Snodra example service C: handles Shout and Reverse, co-owns Inventory, the streaming Rows and the subscription WatchCounter, owns IncrementCounter, publishes text events, logs GreetingDelivered, prints every shout as a banner through a saga, runs the named event processor audit with a dead-letter admin API"
+license = "Apache-2.0"
 publish = false
 
 [dependencies]
-kraken-messaging-rs = { path = "../.." }
+snodra-messaging-rs = { path = "../.." }
 # The message store (ADR 0028): its own MongoDB database, through the MongoDB add-on.
-kraken-messaging-mongo = { path = "../../crates/kraken-messaging-mongo" }
+snodra-messaging-mongo = { path = "../../crates/snodra-messaging-mongo" }
 # The event store (ADR 0027): Kafka, through the Kafka add-on (also the printer's partner topic).
-kraken-messaging-kafka = { path = "../../crates/kraken-messaging-kafka" }
+snodra-messaging-kafka = { path = "../../crates/snodra-messaging-kafka" }
 mongodb = "3.9.1"
 tokio = { version = "1.54.1", features = ["full"] }
 futures = "0.3"
@@ -21,7 +21,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # The metrics export (ADR 0026): the OTLP meter provider the library's metrics go to when
-# KRAKEN_OTLP_ENDPOINT is set (the versions kraken-hub and files-service use).
+# SNODRA_OTLP_ENDPOINT is set (the versions snodra-server and files-service use).
 opentelemetry = { version = "0.33.1", default-features = false, features = ["metrics"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["metrics", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["grpc-tonic", "metrics"] }
@@ -33,4 +33,4 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "r
 
 [dev-dependencies]
 # SagaTestFixture (feature `testing`) for the banner saga's unit tests.
-kraken-messaging-rs = { path = "../..", features = ["testing"] }
+snodra-messaging-rs = { path = "../..", features = ["testing"] }

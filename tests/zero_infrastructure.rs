@@ -9,10 +9,10 @@ mod support;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kraken_messaging::store::DeadLetterReason;
-use kraken_messaging::testing::InMemoryStores;
-use kraken_messaging::{Event, KrakenMessaging, MessagingError, SendOptions, message_type};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::store::DeadLetterReason;
+use snodra_messaging::testing::InMemoryStores;
+use snodra_messaging::{Event, MessagingError, SendOptions, SnodraMessaging, message_type};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct OrderPlaced {
@@ -37,7 +37,7 @@ async fn a_service_runs_on_the_in_memory_stores() {
     let stores = InMemoryStores::new();
     let mut config = stores.config("zero");
     config.consumer_max_attempts = 2;
-    let builder = stores.install(KrakenMessaging::builder(config).await.unwrap());
+    let builder = stores.install(SnodraMessaging::builder(config).await.unwrap());
     let events = builder.events();
     let handled: Arc<Mutex<Vec<String>>> = Arc::default();
     let seen = Arc::clone(&handled);
@@ -136,7 +136,7 @@ async fn an_event_is_relayed_without_waiting_for_the_poll() {
     let stores = InMemoryStores::new();
     let mut config = stores.config("zero");
     config.outbox_poll_interval = Duration::from_secs(600);
-    let builder = stores.install(KrakenMessaging::builder(config).await.unwrap());
+    let builder = stores.install(SnodraMessaging::builder(config).await.unwrap());
     let events = builder.events();
     let app = builder.start().await.unwrap();
     assert_eq!(stores.store().append_listeners(), 1, "the relay listens");
@@ -175,7 +175,7 @@ async fn paused_time_moves_the_applications_clock() {
     let stores = InMemoryStores::new();
     let app = stores
         .install(
-            KrakenMessaging::builder(stores.config("zero"))
+            SnodraMessaging::builder(stores.config("zero"))
                 .await
                 .unwrap(),
         )
@@ -247,7 +247,7 @@ async fn without_a_hub_a_command_fails_at_once_naming_the_setting() {
     let stores = InMemoryStores::new();
     let app = stores
         .install(
-            KrakenMessaging::builder(stores.config("zero"))
+            SnodraMessaging::builder(stores.config("zero"))
                 .await
                 .unwrap(),
         )
@@ -266,7 +266,7 @@ async fn without_a_hub_a_command_fails_at_once_naming_the_setting() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&refused, MessagingError::HubUnavailable(why) if why.contains("KRAKEN_HUB_ENABLED")),
+        matches!(&refused, MessagingError::HubUnavailable(why) if why.contains("SNODRA_SERVER_ENABLED")),
         "{refused:?}"
     );
     assert!(started.elapsed() < Duration::from_secs(1), "at once");
@@ -284,7 +284,7 @@ struct PlaceOrder {
     order: String,
 }
 message_type!(PlaceOrder, "zero.PlaceOrder");
-impl kraken_messaging::Command for PlaceOrder {
+impl snodra_messaging::Command for PlaceOrder {
     type Reply = ();
 }
 
@@ -294,7 +294,7 @@ async fn awaiting_a_hub_that_is_off_answers_false_at_once() {
     let stores = InMemoryStores::new();
     let app = stores
         .install(
-            KrakenMessaging::builder(stores.config("zero"))
+            SnodraMessaging::builder(stores.config("zero"))
                 .await
                 .unwrap(),
         )

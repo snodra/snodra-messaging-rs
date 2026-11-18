@@ -12,20 +12,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use kraken_messaging::context::CURRENT;
-use kraken_messaging::events::EventBus;
-use kraken_messaging::events::dispatch::{LocalEventDispatcher, NoSagas, SagaStage};
-use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::saga::store::{DispatchKind, SagaDispatchDocument, SagaDocument};
-use kraken_messaging::saga::{
+use serde::{Deserialize, Serialize};
+use snodra_messaging::context::CURRENT;
+use snodra_messaging::events::EventBus;
+use snodra_messaging::events::dispatch::{LocalEventDispatcher, NoSagas, SagaStage};
+use snodra_messaging::hub::HandlerRegistry;
+use snodra_messaging::saga::store::{DispatchKind, SagaDispatchDocument, SagaDocument};
+use snodra_messaging::saga::{
     FailureReason, LocalRawCommandSender, NoopSagaMetrics, RETRYABLE_MARKER, RawCommandSender,
     RawOutcome, RelaySettings, SagaCommandFailed, SagaDefinition, SagaDispatchRelay, SagaMetrics,
     SagaRetry, SagaRuntime, SagaType,
 };
-use kraken_messaging::{
+use snodra_messaging::{
     Command, Event, Guard, MessageContext, MessagingError, RetryPolicy, SendOptions, message_type,
 };
-use serde::{Deserialize, Serialize};
 use support::saga::{Store, event_ctx, state, t0};
 use tokio_util::sync::CancellationToken;
 
@@ -37,7 +37,7 @@ struct OutboxDocument {
     headers: HashMap<String, String>,
 }
 
-fn outbox_document(record: kraken_messaging::store::memory::OutboxRecord) -> OutboxDocument {
+fn outbox_document(record: snodra_messaging::store::memory::OutboxRecord) -> OutboxDocument {
     let e = record.entry;
     OutboxDocument {
         type_name: e.type_name,
@@ -450,7 +450,7 @@ impl Rl {
 
     /// [`deliver`](Self::deliver) with these headers on the event besides `id` and `type`.
     async fn deliver_with<E: Event>(&self, event: &E, id: &str, headers: &[(&str, &str)]) {
-        use kraken_messaging::events::SagaStage;
+        use snodra_messaging::events::SagaStage;
         self.runtime
             .process(
                 E::TYPE,
@@ -733,7 +733,7 @@ async fn the_lease_of_a_saga_is_renewed_while_its_send_is_alive_so_another_relay
             .into_iter()
             .find(|(saga, _, _)| saga == "slow")
             .expect("the lease of slow");
-        lease.2 > kraken_messaging::time::epoch_ms(rl.store.clock.now())
+        lease.2 > snodra_messaging::time::epoch_ms(rl.store.clock.now())
     })
     .await;
 
@@ -789,7 +789,7 @@ async fn a_step_in_retry_holds_back_that_sagas_later_steps_only() {
     );
     let first = rl.entry("a:1000").await;
     assert_eq!(first.attempts, 1);
-    assert!(first.next_attempt_at_ms.unwrap() > kraken_messaging::time::epoch_ms(t0()));
+    assert!(first.next_attempt_at_ms.unwrap() > snodra_messaging::time::epoch_ms(t0()));
     assert!(rl.entry("a:2000").await.dispatched_at_ms.is_none());
     assert!(rl.entry("b:1000").await.dispatched_at_ms.is_some());
 
@@ -923,7 +923,7 @@ async fn an_event_entry_that_cannot_become_an_outbox_document_fails_for_good_and
     assert_eq!(
         *rl.metrics.unhandled.lock().unwrap(),
         vec![("rl.Announced".to_string(), FailureReason::Invalid); 3],
-        "each refused event counts on kraken.saga.command.failures{{reason=INVALID}}"
+        "each refused event counts on snodra.saga.command.failures{{reason=INVALID}}"
     );
 }
 
@@ -1455,7 +1455,7 @@ async fn a_failure_event_for_an_ended_saga_or_one_whose_type_has_no_handler_is_l
     .await;
     let deaf = rl.saga_of("rl.Deaf", "d1").await;
     // The ended saga's own entries are dispatched too: take them out of the way.
-    let now = kraken_messaging::time::now_ms();
+    let now = snodra_messaging::time::now_ms();
     rl.store.edit(|c| {
         c.dispatch
             .iter_mut()
@@ -1697,7 +1697,7 @@ async fn a_failure_notice_whose_saga_handler_fails_is_parked_and_not_reported_as
             .iter()
             .filter(|f| {
                 f.saga_type == "rl.Grumpy"
-                    && f.event_type == <SagaCommandFailed as kraken_messaging::MessageType>::TYPE
+                    && f.event_type == <SagaCommandFailed as snodra_messaging::MessageType>::TYPE
             })
             .count(),
         1,

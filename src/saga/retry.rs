@@ -45,7 +45,7 @@ impl SagaRetry {
 
 impl SagaRetry {
     /// The default policy: 5 attempts, 200 ms doubling up to 5 s (ruling 16: only the attempts
-    /// are configurable, `KRAKEN_SAGAS_MAX_ATTEMPTS`).
+    /// are configurable, `SNODRA_SAGAS_MAX_ATTEMPTS`).
     pub fn default_policy() -> RetryPolicy {
         RetryPolicy {
             max_attempts: 5,

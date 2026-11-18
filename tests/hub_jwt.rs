@@ -7,11 +7,11 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kraken_messaging::hub::{
+use snodra_messaging::hub::{
     AuthKind, FetchResult, HubConnection, HubPool, HubSettings, Inbound, TokenProvider, TokenStats,
 };
-use kraken_messaging::proto::{self, ClientMessage, client_message};
-use kraken_messaging::{HubOAuth2, SecretString};
+use snodra_messaging::proto::{self, ClientMessage, client_message};
+use snodra_messaging::{HubOAuth2, SecretString};
 use support::fake_hub::{Acl, AuthMode, FakeHub};
 use support::idp::{self, Idp, Mode};
 use support::logs::Captured;
@@ -33,7 +33,7 @@ fn provider(idp: &Idp) -> Arc<TokenProvider> {
 }
 
 fn temp_dir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("kraken-jwt-{}", uuid::Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!("snodra-jwt-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -379,9 +379,9 @@ async fn no_secret_and_no_token_ever_reach_a_log_a_debug_print_or_an_error() {
         format!("{:?}", jwt_settings("static://hub:7000".into(), &provider)),
         format!(
             "{:?}",
-            kraken_messaging::Config {
+            snodra_messaging::Config {
                 hub_oauth2: Some(oauth2(&idp, "svc", SECRET)),
-                ..kraken_messaging::Config::new("svc", "hub:7000")
+                ..snodra_messaging::Config::new("svc", "hub:7000")
             }
         ),
     ];
@@ -515,7 +515,7 @@ async fn a_token_fetched_during_a_failure_streak_is_not_fetched_again_by_the_ret
 async fn the_default_wake_interval_renews_within_a_few_seconds_of_a_wake_from_suspend() {
     let idp = Idp::start("svc", SECRET).await;
     idp.set_lifetime(300);
-    let (provider, skew) = skewed_provider(&idp, kraken_messaging::hub::WAKE_INTERVAL);
+    let (provider, skew) = skewed_provider(&idp, snodra_messaging::hub::WAKE_INTERVAL);
     let mut tokens = provider.subscribe();
     provider.token().await.unwrap();
     tokens.changed().await.unwrap();
@@ -536,7 +536,7 @@ fn skewed_provider(
 ) -> (Arc<TokenProvider>, Arc<std::sync::atomic::AtomicU64>) {
     let skew = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let clock_skew = Arc::clone(&skew);
-    let clock: kraken_messaging::hub::WallClock = Arc::new(move || {
+    let clock: snodra_messaging::hub::WallClock = Arc::new(move || {
         std::time::SystemTime::now()
             + Duration::from_secs(clock_skew.load(std::sync::atomic::Ordering::SeqCst))
     });

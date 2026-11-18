@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
-use kraken_messaging::event_store::browse::{BrowseSettings, EventBrowser};
-use kraken_messaging::event_store::memory::{MemoryEventStore, MemoryEventStoreConfig};
-use kraken_messaging::event_store::{
+use snodra_messaging::event_store::browse::{BrowseSettings, EventBrowser};
+use snodra_messaging::event_store::memory::{MemoryEventStore, MemoryEventStoreConfig};
+use snodra_messaging::event_store::{
     Capability, EventStore, EventStoreError, OutgoingEvent, SegmentStatus, Subscription,
     SubscriptionAdmin, SubscriptionEvent, SubscriptionSpec,
 };

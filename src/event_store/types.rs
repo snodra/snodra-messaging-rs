@@ -120,7 +120,7 @@ pub struct OutgoingEvent {
     /// them as the event store does.
     pub key: Option<String>,
     /// Carried as given, as the event store's native metadata: the seven [`headers`] and any
-    /// other (a dead letter's `kraken-dlt-*`). Headers are UTF-8 text, one value per name.
+    /// other (a dead letter's `snodra-dlt-*`). Headers are UTF-8 text, one value per name.
     pub headers: HashMap<String, String>,
     /// JSON bytes, carried as given.
     pub payload: Vec<u8>,

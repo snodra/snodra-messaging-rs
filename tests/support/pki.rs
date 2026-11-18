@@ -68,11 +68,11 @@ pub struct ClientSpec {
 }
 
 impl ClientSpec {
-    /// The certificate of `name`: one `kraken://service/<name>` URI SAN, valid for a week.
+    /// The certificate of `name`: one `snodra://service/<name>` URI SAN, valid for a week.
     pub fn service(name: &str) -> Self {
         let now = time::OffsetDateTime::now_utc();
         ClientSpec {
-            uris: vec![format!("kraken://service/{name}")],
+            uris: vec![format!("snodra://service/{name}")],
             dns: vec![],
             not_before: now - time::Duration::hours(1),
             not_after: now + time::Duration::days(7),
@@ -169,7 +169,7 @@ impl TempDir {
         // Under `target/` (inside the checkout) rather than the system temp dir: container runtimes
         // that run in a VM share the home directory, not necessarily `/var/folders`.
         let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("kraken-test-{}", uuid::Uuid::new_v4()));
+            .join(format!("snodra-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)
     }

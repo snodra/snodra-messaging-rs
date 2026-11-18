@@ -9,16 +9,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use kraken_messaging::events::SagaStage;
-use kraken_messaging::saga::store::{DeadlineDocument, DeadlineStatus, DispatchKind, SagaDocument};
-use kraken_messaging::saga::{
-    DeadlineScheduler, DeadlineSettings, SagaDefinition, SagaRetry, SagaRuntime, SagaType,
-};
-use kraken_messaging::store::MessageStore;
-use kraken_messaging::time::epoch_ms;
-use kraken_messaging::{Command, Event, RetryPolicy, message_type};
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
+use snodra_messaging::events::SagaStage;
+use snodra_messaging::saga::store::{DeadlineDocument, DeadlineStatus, DispatchKind, SagaDocument};
+use snodra_messaging::saga::{
+    DeadlineScheduler, DeadlineSettings, SagaDefinition, SagaRetry, SagaRuntime, SagaType,
+};
+use snodra_messaging::store::MessageStore;
+use snodra_messaging::time::epoch_ms;
+use snodra_messaging::{Command, Event, RetryPolicy, message_type};
 use support::order_saga::RecordingMetrics;
 use support::saga::{Store, event_ctx, state, t0};
 use tokio_util::sync::CancellationToken;
@@ -117,7 +117,7 @@ fn charge_saga(broken: &Arc<AtomicBool>) -> SagaType {
         .ending()
         .on_deadline::<TimeoutPayload>("charge-timeout", move |s, payload, ctx| {
             if broken.load(Ordering::SeqCst) {
-                return Err(kraken_messaging::MessagingError::InvalidMessage(
+                return Err(snodra_messaging::MessagingError::InvalidMessage(
                     "deadline handler failed on purpose".into(),
                 ));
             }

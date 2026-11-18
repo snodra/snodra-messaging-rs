@@ -1,4 +1,4 @@
-//! End to end against the real hub image (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`): a
+//! End to end against the real hub image (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`): a
 //! service's event processors, a parked letter and the lag reach the hub's `GET /api/v1/processors`
 //! and topology (ADR 0022).
 
@@ -7,11 +7,11 @@ mod support;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kraken_messaging::{Config, Event, KrakenMessaging, MessagingError, message_type};
 use rdkafka::config::ClientConfig;
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::{Config, Event, MessagingError, SnodraMessaging, message_type};
 use support::containers::{HubOptions, hub_with};
 
 macro_rules! require_docker {
@@ -48,7 +48,7 @@ async fn the_hub_shows_the_processors_their_letters_and_their_lag() {
     config.hub_status_interval = Duration::from_millis(500);
     let failing = Arc::new(Mutex::new(true));
     let fail = Arc::clone(&failing);
-    let app = KrakenMessaging::builder(config)
+    let app = SnodraMessaging::builder(config)
         .await
         .unwrap()
         .store(support::mongo_store(&mongo.uri_for("e2e")).await)

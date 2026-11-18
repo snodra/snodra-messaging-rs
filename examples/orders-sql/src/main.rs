@@ -1,12 +1,12 @@
-//! The orders service: `DATABASE_URL` (PostgreSQL), the `KRAKEN_*` settings of the library and of
-//! the SQL store (`KRAKEN_STORE_SQL_*`). The in-memory event store keeps the example to one
+//! The orders service: `DATABASE_URL` (PostgreSQL), the `SNODRA_*` settings of the library and of
+//! the SQL store (`SNODRA_STORE_SQL_*`). The in-memory event store keeps the example to one
 //! database; a real service adds an event-store add-on (Kafka, RabbitMQ Streams).
 
 use std::sync::Arc;
 
-use kraken_messaging::event_store::memory::MemoryEventStore;
-use kraken_messaging::{Config, KrakenMessaging};
-use kraken_messaging_sqlx::{SqlxSettings, SqlxStore};
+use snodra_messaging::event_store::memory::MemoryEventStore;
+use snodra_messaging::{Config, SnodraMessaging};
+use snodra_messaging_sqlx::{SqlxSettings, SqlxStore};
 use sqlx::postgres::PgPoolOptions;
 
 #[tokio::main]
@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     sqlx::raw_sql(orders_sql::SCHEMA).execute(&pool).await?;
     let store = SqlxStore::postgres(pool).with_settings(SqlxSettings::from_env()?);
-    let builder = KrakenMessaging::builder(Config::from_env()?)
+    let builder = SnodraMessaging::builder(Config::from_env()?)
         .await?
         .event_store(Arc::new(MemoryEventStore::default()));
     let app = orders_sql::handlers(builder, store).start().await?;

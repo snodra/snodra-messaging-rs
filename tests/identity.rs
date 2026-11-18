@@ -1,8 +1,8 @@
 mod support;
 
-use kraken_messaging::identity::{Guard, IdentityResolver, realm_roles};
-use kraken_messaging::{Identity, MessageContext, MessagingError};
 use serde_json::json;
+use snodra_messaging::identity::{Guard, IdentityResolver, realm_roles};
+use snodra_messaging::{Identity, MessageContext, MessagingError};
 
 fn ctx() -> MessageContext {
     MessageContext::default()
@@ -14,10 +14,10 @@ fn resolver() -> IdentityResolver {
 
 #[test]
 fn realm_roles_read_from_claims() {
-    let claims = json!({"realm_access": {"roles": ["kraken-user", "kraken-admin"]}});
+    let claims = json!({"realm_access": {"roles": ["snodra-user", "snodra-admin"]}});
     assert_eq!(
         realm_roles(claims.as_object().unwrap()),
-        vec!["kraken-user", "kraken-admin"]
+        vec!["snodra-user", "snodra-admin"]
     );
 }
 
@@ -31,16 +31,16 @@ fn roles_empty_when_realm_access_missing() {
 fn guard_role_denies_missing_role() {
     let id = Identity {
         user_id: Some("u".into()),
-        roles: vec!["kraken-user".into()],
+        roles: vec!["snodra-user".into()],
         verified: true,
     };
     assert!(matches!(
-        Guard::role("kraken-admin").check(Some(&id), &ctx()),
+        Guard::role("snodra-admin").check(Some(&id), &ctx()),
         Err(MessagingError::AccessDenied(_))
     ));
-    assert!(Guard::role("kraken-user").check(Some(&id), &ctx()).is_ok());
+    assert!(Guard::role("snodra-user").check(Some(&id), &ctx()).is_ok());
     assert!(
-        Guard::any_role(["x", "kraken-user"])
+        Guard::any_role(["x", "snodra-user"])
             .check(Some(&id), &ctx())
             .is_ok()
     );
@@ -59,7 +59,7 @@ fn guard_anonymous_is_unauthenticated() {
         Err(MessagingError::Unauthenticated(_))
     ));
     assert!(matches!(
-        Guard::role("kraken-user").check(None, &ctx()),
+        Guard::role("snodra-user").check(None, &ctx()),
         Err(MessagingError::Unauthenticated(_))
     ));
 }
@@ -89,7 +89,7 @@ async fn unverified_mode_reads_signed_token_without_checking_signature() {
         support::OTHER_KEY_PEM,
         None,
         "u-9",
-        &["kraken-admin"],
+        &["snodra-admin"],
         "https://other.test",
         support::now() + 60,
     );
@@ -99,7 +99,7 @@ async fn unverified_mode_reads_signed_token_without_checking_signature() {
         .unwrap()
         .unwrap();
     assert_eq!(id.user_id.as_deref(), Some("u-9"));
-    assert_eq!(id.roles, vec!["kraken-admin"]);
+    assert_eq!(id.roles, vec!["snodra-admin"]);
     assert!(!id.verified);
 }
 

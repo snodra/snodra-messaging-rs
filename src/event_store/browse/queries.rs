@@ -1,5 +1,5 @@
 //! The five calls of the event browser, as JSON: the payloads of the hub query types
-//! `kraken.events.*` (see the module docs of [`browse`](super) for the shapes), the error every
+//! `snodra.events.*` (see the module docs of [`browse`](super) for the shapes), the error every
 //! call may answer, and the settings that bound them.
 
 use std::time::Duration;
@@ -13,15 +13,15 @@ use crate::event_store::{MAX_POSITION_BYTES, MAX_SEGMENT_BYTES};
 use crate::types::{Query, StreamingQuery};
 
 /// The query type of [`SearchRequest`].
-pub const SEARCH: &str = "kraken.events.Search";
+pub const SEARCH: &str = "snodra.events.Search";
 /// The query type of [`GetRequest`].
-pub const GET: &str = "kraken.events.Get";
+pub const GET: &str = "snodra.events.Get";
 /// The query type of [`SourcesRequest`].
-pub const SOURCES: &str = "kraken.events.Sources";
+pub const SOURCES: &str = "snodra.events.Sources";
 /// The query type of [`LagRequest`].
-pub const LAG: &str = "kraken.events.Lag";
+pub const LAG: &str = "snodra.events.Lag";
 /// The streaming query type of [`TailRequest`].
-pub const TAIL: &str = "kraken.events.Tail";
+pub const TAIL: &str = "snodra.events.Tail";
 
 /// Results a search page returns when the request names no `limit`.
 pub const DEFAULT_LIMIT: usize = 50;
@@ -282,9 +282,9 @@ pub fn quoted(s: &str) -> String {
     }
 }
 
-// ---- kraken.events.Search -----------------------------------------------------------------------
+// ---- snodra.events.Search -----------------------------------------------------------------------
 
-/// `kraken.events.Search`: one page of a search, newest first.
+/// `snodra.events.Search`: one page of a search, newest first.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchRequest {
@@ -318,7 +318,7 @@ pub enum StoppedBy {
     TimeBudget,
 }
 
-/// The answer of `kraken.events.Search`.
+/// The answer of `snodra.events.Search`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchPage {
@@ -338,14 +338,14 @@ pub struct SearchPage {
     pub cursor: Option<String>,
 }
 
-crate::message_type!(SearchRequest, "kraken.events.Search");
+crate::message_type!(SearchRequest, "snodra.events.Search");
 impl Query for SearchRequest {
     type Reply = SearchPage;
 }
 
-// ---- kraken.events.Get --------------------------------------------------------------------------
+// ---- snodra.events.Get --------------------------------------------------------------------------
 
-/// `kraken.events.Get`: one event, every header, and its payload when asked for. Check
+/// `snodra.events.Get`: one event, every header, and its payload when asked for. Check
 /// [`place`](Self::place) before reading.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -380,18 +380,18 @@ impl GetRequest {
     }
 }
 
-crate::message_type!(GetRequest, "kraken.events.Get");
+crate::message_type!(GetRequest, "snodra.events.Get");
 impl Query for GetRequest {
     type Reply = EventRecord;
 }
 
-// ---- kraken.events.Sources ----------------------------------------------------------------------
+// ---- snodra.events.Sources ----------------------------------------------------------------------
 
-/// `kraken.events.Sources`: the sources the browser reads, `{}`.
+/// `snodra.events.Sources`: the sources the browser reads, `{}`.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourcesRequest {}
 
-/// The answer of `kraken.events.Sources`: every source the browser reads, the default first.
+/// The answer of `snodra.events.Sources`: every source the browser reads, the default first.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SourcesView {
     pub sources: Vec<SourceView>,
@@ -420,14 +420,14 @@ pub struct SegmentBounds {
     pub head: String,
 }
 
-crate::message_type!(SourcesRequest, "kraken.events.Sources");
+crate::message_type!(SourcesRequest, "snodra.events.Sources");
 impl Query for SourcesRequest {
     type Reply = SourcesView;
 }
 
-// ---- kraken.events.Lag --------------------------------------------------------------------------
+// ---- snodra.events.Lag --------------------------------------------------------------------------
 
-/// `kraken.events.Lag`: every subscription with a committed position on a source, live or not.
+/// `snodra.events.Lag`: every subscription with a committed position on a source, live or not.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LagRequest {
@@ -436,7 +436,7 @@ pub struct LagRequest {
     pub source: Option<String>,
 }
 
-/// The answer of `kraken.events.Lag`.
+/// The answer of `snodra.events.Lag`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LagView {
@@ -478,14 +478,14 @@ pub struct SegmentLag {
     pub lag: Option<u64>,
 }
 
-crate::message_type!(LagRequest, "kraken.events.Lag");
+crate::message_type!(LagRequest, "snodra.events.Lag");
 impl Query for LagRequest {
     type Reply = LagView;
 }
 
-// ---- kraken.events.Tail -------------------------------------------------------------------------
+// ---- snodra.events.Tail -------------------------------------------------------------------------
 
-/// `kraken.events.Tail` (a streaming query): the events appended from now on, as they come.
+/// `snodra.events.Tail` (a streaming query): the events appended from now on, as they come.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TailRequest {
@@ -554,7 +554,7 @@ pub enum EndReason {
     Failed,
 }
 
-crate::message_type!(TailRequest, "kraken.events.Tail");
+crate::message_type!(TailRequest, "snodra.events.Tail");
 impl StreamingQuery for TailRequest {
     type Item = TailEvent;
 }
@@ -566,7 +566,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn the_query_types_are_the_kraken_events_namespace() {
+    fn the_query_types_are_the_snodra_events_namespace() {
         assert_eq!(SearchRequest::TYPE, SEARCH);
         assert_eq!(GetRequest::TYPE, GET);
         assert_eq!(SourcesRequest::TYPE, SOURCES);

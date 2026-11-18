@@ -43,26 +43,26 @@ impl From<&str> for SecretString {
     }
 }
 
-/// TLS towards the hubs (`KRAKEN_HUB_TLS=true`), rustls with the platform's root certificates
+/// TLS towards the hubs (`SNODRA_SERVER_TLS=true`), rustls with the platform's root certificates
 /// unless `ca_file` names the CA to trust instead. Applies to every address form (a static list,
 /// `dns:///`). With `client_cert_file` and `client_key_file` the service also presents a client
 /// certificate (mutual TLS, roadmap P5c, hub ADR 0020). Build `HubTls` with `..HubTls::default()`
 /// so the fields added later do not break you.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HubTls {
-    /// PEM file with the CA certificate(s) that sign the hub's certificate (`KRAKEN_HUB_TLS_CA`).
+    /// PEM file with the CA certificate(s) that sign the hub's certificate (`SNODRA_SERVER_TLS_CA`).
     /// `None`: the platform's root store. Re-read on every (re)connect.
     pub ca_file: Option<PathBuf>,
-    /// The name the hub's certificate must carry and the SNI sent (`KRAKEN_HUB_TLS_SERVER_NAME`).
+    /// The name the hub's certificate must carry and the SNI sent (`SNODRA_SERVER_TLS_SERVER_NAME`).
     /// `None`: the host of the address (for `dns:///name:port`, `name`, not the resolved IP).
     pub server_name: Option<String>,
-    /// PEM file with the client certificate chain, leaf first (`KRAKEN_HUB_TLS_CLIENT_CERT`). The
-    /// leaf carries exactly one URI SAN `kraken://service/<name>`, `<name>` being the service name.
+    /// PEM file with the client certificate chain, leaf first (`SNODRA_SERVER_TLS_CLIENT_CERT`). The
+    /// leaf carries exactly one URI SAN `snodra://service/<name>`, `<name>` being the service name.
     /// Both this and `client_key_file`, or neither. Re-read on every (re)connect and checked for
     /// a renewal every `certificate_check_interval` (3 s), see [`crate::hub::HubPool`]. Excludes a static hub
     /// token and OAuth2 ([`crate::Config::validate`]).
     pub client_cert_file: Option<PathBuf>,
-    /// PEM file with the private key of the client certificate (`KRAKEN_HUB_TLS_CLIENT_KEY`),
+    /// PEM file with the private key of the client certificate (`SNODRA_SERVER_TLS_CLIENT_KEY`),
     /// PKCS#8 (`BEGIN PRIVATE KEY`); EC and RSA PEM keys work as well without a promise.
     pub client_key_file: Option<PathBuf>,
 }
@@ -80,25 +80,25 @@ impl HubTls {
 /// static hub token. Build it with `..HubOAuth2::default()` so fields added later do not break you.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HubOAuth2 {
-    /// The realm's token endpoint (`KRAKEN_HUB_OAUTH2_TOKEN_URI`), e.g.
-    /// `https://keycloak/realms/kraken/protocol/openid-connect/token`. `http://` is allowed (a
+    /// The realm's token endpoint (`SNODRA_SERVER_OAUTH2_TOKEN_URI`), e.g.
+    /// `https://keycloak/realms/snodra/protocol/openid-connect/token`. `http://` is allowed (a
     /// compose network) and logs one warning unless the host is loopback or a single-label name.
     pub token_uri: String,
-    /// The Keycloak client id (`KRAKEN_HUB_OAUTH2_CLIENT_ID`); it must be the service name, because
+    /// The Keycloak client id (`SNODRA_SERVER_OAUTH2_CLIENT_ID`); it must be the service name, because
     /// the hub checks the token's `azp` against `Register.service_name`. `from_env` defaults it to
-    /// `KRAKEN_SERVICE_NAME`.
+    /// `SNODRA_SERVICE_NAME`.
     pub client_id: String,
-    /// The client secret (`KRAKEN_HUB_OAUTH2_CLIENT_SECRET`). Never logged (`Debug` prints `"***"`).
+    /// The client secret (`SNODRA_SERVER_OAUTH2_CLIENT_SECRET`). Never logged (`Debug` prints `"***"`).
     /// Replaced by `client_secret_file` when that is set.
     pub client_secret: Option<SecretString>,
-    /// A file holding the client secret (`KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE`), read at startup
+    /// A file holding the client secret (`SNODRA_SERVER_OAUTH2_CLIENT_SECRET_FILE`), read at startup
     /// and again on every token fetch, so a rotated secret applies without a restart. **It wins
     /// over `client_secret`.** Surrounding whitespace is trimmed.
     pub client_secret_file: Option<PathBuf>,
-    /// The `scope` sent with the grant (`KRAKEN_HUB_OAUTH2_SCOPE`, space-separated as sent), if any.
+    /// The `scope` sent with the grant (`SNODRA_SERVER_OAUTH2_SCOPE`, space-separated as sent), if any.
     pub scope: Option<String>,
     /// PEM file with extra root certificates for an `https://` token endpoint
-    /// (`KRAKEN_HUB_OAUTH2_CA`), added to the platform roots. Not the hub CA (`HubTls.ca_file`).
+    /// (`SNODRA_SERVER_OAUTH2_CA`), added to the platform roots. Not the hub CA (`HubTls.ca_file`).
     pub ca_file: Option<PathBuf>,
 }
 
@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn a_token_file_is_trimmed_and_an_empty_one_is_no_token() {
-        let dir = std::env::temp_dir().join(format!("kraken-sec-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("snodra-sec-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("token");
         std::fs::write(&path, "abc123\n").unwrap();

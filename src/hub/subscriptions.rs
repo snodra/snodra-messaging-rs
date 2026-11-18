@@ -28,7 +28,7 @@ use crate::types::SubscriptionQuery;
 use super::connection::{ReplyTo, StreamId};
 
 /// `Config.hub_max_subscriptions` when nothing sets it: the hub's own default per-instance
-/// limit (`KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE`).
+/// limit (`SNODRA_SERVER_MAX_SUBSCRIPTIONS_PER_INSTANCE`).
 pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 1024;
 
 /// What a subscription's pump writes to its hub stream, in order.
@@ -435,7 +435,7 @@ async fn pump(
 }
 
 /// Pushes updates to the subscriptions of this instance (ADR 0017, P4c). Obtained from
-/// `KrakenMessaging::emitter()` (or the builder's, so handlers can capture it) or from
+/// `SnodraMessaging::emitter()` (or the builder's, so handlers can capture it) or from
 /// `Dispatcher::emitter()`; clones share the same subscriptions.
 ///
 /// Every call reaches every open subscription of `Q` on this instance whose query passes the

@@ -1,5 +1,5 @@
 //! The dead-letter admin API (ADR 0022): [`DeadLetters`], from
-//! [`KrakenMessaging::dead_letters`](crate::KrakenMessaging::dead_letters), on any instance of the
+//! [`SnodraMessaging::dead_letters`](crate::SnodraMessaging::dead_letters), on any instance of the
 //! service that runs the letter's processor.
 
 use std::collections::{BTreeMap, HashMap};
@@ -325,7 +325,7 @@ impl DeadLetters {
         match self.inner.mode {
             DeadLetterMode::Collection => Ok(()),
             mode => Err(MessagingError::InvalidMessage(format!(
-                "dead letters are not kept in mode {} (KRAKEN_EVENTS_DEAD_LETTER_MODE): there is no dead-letter admin API",
+                "dead letters are not kept in mode {} (SNODRA_EVENTS_DEAD_LETTER_MODE): there is no dead-letter admin API",
                 mode.as_str()
             ))),
         }

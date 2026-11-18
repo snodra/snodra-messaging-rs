@@ -9,16 +9,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kraken_messaging::MessageContext;
-use kraken_messaging::saga::store::SagaDocument;
+use snodra_messaging::MessageContext;
+use snodra_messaging::saga::store::SagaDocument;
 #[cfg(feature = "testing")]
-use kraken_messaging::saga::store::{DeadlineDocument, SagaDispatchDocument, SagaFailureDocument};
+use snodra_messaging::saga::store::{DeadlineDocument, SagaDispatchDocument, SagaFailureDocument};
 #[cfg(feature = "testing")]
-use kraken_messaging::saga::{ManualClock, SagaPorts};
+use snodra_messaging::saga::{ManualClock, SagaPorts};
 #[cfg(feature = "testing")]
-use kraken_messaging::store::memory::{MemoryContents, MemoryStore, OutboxRecord};
+use snodra_messaging::store::memory::{MemoryContents, MemoryStore, OutboxRecord};
 #[cfg(feature = "testing")]
-use kraken_messaging::store::{ExternalCall, MessageStore, Tx};
+use snodra_messaging::store::{ExternalCall, MessageStore, Tx};
 
 /// 2026-11-03T10:00:00Z.
 pub fn t0() -> SystemTime {
@@ -39,7 +39,7 @@ pub struct Store {
 /// The MongoDB side of a [`Store`]: the add-on's store over a database of its own container.
 #[cfg(feature = "testing")]
 struct Mongo {
-    store: Arc<kraken_messaging_mongo::MongoStore>,
+    store: Arc<snodra_messaging_mongo::MongoStore>,
     db: mongodb::Database,
     _container: super::containers::MongoDb,
 }
@@ -62,9 +62,9 @@ impl Store {
         let container = super::containers::mongo().await;
         let client = mongodb::Client::with_uri_str(&container.uri).await.unwrap();
         let db = client.default_database().unwrap();
-        let store = kraken_messaging_mongo::MongoStore::new(client, db.clone());
+        let store = snodra_messaging_mongo::MongoStore::new(client, db.clone());
         store
-            .init_schema(&kraken_messaging::Config::new("saga-tests", "127.0.0.1:1"))
+            .init_schema(&snodra_messaging::Config::new("saga-tests", "127.0.0.1:1"))
             .await
             .unwrap();
         Store {
@@ -142,7 +142,7 @@ impl Store {
     }
 
     pub async fn sagas(&self, type_name: &str) -> Vec<SagaDocument> {
-        use kraken_messaging_mongo::documents::SagaDoc;
+        use snodra_messaging_mongo::documents::SagaDoc;
         if let Some(found) = self
             .mongo_find::<SagaDoc>("sagas", mongodb::bson::doc! { "type": type_name })
             .await
@@ -167,7 +167,7 @@ impl Store {
     }
 
     pub async fn dispatch_of(&self, saga_id: &str) -> Vec<SagaDispatchDocument> {
-        use kraken_messaging_mongo::documents::DispatchDoc;
+        use snodra_messaging_mongo::documents::DispatchDoc;
         if let Some(found) = self
             .mongo_find::<DispatchDoc>("saga_dispatch", mongodb::bson::doc! { "sagaId": saga_id })
             .await
@@ -192,7 +192,7 @@ impl Store {
     }
 
     pub async fn failures(&self) -> Vec<SagaFailureDocument> {
-        use kraken_messaging_mongo::documents::FailureDoc;
+        use snodra_messaging_mongo::documents::FailureDoc;
         if let Some(found) = self
             .mongo_find::<FailureDoc>("saga_failures", mongodb::bson::doc! {})
             .await

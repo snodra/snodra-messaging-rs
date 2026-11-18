@@ -8,8 +8,8 @@ mod support;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kraken_messaging::HubTls;
-use kraken_messaging::hub::{HubConnection, HubPool, HubSettings, Inbound};
+use snodra_messaging::HubTls;
+use snodra_messaging::hub::{HubConnection, HubPool, HubSettings, Inbound};
 use support::fake_hub::FakeHub;
 use support::logs::Captured;
 use support::pki::{Pki, TempDir};
@@ -42,7 +42,7 @@ fn ca(dir: &TempDir, pki: &Pki) -> HubTls {
 }
 
 async fn tls_hub(pki: &Pki) -> FakeHub {
-    let (cert, key) = pki.server(&["kraken-hub"]);
+    let (cert, key) = pki.server(&["snodra-server"]);
     FakeHub::start_tls(&cert, &key).await
 }
 
@@ -104,7 +104,7 @@ async fn the_ca_file_is_reread_on_reconnect() {
 #[tokio::test]
 async fn server_name_is_what_the_certificate_is_checked_against() {
     let (dir, pki) = (TempDir::new(), Pki::new("test CA"));
-    let hub = tls_hub(&pki).await; // the certificate names localhost, 127.0.0.1 and kraken-hub
+    let hub = tls_hub(&pki).await; // the certificate names localhost, 127.0.0.1 and snodra-server
     let wrong = connection(settings(
         address(&hub),
         Some(HubTls {
@@ -119,7 +119,7 @@ async fn server_name_is_what_the_certificate_is_checked_against() {
     let right = connection(settings(
         address(&hub),
         Some(HubTls {
-            server_name: Some("kraken-hub".into()),
+            server_name: Some("snodra-server".into()),
             ..ca(&dir, &pki)
         }),
     ));
@@ -184,7 +184,7 @@ async fn dns_pool(address: String, tls: HubTls) -> Arc<HubPool> {
 async fn a_dns_target_is_verified_against_its_name_not_the_resolved_ip() {
     // The certificate names `localhost` and nothing else (no IP SAN), as one issued for a service
     // name does. `dns:///` resolves to `127.0.0.1:port`; the certificate must be checked against
-    // the DNS name, like kraken-messaging (Kotlin) does, without `server_name`.
+    // the DNS name, like snodra-messaging (Kotlin) does, without `server_name`.
     let (dir, pki) = (TempDir::new(), Pki::new("test CA"));
     let (cert, key) = pki.server_names_only(&["localhost"]);
     let hub = FakeHub::start_tls(&cert, &key).await;
@@ -262,7 +262,7 @@ async fn plain_text_against_a_tls_hub_fails_fast_and_says_to_enable_tls() {
     assert!(!conn.is_connected() || conn.handshake().is_none());
     assert!(hub.registers().await.is_empty());
     let log = captured.text();
-    assert!(log.contains("KRAKEN_HUB_TLS=true"), "{log}");
+    assert!(log.contains("SNODRA_SERVER_TLS=true"), "{log}");
     conn.shutdown().await;
     hub.stop();
 }
@@ -279,7 +279,7 @@ fn free_port() -> u16 {
 #[tokio::test]
 async fn the_tls_hint_is_logged_at_warn_once_whatever_the_attempt_number() {
     let pki = Pki::new("test CA");
-    let (cert, key) = pki.server(&["kraken-hub"]);
+    let (cert, key) = pki.server(&["snodra-server"]);
     let port = free_port();
     let captured = Captured::default();
     let _logs = captured.install();
@@ -293,7 +293,7 @@ async fn the_tls_hint_is_logged_at_warn_once_whatever_the_attempt_number() {
     }
     // ... then a TLS-only hub comes up on that port: the first failure it causes is a later attempt.
     let hub = FakeHub::start_tls_on(port, &cert, &key).await;
-    let hint = |l: &String| l.contains("KRAKEN_HUB_TLS=true");
+    let hint = |l: &String| l.contains("SNODRA_SERVER_TLS=true");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !captured
         .lines()

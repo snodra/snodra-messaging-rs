@@ -10,15 +10,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kraken_messaging::events::LocalEventDispatcher;
-use kraken_messaging::external::webhook::{
+use serde::{Deserialize, Serialize};
+use snodra_messaging::events::LocalEventDispatcher;
+use snodra_messaging::external::webhook::{
     SECRET_HEADER, SIGNATURE_HEADER, constant_time_eq, hmac_hex, verify, verify_with,
 };
-use kraken_messaging::external::{ExternalEventIngress, IngressResult};
-use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::saga::{NoopSagaMetrics, SagaDefinition, SagaRetry, SagaRuntime, SagaType};
-use kraken_messaging::{Event, MessageContext, MessagingError, RetryPolicy, message_type};
-use serde::{Deserialize, Serialize};
+use snodra_messaging::external::{ExternalEventIngress, IngressResult};
+use snodra_messaging::hub::HandlerRegistry;
+use snodra_messaging::saga::{NoopSagaMetrics, SagaDefinition, SagaRetry, SagaRuntime, SagaType};
+use snodra_messaging::{Event, MessageContext, MessagingError, RetryPolicy, message_type};
 use support::saga::{Store, state, t0};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -183,7 +183,7 @@ async fn an_accepted_webhook_event_reaches_a_saga() {
     assert_eq!(marker.type_name, "wh.Hook");
     assert_eq!(
         marker.processed_at_ms,
-        kraken_messaging::time::epoch_ms(t0()),
+        snodra_messaging::time::epoch_ms(t0()),
         "the marker's time is the clock's"
     );
     // The handlers see the dedupe id, the source, the type and the given headers.
@@ -341,25 +341,25 @@ fn a_valid_hmac_verifies_with_the_current_and_with_the_previous_secret() {
     assert!(verify(
         "new-secret",
         None,
-        &headers(&[("x-kraken-signature", &upper)]),
+        &headers(&[("x-snodra-signature", &upper)]),
         BODY
     ));
     assert!(verify(
         "new-secret",
         None,
-        &headers(&[("X-Kraken-Signature", &hmac_hex(b"new-secret", BODY))]),
+        &headers(&[("X-Snodra-Signature", &hmac_hex(b"new-secret", BODY))]),
         BODY
     ));
     assert!(verify(
         "new-secret",
         Some("old-secret"),
-        &headers(&[("x-kraken-webhook-secret", "new-secret")]),
+        &headers(&[("x-snodra-webhook-secret", "new-secret")]),
         BODY
     ));
     assert!(verify(
         "new-secret",
         Some("old-secret"),
-        &headers(&[("X-KRAKEN-WEBHOOK-SECRET", "old-secret")]),
+        &headers(&[("X-SNODRA-WEBHOOK-SECRET", "old-secret")]),
         BODY
     ));
     // Any header shape that iterates as name/value pairs: a slice of tuples here.

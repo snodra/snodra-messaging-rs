@@ -2,7 +2,7 @@
 //! ([`EventStore::publish`]), marking them sent or failed.
 //!
 //! Each poll claims a batch from the message store's outbox ([`OutboxStore::claim`]) under a
-//! lease ([`OutboxPublisherSettings::lease`], `KRAKEN_OUTBOX_LEASE_MS`) held by this publisher, so
+//! lease ([`OutboxPublisherSettings::lease`], `SNODRA_OUTBOX_LEASE_MS`) held by this publisher, so
 //! two instances relaying one outbox never both send an entry while both live, and a crashed
 //! one's entries are relayed after its lease. A batch stops before its lease could run out under
 //! a send ([`OUTBOX_SEND_TIMEOUT`] before its end, by the injected clock); the next poll claims
@@ -11,8 +11,8 @@
 //! ([`EventStoreError::Rejected`], or `Invalid`) marks the entry failed at once; any other failure
 //! is tried again, up to the attempts.
 //!
-//! Metrics (ADR 0026): every publish attempt counts in `kraken.outbox.published{outcome}`; the
-//! gauges `kraken.outbox.pending` and `kraken.outbox.oldest.age` read what the last poll saw (the
+//! Metrics (ADR 0026): every publish attempt counts in `snodra.outbox.published{outcome}`; the
+//! gauges `snodra.outbox.pending` and `snodra.outbox.oldest.age` read what the last poll saw (the
 //! batch it claimed, or, when the batch is full, the store's count of every pending entry and its
 //! oldest one, [`OutboxStore::pending`] and [`OutboxStore::oldest_pending`]), less what it relayed
 //! since: no query of their own.

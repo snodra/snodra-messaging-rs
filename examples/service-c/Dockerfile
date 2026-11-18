@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
-# Context = the kraken-messaging-rs repo root (the crate is compiled from source).
-#   docker build -f examples/service-c/Dockerfile -t kraken-examples-service-c:dev .
+# Context = the snodra-messaging-rs repo root (the crate is compiled from source).
+#   docker build -f examples/service-c/Dockerfile -t snodra-examples-service-c:dev .
 FROM rust:1.99.1-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends cmake protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*

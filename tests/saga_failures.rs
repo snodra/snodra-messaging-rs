@@ -10,13 +10,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use kraken_messaging::events::SagaStage;
-use kraken_messaging::saga::ports::SagaPorts;
-use kraken_messaging::saga::store::SagaFailureDocument;
-use kraken_messaging::saga::{NoopSagaMetrics, SagaFailures, SagaRetry, SagaRuntime, SagaType};
-use kraken_messaging::store::{StoreError, Tx, TxProvider};
-use kraken_messaging::time::epoch_ms;
-use kraken_messaging::{MessageType, MessagingError, RetryPolicy};
+use snodra_messaging::events::SagaStage;
+use snodra_messaging::saga::ports::SagaPorts;
+use snodra_messaging::saga::store::SagaFailureDocument;
+use snodra_messaging::saga::{NoopSagaMetrics, SagaFailures, SagaRetry, SagaRuntime, SagaType};
+use snodra_messaging::store::{StoreError, Tx, TxProvider};
+use snodra_messaging::time::epoch_ms;
+use snodra_messaging::{MessageType, MessagingError, RetryPolicy};
 use support::order_saga::*;
 use support::saga::{Store, event_ctx, state, t0};
 
@@ -150,7 +150,7 @@ async fn a_retry_that_fails_again_keeps_it_parked_with_attempts_increased() {
 /// retry, i.e. between the last failed attempt and the bookkeeping that records it.
 struct DiscardAfterRollbacks {
     inner: Arc<dyn TxProvider>,
-    failures: Arc<dyn kraken_messaging::store::FailureStore>,
+    failures: Arc<dyn snodra_messaging::store::FailureStore>,
     failure_id: String,
     after: usize,
     rollbacks: AtomicUsize,

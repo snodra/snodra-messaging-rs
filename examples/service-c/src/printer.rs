@@ -8,11 +8,11 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use kraken_messaging::MessagingError;
-use kraken_messaging::events::EventBus;
-use kraken_messaging::external::webhook;
-use kraken_messaging::external::{ExternalRecord, TranslatedEvent};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::MessagingError;
+use snodra_messaging::events::EventBus;
+use snodra_messaging::external::webhook;
+use snodra_messaging::external::{ExternalRecord, TranslatedEvent};
 
 use crate::messages::{BannerPrinted, PollBannerJob};
 
@@ -279,8 +279,8 @@ mod tests {
         Printer, PrinterNotification, ReplyTo, check_webhook, classify, poll, translate_payload,
     };
     use crate::messages::PollBannerJob;
-    use kraken_messaging::MessagingError;
-    use kraken_messaging::events::EventBus;
+    use snodra_messaging::MessagingError;
+    use snodra_messaging::events::EventBus;
 
     /// A printer on a free loopback port that answers every request with `DONE` for `jobId` and
     /// records the path and query it was asked for.
@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn a_webhook_with_the_shared_secret_is_the_printers_notification() {
         let notification =
-            check_webhook(SECRET, [("X-Kraken-Webhook-Secret", SECRET)], BODY).unwrap();
+            check_webhook(SECRET, [("X-Snodra-Webhook-Secret", SECRET)], BODY).unwrap();
         assert_eq!(
             notification,
             PrinterNotification {
@@ -362,11 +362,11 @@ mod tests {
         let signature = "sha256=9f69fed2d08d376e0365531041e58607a2b2120e6509f22664dbe31be53defc1";
         // Signed correctly, but no whole notification: past the 401, refused as a bad body.
         assert_eq!(
-            check_webhook(SECRET, [("X-Kraken-Signature", signature)], body),
+            check_webhook(SECRET, [("X-Snodra-Signature", signature)], body),
             Err(400)
         );
         assert_eq!(
-            check_webhook("another-secret", [("X-Kraken-Signature", signature)], body),
+            check_webhook("another-secret", [("X-Snodra-Signature", signature)], body),
             Err(401)
         );
     }
@@ -374,7 +374,7 @@ mod tests {
     #[test]
     fn a_webhook_with_a_wrong_secret_is_401_and_a_body_that_is_no_notification_400() {
         assert_eq!(
-            check_webhook(SECRET, [("X-Kraken-Webhook-Secret", "nope")], BODY),
+            check_webhook(SECRET, [("X-Snodra-Webhook-Secret", "nope")], BODY),
             Err(401)
         );
         assert_eq!(
@@ -382,7 +382,7 @@ mod tests {
             Err(401)
         );
         assert_eq!(
-            check_webhook(SECRET, [("X-Kraken-Webhook-Secret", SECRET)], b"{}"),
+            check_webhook(SECRET, [("X-Snodra-Webhook-Secret", SECRET)], b"{}"),
             Err(400)
         );
     }

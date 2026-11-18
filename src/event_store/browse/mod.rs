@@ -3,14 +3,14 @@
 //! declares `browse` gives an [`EventBrowser`]
 //! ([`EventStore::browser`](super::EventStore::browser)).
 //!
-//! The browser binary (`kraken-event-browser`) answers five hub query types with it; the hub
+//! The browser binary (`snodra-event-browser`) answers five hub query types with it; the hub
 //! turns its dashboard API into them. Each request and answer below is the JSON of the type
 //! named, which implements the library's [`Query`](crate::Query) (or
 //! [`StreamingQuery`](crate::StreamingQuery)) with that type name. Field names are camelCase; a
 //! field marked optional may be absent; positions and segments are the event store's opaque
 //! strings (at most 128 bytes).
 //!
-//! # `kraken.events.Search` ([`SearchRequest`] → [`SearchPage`])
+//! # `snodra.events.Search` ([`SearchRequest`] → [`SearchPage`])
 //!
 //! ```json
 //! {"source": "kraken.events",                      // optional: the browser's first source
@@ -54,7 +54,7 @@
 //!  "size": 17}                                     // payload bytes
 //! ```
 //!
-//! # `kraken.events.Get` ([`GetRequest`] → [`EventRecord`])
+//! # `snodra.events.Get` ([`GetRequest`] → [`EventRecord`])
 //!
 //! ```json
 //! {"source": "kraken.events", "segment": "3", "position": "42",  // source optional; 1-128 bytes
@@ -71,7 +71,7 @@
 //!  "payloadTruncated": true}                       // only when cut (256 KiB)
 //! ```
 //!
-//! # `kraken.events.Sources` ([`SourcesRequest`] → [`SourcesView`])
+//! # `snodra.events.Sources` ([`SourcesRequest`] → [`SourcesView`])
 //!
 //! `{}` →
 //!
@@ -81,7 +81,7 @@
 //!               "segments": [{"segment": "0", "first": "0", "head": "120"}]}]}
 //! ```
 //!
-//! # `kraken.events.Lag` ([`LagRequest`] → [`LagView`])
+//! # `snodra.events.Lag` ([`LagRequest`] → [`LagView`])
 //!
 //! `{"source": "kraken.events"}` (optional) →
 //!
@@ -94,7 +94,7 @@
 //!  "truncated": false}
 //! ```
 //!
-//! # `kraken.events.Tail` ([`TailRequest`] → [`TailEvent`] parts, streaming)
+//! # `snodra.events.Tail` ([`TailRequest`] → [`TailEvent`] parts, streaming)
 //!
 //! ```json
 //! {"source": "kraken.events", "filters": {<no from, no to>},   // both optional

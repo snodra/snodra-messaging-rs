@@ -1,4 +1,4 @@
-//! The hubs an instance connects to (`KRAKEN_HUB_ADDRESS`, ADR 0016), and the pure rules that
+//! The hubs an instance connects to (`SNODRA_SERVER_ADDRESS`, ADR 0016), and the pure rules that
 //! pick one of them for a request.
 //!
 //! - **Targets**: a comma-separated list of `host:port` (`static://` or `http(s)://` prefix
@@ -29,13 +29,13 @@ pub enum HubTargets {
 }
 
 impl HubTargets {
-    /// Parses `KRAKEN_HUB_ADDRESS` / `Config.hub_address`. `InvalidMessage` when it names no hub,
+    /// Parses `SNODRA_SERVER_ADDRESS` / `Config.hub_address`. `InvalidMessage` when it names no hub,
     /// when a `dns:///` target is not alone, or when it lacks a host or a port (1-65535) or its
     /// host contains `/`.
     pub fn parse(address: &str) -> Result<HubTargets, MessagingError> {
         let bad = |why: &str| {
             MessagingError::InvalidMessage(format!(
-                "hub_address (KRAKEN_HUB_ADDRESS) '{address}': {why}"
+                "hub_address (SNODRA_SERVER_ADDRESS) '{address}': {why}"
             ))
         };
         let entries: Vec<&str> = address
@@ -86,7 +86,7 @@ impl HubTargets {
 }
 
 /// The id of a hub whose `RegisterAck.hub_id` is empty (a real hub always names itself;
-/// defensive): its target as `host:port`, the `static://` or `http(s)://` prefix stripped (shared with kraken-messaging).
+/// defensive): its target as `host:port`, the `static://` or `http(s)://` prefix stripped (shared with snodra-messaging).
 pub fn target_id(address: &str) -> String {
     let address = address.strip_prefix("static://").unwrap_or(address);
     ["http://", "https://"]
@@ -96,7 +96,7 @@ pub fn target_id(address: &str) -> String {
         .to_string()
 }
 
-/// The targets of one `dns:///` resolution (shared with kraken-messaging): the IPv4 addresses
+/// The targets of one `dns:///` resolution (shared with snodra-messaging): the IPv4 addresses
 /// when there is any, else the IPv6 ones, each as `ip:port` (`[ip]:port` for IPv6, no zone), no
 /// prefix, repeats dropped, order kept. A dual-stack name lists every hub under both families;
 /// connecting to both would register twice on one hub, and the second `Register` takes the session
@@ -207,9 +207,9 @@ mod tests {
     #[test]
     fn a_dns_target_names_a_host_and_a_port() {
         assert_eq!(
-            HubTargets::parse("dns:///kraken-hub:7000").unwrap(),
+            HubTargets::parse("dns:///snodra-server:7000").unwrap(),
             HubTargets::Dns {
-                host: "kraken-hub".into(),
+                host: "snodra-server".into(),
                 port: 7000
             }
         );
@@ -222,7 +222,7 @@ mod tests {
         );
     }
 
-    /// Shared with kraken-messaging (Kotlin): the id of a hub with an empty `RegisterAck.hub_id`
+    /// Shared with snodra-messaging (Kotlin): the id of a hub with an empty `RegisterAck.hub_id`
     /// is its target as `host:port`, prefix stripped.
     #[test]
     fn a_target_id_is_the_bare_host_and_port() {
@@ -238,7 +238,7 @@ mod tests {
         }
     }
 
-    /// Shared with kraken-messaging (Kotlin): a `dns:///` name yields one target per address of
+    /// Shared with snodra-messaging (Kotlin): a `dns:///` name yields one target per address of
     /// one family (IPv4 when there is any, else IPv6), `ip:port` without prefix, repeats dropped,
     /// order kept. A dual-stack name would otherwise reach each hub twice.
     #[test]
@@ -268,14 +268,14 @@ mod tests {
         for bad in [
             "",
             " , ",
-            "dns:///kraken-hub",      // no port
-            "dns:///kraken-hub:0",    // port 0
-            "dns:///kraken-hub:x",    // not a port
+            "dns:///snodra-server",   // no port
+            "dns:///snodra-server:0", // port 0
+            "dns:///snodra-server:x", // not a port
             "dns:///:7000",           // no host
-            "dns:///kraken/hub:7000", // a path, not a host
-            "dns:///kraken-hub/:7000",
-            "dns://8.8.8.8/kraken-hub:7000", // an authority (DNS server) is not supported
-            "dns:///a:7000,dns:///b:7000",   // dns only alone
+            "dns:///snodra/hub:7000", // a path, not a host
+            "dns:///snodra-server/:7000",
+            "dns://8.8.8.8/snodra-server:7000", // an authority (DNS server) is not supported
+            "dns:///a:7000,dns:///b:7000",      // dns only alone
             "hub-1:7000,dns:///b:7000",
         ] {
             assert!(
@@ -289,7 +289,7 @@ mod tests {
         }
     }
 
-    /// Test vectors for kraken-messaging (Kotlin): FNV-1a 64 over `hub_id + "\0" + key`, then fmix64.
+    /// Test vectors for snodra-messaging (Kotlin): FNV-1a 64 over `hub_id + "\0" + key`, then fmix64.
     #[test]
     fn rendezvous_score_is_fnv1a_64_over_hub_id_zero_key_then_fmix64() {
         assert_eq!(fnv(b"\0"), 0xaf63_bd4c_8601_b7df, "the reference FNV-1a 64");

@@ -6,7 +6,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         // The token and the JWT travel in `Credentials`: a derived `Debug` would print them in any
         // `{:?}` of a `Register` or `ClientMessage`. `src/proto.rs` writes it by hand, with `"***"`.
-        .skip_debug([".kraken.hub.v1.Credentials"])
+        .skip_debug([".snodra.hub.v1.Credentials"])
         .build_transport(false) // the `Connect` rpc would clash with the generated transport `connect`; channels are built via Endpoint
         .compile_protos(&["proto/hub.proto"], &["proto"])?;
     Ok(())

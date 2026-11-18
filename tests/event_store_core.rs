@@ -9,20 +9,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kraken_messaging::config::DeadLetterMode;
-use kraken_messaging::event_store::{Capability, EventStore, OutgoingEvent, SubscriptionSpec};
-use kraken_messaging::events::{
+use serde::{Deserialize, Serialize};
+use snodra_messaging::config::DeadLetterMode;
+use snodra_messaging::event_store::{Capability, EventStore, OutgoingEvent, SubscriptionSpec};
+use snodra_messaging::events::{
     EventConsumer, LocalEventDispatcher, NoSagas, ProcessorSettings, RESUBSCRIBE_MIN,
 };
-use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::metrics::Metrics;
-use kraken_messaging::proto::control_reply::Result as Answer;
-use kraken_messaging::proto::control_request::Action;
-use kraken_messaging::proto::{self, ControlRefusal, ControlRequest, ProcessorState, reset_target};
-use kraken_messaging::store::MessageStore;
-use kraken_messaging::store::memory::MemoryStore;
-use kraken_messaging::{Config, Event, KrakenMessaging, message_type};
-use serde::{Deserialize, Serialize};
+use snodra_messaging::hub::HandlerRegistry;
+use snodra_messaging::metrics::Metrics;
+use snodra_messaging::proto::control_reply::Result as Answer;
+use snodra_messaging::proto::control_request::Action;
+use snodra_messaging::proto::{self, ControlRefusal, ControlRequest, ProcessorState, reset_target};
+use snodra_messaging::store::MessageStore;
+use snodra_messaging::store::memory::MemoryStore;
+use snodra_messaging::{Config, Event, SnodraMessaging, message_type};
 use support::event_store::Log;
 use tokio_util::sync::CancellationToken;
 
@@ -166,7 +166,7 @@ async fn control_action_without_capability_is_unsupported() {
     config.events_source = SOURCE.into();
     config.outbox_enabled = false;
     let events = Log::new(vec![Capability::Lag]);
-    let app = KrakenMessaging::builder(config)
+    let app = SnodraMessaging::builder(config)
         .await
         .unwrap()
         .store(Arc::new(store.clone()))
@@ -179,7 +179,7 @@ async fn control_action_without_capability_is_unsupported() {
         name: "core.default".into(),
         source: SOURCE.into(),
     };
-    let running = |app: &KrakenMessaging| {
+    let running = |app: &SnodraMessaging| {
         app.processors().remove(0).state == ProcessorState::ProcessorRunning as i32
     };
     eventually("the processor reads its subscription", || {
@@ -260,7 +260,7 @@ async fn an_idle_newcomer_reads_running() {
         name: "core.idle".into(),
         source: SOURCE.into(),
     };
-    let state = |m: &kraken_messaging::processors::ProcessorMonitor| {
+    let state = |m: &snodra_messaging::processors::ProcessorMonitor| {
         ProcessorState::try_from(m.status().state).unwrap()
     };
     let cancel = CancellationToken::new();

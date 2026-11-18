@@ -1,0 +1,69 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "29.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: the tag must be the crate version
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          MANIFEST=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          if [ "$VERSION" != "$MANIFEST" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $MANIFEST" >&2
+            exit 1
+          fi
+
+      # crates.io needs the core in the index before the add-ons can be published, so the add-ons
+      # retry for a few minutes while it propagates.
+      - name: publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          cargo publish -p snodra-messaging-rs --locked
+          for crate in snodra-messaging-kafka snodra-messaging-mongo snodra-messaging-sqlx snodra-messaging-rabbitmq; do
+            for attempt in $(seq 1 20); do
+              if cargo publish -p "$crate" --locked; then
+                break
+              fi
+              if [ "$attempt" -eq 20 ]; then
+                echo "gave up publishing $crate" >&2
+                exit 1
+              fi
+              sleep 15
+            done
+          done
+
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "${GITHUB_REPOSITORY#*/} $GITHUB_REF_NAME" \
+            --generate-notes \
+            --notes "crates.io: \`snodra-messaging-rs\`, \`-kafka\`, \`-mongo\`, \`-sqlx\`, \`-rabbitmq\` at \`$GITHUB_REF_NAME\`"

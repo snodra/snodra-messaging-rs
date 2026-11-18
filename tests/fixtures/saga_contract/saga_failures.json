@@ -1,6 +1,6 @@
 {
   "_id": "PaymentSaga:evt-9",
-  "_class": "io.damoreira.kraken.messaging.saga.SagaFailureDocument",
+  "_class": "com.damoreira.snodra.messaging.saga.SagaFailureDocument",
   "sagaType": "PaymentSaga",
   "eventId": "evt-9",
   "eventType": "examples.OrderPlaced",

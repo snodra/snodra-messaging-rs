@@ -1,4 +1,4 @@
-//! Partner Kafka topics become local kraken events (S2 Task 10, ADR 0021 rulings 20, 40; ADR 0027):
+//! Partner Kafka topics become local snodra events (S2 Task 10, ADR 0021 rulings 20, 40; ADR 0027):
 //! the core's external sources over the Kafka add-on's `KafkaExternalSource`, the Rust form of the
 //! Kotlin `ExternalKafkaSourcesTest`, against a real Kafka (the in-memory message store keeps the rest). One broker serves every
 //! scenario (each on a topic and source of its own).
@@ -11,18 +11,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kraken_messaging::events::LocalEventDispatcher;
-use kraken_messaging::external::sources::{SourceRegistration, validate_source};
-use kraken_messaging::external::{ExternalSources, TranslatedEvent, Translator};
-use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::saga::{NoopSagaMetrics, SagaDefinition, SagaRetry, SagaRuntime, SagaType};
-use kraken_messaging::{Event, MessageContext, MessagingError, RetryPolicy, message_type};
-use kraken_messaging_kafka::{ExternalSource, KafkaExternalSource};
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::events::LocalEventDispatcher;
+use snodra_messaging::external::sources::{SourceRegistration, validate_source};
+use snodra_messaging::external::{ExternalSources, TranslatedEvent, Translator};
+use snodra_messaging::hub::HandlerRegistry;
+use snodra_messaging::saga::{NoopSagaMetrics, SagaDefinition, SagaRetry, SagaRuntime, SagaType};
+use snodra_messaging::{Event, MessageContext, MessagingError, RetryPolicy, message_type};
+use snodra_messaging_kafka::{ExternalSource, KafkaExternalSource};
 use support::saga::{Store, state};
 use tokio_util::sync::CancellationToken;
 
@@ -281,12 +281,12 @@ fn a_reserved_source_name_fails_the_startup_naming_it() {
             e.contains(&format!("'{name}'")) && e.contains("reserved"),
             "{name}: {e}"
         );
-        assert!(kraken_messaging::external::is_reserved_source_name(name));
+        assert!(snodra_messaging::external::is_reserved_source_name(name));
     }
-    assert!(!kraken_messaging::external::is_reserved_source_name(
+    assert!(!snodra_messaging::external::is_reserved_source_name(
         "printer"
     ));
-    assert!(!kraken_messaging::external::is_reserved_source_name(
+    assert!(!snodra_messaging::external::is_reserved_source_name(
         "processors"
     ));
 }
@@ -430,7 +430,7 @@ fn two_sources_of_one_name_fail_the_startup() {
         let dispatcher = Arc::new(LocalEventDispatcher::new(
             None,
             Arc::new(HandlerRegistry::new()),
-            Arc::new(kraken_messaging::events::NoSagas),
+            Arc::new(snodra_messaging::events::NoSagas),
         ));
         let calls = Arc::new(AtomicUsize::new(0));
         let registration = || SourceRegistration {

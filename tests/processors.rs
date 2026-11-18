@@ -1,4 +1,4 @@
-//! Named event processors and dead letters through `KrakenMessaging` (ADR 0022, P6a), against a
+//! Named event processors and dead letters through `SnodraMessaging` (ADR 0022, P6a), against a
 //! real Kafka and MongoDB (and the in-process fake hub): each processor its own group and marker
 //! family, one event in two processors, failure isolation, sagas only in `default`, every letter
 //! reason, sequencing per key (stage 2 still runs, a miss after a remote discard handles
@@ -12,16 +12,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::TryStreamExt;
-use kraken_messaging::config::DeadLetterMode;
-use kraken_messaging::processors::{DeadLetters, RetryResult};
-use kraken_messaging::proto::{ProcessorState, ProcessorStatus};
-use kraken_messaging::saga::store::SagaDocument;
-use kraken_messaging::store::{DeadLetter, DeadLetterReason};
-use kraken_messaging::{
-    Config, Event, KrakenMessaging, KrakenMessagingBuilder, MessagingError, message_type,
-};
-use kraken_messaging_mongo::documents::DeadLetterDocument;
-use kraken_messaging_mongo::documents::SagaDoc;
 use mongodb::bson::{Document, doc};
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
@@ -31,6 +21,16 @@ use rdkafka::message::{Header, Headers, Message, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::{Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::config::DeadLetterMode;
+use snodra_messaging::processors::{DeadLetters, RetryResult};
+use snodra_messaging::proto::{ProcessorState, ProcessorStatus};
+use snodra_messaging::saga::store::SagaDocument;
+use snodra_messaging::store::{DeadLetter, DeadLetterReason};
+use snodra_messaging::{
+    Config, Event, MessagingError, SnodraMessaging, SnodraMessagingBuilder, message_type,
+};
+use snodra_messaging_mongo::documents::DeadLetterDocument;
+use snodra_messaging_mongo::documents::SagaDoc;
 use support::fake_hub::FakeHub;
 
 macro_rules! require_docker {
@@ -62,8 +62,8 @@ async fn builder(
     kafka: &str,
     mongo: &str,
     topic: &str,
-) -> KrakenMessagingBuilder {
-    KrakenMessaging::builder(config(service, hub, topic))
+) -> SnodraMessagingBuilder {
+    SnodraMessaging::builder(config(service, hub, topic))
         .await
         .unwrap()
         .store(support::mongo_store(mongo).await)
@@ -168,7 +168,7 @@ impl Handler {
         &self,
     ) -> impl Fn(
         Placed,
-        kraken_messaging::EventContext,
+        snodra_messaging::EventContext,
     ) -> futures::future::BoxFuture<'static, Result<(), MessagingError>>
     + Send
     + Sync
@@ -251,7 +251,7 @@ async fn an_invalid_processor_name_fails_the_start_naming_the_handler() {
         ("Orders", "^[a-z0-9][a-z0-9-]{0,47}$"),
         ("default", "'default'"),
     ] {
-        let builder = KrakenMessaging::builder(Config::new("svc", "static://127.0.0.1:1"))
+        let builder = SnodraMessaging::builder(Config::new("svc", "static://127.0.0.1:1"))
             .await
             .unwrap();
         let e = builder
@@ -269,14 +269,14 @@ async fn an_invalid_processor_name_fails_the_start_naming_the_handler() {
 }
 
 /// The admin API serves the processors that have handlers here, whether or not the consumer runs
-/// on this instance (an admin-only deployment with `KRAKEN_CONSUMER_ENABLED=false`).
+/// on this instance (an admin-only deployment with `SNODRA_CONSUMER_ENABLED=false`).
 #[tokio::test]
 async fn the_admin_api_knows_the_processors_without_a_running_consumer() {
     require_docker!();
     let mongo = support::containers::mongo().await;
     let mut c = config("svc-admin", "static://127.0.0.1:1", "a.events");
     c.consumer_enabled = false;
-    let app = KrakenMessaging::builder(c)
+    let app = SnodraMessaging::builder(c)
         .await
         .unwrap()
         .store(support::mongo_store(&mongo.uri_for("admin")).await)
@@ -425,7 +425,7 @@ async fn a_failing_key_parks_its_later_records_while_other_keys_flow_until_it_is
     handler.fail("o-bad");
     let meter = support::metrics::TestMeter::new();
     let app =
-        KrakenMessaging::builder_with_meter(config("svc-s", &hub.address(), topic), meter.meter())
+        SnodraMessaging::builder_with_meter(config("svc-s", &hub.address(), topic), meter.meter())
             .await
             .unwrap()
             .store(support::mongo_store(&mongo.uri_for("seq")).await)
@@ -478,7 +478,7 @@ async fn a_failing_key_parks_its_later_records_while_other_keys_flow_until_it_is
     // type header (or of a type nobody handles here) is `other`.
     let consumed = |type_name: &str, outcome: &str| {
         meter.value(
-            kraken_messaging::metrics::EVENTS_CONSUMED,
+            snodra_messaging::metrics::EVENTS_CONSUMED,
             &[
                 ("processor", "default"),
                 ("type", type_name),
@@ -842,7 +842,7 @@ async fn mode_topic_produces_to_the_dlt_and_mode_log_skips() {
     handler.fail("o-1");
     let mut c = config("svc-t", &hub.address(), "t.events");
     c.dead_letter_mode = DeadLetterMode::EventStore;
-    let app = KrakenMessaging::builder(c)
+    let app = SnodraMessaging::builder(c)
         .await
         .unwrap()
         .store(support::mongo_store(&mongo.uri_for("t")).await)
@@ -891,28 +891,28 @@ async fn mode_topic_produces_to_the_dlt_and_mode_log_skips() {
     };
     assert_eq!(got[0].key(), Some(b"k".as_slice()));
     assert_eq!(
-        header(&got[0], "kraken-dlt-processor").as_deref(),
+        header(&got[0], "snodra-dlt-processor").as_deref(),
         Some("default")
     );
     assert_eq!(
-        header(&got[0], "kraken-dlt-reason").as_deref(),
+        header(&got[0], "snodra-dlt-reason").as_deref(),
         Some("HANDLER_FAILED")
     );
     assert!(
-        header(&got[0], "kraken-dlt-error")
+        header(&got[0], "snodra-dlt-error")
             .unwrap()
             .contains("cannot handle o-1")
     );
     assert_eq!(
-        header(&got[0], "kraken-dlt-original-topic").as_deref(),
+        header(&got[0], "snodra-dlt-original-topic").as_deref(),
         Some("t.events")
     );
     assert_eq!(
-        header(&got[0], "kraken-dlt-original-partition").as_deref(),
+        header(&got[0], "snodra-dlt-original-partition").as_deref(),
         Some("0")
     );
     assert_eq!(
-        header(&got[0], "kraken-dlt-original-offset").as_deref(),
+        header(&got[0], "snodra-dlt-original-offset").as_deref(),
         Some("0")
     );
     assert_eq!(
@@ -921,11 +921,11 @@ async fn mode_topic_produces_to_the_dlt_and_mode_log_skips() {
         "original headers kept"
     );
     assert_eq!(
-        header(&got[1], "kraken-dlt-reason").as_deref(),
+        header(&got[1], "snodra-dlt-reason").as_deref(),
         Some("INVALID")
     );
     assert_eq!(
-        header(&got[1], "kraken-dlt-original-offset").as_deref(),
+        header(&got[1], "snodra-dlt-original-offset").as_deref(),
         Some("1")
     );
     assert_eq!(got[1].payload(), Some(b"nope".as_slice()));
@@ -952,7 +952,7 @@ async fn mode_topic_produces_to_the_dlt_and_mode_log_skips() {
     handler.fail("o-1");
     let mut c = config("svc-l", &hub.address(), "l.events");
     c.dead_letter_mode = DeadLetterMode::Log;
-    let app = KrakenMessaging::builder(c)
+    let app = SnodraMessaging::builder(c)
         .await
         .unwrap()
         .store(support::mongo_store(&mongo.uri_for("l")).await)

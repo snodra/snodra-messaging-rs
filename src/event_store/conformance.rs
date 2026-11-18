@@ -7,7 +7,7 @@
 //! #[tokio::test]
 //! async fn my_event_store_passes_conformance() {
 //!     let store: Arc<dyn MessageStore> = ..; // any message store add-on, its schema in place
-//!     run_event_store_conformance("kraken.conformance", || Arc::new(MyEventStore::new(..)), store)
+//!     run_event_store_conformance("snodra.conformance", || Arc::new(MyEventStore::new(..)), store)
 //!         .await;
 //! }
 //! ```
@@ -35,9 +35,9 @@
 //!   [`SubscriptionAdmin`] call (each runs on a thread of its own, so a blocked one is left
 //!   behind rather than holding the runtime).
 //!
-//! # The checks and their names in kraken-messaging
+//! # The checks and their names in snodra-messaging
 //!
-//! The Kotlin kit (`EventStoreConformanceTest` in `kraken-messaging-test`) checks the same
+//! The Kotlin kit (`EventStoreConformanceTest` in `snodra-messaging-test`) checks the same
 //! contract under the same names in camelCase; the browser checks are this kit's alone (the event
 //! browser is a Rust crate, so the Kotlin event stores have none):
 //!
@@ -920,16 +920,16 @@ pub async fn lag_counts_unacked(kit: &EventStoreKit<'_>) {
     reader.close().await;
 }
 
-/// `native-dead-letter`: the dead-letter source takes a letter (its `kraken-dlt-*` headers
+/// `native-dead-letter`: the dead-letter source takes a letter (its `snodra-dlt-*` headers
 /// included) and delivers it as published.
 pub async fn dead_letter_source_receives(kit: &EventStoreKit<'_>) {
     let events = kit.instance();
     let dlt = dead_letter_source(kit.source);
     let mut letter = event(&dlt, Some(fresh("key").as_str()));
     for (name, value) in [
-        ("kraken-dlt-processor", "conformance"),
-        ("kraken-dlt-reason", "FAILED"),
-        ("kraken-dlt-error", "the handler failed"),
+        ("snodra-dlt-processor", "conformance"),
+        ("snodra-dlt-reason", "FAILED"),
+        ("snodra-dlt-error", "the handler failed"),
     ] {
         letter.headers.insert(name.into(), value.into());
     }

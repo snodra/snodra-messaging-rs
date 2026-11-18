@@ -30,14 +30,14 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use chrono::Utc;
-use kraken_messaging::event_store::ResetTarget;
-use kraken_messaging::events::EventBus;
-use kraken_messaging::processors::{
+use serde::{Deserialize, Serialize};
+use snodra_messaging::event_store::ResetTarget;
+use snodra_messaging::events::EventBus;
+use snodra_messaging::processors::{
     DEFAULT_LIST_LIMIT, DeadLetters, EventOptions, ResetContext, RetryResult,
 };
-use kraken_messaging::store::DeadLetter;
-use kraken_messaging::{KrakenMessagingBuilder, MessagingError};
-use serde::{Deserialize, Serialize};
+use snodra_messaging::store::DeadLetter;
+use snodra_messaging::{MessagingError, SnodraMessagingBuilder};
 
 use crate::messages::ShoutAudit;
 
@@ -108,7 +108,7 @@ impl From<&ResetContext> for ResetView {
 
 /// The `audit` processor's registrations on `builder`: its handler, a second handler there that a
 /// replay never runs again (P6b), and its reset handler, all reporting to `audit`.
-pub fn register(builder: KrakenMessagingBuilder, audit: &Audit) -> KrakenMessagingBuilder {
+pub fn register(builder: SnodraMessagingBuilder, audit: &Audit) -> SnodraMessagingBuilder {
     let (handler, notifier, resets) = (audit.clone(), audit.clone(), audit.clone());
     builder
         .event_in::<ShoutAudit, _, _>(PROCESSOR, move |e, _ctx| {
@@ -421,17 +421,17 @@ async fn discard(State(http): State<AuditHttp>, Path(id): Path<String>) -> Respo
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
-    use kraken_messaging::MessageType;
-    use kraken_messaging::MessagingError;
-    use kraken_messaging::processors::RetryResult;
-    use kraken_messaging::store::{DeadLetter, DeadLetterError, DeadLetterReason};
     use serde_json::json;
+    use snodra_messaging::MessageType;
+    use snodra_messaging::MessagingError;
+    use snodra_messaging::processors::RetryResult;
+    use snodra_messaging::store::{DeadLetter, DeadLetterError, DeadLetterReason};
 
     use axum::extract::{RawQuery, State};
     use axum::http::StatusCode;
-    use kraken_messaging::config::DeadLetterMode;
-    use kraken_messaging::events::EventBus;
-    use kraken_messaging::processors::DeadLetters;
+    use snodra_messaging::config::DeadLetterMode;
+    use snodra_messaging::events::EventBus;
+    use snodra_messaging::processors::DeadLetters;
 
     use super::{Audit, AuditHttp, LetterView, RetryView, list, param};
     use crate::messages::ShoutAudit;
@@ -575,8 +575,8 @@ mod tests {
 
     #[test]
     fn a_reset_is_shown_the_way_service_b_shows_it() {
-        use kraken_messaging::event_store::{ReplayRange, ResetTarget};
-        use kraken_messaging::processors::ResetContext;
+        use snodra_messaging::event_store::{ReplayRange, ResetTarget};
+        use snodra_messaging::processors::ResetContext;
         let audit = Audit::default();
         let ctx = |target| ResetContext {
             processor: "audit".into(),
@@ -623,7 +623,7 @@ mod tests {
     }
 }
 
-/// The `audit` processor in the zero-infrastructure mode (`kraken_messaging::testing`): on the
+/// The `audit` processor in the zero-infrastructure mode (`snodra_messaging::testing`): on the
 /// in-memory event store and message store, no Kafka, MongoDB or hub. What the sandbox shows with
 /// containers (`examples/smoke.sh`), as a unit test.
 #[cfg(test)]
@@ -631,10 +631,10 @@ mod zero_infrastructure {
     use std::time::Duration;
 
     use chrono::Utc;
-    use kraken_messaging::KrakenMessaging;
-    use kraken_messaging::processors::RetryResult;
-    use kraken_messaging::store::DeadLetterReason;
-    use kraken_messaging::testing::InMemoryStores;
+    use snodra_messaging::SnodraMessaging;
+    use snodra_messaging::processors::RetryResult;
+    use snodra_messaging::store::DeadLetterReason;
+    use snodra_messaging::testing::InMemoryStores;
 
     use super::{Audit, PROCESSOR, register};
     use crate::messages::ShoutAudit;
@@ -669,7 +669,7 @@ mod zero_infrastructure {
         let mut config = stores.config("service-c");
         config.consumer_max_attempts = 2;
         let audit = Audit::default();
-        let builder = stores.install(KrakenMessaging::builder(config).await.unwrap());
+        let builder = stores.install(SnodraMessaging::builder(config).await.unwrap());
         let events = builder.events();
         let app = register(builder, &audit).start().await.unwrap();
 

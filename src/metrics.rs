@@ -1,16 +1,16 @@
 //! The library's metrics (ADR 0026), through the OpenTelemetry metrics API: the library records,
 //! the application installs the meter provider (the SDK with an exporter, e.g. OTLP to
-//! otel-lgtm). [`KrakenMessaging::builder`](crate::KrakenMessaging::builder) records on
-//! `opentelemetry::global::meter("kraken-messaging-rs")` as the global provider is when it runs,
+//! otel-lgtm). [`SnodraMessaging::builder`](crate::SnodraMessaging::builder) records on
+//! `opentelemetry::global::meter("snodra-messaging-rs")` as the global provider is when it runs,
 //! so the provider is installed before it; with none installed that is the API's no-op meter:
 //! nothing is recorded, an observable gauge's callback never runs, and a measurement costs a
-//! virtual call. [`KrakenMessaging::builder_with_meter`](crate::KrakenMessaging::builder_with_meter)
+//! virtual call. [`SnodraMessaging::builder_with_meter`](crate::SnodraMessaging::builder_with_meter)
 //! takes the meter instead (tests read it back from an in-memory exporter).
 //!
 //! Instruments are named with dots, as Kotlin's Micrometer meters; the OTLP→Prometheus translation
 //! turns the dots into underscores, adds the unit suffix (`s` → `_seconds`) and `_total` to a
-//! counter, which gives the series of the README's Metrics section (`kraken.outbox.published` is
-//! `kraken_outbox_published_total`). Every label value comes from a bounded set: a type this
+//! counter, which gives the series of the README's Metrics section (`snodra.outbox.published` is
+//! `snodra_outbox_published_total`). Every label value comes from a bounded set: a type this
 //! service registered (a foreign one is [`OTHER`]), a processor name, an outcome, a state.
 //!
 //! Gauges are observable: their callbacks read values the library holds anyway (the processor
@@ -28,54 +28,54 @@ use crate::error::MessagingError;
 use crate::proto::RequestKind;
 
 /// The instrumentation scope of every instrument of the library.
-pub const METER_NAME: &str = "kraken-messaging-rs";
+pub const METER_NAME: &str = "snodra-messaging-rs";
 
 /// The `type` label of a type this service did not register (a foreign producer's).
 pub const OTHER: &str = "other";
 
-/// `kraken_outbox_pending`: outbox documents not yet published (neither sent nor failed), as the
+/// `snodra_outbox_pending`: outbox documents not yet published (neither sent nor failed), as the
 /// relay's last poll counted them.
-pub const OUTBOX_PENDING: &str = "kraken.outbox.pending";
-/// `kraken_outbox_oldest_age_seconds`: the age of the oldest of them, 0 when none.
-pub const OUTBOX_OLDEST_AGE: &str = "kraken.outbox.oldest.age";
-/// `kraken_outbox_published_total{outcome}`: publish attempts, `ok` or `failed`.
-pub const OUTBOX_PUBLISHED: &str = "kraken.outbox.published";
-/// `kraken_events_consumed_total{processor,type,outcome}`: stage-1 outcomes per record.
-pub const EVENTS_CONSUMED: &str = "kraken.events.consumed";
-/// `kraken_event_handler_duration_seconds{processor,type}`: one stage-1 attempt that ran the
+pub const OUTBOX_PENDING: &str = "snodra.outbox.pending";
+/// `snodra_outbox_oldest_age_seconds`: the age of the oldest of them, 0 when none.
+pub const OUTBOX_OLDEST_AGE: &str = "snodra.outbox.oldest.age";
+/// `snodra_outbox_published_total{outcome}`: publish attempts, `ok` or `failed`.
+pub const OUTBOX_PUBLISHED: &str = "snodra.outbox.published";
+/// `snodra_events_consumed_total{processor,type,outcome}`: stage-1 outcomes per record.
+pub const EVENTS_CONSUMED: &str = "snodra.events.consumed";
+/// `snodra_event_handler_duration_seconds{processor,type}`: one stage-1 attempt that ran the
 /// handlers.
-pub const EVENT_HANDLER_DURATION: &str = "kraken.event.handler.duration";
-/// `kraken_processor_lag{processor,segment}`: the lag of an assigned segment, as the status.
-pub const PROCESSOR_LAG: &str = "kraken.processor.lag";
-/// `kraken_processor_state{processor,state}`: 1 for the processor's state now, 0 for the others.
-pub const PROCESSOR_STATE: &str = "kraken.processor.state";
-/// `kraken_dead_letters{processor}`: the processor's letters, as the status samples them.
-pub const DEAD_LETTERS: &str = "kraken.dead.letters";
-/// `kraken_hub_client_request_duration_seconds{kind,type,outcome}`: a command or query sent
+pub const EVENT_HANDLER_DURATION: &str = "snodra.event.handler.duration";
+/// `snodra_processor_lag{processor,segment}`: the lag of an assigned segment, as the status.
+pub const PROCESSOR_LAG: &str = "snodra.processor.lag";
+/// `snodra_processor_state{processor,state}`: 1 for the processor's state now, 0 for the others.
+pub const PROCESSOR_STATE: &str = "snodra.processor.state";
+/// `snodra_dead_letters{processor}`: the processor's letters, as the status samples them.
+pub const DEAD_LETTERS: &str = "snodra.dead.letters";
+/// `snodra_hub_client_request_duration_seconds{kind,type,outcome}`: a command or query sent
 /// through the hub, from the call to its result (retries included).
-pub const HUB_CLIENT_REQUEST_DURATION: &str = "kraken.hub.client.request.duration";
-/// `kraken_hub_client_handlers_in_flight`: requests from the hubs whose handler runs now.
-pub const HUB_CLIENT_HANDLERS_IN_FLIGHT: &str = "kraken.hub.client.handlers.in.flight";
-/// `kraken_hub_client_connected_hubs`: hubs with an acknowledged stream.
-pub const HUB_CLIENT_CONNECTED_HUBS: &str = "kraken.hub.client.connected.hubs";
+pub const HUB_CLIENT_REQUEST_DURATION: &str = "snodra.hub.client.request.duration";
+/// `snodra_hub_client_handlers_in_flight`: requests from the hubs whose handler runs now.
+pub const HUB_CLIENT_HANDLERS_IN_FLIGHT: &str = "snodra.hub.client.handlers.in.flight";
+/// `snodra_hub_client_connected_hubs`: hubs with an acknowledged stream.
+pub const HUB_CLIENT_CONNECTED_HUBS: &str = "snodra.hub.client.connected.hubs";
 
-/// `kraken_hub_client_token_fetches_total{result}`: access token fetches (OAuth2 only) by result
+/// `snodra_hub_client_token_fetches_total{result}`: access token fetches (OAuth2 only) by result
 /// (`ok`, `http_error`, `oauth_error`, `io_error`, `bad_response`).
-pub const HUB_CLIENT_TOKEN_FETCHES: &str = "kraken.hub.client.token.fetches";
-/// `kraken_hub_client_certificate_rotations_total`: client certificate pairs adopted after the
+pub const HUB_CLIENT_TOKEN_FETCHES: &str = "snodra.hub.client.token.fetches";
+/// `snodra_hub_client_certificate_rotations_total`: client certificate pairs adopted after the
 /// first (client certificate only).
-pub const HUB_CLIENT_CERTIFICATE_ROTATIONS: &str = "kraken.hub.client.certificate.rotations";
-/// `kraken_hub_client_credentials_refreshes_sent_total`: `ClientMessage.credentials` written to
+pub const HUB_CLIENT_CERTIFICATE_ROTATIONS: &str = "snodra.hub.client.certificate.rotations";
+/// `snodra_hub_client_credentials_refreshes_sent_total`: `ClientMessage.credentials` written to
 /// the hubs.
 pub const HUB_CLIENT_CREDENTIALS_REFRESHES_SENT: &str =
-    "kraken.hub.client.credentials.refreshes.sent";
+    "snodra.hub.client.credentials.refreshes.sent";
 
 /// The bucket boundaries of the duration histograms, in seconds (the hub's).
 pub const DURATION_BOUNDARIES: [f64; 15] = [
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 
-/// How one record ended for one processor (`kraken.events.consumed{outcome}`): one per record
+/// How one record ended for one processor (`snodra.events.consumed{outcome}`): one per record
 /// and processor, at its final outcome there, never per attempt (a stop in the middle of the
 /// attempts records nothing: the record comes again).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -214,7 +214,7 @@ impl Metrics {
         }
     }
 
-    /// The instruments on `opentelemetry::global::meter("kraken-messaging-rs")`, as the global
+    /// The instruments on `opentelemetry::global::meter("snodra-messaging-rs")`, as the global
     /// provider is now (the no-op meter when none is installed).
     pub fn global() -> Metrics {
         Metrics::new(global::meter(METER_NAME))
@@ -421,7 +421,7 @@ mod tests {
         let ran = Arc::clone(&gauge_ran);
         metrics
             .meter()
-            .u64_observable_gauge("kraken.test.gauge")
+            .u64_observable_gauge("snodra.test.gauge")
             .with_callback(move |_| ran.store(true, std::sync::atomic::Ordering::SeqCst))
             .build();
         assert!(!gauge_ran.load(std::sync::atomic::Ordering::SeqCst));

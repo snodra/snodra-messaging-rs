@@ -7,26 +7,26 @@ mod support;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use kraken_messaging::store::MessageStore;
+use snodra_messaging::store::MessageStore;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
-use kraken_messaging::config::DeadLetterMode;
-use kraken_messaging::event_store::{SubscriptionSpec, headers};
-use kraken_messaging::events::dispatch::{
-    LocalEventDispatcher, NoSagas, Outcome, SagaStage, StageOneDone,
-};
-use kraken_messaging::events::{
-    EventConsumer, ProcessorSettings, RecordDisposition, classify_with,
-};
-use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::{Event, MessageContext, MessagingError, message_type};
 use mongodb::Database;
 use mongodb::bson::doc;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::config::DeadLetterMode;
+use snodra_messaging::event_store::{SubscriptionSpec, headers};
+use snodra_messaging::events::dispatch::{
+    LocalEventDispatcher, NoSagas, Outcome, SagaStage, StageOneDone,
+};
+use snodra_messaging::events::{
+    EventConsumer, ProcessorSettings, RecordDisposition, classify_with,
+};
+use snodra_messaging::hub::HandlerRegistry;
+use snodra_messaging::{Event, MessageContext, MessagingError, message_type};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -445,7 +445,7 @@ fn a_record_only_a_saga_wants_is_handled_not_skipped() {
     );
     // `classify` is `classify_with` over the registry's handlers.
     assert_eq!(
-        kraken_messaging::events::classify(&hdrs, b"{}", "kraken.events", "0", "7", &none),
+        snodra_messaging::events::classify(&hdrs, b"{}", "kraken.events", "0", "7", &none),
         RecordDisposition::Skip("no handler for this type")
     );
 }
@@ -469,7 +469,7 @@ async fn the_consumer_hands_a_record_only_a_saga_wants_to_the_saga_stage() {
             dead_letter_mode: DeadLetterMode::Log,
             dead_letter_retention: Duration::from_secs(86_400),
             dead_letters: None,
-            metrics: kraken_messaging::metrics::Metrics::global(),
+            metrics: snodra_messaging::metrics::Metrics::global(),
         },
         Arc::new(LocalEventDispatcher::new(
             Some(f.message_store()),

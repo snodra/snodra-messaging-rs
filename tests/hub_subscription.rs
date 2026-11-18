@@ -11,16 +11,16 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::stream::BoxStream;
-use kraken_messaging::hub::{
+use serde::{Deserialize, Serialize};
+use snodra_messaging::hub::{
     Dispatcher, HandlerRegistry, HubPool, HubSettings, Inbound, QueryUpdateEmitter,
     RegisteredTypes, Sender, SenderSettings, SubscriptionOptions,
 };
-use kraken_messaging::identity::{Guard, IdentityResolver};
-use kraken_messaging::proto::{self, ErrorCode, ServerMessage, server_message};
-use kraken_messaging::{
+use snodra_messaging::identity::{Guard, IdentityResolver};
+use snodra_messaging::proto::{self, ErrorCode, ServerMessage, server_message};
+use snodra_messaging::{
     Command, MessagingError, Query, RetryPolicy, StreamingQuery, SubscriptionQuery, message_type,
 };
-use serde::{Deserialize, Serialize};
 use support::fake_hub::FakeHub;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
@@ -207,7 +207,7 @@ fn settings(address: &str, max_handlers: usize) -> HubSettings {
 }
 
 /// An instance of `service` on the hubs of `address` serving `registry` with `max_handlers`
-/// permits, wired as `KrakenMessaging` wires it: requests to the dispatcher, `Flow` and `Cancel`
+/// permits, wired as `SnodraMessaging` wires it: requests to the dispatcher, `Flow` and `Cancel`
 /// to its running handlers and subscriptions, everything else to the sender.
 async fn node_with(
     address: &str,
@@ -234,8 +234,8 @@ async fn node_with(
 /// What a test changes in how a node is wired.
 struct Wiring {
     /// Awaited by every subscription request before its identity check (a slow identity).
-    admission_hook: Option<kraken_messaging::hub::AdmissionHook>,
-    /// Whether a lost hub stream reaches `Dispatcher::stream_lost` (as `KrakenMessaging` does).
+    admission_hook: Option<snodra_messaging::hub::AdmissionHook>,
+    /// Whether a lost hub stream reaches `Dispatcher::stream_lost` (as `SnodraMessaging` does).
     stream_lost: bool,
 }
 
@@ -262,7 +262,7 @@ impl Gate {
 
     /// The hook that holds the requests whose id ends with `#1` (the update targets, not the
     /// `#0` initial request) until the gate opens.
-    fn hook(&self) -> kraken_messaging::hub::AdmissionHook {
+    fn hook(&self) -> snodra_messaging::hub::AdmissionHook {
         let tx = self.0.clone();
         Arc::new(move |id| {
             let mut rx = tx.subscribe();
@@ -469,7 +469,7 @@ async fn the_register_announces_the_types() {
     a.shutdown().await;
 }
 
-// Handler side, driven by messages the fake hub pushes as kraken-hub would.
+// Handler side, driven by messages the fake hub pushes as snodra-server would.
 
 #[tokio::test]
 async fn a_subscription_request_registers_and_the_emitter_sends_parts_then_the_end() {

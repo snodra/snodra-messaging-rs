@@ -1,5 +1,5 @@
 //! What a record looks like to the event browser: a summary in a search result or a tail (never
-//! a payload), the full record of `kraken.events.Get` (every header, the payload when asked), and
+//! a payload), the full record of `snodra.events.Get` (every header, the payload when asked), and
 //! the bounds of both.
 
 use std::collections::BTreeMap;
@@ -150,7 +150,7 @@ pub struct HeaderView {
     pub truncated: bool,
 }
 
-/// One event as `kraken.events.Get` answers it: the summary, every header, and the payload when
+/// One event as `snodra.events.Get` answers it: the summary, every header, and the payload when
 /// it was asked for.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

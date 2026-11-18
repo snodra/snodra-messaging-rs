@@ -1,5 +1,5 @@
 //! Processor control (ADR 0023): [`ProcessorControl`], from
-//! [`KrakenMessaging::processor_control`](crate::KrakenMessaging::processor_control), answers the
+//! [`SnodraMessaging::processor_control`](crate::SnodraMessaging::processor_control), answers the
 //! hub's [`ControlRequest`]s and pauses or resumes a processor
 //! locally. One action per processor at a time on an instance; a renewal of the reset this
 //! instance holds is answered at once, never behind another action, and so is a dead-letter
@@ -234,7 +234,7 @@ impl ProcessorControl {
             mode => Err(refused(Refusal::new(
                 ControlRefusal::Invalid,
                 format!(
-                    "dead letters are not kept in mode {} (KRAKEN_EVENTS_DEAD_LETTER_MODE)",
+                    "dead letters are not kept in mode {} (SNODRA_EVENTS_DEAD_LETTER_MODE)",
                     mode.as_str()
                 ),
             ))),

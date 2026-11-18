@@ -12,10 +12,10 @@ COPY proto ./proto
 COPY src ./src
 COPY crates ./crates
 COPY examples ./examples
-RUN cargo build --release --locked -p kraken-messaging-rs
+RUN cargo build --release --locked -p snodra-messaging-rs
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 WORKDIR /app
-COPY --from=builder /app/target/release/libkraken_messaging.rlib /app/
+COPY --from=builder /app/target/release/libsnodra_messaging.rlib /app/
 USER nonroot
 CMD ["/bin/true"]

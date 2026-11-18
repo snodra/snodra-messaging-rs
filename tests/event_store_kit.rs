@@ -9,12 +9,12 @@ mod support;
 
 use std::sync::Arc;
 
-use kraken_messaging::event_store::EventStore;
-use kraken_messaging::event_store::conformance::{
+use snodra_messaging::event_store::EventStore;
+use snodra_messaging::event_store::conformance::{
     EventStoreKit, lag_counts_unacked, run_event_store_conformance,
 };
-use kraken_messaging::event_store::memory::MemoryEventStore;
-use kraken_messaging::store::memory::MemoryStore;
+use snodra_messaging::event_store::memory::MemoryEventStore;
+use snodra_messaging::store::memory::MemoryStore;
 use support::event_store::{Log, Stuck};
 
 /// Without the optional capabilities, the kit checks that the store says so.

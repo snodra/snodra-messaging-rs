@@ -125,7 +125,7 @@ pub struct ProcessorSettings {
     pub subscription: SubscriptionSpec,
     /// The event store the processor reads (and its dead letters go to in mode `event-store`).
     pub events: Arc<dyn EventStore>,
-    /// Handler invocations per record in all (`KRAKEN_CONSUMER_MAX_ATTEMPTS`), at least 1.
+    /// Handler invocations per record in all (`SNODRA_CONSUMER_MAX_ATTEMPTS`), at least 1.
     pub max_attempts: u32,
     /// Between two invocations.
     pub backoff: Duration,
@@ -133,7 +133,7 @@ pub struct ProcessorSettings {
     pub dead_letter_retention: Duration,
     /// The message store's dead letters (mode `collection`).
     pub dead_letters: Option<Arc<dyn DeadLetterStore>>,
-    /// What the consumer records `kraken.events.consumed` and `kraken.event.handler.duration`
+    /// What the consumer records `snodra.events.consumed` and `snodra.event.handler.duration`
     /// on (ADR 0026).
     pub metrics: Metrics,
 }
@@ -632,7 +632,7 @@ impl EventConsumer {
         Done::Ack { processed: false }
     }
 
-    /// How a record ended for this processor (`kraken.events.consumed`).
+    /// How a record ended for this processor (`snodra.events.consumed`).
     fn consumed(&self, type_label: &Value, outcome: Consumed) {
         self.metrics
             .event_consumed(self.processor_label.clone(), type_label.clone(), outcome);
@@ -942,12 +942,12 @@ const NO_HANDLER: &str = "no handler for this type";
 /// partition and offset: the source, segment and position); a record's own header of one of
 /// these names is replaced.
 pub const DLT_HEADERS: [&str; 6] = [
-    "kraken-dlt-processor",
-    "kraken-dlt-reason",
-    "kraken-dlt-error",
-    "kraken-dlt-original-topic",
-    "kraken-dlt-original-partition",
-    "kraken-dlt-original-offset",
+    "snodra-dlt-processor",
+    "snodra-dlt-reason",
+    "snodra-dlt-error",
+    "snodra-dlt-original-topic",
+    "snodra-dlt-original-partition",
+    "snodra-dlt-original-offset",
 ];
 
 /// The event mode `event-store` publishes to `dlt` for `record` of `source`: its key, payload
@@ -1030,7 +1030,7 @@ mod tests {
             headers: HashMap::from([
                 ("type".to_string(), "t.Happened".to_string()),
                 ("id".to_string(), "e-1".to_string()),
-                ("kraken-dlt-reason".to_string(), "stale".to_string()),
+                ("snodra-dlt-reason".to_string(), "stale".to_string()),
             ]),
             payload: b"{}".to_vec(),
             timestamp_ms: 0,
@@ -1053,16 +1053,16 @@ mod tests {
         assert_eq!(e.payload, b"{}");
         let h = |name: &str| e.headers[name].as_str();
         assert_eq!(h("type"), "t.Happened");
-        assert_eq!(h("kraken-dlt-processor"), "orders");
+        assert_eq!(h("snodra-dlt-processor"), "orders");
         assert_eq!(
-            h("kraken-dlt-reason"),
+            h("snodra-dlt-reason"),
             "HANDLER_FAILED",
             "the record's own is replaced"
         );
-        assert_eq!(h("kraken-dlt-error"), "Storage: down");
-        assert_eq!(h("kraken-dlt-original-topic"), "kraken.events");
-        assert_eq!(h("kraken-dlt-original-partition"), "3");
-        assert_eq!(h("kraken-dlt-original-offset"), "41");
+        assert_eq!(h("snodra-dlt-error"), "Storage: down");
+        assert_eq!(h("snodra-dlt-original-topic"), "kraken.events");
+        assert_eq!(h("snodra-dlt-original-partition"), "3");
+        assert_eq!(h("snodra-dlt-original-offset"), "41");
     }
 
     /// A record without an `id` header (or a blank one) gets `<source>-<segment>-<position>` as

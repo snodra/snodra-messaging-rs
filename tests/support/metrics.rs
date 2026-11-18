@@ -60,7 +60,7 @@ impl TestMeter {
 
     /// A meter of this provider, under the library's scope name.
     pub fn meter(&self) -> Meter {
-        self.provider.meter("kraken-messaging-rs")
+        self.provider.meter("snodra-messaging-rs")
     }
 
     /// Every data point exported now (the observable instruments' callbacks run).

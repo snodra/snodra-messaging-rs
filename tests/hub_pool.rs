@@ -8,12 +8,12 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kraken_messaging::hub::{
+use serde::{Deserialize, Serialize};
+use snodra_messaging::hub::{
     HubPool, HubSettings, Inbound, ReplyTo, SendOptions, Sender, SenderSettings, rendezvous_score,
 };
-use kraken_messaging::proto::{self, ServerMessage, reply, server_message};
-use kraken_messaging::{Command, MessagingError, Query, RetryPolicy, message_type};
-use serde::{Deserialize, Serialize};
+use snodra_messaging::proto::{self, ServerMessage, reply, server_message};
+use snodra_messaging::{Command, MessagingError, Query, RetryPolicy, message_type};
 use support::fake_hub::{Event, FakeHub};
 use tokio::sync::mpsc;
 
@@ -196,7 +196,7 @@ async fn a_stream_opened_while_the_other_hub_is_down_offers_all_permits() {
 }
 
 /// `await_registered` is "any hub" (the client can send), `await_all_registered` "every hub"
-/// (kraken-messaging's `awaitRegistered`): a hub that is down holds back only the latter.
+/// (snodra-messaging's `awaitRegistered`): a hub that is down holds back only the latter.
 #[tokio::test]
 async fn await_registered_waits_for_any_hub_and_await_all_registered_for_every_hub() {
     let (a, b) = (answering("hub-a").await, answering("hub-b").await);
@@ -214,10 +214,10 @@ async fn await_registered_waits_for_any_hub_and_await_all_registered_for_every_h
     c.shutdown().await;
 }
 
-/// While a hub is out, the survivors may run its share too (shared with kraken-messaging): when
+/// While a hub is out, the survivors may run its share too (shared with snodra-messaging): when
 /// the live hubs go from N_old to N_new < N_old, every live hub gets a `Permits` top-up up to
 /// `ceil(max / N_new)` (here 8 / 1 − 8 / 2 = 4) with `grant = ceil(max / N_new)`, which raises the
-/// hub's permit cap (the fake hub caps like kraken-hub) so the hub keeps the top-up. A returning hub
+/// hub's permit cap (the fake hub caps like snodra-server) so the hub keeps the top-up. A returning hub
 /// offers `ceil(max / N)` afresh; nothing is revoked, and a hub that already holds the larger share
 /// gets no second top-up.
 #[tokio::test]
@@ -503,7 +503,7 @@ impl Command for Blob {
 }
 
 /// A request still in the connection's outbound buffer when its stream is lost was never written:
-/// it goes to another hub with the same id (as kraken-messaging does), not `HubConnectionLost`.
+/// it goes to another hub with the same id (as snodra-messaging does), not `HubConnectionLost`.
 /// Only the few the transport had taken (possibly on the wire) have an unknown outcome.
 #[tokio::test]
 async fn requests_still_buffered_when_a_stream_is_lost_go_to_another_hub() {
@@ -619,7 +619,7 @@ async fn two_targets_of_one_replacing_hub_settle_without_ping_pong() {
     .await;
     assert!(
         hub.evictions() >= 1,
-        "the fake hub replaces sessions like kraken-hub"
+        "the fake hub replaces sessions like snodra-server"
     );
     assert!(
         c.pool.await_all_registered(Duration::from_secs(1)).await,
@@ -650,7 +650,7 @@ async fn two_targets_of_one_replacing_hub_settle_without_ping_pong() {
 }
 
 /// A hub whose ack carries an empty `RegisterAck.hub_id` is known by its target as `host:port`
-/// (shared with kraken-messaging): two such hubs are two hubs, not duplicates.
+/// (shared with snodra-messaging): two such hubs are two hubs, not duplicates.
 #[tokio::test]
 async fn a_hub_without_an_id_is_known_by_its_bare_target() {
     let (a, b) = (answering("").await, answering("").await);
@@ -732,7 +732,7 @@ async fn instance_status_goes_to_every_hub() {
 /// handled; the credential counters are read from memory too (no token fetch without OAuth2).
 #[tokio::test]
 async fn the_hub_client_gauges_count_live_hubs_and_running_handlers() {
-    use kraken_messaging::metrics::{
+    use snodra_messaging::metrics::{
         HUB_CLIENT_CONNECTED_HUBS, HUB_CLIENT_CREDENTIALS_REFRESHES_SENT,
         HUB_CLIENT_HANDLERS_IN_FLIGHT, HUB_CLIENT_TOKEN_FETCHES, Metrics,
     };

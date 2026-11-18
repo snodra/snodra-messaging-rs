@@ -1,6 +1,6 @@
 {
   "_id": "d3a1b0aa-0c1e-4f7a-9d7e-6a1d0c8b2201",
-  "_class": "io.damoreira.kraken.messaging.saga.DeadlineDocument",
+  "_class": "com.damoreira.snodra.messaging.saga.DeadlineDocument",
   "sagaType": "PaymentSaga",
   "sagaId": "7f6c1f0e-5a53-4f3e-9a0a-1d2f6f0c9b11",
   "name": "charge-timeout",
