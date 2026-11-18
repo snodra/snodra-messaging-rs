@@ -667,18 +667,18 @@ mod tests {
     /// looks the same), never flatly "does not exist"; only the broker's own code says that.
     #[test]
     fn no_leader_says_why() {
-        let EventStoreError::Failed(m) = NoLeader::NotInMetadata.error("kraken.events-0") else {
+        let EventStoreError::Failed(m) = NoLeader::NotInMetadata.error("snodra.events-0") else {
             panic!("Failed")
         };
         assert!(
-            m.contains("kraken.events-0 is unavailable right now") && m.contains("no leader"),
+            m.contains("snodra.events-0 is unavailable right now") && m.contains("no leader"),
             "{m}"
         );
-        let EventStoreError::Failed(m) = NoLeader::DoesNotExist.error("kraken.events-0") else {
+        let EventStoreError::Failed(m) = NoLeader::DoesNotExist.error("snodra.events-0") else {
             panic!("Failed")
         };
         assert!(
-            m.contains("the broker says the stream kraken.events-0 does not exist"),
+            m.contains("the broker says the stream snodra.events-0 does not exist"),
             "{m}"
         );
     }
@@ -700,7 +700,7 @@ mod tests {
     async fn an_unreachable_host_fails_naming_it() {
         let broker = Broker::new(Arc::new(RabbitConfig::new("127.0.0.1:1")), "test").unwrap();
         let mut nodes = Nodes::new(broker);
-        let failed = nodes.layout("kraken.events").await;
+        let failed = nodes.layout("snodra.events").await;
         assert!(
             matches!(&failed, Err(EventStoreError::Failed(m)) if m.contains("127.0.0.1:1")),
             "{failed:?}"

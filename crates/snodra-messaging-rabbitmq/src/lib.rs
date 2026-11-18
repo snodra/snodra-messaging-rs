@@ -7,9 +7,9 @@
 //! The Kotlin add-on (`com.rabbitmq:stream-client`) reads and writes the same streams the same
 //! way. These are rules, not descriptions: both libraries must follow them.
 //!
-//! - **A source is a super stream** (`kraken.events`, partition streams `kraken.events-0` to
+//! - **A source is a super stream** (`snodra.events`, partition streams `snodra.events-0` to
 //!   `-N`), created by the infrastructure, never by the library
-//!   (`rabbitmq-streams add_super_stream kraken.events --partitions 6`); a source that is a plain
+//!   (`rabbitmq-streams add_super_stream snodra.events --partitions 6`); a source that is a plain
 //!   stream (a dead-letter stream) is read and written as one partition. A source that is
 //!   neither fails the publish or the subscription, naming the command that creates it.
 //! - **Routing** is the stream clients' hash routing: murmur3 x86_32 of the routing key's UTF-8
@@ -37,7 +37,7 @@
 //!   client cannot decode such a chunk (its decoder fails on the connection's read task, so the
 //!   connection stops reading; a subscription notices on its next liveness check and ends).
 //! - **A segment** is the partition stream's suffix after `<source>-` (`3` for
-//!   `kraken.events-3`: decimal names sort by value, as the hub lists segments, and fit the
+//!   `snodra.events-3`: decimal names sort by value, as the hub lists segments, and fit the
 //!   128-byte bound), `0` for a plain stream; **a position** is the offset in decimal; an
 //!   event's time is its chunk's timestamp (the leader's clock when it wrote it).
 //! - **A processor's subscription** `<service>.<processor>` is a consumer of that name on every
@@ -57,9 +57,9 @@
 //!   Stored offsets are entries in the stream itself, so a subscription stores every
 //!   [`StorePolicy::messages`] acknowledgements or [`StorePolicy::interval`] (10 000 / 5 s by
 //!   default, the Java client's), and always on deactivation and at close.
-//! - **The native dead letter** is the stream `<source>.dlt` (`kraken.events.dlt`), with the
+//! - **The native dead letter** is the stream `<source>.dlt` (`snodra.events.dlt`), with the
 //!   headers the core writes (as the Kafka add-on's), created by the infrastructure: a stream
-//!   queue, e.g. `rabbitmqadmin declare queue --name kraken.events.dlt --type stream --durable true`
+//!   queue, e.g. `rabbitmqadmin declare queue --name snodra.events.dlt --type stream --durable true`
 //!   (`rabbitmqadmin` 2.x, shipped in the `-management` images; from outside a node add `--host`,
 //!   `--port`, `--username` and `--password`; `rabbitmq-streams` has no command for a plain
 //!   stream).
@@ -379,7 +379,7 @@ mod tests {
         );
         let spec = SubscriptionSpec {
             name: "svc.p".into(),
-            source: "kraken.events".into(),
+            source: "snodra.events".into(),
         };
         assert!(matches!(
             without.admin(&spec).err(),

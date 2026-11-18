@@ -454,7 +454,7 @@ mod tests {
 
     fn settings(lease: Duration) -> OutboxPublisherSettings {
         OutboxPublisherSettings {
-            source: "kraken.events".into(),
+            source: "snodra.events".into(),
             service_name: "svc".into(),
             poll_interval: Duration::from_millis(100),
             batch_size: 10,
@@ -516,7 +516,7 @@ mod tests {
         e.headers.insert("correlationId".into(), "c-1".into());
         e.headers.insert("type".into(), "stale".into());
         let event = relay.event(&e);
-        assert_eq!(event.source, "kraken.events");
+        assert_eq!(event.source, "snodra.events");
         assert_eq!(
             (event.id.as_str(), event.type_name.as_str()),
             ("e-1", "t.Happened")

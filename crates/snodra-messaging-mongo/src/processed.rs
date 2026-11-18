@@ -129,12 +129,12 @@ mod tests {
             type_name: "t.E".into(),
             processed_at_ms: 0,
             processor: Some("default".into()),
-            source: Some("kraken.events".into()),
+            source: Some("snodra.events".into()),
             segment: Some(segment.into()),
             position: Some(position.into()),
         };
         let stored = marker_document(&marker("2", "41"));
-        assert_eq!(stored.get_str("topic"), Ok("kraken.events"));
+        assert_eq!(stored.get_str("topic"), Ok("snodra.events"));
         assert_eq!(stored.get_i32("partition"), Ok(2));
         assert_eq!(stored.get_i64("offset"), Ok(41));
         let stored = marker_document(&marker("p-0", "x7"));

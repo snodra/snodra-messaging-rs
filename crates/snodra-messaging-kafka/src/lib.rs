@@ -98,7 +98,7 @@ pub struct KafkaConfig {
     /// browser; the producer would log them as ignored), never one of [`FIXED_KEYS`].
     pub consumer_properties: HashMap<String, String>,
     /// The browser's topics (the first is the default) and bounds (ADR 0025's by default, on
-    /// `kraken.events`).
+    /// `snodra.events`).
     pub browse: BrowseSettings,
 }
 

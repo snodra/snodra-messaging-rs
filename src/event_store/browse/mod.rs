@@ -13,7 +13,7 @@
 //! # `snodra.events.Search` ([`SearchRequest`] → [`SearchPage`])
 //!
 //! ```json
-//! {"source": "kraken.events",                      // optional: the browser's first source
+//! {"source": "snodra.events",                      // optional: the browser's first source
 //!  "filters": {"from": 1730000000000,              // optional, each; number (epoch ms) or text
 //!              "to": "2026-11-05T10:00:00Z",       //   (epoch ms or RFC 3339)
 //!              "type": "orders.*",                 // exact, or a prefix ending with *
@@ -32,7 +32,7 @@
 //! 1 KiB.
 //!
 //! ```json
-//! {"source": "kraken.events",
+//! {"source": "snodra.events",
 //!  "missing": true,                                // only when the source does not exist
 //!  "results": [<summary>, ...],                    // newest first
 //!  "scanned": 1234,                                // records read for this page
@@ -44,7 +44,7 @@
 //! A summary ([`EventSummary`]) is never a payload:
 //!
 //! ```json
-//! {"source": "kraken.events", "segment": "3", "position": "42",
+//! {"source": "snodra.events", "segment": "3", "position": "42",
 //!  "timestamp": 1730000000000 | null,              // epoch ms
 //!  "key": "order-42" | null,                       // \xNN for bytes not UTF-8, cut to 128 bytes
 //!  "keyTruncated": true,                           // only when cut
@@ -57,7 +57,7 @@
 //! # `snodra.events.Get` ([`GetRequest`] → [`EventRecord`])
 //!
 //! ```json
-//! {"source": "kraken.events", "segment": "3", "position": "42",  // source optional; 1-128 bytes
+//! {"source": "snodra.events", "segment": "3", "position": "42",  // source optional; 1-128 bytes
 //!  "payload": true}                                // optional, default false
 //! ```
 //!
@@ -76,17 +76,17 @@
 //! `{}` →
 //!
 //! ```json
-//! {"sources": [{"source": "kraken.events",
+//! {"sources": [{"source": "snodra.events",
 //!               "missing": true,                   // only when it does not exist
 //!               "segments": [{"segment": "0", "first": "0", "head": "120"}]}]}
 //! ```
 //!
 //! # `snodra.events.Lag` ([`LagRequest`] → [`LagView`])
 //!
-//! `{"source": "kraken.events"}` (optional) →
+//! `{"source": "snodra.events"}` (optional) →
 //!
 //! ```json
-//! {"source": "kraken.events", "missing": true,     // missing only when it does not exist
+//! {"source": "snodra.events", "missing": true,     // missing only when it does not exist
 //!  "subscriptions": [{"subscription": "orders.projector", "state": "<the store's>", "members": 0,
 //!                     "segments": [{"segment": "0", "committed": "4" | null, "head": "10",
 //!                                   "lag": 6 | null}],
@@ -97,7 +97,7 @@
 //! # `snodra.events.Tail` ([`TailRequest`] → [`TailEvent`] parts, streaming)
 //!
 //! ```json
-//! {"source": "kraken.events", "filters": {<no from, no to>},   // both optional
+//! {"source": "snodra.events", "filters": {<no from, no to>},   // both optional
 //!  "heartbeatMs": 15000, "maxDurationMs": 900000}             // optional
 //!                                // heartbeat: 100 ms to 1 h, sent when no part came for that long
 //! ```
@@ -105,7 +105,7 @@
 //! Each part is one of
 //!
 //! ```json
-//! {"start": {"source": "kraken.events", "segments": 6, "endsAtMs": 1730000900000}}  // first
+//! {"start": {"source": "snodra.events", "segments": 6, "endsAtMs": 1730000900000}}  // first
 //! {"record": <summary>}
 //! {"heartbeat": {"nowMs": 1730000015000}}
 //! {"end": {"reason": "maxDuration" | "slowReader" | "shutdown" | "failed"}}       // last

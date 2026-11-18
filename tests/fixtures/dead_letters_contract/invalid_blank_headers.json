@@ -1,7 +1,7 @@
 {
-  "_id": "default:kraken.events:0:8",
+  "_id": "default:snodra.events:0:8",
   "processor": "default",
-  "topic": "kraken.events",
+  "topic": "snodra.events",
   "partition": 0,
   "offset": {"$numberLong": "8"},
   "headers": {"type": "  ", "id": ""},

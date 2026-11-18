@@ -73,7 +73,7 @@ impl Default for InMemoryStores {
 }
 
 impl InMemoryStores {
-    /// Empty stores; the events go to the source `kraken.events` (as [`Config`]'s default).
+    /// Empty stores; the events go to the source `snodra.events` (as [`Config`]'s default).
     pub fn new() -> InMemoryStores {
         InMemoryStores {
             events: MemoryEventStore::default(),

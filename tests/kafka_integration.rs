@@ -34,7 +34,7 @@ struct Happened {
 message_type!(Happened, "t.Happened");
 impl Event for Happened {}
 
-const TOPIC: &str = "kraken.events";
+const TOPIC: &str = "snodra.events";
 
 macro_rules! require_docker {
     () => {

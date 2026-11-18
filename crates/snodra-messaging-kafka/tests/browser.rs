@@ -1140,7 +1140,7 @@ async fn an_unreachable_kafka_is_unavailable_and_never_blocks_the_runtime() {
     let budget = Duration::from_secs(2);
     let browser = browser(
         &closed_port(),
-        &["kraken.events"],
+        &["snodra.events"],
         BrowseSettings {
             timeout: budget,
             ..defaults()
@@ -1163,7 +1163,7 @@ async fn an_unreachable_kafka_is_unavailable_and_never_blocks_the_runtime() {
     });
     let (search, record, sources, lag, tail) = tokio::join!(
         browser.search(SearchRequest::default()),
-        get(&*browser, "kraken.events", "0", "0", false),
+        get(&*browser, "snodra.events", "0", "0", false),
         browser.sources(SourcesRequest {}),
         browser.lag(LagRequest::default()),
         browser.tail(TailRequest::default()),
@@ -1195,7 +1195,7 @@ async fn an_abandoned_tail_keeps_its_slot_until_its_setup_ends() {
     let budget = Duration::from_secs(3);
     let browser = browser(
         &closed_port(),
-        &["kraken.events"],
+        &["snodra.events"],
         BrowseSettings {
             timeout: budget,
             max_tails: 4,
@@ -1234,7 +1234,7 @@ async fn a_silent_broker_frees_every_slot_within_the_budget_and_the_close_grace(
     let budget = Duration::from_secs(2);
     let browser = browser(
         &silent_broker(),
-        &["kraken.events"],
+        &["snodra.events"],
         BrowseSettings {
             timeout: budget,
             max_searches: 1,
@@ -1246,7 +1246,7 @@ async fn a_silent_broker_frees_every_slot_within_the_budget_and_the_close_grace(
         let run = || async {
             match call {
                 "search" => browser.search(SearchRequest::default()).await.err(),
-                "get" => get(&*browser, "kraken.events", "0", "0", false).await.err(),
+                "get" => get(&*browser, "snodra.events", "0", "0", false).await.err(),
                 "sources" => browser.sources(SourcesRequest {}).await.err(),
                 "lag" => browser.lag(LagRequest::default()).await.err(),
                 _ => browser.tail(TailRequest::default()).await.err(),

@@ -222,7 +222,7 @@ mod tests {
         let config = Arc::new(RabbitConfig::new("127.0.0.1:1"));
         let publisher = Publisher::new(Broker::new(config, "test").unwrap());
         let event = OutgoingEvent {
-            source: "kraken.events".into(),
+            source: "snodra.events".into(),
             id: "e-1".into(),
             type_name: "t".into(),
             key: Some("k".into()),

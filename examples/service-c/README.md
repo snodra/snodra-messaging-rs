@@ -69,11 +69,11 @@ Kafka consumer in the group `service-c.audit` with the markers `processor:audit:
   `offsets {<partition>=<offset>, ...}`), `GET /audit/notified` the notes the second handler handled (`[{"key","text","at"}]`;
   a replay adds nothing there, while `GET /audit/handled` gets the replayed notes again). Same paths and JSON as service-b's.
 
-Through the hub, with the sandbox's write token (`kraken/infra/scripts/dev-hub-pki.sh` writes it to
-`kraken/infra/.secrets/hub-control/dashboard-write.token`; every sandbox mode mounts it into both hubs), from `snodra-messaging-rs`:
+Through the hub, with the sandbox's write token (its dev PKI setup writes the token as
+`hub-control/dashboard-write.token`; every sandbox mode mounts it into both hubs), from `snodra-messaging-rs`:
 
 ```bash
-W="Authorization: Bearer $(cat ../kraken/infra/.secrets/hub-control/dashboard-write.token)"
+W="Authorization: Bearer $(cat dashboard-write.token)"
 HUB=http://localhost:7001/api/v1/services/service-c/processors/audit
 curl -s -X POST -H "$W" "$HUB/pause"             # service-c's audit PAUSED on /api/v1/processors; notes are held
 curl -s -X POST -H 'content-type: application/json' localhost:8094/audit/notes -d '{"key":"ada","text":"held"}'

@@ -143,7 +143,7 @@ pub struct BrowseSettings {
 impl Default for BrowseSettings {
     fn default() -> Self {
         BrowseSettings {
-            sources: vec!["kraken.events".to_string()],
+            sources: vec!["snodra.events".to_string()],
             max_scanned: 50_000,
             max_results: 100,
             timeout: Duration::from_secs(10),
@@ -602,7 +602,7 @@ mod tests {
     #[test]
     fn requests_read_the_documented_json() {
         let search: SearchRequest = serde_json::from_value(json!({
-            "source": "kraken.events",
+            "source": "snodra.events",
             "filters": {"type": "orders.*", "from": 1700000000000i64, "to": "2026-11-05T10:00:00Z"},
             "limit": 20,
             "cursor": "abc",
@@ -688,7 +688,7 @@ mod tests {
     #[test]
     fn settings_default_to_adr_0025_and_refuse_zero_bounds() {
         let s = BrowseSettings::default();
-        assert_eq!(s.sources, ["kraken.events"]);
+        assert_eq!(s.sources, ["snodra.events"]);
         assert_eq!((s.max_scanned, s.max_results), (50_000, 100));
         assert_eq!(s.timeout, Duration::from_secs(10));
         assert_eq!((s.max_searches, s.max_tails, s.tail_buffer), (4, 4, 256));
@@ -754,8 +754,8 @@ mod tests {
             ..BrowseSettings::default()
         };
         assert_eq!(widest.validate(), Ok(()));
-        assert_eq!(s.source(None).as_deref(), Ok("kraken.events"));
-        assert_eq!(s.source(Some("")).as_deref(), Ok("kraken.events"));
+        assert_eq!(s.source(None).as_deref(), Ok("snodra.events"));
+        assert_eq!(s.source(Some("")).as_deref(), Ok("snodra.events"));
         assert!(matches!(s.source(Some("b")), Err(BrowseError::Invalid(_))));
         assert_eq!(s.tail_duration(Some(2_000)), Ok(Duration::from_secs(2)));
         assert_eq!(s.tail_duration(Some(u64::MAX)), Ok(s.tail_duration));

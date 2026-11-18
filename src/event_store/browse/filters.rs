@@ -491,16 +491,16 @@ mod tests {
     #[test]
     fn the_digest_names_the_source_and_every_filter() {
         let f = Filters::parse(&filter(&[("type", "a.*")]), false).unwrap();
-        let digest = f.digest("kraken.events");
+        let digest = f.digest("snodra.events");
         assert_eq!(digest.len(), 16);
-        assert_eq!(digest, f.digest("kraken.events"), "stable");
-        assert_ne!(f.digest("kraken.events.dlt"), digest, "the source counts");
+        assert_eq!(digest, f.digest("snodra.events"), "stable");
+        assert_ne!(f.digest("snodra.events.dlt"), digest, "the source counts");
         let other = Filters::parse(&filter(&[("type", "a.Placed")]), false).unwrap();
-        assert_ne!(other.digest("kraken.events"), digest);
-        let header = Filters::parse(&filter(&[("source", "kraken.events")]), false).unwrap();
+        assert_ne!(other.digest("snodra.events"), digest);
+        let header = Filters::parse(&filter(&[("source", "snodra.events")]), false).unwrap();
         assert_ne!(
             header.digest("x"),
-            Filters::default().digest("kraken.events"),
+            Filters::default().digest("snodra.events"),
             "the source header is not the source"
         );
         // A value holding what would separate fields in a plain text cannot pass for two.

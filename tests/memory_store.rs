@@ -303,9 +303,9 @@ async fn an_expired_dead_letter_disappears() {
     let letters = store.dead_letters();
     let now = snodra_messaging::saga::Clock::tokio().now_ms();
     let letter = DeadLetter {
-        id: letter_id("p", "kraken.events", "0", "5"),
+        id: letter_id("p", "snodra.events", "0", "5"),
         processor: "p".into(),
-        source: "kraken.events".into(),
+        source: "snodra.events".into(),
         segment: "0".into(),
         position: "5".into(),
         key: Some("k".into()),

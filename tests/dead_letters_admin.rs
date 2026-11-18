@@ -252,7 +252,7 @@ impl<'a> Letter<'a> {
         park(
             DeadLetterRecord {
                 processor: self.processor.to_string(),
-                source: "kraken.events".to_string(),
+                source: "snodra.events".to_string(),
                 segment: "1".to_string(),
                 position: self.offset.to_string(),
                 key: self.key.map(str::to_string),
@@ -338,9 +338,9 @@ async fn list_get_count_and_the_processor_check() {
     assert_eq!(
         names(&orders),
         [
-            "orders:kraken.events:1:3",
-            "orders:kraken.events:1:1",
-            "orders:kraken.events:1:2"
+            "orders:snodra.events:1:3",
+            "orders:snodra.events:1:1",
+            "orders:snodra.events:1:2"
         ]
     );
     assert_eq!(
@@ -356,14 +356,14 @@ async fn list_get_count_and_the_processor_check() {
     assert_eq!(admin.count(Some("default")).await.unwrap(), 1);
     assert_eq!(admin.count(None).await.unwrap(), 5);
     let got = admin
-        .get("orders:kraken.events:1:1")
+        .get("orders:snodra.events:1:1")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(got.event_id.as_deref(), Some("o-1"));
     assert!(
         admin
-            .get("orders:kraken.events:1:99")
+            .get("orders:snodra.events:1:99")
             .await
             .unwrap()
             .is_none()
@@ -373,17 +373,17 @@ async fn list_get_count_and_the_processor_check() {
     for e in [
         admin.list(Some("billing"), 100).await.unwrap_err(),
         admin.count(Some("billing")).await.unwrap_err(),
-        admin.get("billing:kraken.events:1:5").await.unwrap_err(),
-        admin.retry("billing:kraken.events:1:5").await.unwrap_err(),
+        admin.get("billing:snodra.events:1:5").await.unwrap_err(),
+        admin.retry("billing:snodra.events:1:5").await.unwrap_err(),
         admin.retry_all("billing").await.unwrap_err(),
         admin
-            .discard("billing:kraken.events:1:5")
+            .discard("billing:snodra.events:1:5")
             .await
             .unwrap_err(),
     ] {
         assert!(e.to_string().contains("'billing'"), "{e}");
     }
-    assert!(f.letter("billing:kraken.events:1:5").await.is_some());
+    assert!(f.letter("billing:snodra.events:1:5").await.is_some());
 }
 
 #[tokio::test]
@@ -449,7 +449,7 @@ async fn every_retry_result() {
     );
 
     assert_eq!(
-        admin.retry("orders:kraken.events:1:999").await.unwrap(),
+        admin.retry("orders:snodra.events:1:999").await.unwrap(),
         RetryResult::NotFound
     );
 
@@ -461,7 +461,7 @@ async fn every_retry_result() {
     assert!(
         f.markers()
             .await
-            .contains(&"processor:orders:kraken.events-1-15".to_string())
+            .contains(&"processor:orders:snodra.events-1-15".to_string())
     );
 }
 
@@ -674,7 +674,7 @@ async fn discarding_a_head_unblocks_the_next_letter_of_its_key() {
     );
     assert!(admin.discard(&head).await.unwrap());
     assert!(!admin.discard(&head).await.unwrap(), "already gone");
-    assert!(!admin.discard("orders:kraken.events:1:77").await.unwrap());
+    assert!(!admin.discard("orders:snodra.events:1:77").await.unwrap());
     assert_eq!(admin.retry(&next).await.unwrap(), RetryResult::Retried);
     assert_eq!(*f.seen.lock().unwrap(), ["n"]);
     let _ = HashMap::<String, String>::new();

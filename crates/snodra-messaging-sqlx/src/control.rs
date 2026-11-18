@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn replay_ranges_are_a_json_array_of_string_objects_in_order() {
         let r = |s: &str| ReplayRange {
-            source: "kraken.events".into(),
+            source: "snodra.events".into(),
             segment: s.into(),
             from: "0".into(),
             until: "10".into(),
@@ -407,13 +407,13 @@ mod tests {
         let json = ranges_json(&[r("2"), r("1")]).unwrap();
         assert_eq!(
             json,
-            r#"[{"source":"kraken.events","segment":"2","from":"0","until":"10"},{"source":"kraken.events","segment":"1","from":"0","until":"10"}]"#
+            r#"[{"source":"snodra.events","segment":"2","from":"0","until":"10"},{"source":"snodra.events","segment":"1","from":"0","until":"10"}]"#
         );
         assert_eq!(ranges(Some(&json)).unwrap(), vec![r("2"), r("1")]);
         // Key order as MySQL or PostgreSQL normalise it is read the same.
         assert_eq!(
             ranges(Some(
-                r#"[{"from":"0","until":"10","source":"kraken.events","segment":"2"}]"#
+                r#"[{"from":"0","until":"10","source":"snodra.events","segment":"2"}]"#
             ))
             .unwrap(),
             vec![r("2")]

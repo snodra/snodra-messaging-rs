@@ -140,7 +140,7 @@ pub fn delivery(segment: &str, offset: u64, timestamp_ms: i64, message: &Message
 }
 
 /// The segment of partition stream `stream` of super stream `source`: the partition's suffix
-/// after `<source>-` (`kraken.events-3` is `3`), else the stream's whole name.
+/// after `<source>-` (`snodra.events-3` is `3`), else the stream's whole name.
 pub fn segment_of(source: &str, stream: &str) -> String {
     stream
         .strip_prefix(source)
@@ -239,7 +239,7 @@ mod tests {
 
     fn event(key: Option<&str>) -> OutgoingEvent {
         OutgoingEvent {
-            source: "kraken.events".into(),
+            source: "snodra.events".into(),
             id: "e-1".into(),
             type_name: "orders.Placed".into(),
             key: key.map(str::to_string),
@@ -313,13 +313,13 @@ mod tests {
 
     #[test]
     fn segments_are_partition_suffixes() {
-        assert_eq!(segment_of("kraken.events", "kraken.events-0"), "0");
-        assert_eq!(segment_of("kraken.events", "kraken.events-11"), "11");
-        assert_eq!(segment_of("kraken.events", "kraken.events-eu"), "eu");
-        assert_eq!(segment_of("kraken.events", "other-3"), "other-3");
+        assert_eq!(segment_of("snodra.events", "snodra.events-0"), "0");
+        assert_eq!(segment_of("snodra.events", "snodra.events-11"), "11");
+        assert_eq!(segment_of("snodra.events", "snodra.events-eu"), "eu");
+        assert_eq!(segment_of("snodra.events", "other-3"), "other-3");
         assert_eq!(
-            segment_of("kraken.events", "kraken.events-"),
-            "kraken.events-"
+            segment_of("snodra.events", "snodra.events-"),
+            "snodra.events-"
         );
         assert!(segment_fits("3") && !segment_fits("") && !segment_fits(&"9".repeat(129)));
     }
@@ -349,11 +349,11 @@ mod tests {
         let mut frame = Vec::new();
         frame.extend_from_slice(&6u16.to_be_bytes()); // stream not available
         frame.extend_from_slice(&(15i16).to_be_bytes());
-        frame.extend_from_slice(b"kraken.events-3");
+        frame.extend_from_slice(b"snodra.events-3");
         let (_, update) = MetadataUpdateCommand::decode(&frame).expect("a metadata update");
         assert_eq!(
             metadata_update_stream(&update).as_deref(),
-            Some("kraken.events-3")
+            Some("snodra.events-3")
         );
     }
 
@@ -477,7 +477,7 @@ mod golden {
     #[test]
     fn the_message_has_the_types_of_the_wire_layout() {
         let event = OutgoingEvent {
-            source: "kraken.events".into(),
+            source: "snodra.events".into(),
             id: "e-42".into(),
             type_name: "orders.Placed".into(),
             key: Some("order-42".into()),

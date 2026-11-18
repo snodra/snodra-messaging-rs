@@ -193,7 +193,7 @@ impl Metrics {
                 .build(),
             events_consumed: meter
                 .u64_counter(EVENTS_CONSUMED)
-                .with_description("Records of kraken.events per processor, type and stage-1 outcome (handled, duplicate, skipped, failed, parked)")
+                .with_description("Records of snodra.events per processor, type and stage-1 outcome (handled, duplicate, skipped, failed, parked)")
                 .build(),
             handler_duration: meter
                 .f64_histogram(EVENT_HANDLER_DURATION)

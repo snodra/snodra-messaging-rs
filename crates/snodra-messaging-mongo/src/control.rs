@@ -382,7 +382,7 @@ mod tests {
 
     fn range(segment: &str, from: &str, until: &str) -> ReplayRange {
         ReplayRange {
-            source: "kraken.events".into(),
+            source: "snodra.events".into(),
             segment: segment.into(),
             from: from.into(),
             until: until.into(),
@@ -394,7 +394,7 @@ mod tests {
         let stored = range_document(&range("3", "10", "20"));
         assert_eq!(
             stored,
-            doc! { "topic": "kraken.events", "partition": 3_i32, "from": 10_i64, "until": 20_i64 }
+            doc! { "topic": "snodra.events", "partition": 3_i32, "from": 10_i64, "until": 20_i64 }
         );
         let read: RangeDocument = mongodb::bson::from_document(stored).expect("read");
         assert_eq!(ReplayRange::from(read), range("3", "10", "20"));
@@ -406,7 +406,7 @@ mod tests {
         let stored = range_document(&odd);
         assert_eq!(
             stored,
-            doc! { "topic": "kraken.events", "partition": "p-0", "from": "a1", "until": "b2" }
+            doc! { "topic": "snodra.events", "partition": "p-0", "from": "a1", "until": "b2" }
         );
         let read: RangeDocument = mongodb::bson::from_document(stored).expect("read");
         assert_eq!(ReplayRange::from(read), odd);
