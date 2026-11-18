@@ -1008,7 +1008,7 @@ async fn the_hub_gets_and_shows_the_processor_status() {
         vec![proto::ProcessorStatus {
             name: "orders".into(),
             subscription: "proto-processors.orders".into(),
-            source: "kraken.events".into(),
+            source: "snodra.events".into(),
             state: proto::ProcessorState::ProcessorRunning as i32,
             segments: vec![proto::SegmentStatus {
                 segment: "0".into(),

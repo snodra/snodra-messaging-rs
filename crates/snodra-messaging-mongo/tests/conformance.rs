@@ -109,7 +109,7 @@ async fn markers_without_position_behave_as_before() {
         .insert_many([
             // Written before E0 by either library, for the record at offset 4 of partition 1.
             doc! { "_id": "processor:default:old-4", "type": "t.E", "processedAt": at,
-            "processor": "default", "topic": "kraken.events", "partition": 1_i32,
+            "processor": "default", "topic": "snodra.events", "partition": 1_i32,
             "offset": 4_i64 },
             // Without a position: a saga's marker, from before as from now on.
             doc! { "_id": "saga:t.Order:e-1", "type": "t.E", "processedAt": at },
@@ -123,7 +123,7 @@ async fn markers_without_position_behave_as_before() {
         type_name: "t.E".into(),
         processed_at_ms: 0,
         processor: segment.map(|_| "default".to_string()),
-        source: segment.map(|_| "kraken.events".to_string()),
+        source: segment.map(|_| "snodra.events".to_string()),
         segment: segment.map(str::to_string),
         position: position.map(str::to_string),
     };
@@ -149,7 +149,7 @@ async fn markers_without_position_behave_as_before() {
         assert_eq!(recorded, fresh, "{}", marker.id);
     }
     let range = |segment: &str, from: &str, until: &str| ReplayRange {
-        source: "kraken.events".into(),
+        source: "snodra.events".into(),
         segment: segment.into(),
         from: from.into(),
         until: until.into(),

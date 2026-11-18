@@ -115,7 +115,7 @@ async fn golden_values(kind: Kind) {
                         type_name: "t.Happened".into(),
                         processed_at_ms: AT,
                         processor: Some("default".into()),
-                        source: Some("kraken.events".into()),
+                        source: Some("snodra.events".into()),
                         segment: Some("2".into()),
                         position: Some(position.into()),
                     },
@@ -141,7 +141,7 @@ async fn golden_values(kind: Kind) {
                 Some("t.Happened"),
                 Some(AT_TEXT),
                 Some("default"),
-                Some("kraken.events"),
+                Some("snodra.events"),
                 Some("2"),
                 Some("41"),
                 Some("41"),
@@ -152,7 +152,7 @@ async fn golden_values(kind: Kind) {
                 Some("t.Happened"),
                 Some(AT_TEXT),
                 Some("default"),
-                Some("kraken.events"),
+                Some("snodra.events"),
                 Some("2"),
                 Some("x7"),
                 None,
@@ -415,9 +415,9 @@ async fn golden_values(kind: Kind) {
     store
         .dead_letters()
         .park(&DeadLetter {
-            id: "default:kraken.events:2:41".into(),
+            id: "default:snodra.events:2:41".into(),
             processor: "default".into(),
-            source: "kraken.events".into(),
+            source: "snodra.events".into(),
             segment: "2".into(),
             position: "41".into(),
             key: Some("key-9".into()),
@@ -454,7 +454,7 @@ async fn golden_values(kind: Kind) {
         .set_replay(
             "default",
             &[ReplayRange {
-                source: "kraken.events".into(),
+                source: "snodra.events".into(),
                 segment: "2".into(),
                 from: "0".into(),
                 until: "10".into(),
@@ -479,7 +479,7 @@ async fn golden_values(kind: Kind) {
         .await;
     assert_eq!(
         json(&row[0]),
-        serde_json::json!([{"source": "kraken.events", "segment": "2", "from": "0", "until": "10"}])
+        serde_json::json!([{"source": "snodra.events", "segment": "2", "from": "0", "until": "10"}])
     );
     assert_eq!(
         &row[1..],
@@ -537,7 +537,7 @@ async fn rows_in_the_kotlin_layout_are_read(kind: Kind) {
         "INSERT INTO snodra_dead_letters (id, processor, source, segment, position, position_num, event_key, event_key_hash, \
          event_id, event_type, headers, payload, payload_binary, reason, error_type, error_message, blocked_by, attempts, \
          parked_at, last_attempt_at, expire_at, replay) VALUES \
-         ('default:kraken.events:1:9', 'default', 'kraken.events', '1', '9', 9, 'key-9', \
+         ('default:snodra.events:1:9', 'default', 'snodra.events', '1', '9', 9, 'key-9', \
          '1a4d5bcb1c7d0500b0f6566d599bf7a5492d0fded14c7bed41a682815d6bec92', 'e-9', 'k.Placed', \
          CAST('{{\"type\":\"k.Placed\"}}' AS {{json}}), '{{\"n\":9}}', NULL, 'HANDLER_FAILED', 'IllegalStateException', 'down', NULL, 3, \
          {t0}, {t0}, {later}, FALSE)"
@@ -546,7 +546,7 @@ async fn rows_in_the_kotlin_layout_are_read(kind: Kind) {
     raw.exec(&format!(
         "INSERT INTO snodra_processor_control (processor, paused, paused_at, paused_by, op_id, op_kind, op_lease_until, op_prepared_at, replay, updated_at) VALUES \
          ('default', TRUE, {t0}, 'ctl-1', 'op-9', 'reset', {later}, {t0}, \
-         CAST('[{{\"source\":\"kraken.events\",\"segment\":\"1\",\"from\":\"5\",\"until\":\"9\"}}]' AS {{json}}), {t0})"
+         CAST('[{{\"source\":\"snodra.events\",\"segment\":\"1\",\"from\":\"5\",\"until\":\"9\"}}]' AS {{json}}), {t0})"
     ))
     .await;
     raw.exec(&format!(
@@ -650,11 +650,11 @@ async fn rows_in_the_kotlin_layout_are_read(kind: Kind) {
     let letters = store.dead_letters();
     assert_eq!(
         letters.head("default", "key-9").await.unwrap().as_deref(),
-        Some("default:kraken.events:1:9"),
+        Some("default:snodra.events:1:9"),
         "a Kotlin letter, found by its key's hash"
     );
     let letter = letters
-        .get("default:kraken.events:1:9")
+        .get("default:snodra.events:1:9")
         .await
         .unwrap()
         .unwrap();
@@ -672,7 +672,7 @@ async fn rows_in_the_kotlin_layout_are_read(kind: Kind) {
     assert_eq!(
         state.replay,
         vec![ReplayRange {
-            source: "kraken.events".into(),
+            source: "snodra.events".into(),
             segment: "1".into(),
             from: "5".into(),
             until: "9".into(),

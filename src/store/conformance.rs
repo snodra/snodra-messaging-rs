@@ -2967,7 +2967,7 @@ pub async fn dispatch_hands_out_each_saga_in_seq_order_on(
 
 // ---- helpers -----------------------------------------------------------------------------------
 
-const TOPIC: &str = "kraken.events";
+const TOPIC: &str = "snodra.events";
 /// `paused_by` of a pause made on the instance itself.
 const PAUSED_BY_LOCAL: &str = "local";
 

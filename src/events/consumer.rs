@@ -1041,13 +1041,13 @@ mod tests {
     fn a_dead_letter_event_keeps_the_record_and_names_where_it_came_from() {
         let e = dead_letter_event(
             "orders",
-            "kraken.events",
-            "kraken.events.dlt",
+            "snodra.events",
+            "snodra.events.dlt",
             &delivery(),
             DeadLetterReason::HandlerFailed,
             &DeadLetterError::new("Storage", "down"),
         );
-        assert_eq!(e.source, "kraken.events.dlt");
+        assert_eq!(e.source, "snodra.events.dlt");
         assert_eq!((e.id.as_str(), e.type_name.as_str()), ("e-1", "t.Happened"));
         assert_eq!(e.key.as_deref(), Some("k"));
         assert_eq!(e.payload, b"{}");
@@ -1060,7 +1060,7 @@ mod tests {
             "the record's own is replaced"
         );
         assert_eq!(h("snodra-dlt-error"), "Storage: down");
-        assert_eq!(h("snodra-dlt-original-topic"), "kraken.events");
+        assert_eq!(h("snodra-dlt-original-topic"), "snodra.events");
         assert_eq!(h("snodra-dlt-original-partition"), "3");
         assert_eq!(h("snodra-dlt-original-offset"), "41");
     }
@@ -1077,13 +1077,13 @@ mod tests {
             };
             let e = dead_letter_event(
                 "orders",
-                "kraken.events",
-                "kraken.events.dlt",
+                "snodra.events",
+                "snodra.events.dlt",
                 &record,
                 DeadLetterReason::Invalid,
                 &DeadLetterError::new("Invalid", "no id"),
             );
-            assert_eq!(e.id, "kraken.events-3-41", "{id:?}");
+            assert_eq!(e.id, "snodra.events-3-41", "{id:?}");
             assert_eq!(
                 e.headers.get("id").map(String::as_str),
                 id,
@@ -1237,7 +1237,7 @@ mod tests {
             name: "default".into(),
             subscription: SubscriptionSpec {
                 name: "svc.default".into(),
-                source: "kraken.events".into(),
+                source: "snodra.events".into(),
             },
             events: Arc::clone(&events),
             max_attempts: 1,

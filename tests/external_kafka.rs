@@ -385,11 +385,11 @@ async fn partner_records_become_local_events_deduplicated_never_published_and_re
     );
     assert_eq!(ek.replies("bad").await, None);
 
-    // -- the event is not published to kraken.events
+    // -- the event is not published to snodra.events
     assert_eq!(
         ek.store.outbox().await.len(),
         0,
-        "nothing reached the outbox that relays to kraken.events"
+        "nothing reached the outbox that relays to snodra.events"
     );
 
     cancel.cancel();

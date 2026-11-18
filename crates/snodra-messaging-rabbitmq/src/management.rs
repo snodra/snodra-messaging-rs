@@ -241,12 +241,12 @@ mod tests {
     fn consumers_are_read_from_the_api_answer() {
         let body = serde_json::json!([
             {"properties": {"name": "svc.p", "single-active-consumer": "true",
-                            "snodra-member": "m-1", "super-stream": "kraken.events"},
-             "queue": {"name": "kraken.events-0", "vhost": "/"},
+                            "snodra-member": "m-1", "super-stream": "snodra.events"},
+             "queue": {"name": "snodra.events-0", "vhost": "/"},
              "connection_details": {"name": "10.0.0.1:5000 -> 10.0.0.2:5552"},
              "subscription_id": 0, "active": true},
             {"properties": {"name": "other"},
-             "queue": {"name": "kraken.events-1", "vhost": "/"},
+             "queue": {"name": "snodra.events-1", "vhost": "/"},
              "connection_details": {"name": "c-2"}, "subscription_id": 3},
             {"properties": {}, "queue": {"name": "x"}}
         ]);
@@ -256,7 +256,7 @@ mod tests {
             consumers[0],
             Consumer {
                 name: Some("svc.p".into()),
-                stream: "kraken.events-0".into(),
+                stream: "snodra.events-0".into(),
                 member: "m-1".into()
             }
         );

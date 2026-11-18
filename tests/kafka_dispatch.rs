@@ -432,11 +432,11 @@ fn a_record_only_a_saga_wants_is_handled_not_skipped() {
     .into();
     let none = HandlerRegistry::new();
     assert_eq!(
-        classify_with(&hdrs, b"{}", "kraken.events", "0", "7", |_| false),
+        classify_with(&hdrs, b"{}", "snodra.events", "0", "7", |_| false),
         RecordDisposition::Skip("no handler for this type")
     );
     assert_eq!(
-        classify_with(&hdrs, b"{}", "kraken.events", "0", "7", |t| t
+        classify_with(&hdrs, b"{}", "snodra.events", "0", "7", |t| t
             == "t.Happened"),
         RecordDisposition::Handle {
             type_name: "t.Happened".into(),
@@ -445,7 +445,7 @@ fn a_record_only_a_saga_wants_is_handled_not_skipped() {
     );
     // `classify` is `classify_with` over the registry's handlers.
     assert_eq!(
-        snodra_messaging::events::classify(&hdrs, b"{}", "kraken.events", "0", "7", &none),
+        snodra_messaging::events::classify(&hdrs, b"{}", "snodra.events", "0", "7", &none),
         RecordDisposition::Skip("no handler for this type")
     );
 }
@@ -461,7 +461,7 @@ async fn the_consumer_hands_a_record_only_a_saga_wants_to_the_saga_stage() {
             name: "default".into(),
             subscription: SubscriptionSpec {
                 name: "svc-saga.default".into(),
-                source: "kraken.events".into(),
+                source: "snodra.events".into(),
             },
             events: support::kafka_events(&kafka.bootstrap),
             max_attempts: 3,
@@ -500,7 +500,7 @@ async fn the_consumer_hands_a_record_only_a_saga_wants_to_the_saga_stage() {
         });
     producer
         .send(
-            FutureRecord::to("kraken.events")
+            FutureRecord::to("snodra.events")
                 .key("k")
                 .payload(&payload("k-1"))
                 .headers(hs),

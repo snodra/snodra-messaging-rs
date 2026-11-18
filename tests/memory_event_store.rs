@@ -22,7 +22,7 @@ use snodra_messaging::saga::Clock;
 use snodra_messaging::store::MessageStore;
 use snodra_messaging::store::memory::MemoryStore;
 
-const SOURCE: &str = "kraken.events";
+const SOURCE: &str = "snodra.events";
 
 fn browsing(source: &str) -> MemoryEventStoreConfig {
     MemoryEventStoreConfig {

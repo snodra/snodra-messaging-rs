@@ -1,7 +1,7 @@
 //! Who is calling: the identity read from the forwarded JWT, verification, and handler guards.
 //!
-//! Trusted-by-default model (kraken/docs/06-security.md): an absent token is an anonymous caller and
-//! the request proceeds; whether anonymity is acceptable is the handler's decision through a [`Guard`].
+//! Trusted-by-default model: an absent token is an anonymous caller and the request proceeds;
+//! whether anonymity is acceptable is the handler's decision through a [`Guard`].
 
 mod guard;
 mod jwks;

@@ -494,7 +494,7 @@ pub(crate) mod tests {
     fn spec() -> SubscriptionSpec {
         SubscriptionSpec {
             name: "svc.orders".into(),
-            source: "kraken.events".into(),
+            source: "snodra.events".into(),
         }
     }
 
@@ -616,7 +616,7 @@ pub(crate) mod tests {
         let s = monitor().status();
         assert_eq!(s.name, "orders");
         assert_eq!(s.subscription, "svc.orders");
-        assert_eq!(s.source, "kraken.events");
+        assert_eq!(s.source, "snodra.events");
         assert_eq!(s.event_store, "decimal");
         assert_eq!(
             s.capabilities,

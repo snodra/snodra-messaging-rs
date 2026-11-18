@@ -319,7 +319,7 @@ mod tests {
             (b"source", Some(b"svc")),
         ];
         let s = EventSummary::of(
-            "kraken.events",
+            "snodra.events",
             "3",
             "42",
             &view(Some(&key), headers, Some(b"secret")),
@@ -356,7 +356,7 @@ mod tests {
             headers.push((b"filler", Some(b"x")));
         }
         let r = view(None, &headers, Some(b"{\"a\":1}"));
-        let d = EventRecord::of("kraken.events", "1", "2", &r, Some(MAX_PAYLOAD));
+        let d = EventRecord::of("snodra.events", "1", "2", &r, Some(MAX_PAYLOAD));
         assert_eq!(d.all_headers.len(), MAX_HEADERS);
         assert_eq!(d.headers_omitted as usize, headers.len() - MAX_HEADERS);
         let long = &d.all_headers[1];
@@ -383,7 +383,7 @@ mod tests {
         assert_eq!(json["segment"], "1");
         assert_eq!(serde_json::from_value::<EventRecord>(json).unwrap(), d);
 
-        let unasked = EventRecord::of("kraken.events", "1", "2", &r, None);
+        let unasked = EventRecord::of("snodra.events", "1", "2", &r, None);
         let json = serde_json::to_value(&unasked).unwrap();
         assert!(
             json.get("payload").is_none() && json.get("payloadBase64").is_none(),

@@ -524,9 +524,9 @@ mod tests {
     #[test]
     fn a_letter_is_shown_the_way_service_b_shows_it() {
         let letter = DeadLetter {
-            id: "audit:kraken.events:0:8".into(),
+            id: "audit:snodra.events:0:8".into(),
             processor: "audit".into(),
-            source: "kraken.events".into(),
+            source: "snodra.events".into(),
             segment: "0".into(),
             position: "8".into(),
             key: Some("k1".into()),
@@ -536,7 +536,7 @@ mod tests {
             payload: Vec::new(),
             reason: DeadLetterReason::Sequenced,
             error: DeadLetterError::new("Sequenced", "an earlier letter"),
-            blocked_by: Some("audit:kraken.events:0:7".into()),
+            blocked_by: Some("audit:snodra.events:0:7".into()),
             attempts: 0,
             parked_at_ms: 1_793_750_400_000,
             last_attempt_at_ms: 1_793_750_400_000,
@@ -546,9 +546,9 @@ mod tests {
         assert_eq!(
             serde_json::to_value(LetterView::from(letter)).unwrap(),
             json!({
-                "id": "audit:kraken.events:0:8", "processor": "audit", "key": "k1",
+                "id": "audit:snodra.events:0:8", "processor": "audit", "key": "k1",
                 "eventType": "examples.ShoutAudit", "reason": "SEQUENCED", "attempts": 0,
-                "error": "Sequenced: an earlier letter", "blockedBy": "audit:kraken.events:0:7",
+                "error": "Sequenced: an earlier letter", "blockedBy": "audit:snodra.events:0:7",
             })
         );
     }
@@ -583,7 +583,7 @@ mod tests {
             operation_id: "op-1".into(),
             target,
             ranges: vec![ReplayRange {
-                source: "kraken.events".into(),
+                source: "snodra.events".into(),
                 segment: "1".into(),
                 from: "3".into(),
                 until: "9".into(),

@@ -138,7 +138,7 @@ pub struct Config {
     /// exclusive with `hub_token` / `hub_token_file` ([`Config::validate`]).
     pub hub_oauth2: Option<HubOAuth2>,
     /// The event store's source the service publishes its events to and its processors read
-    /// (`SNODRA_EVENTS_SOURCE`, default `kraken.events`).
+    /// (`SNODRA_EVENTS_SOURCE`, default `snodra.events`).
     pub events_source: String,
     pub consumer_enabled: bool,
     pub consumer_max_attempts: u32,

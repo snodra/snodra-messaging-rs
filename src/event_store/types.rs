@@ -277,6 +277,6 @@ mod tests {
 
     #[test]
     fn the_dead_letter_source_is_the_source_with_dlt() {
-        assert_eq!(dead_letter_source("kraken.events"), "kraken.events.dlt");
+        assert_eq!(dead_letter_source("snodra.events"), "snodra.events.dlt");
     }
 }

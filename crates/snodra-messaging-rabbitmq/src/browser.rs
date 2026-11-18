@@ -785,7 +785,7 @@ mod tests {
         let config = RabbitConfig::new("127.0.0.1:1").known_subscriptions(&["svc.p"]);
         let browser = RabbitBrowser::open(&config).unwrap();
         assert_eq!(
-            browser.registry.names("kraken.events"),
+            browser.registry.names("snodra.events"),
             BTreeSet::from(["svc.p".to_string()])
         );
     }
@@ -836,7 +836,7 @@ mod tests {
     #[test]
     fn a_view_carries_the_key_headers_payload_and_time() {
         let event = snodra_messaging::event_store::OutgoingEvent {
-            source: "kraken.events".into(),
+            source: "snodra.events".into(),
             id: "e-1".into(),
             type_name: "t".into(),
             key: Some("k".into()),

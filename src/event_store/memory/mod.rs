@@ -71,7 +71,7 @@ pub struct MemoryEventStoreConfig {
     /// Segments per source, 1 to [`MAX_SEGMENTS`] ([`DEFAULT_SEGMENTS`]): how many instances of
     /// one service can share a processor's events.
     pub segments: usize,
-    /// The browser's sources and bounds (the defaults: source `kraken.events`).
+    /// The browser's sources and bounds (the defaults: source `snodra.events`).
     pub browse: BrowseSettings,
     /// What the events are stamped with (their append time): [`Clock::tokio`] by default, which
     /// follows paused time in tests.

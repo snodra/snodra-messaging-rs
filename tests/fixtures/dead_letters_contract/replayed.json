@@ -1,7 +1,7 @@
 {
-  "_id": "orders:kraken.events:1:44",
+  "_id": "orders:snodra.events:1:44",
   "processor": "orders",
-  "topic": "kraken.events",
+  "topic": "snodra.events",
   "partition": 1,
   "offset": {"$numberLong": "44"},
   "key": "order-8",

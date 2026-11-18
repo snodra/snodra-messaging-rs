@@ -27,4 +27,4 @@ pub use resubscribe::{RESUBSCRIBE_MAX, RESUBSCRIBE_MIN};
 
 /// The source a service's events go to unless `SNODRA_EVENTS_SOURCE` names another (on Kafka,
 /// the topic of ADR 0003).
-pub const EVENTS_SOURCE: &str = "kraken.events";
+pub const EVENTS_SOURCE: &str = "snodra.events";

@@ -7,7 +7,7 @@ use crate::types::Event;
 
 /// What the dispatch relay tells a saga when a command it recorded could not be delivered or
 /// failed: a saga does not wait for replies, so a failure comes back as this event, dispatched
-/// locally (never published to `kraken.events`) with the dedupe id `failed:<sagaId>:<seq>`. A saga
+/// locally (never published to `snodra.events`) with the dedupe id `failed:<sagaId>:<seq>`. A saga
 /// handles it with [`SagaDefinition::on_command_failed`](super::SagaDefinition::on_command_failed),
 /// which the runtime routes by `saga_id` (ADR 0021 ruling 27); unhandled, it is logged at error and
 /// counted. `idempotency_key` is the failed command's `<sagaId>:<seq>`, `command_type` its wire

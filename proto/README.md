@@ -1,6 +1,6 @@
 # proto/
 
-`hub.proto` is a verbatim copy of `proto/hub.proto` in the [Snodra Server](https://gitlab.damoreira.ml/snodra/snodra-server)
+`hub.proto` is a verbatim copy of `proto/hub.proto` in the [Snodra Server](https://github.com/snodra/snodra-server)
 repository, which owns the protocol.
 
 The server repository is the source of truth: do not edit the copy here. Change the protocol there, then re-sync this file.

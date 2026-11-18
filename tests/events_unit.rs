@@ -145,7 +145,7 @@ fn classify_skips_missing_type() {
     let d = classify(
         &hdrs(&[(headers::ID, "x")]),
         b"{}",
-        "kraken.events",
+        "snodra.events",
         "0",
         "1",
         &registry_with_happened(),
@@ -160,7 +160,7 @@ fn classify_skips_a_blank_type() {
         let d = classify(
             &hdrs(&[(headers::TYPE, blank), (headers::ID, "x")]),
             b"{}",
-            "kraken.events",
+            "snodra.events",
             "0",
             "1",
             &registry_with_happened(),
@@ -177,7 +177,7 @@ fn classify_skips_unhandled_type() {
     let d = classify(
         &hdrs(&[(headers::TYPE, "t.Other"), (headers::ID, "x")]),
         b"{}",
-        "kraken.events",
+        "snodra.events",
         "0",
         "1",
         &registry_with_happened(),
@@ -190,7 +190,7 @@ fn classify_skips_non_object_payload() {
     let d = classify(
         &hdrs(&[(headers::TYPE, "t.Happened"), (headers::ID, "x")]),
         b"[1,2]",
-        "kraken.events",
+        "snodra.events",
         "0",
         "1",
         &registry_with_happened(),
@@ -203,13 +203,13 @@ fn classify_uses_source_segment_position_when_id_missing() {
     let d = classify(
         &hdrs(&[(headers::TYPE, "t.Happened")]),
         b"{}",
-        "kraken.events",
+        "snodra.events",
         "3",
         "17",
         &registry_with_happened(),
     );
     assert!(
-        matches!(d, RecordDisposition::Handle { ref type_name, ref id } if type_name == "t.Happened" && id == "kraken.events-3-17")
+        matches!(d, RecordDisposition::Handle { ref type_name, ref id } if type_name == "t.Happened" && id == "snodra.events-3-17")
     );
 }
 
@@ -221,13 +221,13 @@ fn classify_uses_source_segment_position_when_id_blank() {
         let d = classify(
             &hdrs(&[(headers::TYPE, "t.Happened"), (headers::ID, blank)]),
             b"{}",
-            "kraken.events",
+            "snodra.events",
             "3",
             "17",
             &registry_with_happened(),
         );
         assert!(
-            matches!(d, RecordDisposition::Handle { ref id, .. } if id == "kraken.events-3-17"),
+            matches!(d, RecordDisposition::Handle { ref id, .. } if id == "snodra.events-3-17"),
             "{blank:?}: {d:?}"
         );
     }
@@ -238,7 +238,7 @@ fn classify_handles_known_type() {
     let d = classify(
         &hdrs(&[(headers::TYPE, "t.Happened"), (headers::ID, "e-9")]),
         br#"{"id":"e-9"}"#,
-        "kraken.events",
+        "snodra.events",
         "0",
         "1",
         &registry_with_happened(),

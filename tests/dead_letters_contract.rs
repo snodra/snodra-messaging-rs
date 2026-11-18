@@ -135,9 +135,9 @@ fn shape(extra: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static 
 #[test]
 fn the_fixtures_of_each_reason_deserialise() {
     let failed = read("handler_failed");
-    assert_eq!(failed.id, "orders:kraken.events:1:42");
+    assert_eq!(failed.id, "orders:snodra.events:1:42");
     assert_eq!(failed.processor, "orders");
-    assert_eq!(failed.source, "kraken.events");
+    assert_eq!(failed.source, "snodra.events");
     assert_eq!(
         (failed.segment.as_str(), failed.position.as_str()),
         ("1", "42")
@@ -176,11 +176,11 @@ fn the_fixtures_of_each_reason_deserialise() {
     assert_eq!(sequenced.reason, DeadLetterReason::Sequenced);
     assert_eq!(
         sequenced.blocked_by.as_deref(),
-        Some("orders:kraken.events:1:42")
+        Some("orders:snodra.events:1:42")
     );
     assert_eq!(
         sequenced.error,
-        DeadLetterError::sequenced("orders:kraken.events:1:42")
+        DeadLetterError::sequenced("orders:snodra.events:1:42")
     );
     assert_eq!(sequenced.attempts, 0);
     assert_eq!(sequenced.parked_at_ms, at("2026-11-04T10:00:06.250Z"));
@@ -205,7 +205,7 @@ fn the_fixtures_of_each_reason_deserialise() {
     let blank = read("invalid_blank_headers");
     assert!(blank.event_id.is_none() && blank.event_type.is_none());
     assert_eq!(blank.headers["type"], "  ");
-    assert_eq!(blank.dedupe_id(), "kraken.events-0-8");
+    assert_eq!(blank.dedupe_id(), "snodra.events-0-8");
 
     let replayed = read("replayed");
     assert_eq!(replayed.reason, DeadLetterReason::HandlerFailed);
@@ -238,7 +238,7 @@ fn record_at(
 ) -> DeadLetterRecord {
     DeadLetterRecord {
         processor: processor.into(),
-        source: "kraken.events".into(),
+        source: "snodra.events".into(),
         segment: partition.to_string(),
         position: offset.to_string(),
         key: key.map(|k| String::from_utf8_lossy(k).into_owned()),
@@ -294,8 +294,8 @@ fn a_letter_rust_parks_has_exactly_the_contracts_fields_and_types() {
     let sequenced = park(
         record(Some(b"order-7"), &[("type", b"t.E"), ("id", b"e-2")], b"{}"),
         DeadLetterReason::Sequenced,
-        DeadLetterError::sequenced("orders:kraken.events:1:41"),
-        Some("orders:kraken.events:1:41".into()),
+        DeadLetterError::sequenced("orders:snodra.events:1:41"),
+        Some("orders:snodra.events:1:41".into()),
         0,
         now,
         retention,
@@ -314,7 +314,7 @@ fn a_letter_rust_parks_has_exactly_the_contracts_fields_and_types() {
     assert_eq!(doc.get_str("reason"), Ok("SEQUENCED"));
     assert_eq!(
         doc.get_document("error").unwrap(),
-        &mongodb::bson::doc! { "type": "Sequenced", "message": "an earlier letter for this key is parked: orders:kraken.events:1:41" }
+        &mongodb::bson::doc! { "type": "Sequenced", "message": "an earlier letter for this key is parked: orders:snodra.events:1:41" }
     );
 
     // No key, no type or id header, a value that is not UTF-8 (and a header that is not either).
@@ -356,7 +356,7 @@ fn a_letter_rust_parks_has_exactly_the_contracts_fields_and_types() {
     let doc = to_doc(&empty);
     assert_shape(&doc, &shape(&[("key", "string"), ("eventType", "string")]));
     assert_eq!(doc.get_str("key"), Ok("k\u{fffd}"), "lossy UTF-8");
-    assert_eq!(doc.get_str("_id"), Ok("orders:kraken.events:1:42"));
+    assert_eq!(doc.get_str("_id"), Ok("orders:snodra.events:1:42"));
 }
 
 /// Every fixture but `handler_failed` (above), written by this library from its record.
@@ -373,8 +373,8 @@ fn rust_parks_each_shared_fixture_from_its_record() {
             br#"{"orderId":"o-7"}"#,
         ),
         DeadLetterReason::Sequenced,
-        DeadLetterError::sequenced("orders:kraken.events:1:42"),
-        Some("orders:kraken.events:1:42".into()),
+        DeadLetterError::sequenced("orders:snodra.events:1:42"),
+        Some("orders:snodra.events:1:42".into()),
         0,
         at("2026-11-04T10:00:06.250Z"),
         retention,
@@ -479,7 +479,7 @@ fn a_blank_event_id_dedupes_by_the_fallback_id() {
     let mut letter = read("handler_failed");
     for blank in ["", "   "] {
         letter.event_id = Some(blank.to_string());
-        assert_eq!(letter.dedupe_id(), "kraken.events-1-42", "{blank:?}");
+        assert_eq!(letter.dedupe_id(), "snodra.events-1-42", "{blank:?}");
     }
 }
 
@@ -538,20 +538,20 @@ async fn every_shared_fixture_reads_back_through_the_store_and_the_admin_api() {
         );
     }
     let failed = store
-        .get("orders:kraken.events:1:42")
+        .get("orders:snodra.events:1:42")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(failed.dedupe_id(), "evt-7");
     assert_eq!(failed.error.type_name, "IllegalStateException");
     let binary = store
-        .get("default:kraken.events:0:7")
+        .get("default:snodra.events:0:7")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(binary.payload, vec![0xff, 0x00, 0xfe]);
     let blank = store
-        .get("default:kraken.events:0:8")
+        .get("default:snodra.events:0:8")
         .await
         .unwrap()
         .unwrap();
@@ -563,12 +563,12 @@ async fn every_shared_fixture_reads_back_through_the_store_and_the_admin_api() {
     assert_eq!(
         listed.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(),
         [
-            "orders:kraken.events:1:42",
-            "orders:kraken.events:1:43",
-            "default:kraken.events:0:7",
-            "orders:kraken.events:2:9",
-            "default:kraken.events:0:8",
-            "orders:kraken.events:1:44",
+            "orders:snodra.events:1:42",
+            "orders:snodra.events:1:43",
+            "default:snodra.events:0:7",
+            "orders:snodra.events:2:9",
+            "default:snodra.events:0:8",
+            "orders:snodra.events:1:44",
         ],
         "by parkedAt"
     );
@@ -580,7 +580,7 @@ async fn every_shared_fixture_reads_back_through_the_store_and_the_admin_api() {
     let store = MongoStore::new(client, db).dead_letters();
     assert_eq!(
         store.head("orders", "order-7").await.unwrap().as_deref(),
-        Some("orders:kraken.events:1:42")
+        Some("orders:snodra.events:1:42")
     );
 }
 
