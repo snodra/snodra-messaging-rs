@@ -75,16 +75,16 @@ impl HubTls {
     }
 }
 
-/// The OAuth2 client-credentials setup that authenticates this service to the hubs with a Keycloak
+/// The OAuth2 client-credentials setup that authenticates this service to the hubs with an OAuth2
 /// access token (JWT; roadmap P5b, hub ADR 0019). `Config.hub_oauth2`; mutually exclusive with a
 /// static hub token. Build it with `..HubOAuth2::default()` so fields added later do not break you.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HubOAuth2 {
     /// The realm's token endpoint (`SNODRA_SERVER_OAUTH2_TOKEN_URI`), e.g.
-    /// `https://keycloak/realms/snodra/protocol/openid-connect/token`. `http://` is allowed (a
+    /// `https://auth.example/realms/snodra/protocol/openid-connect/token`. `http://` is allowed (a
     /// compose network) and logs one warning unless the host is loopback or a single-label name.
     pub token_uri: String,
-    /// The Keycloak client id (`SNODRA_SERVER_OAUTH2_CLIENT_ID`); it must be the service name, because
+    /// The OAuth2 client id (`SNODRA_SERVER_OAUTH2_CLIENT_ID`); it must be the service name, because
     /// the hub checks the token's `azp` against `Register.service_name`. `from_env` defaults it to
     /// `SNODRA_SERVICE_NAME`.
     pub client_id: String,

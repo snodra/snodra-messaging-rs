@@ -132,7 +132,7 @@ pub struct Config {
     /// with `https://` (then TLS with the platform roots). Needed when the hub sets
     /// `SNODRA_SERVER_TLS_CERT`.
     pub hub_tls: Option<HubTls>,
-    /// Authenticate to the hubs with a Keycloak client-credentials access token (JWT) instead of a
+    /// Authenticate to the hubs with an OAuth2 client-credentials access token (JWT) instead of a
     /// static token (`SNODRA_SERVER_OAUTH2_TOKEN_URI` set makes it `Some`; ADR 0019). One token
     /// provider serves every hub connection and refreshes the token before it expires. Mutually
     /// exclusive with `hub_token` / `hub_token_file` ([`Config::validate`]).
@@ -173,7 +173,7 @@ pub struct Config {
     /// Forward the current handler's bearer token on outgoing requests.
     pub forward_jwt: bool,
     /// Where a forwarded token's roles come from (`SNODRA_SECURITY_ROLES_CLAIM`): a dotted claim
-    /// path, or `scope`. `roles` by default; `realm_access.roles` for Keycloak, `groups` for
+    /// path, or `scope`. `roles` by default; `realm_access.roles` for providers that nest them, `groups` for
     /// providers that put them there.
     pub security_roles_claim: String,
     /// Sagas (ADR 0021; `SNODRA_SAGAS_ENABLED`, default true): with `false` a service that
@@ -1543,7 +1543,7 @@ mod tests {
         let c = from(&[
             (
                 "SNODRA_SERVER_OAUTH2_TOKEN_URI",
-                "http://keycloak:8080/token",
+                "http://auth.example:8080/token",
             ),
             ("SNODRA_SERVER_OAUTH2_CLIENT_ID", "orders-service"),
             ("SNODRA_SERVER_OAUTH2_CLIENT_SECRET", "inline"),
@@ -1566,7 +1566,7 @@ mod tests {
     fn oauth2_needs_a_secret_a_readable_secret_file_and_an_http_token_uri() {
         let uri = (
             "SNODRA_SERVER_OAUTH2_TOKEN_URI",
-            "http://keycloak:8080/token",
+            "http://auth.example:8080/token",
         );
         let mentions = |vars: &[(&str, &str)], text: &str| {
             let r = try_from(vars);
@@ -1589,7 +1589,7 @@ mod tests {
         );
         mentions(
             &[
-                ("SNODRA_SERVER_OAUTH2_TOKEN_URI", "ftp://keycloak/token"),
+                ("SNODRA_SERVER_OAUTH2_TOKEN_URI", "ftp://auth.example/token"),
                 ("SNODRA_SERVER_OAUTH2_CLIENT_SECRET", "x"),
             ],
             "SNODRA_SERVER_OAUTH2_TOKEN_URI",
@@ -1621,7 +1621,7 @@ mod tests {
         let oauth2 = [
             (
                 "SNODRA_SERVER_OAUTH2_TOKEN_URI",
-                "http://keycloak:8080/token",
+                "http://auth.example:8080/token",
             ),
             ("SNODRA_SERVER_OAUTH2_CLIENT_SECRET", "x"),
         ];
@@ -1741,7 +1741,7 @@ mod tests {
             vec![
                 (
                     "SNODRA_SERVER_OAUTH2_TOKEN_URI",
-                    "http://keycloak:8080/token",
+                    "http://auth.example:8080/token",
                 ),
                 ("SNODRA_SERVER_OAUTH2_CLIENT_SECRET", "x"),
             ],

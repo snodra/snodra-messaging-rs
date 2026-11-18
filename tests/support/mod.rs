@@ -15,7 +15,7 @@ pub fn now() -> u64 {
     jsonwebtoken::get_current_timestamp()
 }
 
-/// RS256 token signed by the fixture key (`kid = k1`) with Keycloak-shaped claims.
+/// RS256 token signed by the fixture key (`kid = k1`) with provider-shaped claims.
 pub fn token(subject: &str, roles: &[&str], issuer: &str, exp: u64) -> String {
     sign(TEST_KEY_PEM, Some("k1"), subject, roles, issuer, exp)
 }
@@ -45,7 +45,7 @@ pub fn sign(
     .expect("sign")
 }
 
-/// Signed token with an `aud` claim, as Keycloak issues them.
+/// Signed token with an `aud` claim, as some providers issue them.
 pub fn token_with_audience(subject: &str, roles: &[&str], audience: &[&str]) -> String {
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some("k1".into());

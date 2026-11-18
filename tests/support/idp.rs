@@ -1,5 +1,5 @@
 //! A test identity provider for the hub JWT tests (P5b): an OAuth2 token endpoint that answers the
-//! client-credentials grant like Keycloak (HTTP Basic client authentication, `invalid_client` as a
+//! client-credentials grant (HTTP Basic client authentication, `invalid_client` as a
 //! 401 JSON body) with ES256 access tokens, and the JWKS that verifies them. The signing key is
 //! generated at test time (rcgen); nothing is checked in.
 #![allow(dead_code)]
@@ -21,7 +21,7 @@ pub enum Mode {
     Ok,
     /// A bare HTTP status (an overloaded proxy, say).
     Status(u16),
-    /// `{"error": .., "error_description": ..}` with the given status (Keycloak: 401 `invalid_client`).
+    /// `{"error": .., "error_description": ..}` with the given status (the standard: 401 `invalid_client`).
     OAuthError(u16, &'static str, &'static str),
     /// A 200 whose body is not JSON.
     Garbage,

@@ -225,7 +225,7 @@ pub enum AuthKind {
     None,
     /// A static token (`hub_token` / `hub_token_file`).
     Token,
-    /// A Keycloak client-credentials access token (`hub_oauth2`).
+    /// An OAuth2 client-credentials access token (`hub_oauth2`).
     Jwt,
     /// A client certificate (`hub_tls.client_cert_file`, mutual TLS, ADR 0020).
     Certificate,
@@ -846,8 +846,8 @@ mod tests {
         assert!(local("http://localhost:8180/token"));
         assert!(local("http://127.0.0.1:8180/token"));
         assert!(local("http://[::1]:8180/token"));
-        assert!(local("http://keycloak:8080/token"));
-        assert!(!local("http://keycloak.internal.example:8080/token"));
+        assert!(local("http://auth.example:8080/token"));
+        assert!(!local("http://auth.internal.example:8080/token"));
         assert!(!local("http://10.1.2.3/token"));
     }
 }
