@@ -26,6 +26,8 @@ jobs:
         with:
           version: "29.3"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: librdkafka build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev libsasl2-dev zlib1g-dev libzstd-dev
 
       - name: the tag must be the crate version
         run: |
@@ -39,23 +41,31 @@ jobs:
 
       # crates.io needs the core in the index before the add-ons can be published, so the add-ons
       # retry for a few minutes while it propagates.
+      # Publishing is idempotent: a re-run skips what is already on the index, so a failure halfway
+      # through never strands the remaining crates.
       - name: publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
-          cargo publish -p snodra-messaging-rs --locked
-          for crate in snodra-messaging-kafka snodra-messaging-mongo snodra-messaging-sqlx snodra-messaging-rabbitmq; do
+          VERSION="${GITHUB_REF_NAME#v}"
+          publish_crate() {
+            crate="$1"
+            if curl -fsS "https://crates.io/api/v1/crates/$crate/$VERSION" >/dev/null 2>&1; then
+              echo "$crate $VERSION is already on crates.io"
+              return 0
+            fi
             for attempt in $(seq 1 20); do
               if cargo publish -p "$crate" --locked; then
-                break
-              fi
-              if [ "$attempt" -eq 20 ]; then
-                echo "gave up publishing $crate" >&2
-                exit 1
+                return 0
               fi
               sleep 15
             done
+            echo "gave up publishing $crate" >&2
+            return 1
+          }
+          for crate in snodra-messaging-rs snodra-messaging-kafka snodra-messaging-mongo snodra-messaging-sqlx snodra-messaging-rabbitmq; do
+            publish_crate "$crate"
           done
 
       - name: GitHub release
