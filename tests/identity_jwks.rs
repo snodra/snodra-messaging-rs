@@ -132,7 +132,7 @@ async fn unknown_kid_refreshes_once_then_fails() {
 
 #[tokio::test]
 async fn token_with_audience_is_verified() {
-    // Keycloak access tokens carry `aud` ("account", client ids); like Spring's JwtDecoder we do not validate it.
+    // Some providers' access tokens carry `aud` ("account", client ids); like Spring's JwtDecoder we do not validate it.
     let server = server_with(None).await;
     let token = support::token_with_audience("u-3", &["snodra-user"], &["account", "service-a"]);
     let id = resolver(&server)

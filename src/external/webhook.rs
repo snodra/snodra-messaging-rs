@@ -1,5 +1,5 @@
 //! Verifies a webhook request against a shared secret (ADR 0021 ruling 19, spec "Inbound 2"), by
-//! the rules of the Keycloak webhook of the sso-service, as the Kotlin `WebhookSignatureVerifier`:
+//! the rules of the identity provider webhook of the sso-service, as the Kotlin `WebhookSignatureVerifier`:
 //!
 //! - **shared secret**: the header `X-Snodra-Webhook-Secret` holds the secret itself;
 //! - **HMAC**: the header `X-Snodra-Signature` holds `sha256=<hex>`, the HMAC-SHA256 of the raw

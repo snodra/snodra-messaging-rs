@@ -48,7 +48,7 @@ impl Identity {
 /// Where a token's roles come from: a dotted path into the claims, or the space-separated `scope`.
 ///
 /// Providers disagree, so the claim is configuration (`SNODRA_SECURITY_ROLES_CLAIM`): `roles` by
-/// default, `realm_access.roles` for Keycloak, `groups` for Okta/Dex, `scope` for OAuth2 scopes.
+/// default, `realm_access.roles` for providers that nest them there, `groups` for those that use groups, `scope` for OAuth2 scopes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RolesClaim {
     Scope,

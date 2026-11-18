@@ -2,7 +2,7 @@
 //! `SNODRA_SERVER_AUTH_MODE=enforce` with JWT authentication: the test identity provider
 //! (`support::idp`: a token endpoint on the host and ES256 keys generated at test time) issues the
 //! tokens; its JWKS is served to the hub by a small container on the same bridge network (the hub
-//! reaches it as `keycloak`; reaching the test host from a container is runtime-specific). A
+//! reaches it as `auth.example`; reaching the test host from a container is runtime-specific). A
 //! `[[service]]` ACL entry gives a JWT service its rights; a static-token service (`orders`) sits
 //! beside it. No Kafka or MongoDB: the participants are a `HubConnection` and a `Sender`.
 mod support;
@@ -100,12 +100,12 @@ async fn fixture(lifetime: u64) -> Fixture {
             .env("SNODRA_SERVER_JWT_ISSUER", &idp.issuer())
             .env(
                 "SNODRA_SERVER_JWT_JWKS_URI",
-                &format!("http://keycloak:{STATIC_SERVER_PORT}/certs"),
+                &format!("http://auth.example:{STATIC_SERVER_PORT}/certs"),
             )
             .env("SNODRA_SERVER_JWT_LEEWAY", "0s")
             .env("SNODRA_SERVER_JWT_EXPIRY_GRACE", "2s")
             .mount(dir.dir(), "/etc/snodra")
-            .host_name("keycloak", jwks.ip),
+            .host_name("auth.example", jwks.ip),
     )
     .await;
     Fixture {

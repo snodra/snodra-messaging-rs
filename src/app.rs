@@ -316,7 +316,7 @@ impl SnodraMessaging {
     }
 
     /// How this instance authenticates to the hubs: `none`, a static `token`, a `jwt`
-    /// (Keycloak client credentials, ADR 0019) or a client `certificate` (mutual TLS, ADR 0020),
+    /// (OAuth2 client credentials, ADR 0019) or a client `certificate` (mutual TLS, ADR 0020),
     /// the current access token's expiry, the last token fetch error and the token fetch counts by
     /// result (`snodra_hub_client_token_fetches_total{result}`); for a certificate, the one
     /// presented (fingerprint, `notAfter`, rotations).
@@ -1284,7 +1284,7 @@ mod hub_settings_tests {
     fn oauth2_in_the_config_becomes_one_token_provider_for_the_settings() {
         let mut config = Config::new("svc", "a:7000,b:7000");
         config.hub_oauth2 = Some(crate::security::HubOAuth2 {
-            token_uri: "http://keycloak:8080/token".into(),
+            token_uri: "http://auth.example:8080/token".into(),
             client_id: "svc".into(),
             client_secret: Some(SecretString::new("s3cr3t")),
             ..Default::default()

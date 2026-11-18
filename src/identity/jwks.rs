@@ -69,7 +69,7 @@ impl JwksVerifier {
         validation.set_issuer(&[&self.issuer]);
         validation.validate_exp = true;
         validation.validate_nbf = true;
-        // Keycloak tokens carry `aud` ("account", client ids); like Spring's JwtDecoder we do not validate it.
+        // Some providers' tokens carry `aud` ("account", client ids); like Spring's JwtDecoder we do not validate it.
         validation.validate_aud = false;
         validation.set_required_spec_claims(&["exp", "iss"]);
         let data = decode::<Map<String, Value>>(token, &key, &validation).map_err(|e| {
