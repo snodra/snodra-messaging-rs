@@ -25,6 +25,6 @@ pub use publisher::{OUTBOX_SEND_TIMEOUT, OutboxPublisher, OutboxPublisherSetting
 pub(crate) use resubscribe::{Ended, Resubscribing, keep_subscribed};
 pub use resubscribe::{RESUBSCRIBE_MAX, RESUBSCRIBE_MIN};
 
-/// The source a service's events go to unless `KRAKEN_EVENTS_SOURCE` names another (on Kafka,
+/// The source a service's events go to unless `SNODRA_EVENTS_SOURCE` names another (on Kafka,
 /// the topic of ADR 0003).
 pub const EVENTS_SOURCE: &str = "kraken.events";

@@ -1,6 +1,6 @@
-//! End to end against the real hub image (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`) running
-//! `KRAKEN_HUB_AUTH_MODE=enforce` with `KRAKEN_HUB_TLS_CLIENT_AUTH=required`: the services
-//! authenticate with client certificates (`kraken://service/<name>` URI SAN) that a CA generated at
+//! End to end against the real hub image (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`) running
+//! `SNODRA_SERVER_AUTH_MODE=enforce` with `SNODRA_SERVER_TLS_CLIENT_AUTH=required`: the services
+//! authenticate with client certificates (`snodra://service/<name>` URI SAN) that a CA generated at
 //! test time signed, and their rights come from the ACL's `[[service]]` tables. The hub's own
 //! server certificate is issued from the same CA with the client usage too, so the image's
 //! `--health-check` (which presents the hub's own pair under `required`) stays green. No Kafka or
@@ -11,13 +11,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use kraken_messaging::hub::{
+use serde::{Deserialize, Serialize};
+use snodra_messaging::hub::{
     HubConnection, HubPool, HubSettings, Inbound, RegisteredTypes, SendOptions, Sender,
     SenderSettings,
 };
-use kraken_messaging::proto::{self, ClientMessage, client_message, reply};
-use kraken_messaging::{HubTls, MessagingError, Query, message_type};
-use serde::{Deserialize, Serialize};
+use snodra_messaging::proto::{self, ClientMessage, client_message, reply};
+use snodra_messaging::{HubTls, MessagingError, Query, message_type};
 use support::containers::{HubContainer, HubOptions, free_port, hub_with};
 use support::logs::Captured;
 use support::pki::{ClientSpec, Pki, TempDir, fingerprint_of_pem};
@@ -64,7 +64,7 @@ struct Fixture {
 /// `billing` (a `[[service]]`: handles `billing.*`, sends nothing) and `orders` (handles
 /// `orders.*`, sends `billing.*`).
 fn fixture() -> Fixture {
-    let (pki, hub_dir, clients) = (Pki::new("kraken test CA"), TempDir::new(), TempDir::new());
+    let (pki, hub_dir, clients) = (Pki::new("snodra test CA"), TempDir::new(), TempDir::new());
     let (cert, key) = pki.server_and_client(&[]);
     hub_dir.write("hub-cert.pem", &cert);
     hub_dir.write("hub-key.pem", &key);
@@ -85,18 +85,18 @@ impl Fixture {
     /// A hub container; `client_auth` is `required` or `optional`; `port` and `id` for a pair.
     async fn hub(&self, client_auth: &str, port: Option<u16>, id: Option<&str>) -> HubContainer {
         let mut options = HubOptions::new()
-            .env("KRAKEN_HUB_AUTH_MODE", "enforce")
-            .env("KRAKEN_HUB_ACL_FILE", "/etc/kraken/acl.toml")
-            .env("KRAKEN_HUB_TLS_CERT", "/etc/kraken/hub-cert.pem")
-            .env("KRAKEN_HUB_TLS_KEY", "/etc/kraken/hub-key.pem")
-            .env("KRAKEN_HUB_TLS_CLIENT_CA", "/etc/kraken/client-ca.pem")
-            .env("KRAKEN_HUB_TLS_CLIENT_AUTH", client_auth)
-            .mount(self.hub_dir.dir(), "/etc/kraken");
+            .env("SNODRA_SERVER_AUTH_MODE", "enforce")
+            .env("SNODRA_SERVER_ACL_FILE", "/etc/snodra/acl.toml")
+            .env("SNODRA_SERVER_TLS_CERT", "/etc/snodra/hub-cert.pem")
+            .env("SNODRA_SERVER_TLS_KEY", "/etc/snodra/hub-key.pem")
+            .env("SNODRA_SERVER_TLS_CLIENT_CA", "/etc/snodra/client-ca.pem")
+            .env("SNODRA_SERVER_TLS_CLIENT_AUTH", client_auth)
+            .mount(self.hub_dir.dir(), "/etc/snodra");
         if let Some(port) = port {
             options = options.port(port);
         }
         if let Some(id) = id {
-            options = options.env("KRAKEN_HUB_ID", id);
+            options = options.env("SNODRA_SERVER_ID", id);
         }
         hub_with(options).await
     }
@@ -344,7 +344,7 @@ async fn a_certificate_naming_another_service_is_refused() {
         .connect()
         .await
         .unwrap();
-    let mut client = kraken_messaging::proto::hub_client::HubClient::new(channel);
+    let mut client = snodra_messaging::proto::hub_client::HubClient::new(channel);
     let (tx, rx) = mpsc::channel(4);
     tx.send(ClientMessage {
         message: Some(client_message::Message::Register(proto::Register {

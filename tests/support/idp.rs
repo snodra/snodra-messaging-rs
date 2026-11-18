@@ -193,7 +193,7 @@ impl Idp {
                 client_id: client_id.to_string(),
                 secret: secret.to_string(),
                 lifetime: 300,
-                issuer: format!("{}/realms/kraken", server.uri()),
+                issuer: format!("{}/realms/snodra", server.uri()),
                 mode: Mode::Ok,
                 delay: Duration::ZERO,
                 azp: None,

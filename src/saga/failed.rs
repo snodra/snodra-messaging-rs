@@ -21,7 +21,7 @@ pub struct SagaCommandFailed {
     pub reason: FailureReason,
     pub message: String,
 }
-message_type!(SagaCommandFailed, "kraken.SagaCommandFailed");
+message_type!(SagaCommandFailed, "snodra.SagaCommandFailed");
 impl Event for SagaCommandFailed {}
 
 /// Why a command failed (the retry taxonomy of ADR 0021 rulings 9 and 10): the permanent kinds at

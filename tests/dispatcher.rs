@@ -3,12 +3,12 @@ mod support;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use kraken_messaging::hub::{Dispatcher, HandlerRegistry};
-use kraken_messaging::identity::{Guard, IdentityResolver};
-use kraken_messaging::proto::{ErrorCode, Request, RequestKind, reply};
-use kraken_messaging::{Command, MessageContext, MessagingError, Query, message_type};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use snodra_messaging::hub::{Dispatcher, HandlerRegistry};
+use snodra_messaging::identity::{Guard, IdentityResolver};
+use snodra_messaging::proto::{ErrorCode, Request, RequestKind, reply};
+use snodra_messaging::{Command, MessageContext, MessagingError, Query, message_type};
 
 #[derive(Serialize, Deserialize)]
 struct Ping {
@@ -108,7 +108,7 @@ fn registry() -> HandlerRegistry {
         Ok(())
     });
     r.command::<Secret, _, _>(|_, _| async move { Ok(()) });
-    r.requires::<Secret>(Guard::role("kraken-admin"));
+    r.requires::<Secret>(Guard::role("snodra-admin"));
     r.command::<Nested, _, _>(|_, _| async move {
         Err(MessagingError::NoHandler("t.Downstream".into()))
     });
@@ -150,14 +150,14 @@ fn request(kind: RequestKind, type_name: &str, payload: &str, headers: &[(&str, 
     }
 }
 
-fn error_code(reply: &kraken_messaging::proto::Reply) -> (ErrorCode, String) {
+fn error_code(reply: &snodra_messaging::proto::Reply) -> (ErrorCode, String) {
     match &reply.result {
         Some(reply::Result::Error(e)) => (ErrorCode::try_from(e.code).unwrap(), e.message.clone()),
         other => panic!("expected an error reply, got {other:?}"),
     }
 }
 
-fn payload(reply: &kraken_messaging::proto::Reply) -> serde_json::Value {
+fn payload(reply: &snodra_messaging::proto::Reply) -> serde_json::Value {
     match &reply.result {
         Some(reply::Result::Payload(p)) => serde_json::from_slice(p).unwrap(),
         other => panic!("expected a payload reply, got {other:?}"),
@@ -264,7 +264,7 @@ async fn guarded_handler_denies_missing_role() {
         support::OTHER_KEY_PEM,
         None,
         "u-1",
-        &["kraken-user"],
+        &["snodra-user"],
         support::ISSUER,
         support::now() + 60,
     );
@@ -283,7 +283,7 @@ async fn guarded_handler_denies_missing_role() {
         support::OTHER_KEY_PEM,
         None,
         "u-1",
-        &["kraken-admin"],
+        &["snodra-admin"],
         support::ISSUER,
         support::now() + 60,
     );
@@ -426,7 +426,7 @@ async fn shared_query_is_listed_apart_and_dispatched_like_any_query() {
         })
     });
     r.requires::<Search>(Guard::authenticated());
-    // `query_types` is every query served here (as in kraken-messaging); the `Register` lists
+    // `query_types` is every query served here (as in snodra-messaging); the `Register` lists
     // the exclusive and the shared ones apart.
     assert_eq!(r.query_types(), vec!["t.Count", "t.Search"]);
     assert_eq!(r.exclusive_query_types(), vec!["t.Count"]);

@@ -1,5 +1,5 @@
-//! The metrics export (ADR 0026): kraken-messaging-rs records its metrics through the
-//! OpenTelemetry API; the application installs the meter provider. With `KRAKEN_OTLP_ENDPOINT`
+//! The metrics export (ADR 0026): snodra-messaging-rs records its metrics through the
+//! OpenTelemetry API; the application installs the meter provider. With `SNODRA_OTLP_ENDPOINT`
 //! set (OTLP/gRPC, e.g. `http://otel-lgtm:4317`, as files-service), an OTLP meter provider becomes
 //! the global one before the messaging is built, exporting every 60 s
 //! (`OTEL_METRIC_EXPORT_INTERVAL` in milliseconds changes it); unset, none is installed and the
@@ -9,12 +9,12 @@
 //! `service.name` the service name the hub sees, `service.instance.id` the instance id the hub
 //! sees (`Config.instance_id`). No `service.namespace` (it would change `job`).
 
-use kraken_messaging::{Config, MessagingError};
 use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry_otlp::{MetricExporter, WithExportConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
+use snodra_messaging::{Config, MessagingError};
 
 /// Owns the meter provider; dropping it exports what is pending and shuts the exporter down.
 pub struct MetricsGuard(Option<SdkMeterProvider>);
@@ -41,7 +41,7 @@ pub fn resource(config: &Config) -> Resource {
 }
 
 /// Installs the global OTLP meter provider when `endpoint` is set. Must run inside the tokio
-/// runtime, before `KrakenMessaging::builder`.
+/// runtime, before `SnodraMessaging::builder`.
 pub fn init_metrics(
     config: &Config,
     endpoint: Option<&str>,

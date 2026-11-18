@@ -46,7 +46,7 @@ impl ResetTarget {
     }
 }
 
-/// What a reset handler ([`reset_handler`](crate::KrakenMessagingBuilder::reset_handler)) is
+/// What a reset handler ([`reset_handler`](crate::SnodraMessagingBuilder::reset_handler)) is
 /// told: the processor, the operation, the target and the ranges that will be replayed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResetContext {

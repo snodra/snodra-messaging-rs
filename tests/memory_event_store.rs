@@ -7,20 +7,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use kraken_messaging::event_store::browse::{BrowseError, BrowseSettings, TailRequest};
-use kraken_messaging::event_store::conformance::{
+use snodra_messaging::event_store::browse::{BrowseError, BrowseSettings, TailRequest};
+use snodra_messaging::event_store::conformance::{
     EventStoreKit, run_event_store_conformance, search_stops_at_bounds,
 };
-use kraken_messaging::event_store::memory::{
+use snodra_messaging::event_store::memory::{
     DEFAULT_SEGMENTS, MemoryEventStore, MemoryEventStoreConfig,
 };
-use kraken_messaging::event_store::{
+use snodra_messaging::event_store::{
     Capability, EventStore, EventStoreError, OutgoingEvent, ResetTarget, SubscriptionEvent,
     SubscriptionSpec,
 };
-use kraken_messaging::saga::Clock;
-use kraken_messaging::store::MessageStore;
-use kraken_messaging::store::memory::MemoryStore;
+use snodra_messaging::saga::Clock;
+use snodra_messaging::store::MessageStore;
+use snodra_messaging::store::memory::MemoryStore;
 
 const SOURCE: &str = "kraken.events";
 
@@ -229,7 +229,7 @@ async fn misuse_is_an_error_not_a_panic() {
     );
     sub.close().await;
     let admin = events.admin(&spec("p")).expect("admin");
-    let elsewhere = kraken_messaging::event_store::ReplayRange {
+    let elsewhere = snodra_messaging::event_store::ReplayRange {
         source: "another.source".into(),
         segment: "0".into(),
         from: "0".into(),
@@ -386,8 +386,8 @@ async fn a_long_search_does_not_hold_up_a_publish() {
             .expect("publish");
     }
     let browser = events.browser().expect("a browser");
-    let request = kraken_messaging::event_store::browse::SearchRequest {
-        filters: kraken_messaging::event_store::browse::EventFilter {
+    let request = snodra_messaging::event_store::browse::SearchRequest {
+        filters: snodra_messaging::event_store::browse::EventFilter {
             q: Some("nowhere in any payload".into()),
             ..Default::default()
         },

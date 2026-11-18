@@ -13,15 +13,15 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use futures::TryStreamExt;
-use kraken_messaging::MessagingError;
-use kraken_messaging::config::DeadLetterMode;
-use kraken_messaging::processors::DeadLetters;
-use kraken_messaging::processors::dead_letters::{DeadLetterRecord, park};
-use kraken_messaging::store::{DeadLetter, DeadLetterError, DeadLetterReason, MessageStore};
-use kraken_messaging_mongo::documents::DeadLetterDocument;
-use kraken_messaging_mongo::{MongoIndexSettings, MongoStore};
 use mongodb::bson::{Bson, DateTime, Document, spec::BinarySubtype};
 use mongodb::{Database, IndexModel};
+use snodra_messaging::MessagingError;
+use snodra_messaging::config::DeadLetterMode;
+use snodra_messaging::processors::DeadLetters;
+use snodra_messaging::processors::dead_letters::{DeadLetterRecord, park};
+use snodra_messaging::store::{DeadLetter, DeadLetterError, DeadLetterReason, MessageStore};
+use snodra_messaging_mongo::documents::DeadLetterDocument;
+use snodra_messaging_mongo::{MongoIndexSettings, MongoStore};
 
 const DEAD_LETTERS_COLLECTION: &str = "dead_letters";
 
@@ -499,7 +499,7 @@ fn the_error_message_is_cut_at_2000_characters_and_a_repeated_header_keeps_its_l
         e,
         None,
         1,
-        kraken_messaging::time::now_ms(),
+        snodra_messaging::time::now_ms(),
         Duration::from_secs(1),
     );
     assert_eq!(

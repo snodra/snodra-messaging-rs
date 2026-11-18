@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  proto-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: snodra/snodra-server
+          ref: ${{ vars.SNODRA_SERVER_REF || 'main' }}
+          path: server
+      - name: hub.proto must equal the server's
+        run: SNODRA_PROTO_SYNC_REQUIRED=true SNODRA_PROTO_SOURCE="$GITHUB_WORKSPACE/server/proto/hub.proto" bash scripts/check-proto-sync.sh
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+          components: clippy
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "29.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: librdkafka build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev libsasl2-dev zlib1g-dev libzstd-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "29.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: librdkafka build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev libsasl2-dev zlib1g-dev libzstd-dev
+      - uses: Swatinem/rust-cache@v2
+      - uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: the server image the end-to-end tests need
+        run: |
+          docker pull "snodra/snodra-server:${{ vars.SNODRA_SERVER_VERSION || '0.5.0' }}"
+          docker tag "snodra/snodra-server:${{ vars.SNODRA_SERVER_VERSION || '0.5.0' }}" snodra-server:dev
+      - run: cargo test --workspace --all-features -- --test-threads=1

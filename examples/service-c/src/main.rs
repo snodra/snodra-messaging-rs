@@ -24,15 +24,15 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
-use kraken_messaging::external::IdempotencyKey;
-use kraken_messaging::{Config, KrakenMessaging, MessagingError};
-use kraken_messaging_kafka::{ExternalSource, KafkaConfig, KafkaEventStore, KafkaExternalSource};
-use kraken_messaging_mongo::MongoStore;
 use messages::{
     BannerFailed, BannerPrinted, Counter, GreetingDelivered, IncrementCounter, Inventory,
     OpenSubscriptions, PollBannerJob, PrintBanner, Reverse, Reversed, Rows, Shout, Shouted,
     SubscriptionCount, TextReversed, TextShouted, WatchCounter,
 };
+use snodra_messaging::external::IdempotencyKey;
+use snodra_messaging::{Config, MessagingError, SnodraMessaging};
+use snodra_messaging_kafka::{ExternalSource, KafkaConfig, KafkaEventStore, KafkaExternalSource};
+use snodra_messaging_mongo::MongoStore;
 
 /// The banner saga's settings, from the environment (compose.local.yaml sets them in-network):
 /// `SERVER_PORT` (8094), `PRINTER_URL` (http://localhost:8093), `PRINTER_WEBHOOK_SECRET` (the
@@ -82,7 +82,7 @@ async fn main() -> Result<(), MessagingError> {
 
     let config = Config::from_env()?;
     // Before the builder: the library records on the global meter provider as it is then.
-    let otlp_endpoint = std::env::var("KRAKEN_OTLP_ENDPOINT")
+    let otlp_endpoint = std::env::var("SNODRA_OTLP_ENDPOINT")
         .ok()
         .filter(|v| !v.trim().is_empty());
     let _metrics = telemetry::init_metrics(&config, otlp_endpoint.as_deref())?;
@@ -103,14 +103,14 @@ async fn main() -> Result<(), MessagingError> {
     let increment_service = service.clone();
     // The message store: the service's own MongoDB database (a replica set); `start` creates its
     // indexes with the retentions of the config.
-    let mongo = mongodb::Client::with_uri_str(&required_env("KRAKEN_MONGODB_URI")?)
+    let mongo = mongodb::Client::with_uri_str(&required_env("SNODRA_MONGODB_URI")?)
         .await
         .map_err(|e| MessagingError::Storage(e.to_string()))?;
     let db = mongo.default_database().ok_or_else(|| {
-        MessagingError::InvalidMessage("KRAKEN_MONGODB_URI must name a database".into())
+        MessagingError::InvalidMessage("SNODRA_MONGODB_URI must name a database".into())
     })?;
     let store = MongoStore::new(mongo, db);
-    // The event store: Kafka (`KRAKEN_KAFKA_BOOTSTRAP`), and the printer's partner topic on it.
+    // The event store: Kafka (`SNODRA_KAFKA_BOOTSTRAP`), and the printer's partner topic on it.
     let kafka = KafkaConfig::from_env();
     let printer_source = KafkaExternalSource::new(
         printer::SOURCE,
@@ -119,7 +119,7 @@ async fn main() -> Result<(), MessagingError> {
         &kafka.bootstrap_servers,
     )?;
     let events = KafkaEventStore::new(kafka)?;
-    let builder = KrakenMessaging::builder(config)
+    let builder = SnodraMessaging::builder(config)
         .await?
         .store(Arc::new(store))
         .event_store(Arc::new(events));

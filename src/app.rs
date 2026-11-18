@@ -1,7 +1,7 @@
-//! `KrakenMessaging`: everything a service needs, wired from a [`Config`].
+//! `SnodraMessaging`: everything a service needs, wired from a [`Config`].
 //!
 //! ```ignore
-//! let builder = KrakenMessaging::builder(Config::from_env()?).await?
+//! let builder = SnodraMessaging::builder(Config::from_env()?).await?
 //!     .store(Arc::new(store))                         // a message store add-on (events, sagas)
 //!     .event_store(Arc::new(events));                 // an event-store add-on (events, sagas)
 //! let events = builder.events();                      // clone into handlers that publish
@@ -65,12 +65,12 @@ use crate::types::{Command, Event, MessageType, Query, StreamingQuery, Subscript
 /// How long a shutdown waits for the subscriptions' `ReplyEnd`s to be written.
 const SUBSCRIPTION_END_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a graceful shutdown waits for the hubs to ack its empty registration (as
-/// kraken-messaging's `HubLifecycle.stop`).
+/// snodra-messaging's `HubLifecycle.stop`).
 pub const DEREGISTER_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long a shutdown waits for the saga relay, the deadline scheduler and the sampler (ruling 64).
 const SAGA_STOP_TIMEOUT: Duration = Duration::from_secs(20);
 
-pub struct KrakenMessagingBuilder {
+pub struct SnodraMessagingBuilder {
     config: Config,
     registry: HandlerRegistry,
     /// The message store (ADR 0028); none for a service with commands and queries only.
@@ -102,7 +102,7 @@ pub struct KrakenMessagingBuilder {
     reset_handlers: Vec<(String, ResetHandler)>,
 }
 
-pub struct KrakenMessaging {
+pub struct SnodraMessaging {
     hubs: Arc<HubPool>,
     sender: Arc<Sender>,
     dispatcher: Arc<Dispatcher>,
@@ -129,12 +129,12 @@ pub struct KrakenMessaging {
     processor_control: ProcessorControl,
 }
 
-impl KrakenMessaging {
+impl SnodraMessaging {
     /// Prepares the connections (nothing starts yet) so handlers can capture `events()` and the
     /// senders. The metrics (ADR 0026) are recorded on
-    /// `opentelemetry::global::meter("kraken-messaging-rs")` as the global meter provider is now:
+    /// `opentelemetry::global::meter("snodra-messaging-rs")` as the global meter provider is now:
     /// install the application's provider before this call; with none, nothing is recorded.
-    pub async fn builder(config: Config) -> Result<KrakenMessagingBuilder, MessagingError> {
+    pub async fn builder(config: Config) -> Result<SnodraMessagingBuilder, MessagingError> {
         Self::builder_with_meter(
             config,
             opentelemetry::global::meter(crate::metrics::METER_NAME),
@@ -146,7 +146,7 @@ impl KrakenMessaging {
     pub async fn builder_with_meter(
         config: Config,
         meter: opentelemetry::metrics::Meter,
-    ) -> Result<KrakenMessagingBuilder, MessagingError> {
+    ) -> Result<SnodraMessagingBuilder, MessagingError> {
         config.validate()?;
         let metrics = Metrics::new(meter);
         let events = EventBus::new();
@@ -169,7 +169,7 @@ impl KrakenMessaging {
             },
         );
         HubPool::observe(&hubs, &metrics);
-        Ok(KrakenMessagingBuilder {
+        Ok(SnodraMessagingBuilder {
             registry: HandlerRegistry::new(),
             store: None,
             event_store: None,
@@ -247,7 +247,7 @@ impl KrakenMessaging {
     /// event handlers, then the sagas) before returning.
     ///
     /// ```ignore
-    /// async fn webhook(app: &KrakenMessaging, headers: &HashMap<String, String>, body: &[u8]) -> u16 {
+    /// async fn webhook(app: &SnodraMessaging, headers: &HashMap<String, String>, body: &[u8]) -> u16 {
     ///     if !webhook::verify(&secret, None, headers, body) { return 401; }
     ///     let reply: PrinterReply = match serde_json::from_slice(body) { Ok(r) => r, Err(_) => return 400 };
     ///     match app.ingress().accept("printer-banner", &reply.event_id, &BannerPrinted::from(reply), headers).await {
@@ -318,20 +318,20 @@ impl KrakenMessaging {
     /// How this instance authenticates to the hubs: `none`, a static `token`, a `jwt`
     /// (Keycloak client credentials, ADR 0019) or a client `certificate` (mutual TLS, ADR 0020),
     /// the current access token's expiry, the last token fetch error and the token fetch counts by
-    /// result (`kraken_hub_client_token_fetches_total{result}`); for a certificate, the one
+    /// result (`snodra_hub_client_token_fetches_total{result}`); for a certificate, the one
     /// presented (fingerprint, `notAfter`, rotations).
     pub fn hub_auth(&self) -> crate::hub::AuthStatus {
         self.hubs.auth()
     }
 
     /// The credential refreshes sent to the hubs so far
-    /// (`kraken_hub_client_credentials_refreshes_sent_total`).
+    /// (`snodra_hub_client_credentials_refreshes_sent_total`).
     pub fn hub_credentials_refreshes_sent(&self) -> u64 {
         self.hubs.credentials_refreshes_sent()
     }
 
     /// True once a hub (with several: at least one, so requests can be sent) confirmed this
-    /// instance's registration. kraken-messaging's `HubConnections.awaitRegistered` waits for
+    /// instance's registration. snodra-messaging's `HubConnections.awaitRegistered` waits for
     /// every hub; that is [`await_all_hubs`](Self::await_all_hubs) here. False at once when the
     /// hub is turned off ([`Config::hub_enabled`](crate::Config::hub_enabled)).
     pub async fn await_hub(&self, timeout: Duration) -> bool {
@@ -349,7 +349,7 @@ impl KrakenMessaging {
 
     /// First registers no types with every hub and waits for their acks (at most
     /// [`DEREGISTER_TIMEOUT`]): each hub stops routing to this instance and hands the requests
-    /// it queued for it to the other instances at once (kraken-messaging's `HubLifecycle.stop`).
+    /// it queued for it to the other instances at once (snodra-messaging's `HubLifecycle.stop`).
     /// Then stops the saga relay (its sends in flight finish, bounded), the deadline scheduler
     /// and the gauge sampler, drains in-flight handlers (bounded; their replies still go
     /// through), completes the subscriptions served here with a `ReplyEnd` (best effort,
@@ -406,7 +406,7 @@ async fn stop_saga_tasks(tasks: Vec<JoinHandle<()>>, bound: Duration) {
     }
 }
 
-impl KrakenMessagingBuilder {
+impl SnodraMessagingBuilder {
     pub fn command<C, F, Fut>(mut self, handler: F) -> Self
     where
         C: Command,
@@ -694,11 +694,11 @@ impl KrakenMessagingBuilder {
         self
     }
 
-    /// A partner source whose records become local kraken events (ADR 0021 ruling 20, spec
+    /// A partner source whose records become local snodra events (ADR 0021 ruling 20, spec
     /// "Inbound 1"), read through an event-store add-on's `provider` (the Kafka add-on's
     /// `KafkaExternalSource` for a partner's topic), whatever the service's own event store is:
     /// `translator` turns each record into an event (`Ok(None)` ignores it, an error retries it up
-    /// to `KRAKEN_CONSUMER_MAX_ATTEMPTS` times and then skips it, an `InvalidMessage` skips it at
+    /// to `SNODRA_CONSUMER_MAX_ATTEMPTS` times and then skips it, an `InvalidMessage` skips it at
     /// once: map a record that cannot be read to it), which is dispatched locally to this
     /// service's event handlers and sagas, never published to its events. The dedupe id is
     /// `<name>:<segment>:<position>`, or `<name>:<dedupeKey>` when the translation carries one.
@@ -763,13 +763,13 @@ impl KrakenMessagingBuilder {
     }
 
     /// The message store (ADR 0028): the service's own database, through a store add-on (e.g.
-    /// `kraken-messaging-mongo`'s `MongoStore`), where the outbox, the processed events, the dead
+    /// `snodra-messaging-mongo`'s `MongoStore`), where the outbox, the processed events, the dead
     /// letters, the processor control, the external calls and the sagas live; the event bus
     /// (also one taken before this call) appends to its outbox. Publishing an event, an event
     /// handler, a saga, an idempotent handler and a partner source need one
     /// ([`start`](Self::start) fails naming what needs it); commands and queries do not. The
     /// store's schema (its add-on's own: indexes, tables) is prepared by `start` unless
-    /// `Config::store_init_schema` is false (`KRAKEN_STORE_INIT_SCHEMA`), and the store stamps its
+    /// `Config::store_init_schema` is false (`SNODRA_STORE_INIT_SCHEMA`), and the store stamps its
     /// own times with the builder's [`clock`](Self::clock).
     pub fn store(mut self, store: Arc<dyn MessageStore>) -> Self {
         self.events.bind(store.outbox());
@@ -779,7 +779,7 @@ impl KrakenMessagingBuilder {
 
     /// The event store (ADR 0027): where the service's events go (the outbox relay publishes
     /// them there) and where its event processors read them, through an event-store add-on (e.g.
-    /// `kraken-messaging-kafka`'s `KafkaEventStore`). An event handler and a saga need one
+    /// `snodra-messaging-kafka`'s `KafkaEventStore`). An event handler and a saga need one
     /// ([`start`](Self::start) fails naming what needs it), and so does publishing an event;
     /// commands and queries do not.
     pub fn event_store(mut self, events: Arc<dyn EventStore>) -> Self {
@@ -789,9 +789,9 @@ impl KrakenMessagingBuilder {
 
     /// Prepares the message store's schema (unless `Config::store_init_schema` is false), registers
     /// with the hub (in the background), starts the outbox publisher and the event processors.
-    /// Does not wait for the hub: see [`KrakenMessaging::await_hub`].
-    pub async fn start(self) -> Result<KrakenMessaging, MessagingError> {
-        let KrakenMessagingBuilder {
+    /// Does not wait for the hub: see [`SnodraMessaging::await_hub`].
+    pub async fn start(self) -> Result<SnodraMessaging, MessagingError> {
+        let SnodraMessagingBuilder {
             config,
             registry,
             store,
@@ -831,7 +831,7 @@ impl KrakenMessagingBuilder {
             Some(events) => check_dead_letter_mode(config.dead_letter_mode, &**events)?,
         }
         if !config.sagas_enabled && !saga_types.is_empty() {
-            tracing::warn!(sagas = ?saga_types.iter().map(SagaType::name).collect::<Vec<_>>(), "sagas are registered but KRAKEN_SAGAS_ENABLED=false: they do not run");
+            tracing::warn!(sagas = ?saga_types.iter().map(SagaType::name).collect::<Vec<_>>(), "sagas are registered but SNODRA_SAGAS_ENABLED=false: they do not run");
         }
         let saga_types = if config.sagas_enabled {
             saga_types
@@ -953,7 +953,7 @@ impl KrakenMessagingBuilder {
             )));
         }
         // The admin API serves every processor with handlers here, whether or not this instance
-        // consumes (`KRAKEN_CONSUMER_ENABLED=false`).
+        // consumes (`SNODRA_CONSUMER_ENABLED=false`).
         let dead_letters = DeadLetters::new(
             store.as_ref().map(|s| s.dead_letters()),
             config.dead_letter_mode,
@@ -1008,7 +1008,7 @@ impl KrakenMessagingBuilder {
         hubs.set_registered_types(registry.registered_types());
         if !config.hub_enabled {
             hubs.turn_off();
-            tracing::info!("the hub is turned off (KRAKEN_HUB_ENABLED=false): not connecting");
+            tracing::info!("the hub is turned off (SNODRA_SERVER_ENABLED=false): not connecting");
         }
         hubs.start();
         let loop_sender = Arc::clone(&sender);
@@ -1125,8 +1125,8 @@ impl KrakenMessagingBuilder {
         } else {
             "off".to_string()
         };
-        tracing::info!(service = %config.service_name, instance = %hubs.instance_id(), hubs = %hub_targets, commands = ?registry.command_types(), queries = ?registry.exclusive_query_types(), shared_queries = ?registry.shared_query_types(), streaming_queries = ?registry.streaming_query_types(), subscription_queries = ?registry.subscription_query_types(), events = ?registry.event_types(), sagas = ?runtime.as_ref().map(|r| r.saga_types()).unwrap_or_default(), idempotent = ?registry.idempotent_handlers(), processors = ?monitors.iter().map(|m| m.name().to_string()).collect::<Vec<_>>(), dead_letter_mode = config.dead_letter_mode.as_str(), store = store.as_ref().map_or("none", |s| s.name()), event_store = event_store.as_ref().map_or("none", |e| e.name()), "kraken messaging started");
-        Ok(KrakenMessaging {
+        tracing::info!(service = %config.service_name, instance = %hubs.instance_id(), hubs = %hub_targets, commands = ?registry.command_types(), queries = ?registry.exclusive_query_types(), shared_queries = ?registry.shared_query_types(), streaming_queries = ?registry.streaming_query_types(), subscription_queries = ?registry.subscription_query_types(), events = ?registry.event_types(), sagas = ?runtime.as_ref().map(|r| r.saga_types()).unwrap_or_default(), idempotent = ?registry.idempotent_handlers(), processors = ?monitors.iter().map(|m| m.name().to_string()).collect::<Vec<_>>(), dead_letter_mode = config.dead_letter_mode.as_str(), store = store.as_ref().map_or("none", |s| s.name()), event_store = event_store.as_ref().map_or("none", |e| e.name()), "snodra messaging started");
+        Ok(SnodraMessaging {
             hubs,
             sender,
             dispatcher,
@@ -1263,7 +1263,7 @@ mod hub_settings_tests {
         config.hub_token = Some(SecretString::new("tok"));
         config.hub_token_file = Some("/run/secrets/hub-token".into());
         config.hub_tls = Some(HubTls {
-            server_name: Some("kraken-hub".into()),
+            server_name: Some("snodra-server".into()),
             ..HubTls::default()
         });
         let settings = hub_settings(&config).unwrap();

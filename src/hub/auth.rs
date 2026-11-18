@@ -53,7 +53,7 @@ pub const WAKE_INTERVAL: Duration = Duration::from_secs(5);
 pub const ERROR_CLIP: usize = 200;
 
 /// The outcome of one token fetch, as the `result` label of
-/// `kraken_hub_client_token_fetches_total`.
+/// `snodra_hub_client_token_fetches_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FetchResult {
     Ok,
@@ -80,7 +80,7 @@ impl FetchResult {
     }
 }
 
-/// Fetch counts per [`FetchResult`]: what `kraken_hub_client_token_fetches_total{result}` reads
+/// Fetch counts per [`FetchResult`]: what `snodra_hub_client_token_fetches_total{result}` reads
 /// ([`HubPool::observe`](super::HubPool::observe)).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TokenStats {
@@ -251,7 +251,7 @@ pub struct AuthStatus {
     /// The last token fetch error (clipped), cleared by the next success (`Jwt` only).
     pub last_error: Option<String>,
     /// Token fetches so far by result (`Jwt` only; all zero otherwise), as
-    /// `kraken_hub_client_token_fetches_total{result}` exports them.
+    /// `snodra_hub_client_token_fetches_total{result}` exports them.
     pub token_fetches: TokenStats,
     /// The client certificate the hub streams present (`Certificate` only; `None` until a stream
     /// registered with it).
@@ -262,7 +262,7 @@ pub struct AuthStatus {
 /// first 8 hex characters of the SHA-256 of its DER, as the hub shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CertificateStatus {
-    /// The service the leaf names (`kraken://service/<name>`).
+    /// The service the leaf names (`snodra://service/<name>`).
     pub service: String,
     /// The first 8 hex characters of the SHA-256 fingerprint of the leaf presented.
     pub fingerprint: String,
@@ -330,12 +330,12 @@ impl TokenProvider {
     ) -> Result<Arc<TokenProvider>, MessagingError> {
         let url = reqwest::Url::parse(settings.token_uri.trim()).map_err(|e| {
             MessagingError::InvalidMessage(format!(
-                "hub_oauth2.token_uri (KRAKEN_HUB_OAUTH2_TOKEN_URI) is not a URL: {e}"
+                "hub_oauth2.token_uri (SNODRA_SERVER_OAUTH2_TOKEN_URI) is not a URL: {e}"
             ))
         })?;
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
             return Err(MessagingError::InvalidMessage(
-                "hub_oauth2.token_uri (KRAKEN_HUB_OAUTH2_TOKEN_URI) must be an http:// or https:// URL"
+                "hub_oauth2.token_uri (SNODRA_SERVER_OAUTH2_TOKEN_URI) must be an http:// or https:// URL"
                     .into(),
             ));
         }
@@ -349,13 +349,13 @@ impl TokenProvider {
         if let Some(path) = &settings.ca_file {
             let pem = std::fs::read(path).map_err(|e| {
                 MessagingError::InvalidMessage(format!(
-                    "hub_oauth2.ca_file (KRAKEN_HUB_OAUTH2_CA) '{}' cannot be read: {e}",
+                    "hub_oauth2.ca_file (SNODRA_SERVER_OAUTH2_CA) '{}' cannot be read: {e}",
                     path.display()
                 ))
             })?;
             let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| {
                 MessagingError::InvalidMessage(format!(
-                    "hub_oauth2.ca_file (KRAKEN_HUB_OAUTH2_CA) '{}' holds no usable certificate: {e}",
+                    "hub_oauth2.ca_file (SNODRA_SERVER_OAUTH2_CA) '{}' holds no usable certificate: {e}",
                     path.display()
                 ))
             })?;

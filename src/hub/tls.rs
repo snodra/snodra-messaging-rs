@@ -106,7 +106,7 @@ mod tests {
 
     #[test]
     fn a_ca_file_must_hold_a_certificate() {
-        let dir = std::env::temp_dir().join(format!("kraken-tls-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("snodra-tls-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let junk = dir.join("junk.pem");
         std::fs::write(&junk, "nope").unwrap();

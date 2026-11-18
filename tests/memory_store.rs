@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kraken_messaging::saga::store::SagaDocument;
-use kraken_messaging::store::conformance::run_store_conformance;
-use kraken_messaging::store::memory::MemoryStore;
-use kraken_messaging::store::{
+use snodra_messaging::saga::store::SagaDocument;
+use snodra_messaging::store::conformance::run_store_conformance;
+use snodra_messaging::store::memory::MemoryStore;
+use snodra_messaging::store::{
     DeadLetter, DeadLetterError, DeadLetterReason, MessageStore, OutboxEntry, Parked,
     ProcessedMarker, SagaPorts, StoreError, Tx, letter_id,
 };
@@ -301,7 +301,7 @@ async fn a_lease_passes_in_paused_time() {
 async fn an_expired_dead_letter_disappears() {
     let store = MemoryStore::new();
     let letters = store.dead_letters();
-    let now = kraken_messaging::saga::Clock::tokio().now_ms();
+    let now = snodra_messaging::saga::Clock::tokio().now_ms();
     let letter = DeadLetter {
         id: letter_id("p", "kraken.events", "0", "5"),
         processor: "p".into(),
@@ -367,7 +367,7 @@ fn saga(id: &str, start_key: Option<&str>) -> SagaDocument {
         id: id.to_string(),
         type_name: "t.Order".into(),
         state: "{}".into(),
-        associations: vec![kraken_messaging::saga::store::Association::new(
+        associations: vec![snodra_messaging::saga::store::Association::new(
             "orderId",
             start_key.unwrap_or("none"),
         )],
@@ -395,7 +395,7 @@ impl MessageStore for HookedStore {
     }
     fn init_schema<'a>(
         &'a self,
-        config: &'a kraken_messaging::Config,
+        config: &'a snodra_messaging::Config,
     ) -> futures::future::BoxFuture<'a, Result<(), StoreError>> {
         self.inner.init_schema(config)
     }
@@ -406,7 +406,7 @@ impl MessageStore for HookedStore {
         Box::pin(async move {
             if missing {
                 Err(StoreError::Failed(
-                    kraken_messaging::MessagingError::Storage("the schema is at version 0".into()),
+                    snodra_messaging::MessagingError::Storage("the schema is at version 0".into()),
                 ))
             } else {
                 Ok(())
@@ -415,7 +415,7 @@ impl MessageStore for HookedStore {
     }
     fn background(
         &self,
-        _config: &kraken_messaging::Config,
+        _config: &snodra_messaging::Config,
         stop: tokio_util::sync::CancellationToken,
     ) -> Option<futures::future::BoxFuture<'static, ()>> {
         let running = Arc::clone(&self.background);
@@ -425,28 +425,28 @@ impl MessageStore for HookedStore {
             running.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }))
     }
-    fn use_clock(&self, clock: kraken_messaging::saga::Clock) {
+    fn use_clock(&self, clock: snodra_messaging::saga::Clock) {
         self.inner.use_clock(clock)
     }
-    fn tx(&self) -> Arc<dyn kraken_messaging::store::TxProvider> {
+    fn tx(&self) -> Arc<dyn snodra_messaging::store::TxProvider> {
         self.inner.tx()
     }
-    fn outbox(&self) -> Arc<dyn kraken_messaging::store::OutboxStore> {
+    fn outbox(&self) -> Arc<dyn snodra_messaging::store::OutboxStore> {
         self.inner.outbox()
     }
-    fn processed_events(&self) -> Arc<dyn kraken_messaging::store::ProcessedEventStore> {
+    fn processed_events(&self) -> Arc<dyn snodra_messaging::store::ProcessedEventStore> {
         self.inner.processed_events()
     }
-    fn dead_letters(&self) -> Arc<dyn kraken_messaging::store::DeadLetterStore> {
+    fn dead_letters(&self) -> Arc<dyn snodra_messaging::store::DeadLetterStore> {
         self.inner.dead_letters()
     }
-    fn processor_control(&self) -> Arc<dyn kraken_messaging::store::ProcessorControlStore> {
+    fn processor_control(&self) -> Arc<dyn snodra_messaging::store::ProcessorControlStore> {
         self.inner.processor_control()
     }
-    fn external_calls(&self) -> Arc<dyn kraken_messaging::store::ExternalCallStore> {
+    fn external_calls(&self) -> Arc<dyn snodra_messaging::store::ExternalCallStore> {
         self.inner.external_calls()
     }
-    fn sagas(&self) -> kraken_messaging::store::SagaStores {
+    fn sagas(&self) -> snodra_messaging::store::SagaStores {
         self.inner.sagas()
     }
 }
@@ -468,14 +468,14 @@ async fn start_checks_the_schema_when_init_is_off_and_runs_the_stores_background
         (store, checked, background)
     };
     let config = |init: bool| {
-        let mut config = kraken_messaging::Config::new("hooked", "static://127.0.0.1:1");
+        let mut config = snodra_messaging::Config::new("hooked", "static://127.0.0.1:1");
         config.hub_enabled = false;
         config.outbox_enabled = false;
         config.store_init_schema = init;
         config
     };
     let start = async |store: HookedStore, init: bool| {
-        kraken_messaging::KrakenMessaging::builder(config(init))
+        snodra_messaging::SnodraMessaging::builder(config(init))
             .await
             .unwrap()
             .store(Arc::new(store))

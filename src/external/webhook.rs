@@ -1,8 +1,8 @@
 //! Verifies a webhook request against a shared secret (ADR 0021 ruling 19, spec "Inbound 2"), by
 //! the rules of the Keycloak webhook of the sso-service, as the Kotlin `WebhookSignatureVerifier`:
 //!
-//! - **shared secret**: the header `X-Kraken-Webhook-Secret` holds the secret itself;
-//! - **HMAC**: the header `X-Kraken-Signature` holds `sha256=<hex>`, the HMAC-SHA256 of the raw
+//! - **shared secret**: the header `X-Snodra-Webhook-Secret` holds the secret itself;
+//! - **HMAC**: the header `X-Snodra-Signature` holds `sha256=<hex>`, the HMAC-SHA256 of the raw
 //!   body keyed by the secret (the `sha256=` prefix is optional, the case does not matter).
 //!
 //! Either header, matching the current secret or, during a rotation, the previous one, verifies
@@ -15,13 +15,13 @@
 
 use sha2::{Digest, Sha256};
 
-pub const SECRET_HEADER: &str = "X-Kraken-Webhook-Secret";
-pub const SIGNATURE_HEADER: &str = "X-Kraken-Signature";
+pub const SECRET_HEADER: &str = "X-Snodra-Webhook-Secret";
+pub const SIGNATURE_HEADER: &str = "X-Snodra-Signature";
 
 const BLOCK: usize = 64;
 
 /// The HMAC-SHA256 of `body` keyed by `secret`, lowercase hex: what a partner computes for
-/// `X-Kraken-Signature`.
+/// `X-Snodra-Signature`.
 pub fn hmac_hex(secret: &[u8], body: &[u8]) -> String {
     let mut key = [0u8; BLOCK];
     if secret.len() > BLOCK {

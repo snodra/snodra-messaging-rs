@@ -9,16 +9,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use kraken_messaging::config::DeadLetterMode;
-use kraken_messaging::events::{LocalEventDispatcher, NoSagas, SagaStage};
-use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::processors::dead_letters::{DeadLetterRecord, park};
-use kraken_messaging::processors::{DeadLetters, RetryAllResult, RetryResult};
-use kraken_messaging::store::{DeadLetter, DeadLetterError, DeadLetterReason, MessageStore};
-use kraken_messaging::{Event, MessageContext, MessagingError, message_type};
-use kraken_messaging_mongo::MongoTxExt;
 use mongodb::bson::{Document, doc};
 use mongodb::{Client, Database};
+use snodra_messaging::config::DeadLetterMode;
+use snodra_messaging::events::{LocalEventDispatcher, NoSagas, SagaStage};
+use snodra_messaging::hub::HandlerRegistry;
+use snodra_messaging::processors::dead_letters::{DeadLetterRecord, park};
+use snodra_messaging::processors::{DeadLetters, RetryAllResult, RetryResult};
+use snodra_messaging::store::{DeadLetter, DeadLetterError, DeadLetterReason, MessageStore};
+use snodra_messaging::{Event, MessageContext, MessagingError, message_type};
+use snodra_messaging_mongo::MongoTxExt;
 
 const DEAD_LETTERS_COLLECTION: &str = "dead_letters";
 
@@ -64,9 +64,9 @@ impl Fixture {
         let client = Client::with_uri_str(&mongo.uri).await.unwrap();
         let db = client.default_database().unwrap();
         // The handler's own writes join the store's sessions: one client for both.
-        let store = kraken_messaging_mongo::MongoStore::new(client.clone(), db.clone());
+        let store = snodra_messaging_mongo::MongoStore::new(client.clone(), db.clone());
         store
-            .ensure_indexes(&kraken_messaging_mongo::MongoIndexSettings::default())
+            .ensure_indexes(&snodra_messaging_mongo::MongoIndexSettings::default())
             .await
             .unwrap();
         let store: Arc<dyn MessageStore> = Arc::new(store);
@@ -138,7 +138,7 @@ impl Fixture {
     fn dispatcher(&self, name: &str, stage: Arc<dyn SagaStage>) -> Arc<LocalEventDispatcher> {
         Arc::new(
             LocalEventDispatcher::new(Some(Arc::clone(&self.store)), self.registry(), stage)
-                .with_marker_prefix(kraken_messaging::processors::marker_prefix(name)),
+                .with_marker_prefix(snodra_messaging::processors::marker_prefix(name)),
         )
     }
 

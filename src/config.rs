@@ -1,4 +1,4 @@
-//! Runtime configuration, from code or from `KRAKEN_*` environment variables (the names the
+//! Runtime configuration, from code or from `SNODRA_*` environment variables (the names the
 //! compose files use).
 
 use std::collections::HashMap;
@@ -11,19 +11,19 @@ use crate::retry::RetryPolicy;
 use crate::security::{HubOAuth2, HubTls, SecretString};
 
 /// `Config.hub_stream_credit_timeout` when nothing sets it: the hub's default maximum stream
-/// duration (`KRAKEN_HUB_MAX_STREAM_DURATION`, 10 minutes), after which the hub ends any stream
+/// duration (`SNODRA_SERVER_MAX_STREAM_DURATION`, 10 minutes), after which the hub ends any stream
 /// itself.
 pub const DEFAULT_STREAM_CREDIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// What happens to a record an event processor cannot handle (ADR 0022,
-/// `KRAKEN_EVENTS_DEAD_LETTER_MODE`, case-insensitive).
+/// `SNODRA_EVENTS_DEAD_LETTER_MODE`, case-insensitive).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum DeadLetterMode {
     /// Parked in the `dead_letters` collection, sequenced per key, with the admin API
-    /// ([`KrakenMessaging::dead_letters`](crate::KrakenMessaging::dead_letters)). The default.
+    /// ([`SnodraMessaging::dead_letters`](crate::SnodraMessaging::dead_letters)). The default.
     #[default]
     Collection,
-    /// Published to the event store's dead-letter source (`<source>.dlt`) with `kraken-dlt-*`
+    /// Published to the event store's dead-letter source (`<source>.dlt`) with `snodra-dlt-*`
     /// headers; it belongs to the operator's tooling. Needs an event store with the capability
     /// `native-dead-letter`.
     EventStore,
@@ -63,13 +63,13 @@ pub struct Config {
     pub service_name: String,
     /// This instance's id: its hub `Register.instance_id` and the `service.instance.id` the
     /// application gives its meter provider's resource (ADR 0026). A fresh UUID per `Config`
-    /// unless set (`KRAKEN_INSTANCE_ID`, e.g. a pod name); unique among the service's instances.
+    /// unless set (`SNODRA_INSTANCE_ID`, e.g. a pod name); unique among the service's instances.
     pub instance_id: String,
     /// The hubs to connect to (ADR 0016): `host:port` (`static://` prefix optional), a
     /// comma-separated list of them, or one `dns:///name:port` whose addresses are re-resolved
     /// every 30 s. One address is the single-hub setup.
     pub hub_address: String,
-    /// Whether the service connects to the hubs (`KRAKEN_HUB_ENABLED`, default true). Off, it
+    /// Whether the service connects to the hubs (`SNODRA_SERVER_ENABLED`, default true). Off, it
     /// never connects (`hub_address` must still parse, nothing dials it): events, processors,
     /// dead letters, sagas and idempotent handlers work, and every command, query and
     /// subscription sent fails at once with `HubUnavailable` naming the setting, those to the
@@ -107,58 +107,58 @@ pub struct Config {
     /// How long a streaming query handler waits for credit before ending its stream with
     /// `TIMEOUT` `no credit within <d>` and releasing its permits (a hub that forgot the stream
     /// would otherwise leave the handler task waiting for ever). Default 10 minutes, the hub's
-    /// default `KRAKEN_HUB_MAX_STREAM_DURATION`; at least 1 ms ([`Config::validate`]).
+    /// default `SNODRA_SERVER_MAX_STREAM_DURATION`; at least 1 ms ([`Config::validate`]).
     pub hub_stream_credit_timeout: Duration,
     /// The most subscription queries (ADR 0017, P4c) this instance serves at once: a
     /// subscription request beyond it is refused with `ReplyEnd{error = RESOURCE_EXHAUSTED
     /// "subscription limit (N) reached"}`. Subscriptions hold no handler permit, so this is
     /// their only bound here (the hub has its own per-instance limit,
-    /// `KRAKEN_HUB_MAX_SUBSCRIPTIONS_PER_INSTANCE`, 1024). Default 1024; at least 1
+    /// `SNODRA_SERVER_MAX_SUBSCRIPTIONS_PER_INSTANCE`, 1024). Default 1024; at least 1
     /// ([`Config::validate`]).
     pub hub_max_subscriptions: usize,
     /// The static token sent in `Register.credentials.token` on every hub stream (ADR 0018;
-    /// `KRAKEN_HUB_TOKEN`). Needed when the hub runs with `KRAKEN_HUB_AUTH_MODE=enforce`; ignored
+    /// `SNODRA_SERVER_TOKEN`). Needed when the hub runs with `SNODRA_SERVER_AUTH_MODE=enforce`; ignored
     /// by a hub in `off` mode. Never logged (`Debug` prints `"***"`).
     /// An empty token is the same as none. Overridden by `hub_token_file` when that is set.
     pub hub_token: Option<SecretString>,
-    /// A file holding the token (`KRAKEN_HUB_TOKEN_FILE`), for container secrets. Read at
+    /// A file holding the token (`SNODRA_SERVER_TOKEN_FILE`), for container secrets. Read at
     /// startup ([`Config::validate`]) and again on every reconnect, so a rotated secret is picked
     /// up without a restart. **It wins over `hub_token` when both are set.** Surrounding
     /// whitespace is trimmed; a file empty at startup is an error ([`Config::validate`]), one
     /// found empty at a reconnect keeps the last token read.
     pub hub_token_file: Option<PathBuf>,
-    /// TLS to the hubs (`KRAKEN_HUB_TLS=true`, with `KRAKEN_HUB_TLS_CA` and
-    /// `KRAKEN_HUB_TLS_SERVER_NAME`). `None` (the default): plain text, unless an address starts
+    /// TLS to the hubs (`SNODRA_SERVER_TLS=true`, with `SNODRA_SERVER_TLS_CA` and
+    /// `SNODRA_SERVER_TLS_SERVER_NAME`). `None` (the default): plain text, unless an address starts
     /// with `https://` (then TLS with the platform roots). Needed when the hub sets
-    /// `KRAKEN_HUB_TLS_CERT`.
+    /// `SNODRA_SERVER_TLS_CERT`.
     pub hub_tls: Option<HubTls>,
     /// Authenticate to the hubs with a Keycloak client-credentials access token (JWT) instead of a
-    /// static token (`KRAKEN_HUB_OAUTH2_TOKEN_URI` set makes it `Some`; ADR 0019). One token
+    /// static token (`SNODRA_SERVER_OAUTH2_TOKEN_URI` set makes it `Some`; ADR 0019). One token
     /// provider serves every hub connection and refreshes the token before it expires. Mutually
     /// exclusive with `hub_token` / `hub_token_file` ([`Config::validate`]).
     pub hub_oauth2: Option<HubOAuth2>,
     /// The event store's source the service publishes its events to and its processors read
-    /// (`KRAKEN_EVENTS_SOURCE`, default `kraken.events`).
+    /// (`SNODRA_EVENTS_SOURCE`, default `kraken.events`).
     pub events_source: String,
     pub consumer_enabled: bool,
     pub consumer_max_attempts: u32,
     /// Where a record goes that an event processor cannot handle (ADR 0022;
-    /// `KRAKEN_EVENTS_DEAD_LETTER_MODE`, default `collection`).
+    /// `SNODRA_EVENTS_DEAD_LETTER_MODE`, default `collection`).
     pub dead_letter_mode: DeadLetterMode,
-    /// How long a dead letter is kept (`KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS`, default 30 d, at
+    /// How long a dead letter is kept (`SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS`, default 30 d, at
     /// least 1 s): the TTL index on `expireAt` removes it then, which unblocks its key.
     pub dead_letter_retention: Duration,
     pub outbox_enabled: bool,
     pub outbox_poll_interval: Duration,
     pub outbox_batch_size: usize,
     pub outbox_max_attempts: u32,
-    /// How long a batch the relay claims stays its own (`KRAKEN_OUTBOX_LEASE_MS`, default 2 min):
+    /// How long a batch the relay claims stays its own (`SNODRA_OUTBOX_LEASE_MS`, default 2 min):
     /// longer than one send can take ([`OUTBOX_SEND_TIMEOUT`](crate::events::OUTBOX_SEND_TIMEOUT),
     /// 40 s; a startup error otherwise). The relay stops a batch before its lease could run out
     /// under a send, and its next claim renews what it still holds.
     pub outbox_lease: Duration,
-    /// Whether `start()` prepares the message store's schema (`KRAKEN_STORE_INIT_SCHEMA`, default
-    /// true; Kotlin's `kraken.messaging.store.init-schema`): the MongoDB store's indexes, an SQL
+    /// Whether `start()` prepares the message store's schema (`SNODRA_STORE_INIT_SCHEMA`, default
+    /// true; Kotlin's `snodra.messaging.store.init-schema`): the MongoDB store's indexes, an SQL
     /// store's tables. `false` when the schema is managed elsewhere (migrations).
     pub store_init_schema: bool,
     /// The retentions (`outbox_retention`, `idempotency_retention`, `sagas_*_retention`,
@@ -172,43 +172,43 @@ pub struct Config {
     pub issuer: Option<String>,
     /// Forward the current handler's bearer token on outgoing requests.
     pub forward_jwt: bool,
-    /// Sagas (ADR 0021; `KRAKEN_SAGAS_ENABLED`, default true): with `false` a service that
+    /// Sagas (ADR 0021; `SNODRA_SAGAS_ENABLED`, default true): with `false` a service that
     /// registers sagas starts without their runtime, relay and scheduler (logged at warn).
     pub sagas_enabled: bool,
     /// Attempts of one (event, saga type) before the event is parked in `saga_failures`
-    /// (`KRAKEN_SAGAS_MAX_ATTEMPTS`, default 5; 200 ms doubling to 5 s between them).
+    /// (`SNODRA_SAGAS_MAX_ATTEMPTS`, default 5; 200 ms doubling to 5 s between them).
     pub sagas_max_attempts: u32,
-    /// How long an ended saga instance is kept (`KRAKEN_SAGAS_ENDED_RETENTION_MS`, default 30 d).
+    /// How long an ended saga instance is kept (`SNODRA_SAGAS_ENDED_RETENTION_MS`, default 30 d).
     pub sagas_ended_retention: Duration,
-    /// How long a dispatched `saga_dispatch` entry is kept (`KRAKEN_SAGAS_DISPATCH_RETENTION_MS`,
+    /// How long a dispatched `saga_dispatch` entry is kept (`SNODRA_SAGAS_DISPATCH_RETENTION_MS`,
     /// default 7 d; an entry that failed for good is kept by `sagas_failed_retention`).
     pub sagas_dispatch_retention: Duration,
-    /// How long what failed for good is kept (`KRAKEN_SAGAS_FAILED_RETENTION_MS`, default 30 d):
+    /// How long what failed for good is kept (`SNODRA_SAGAS_FAILED_RETENTION_MS`, default 30 d):
     /// `saga_dispatch` entries given up on (by `failedAt`) and parked events in `saga_failures`
     /// (by `lastFailedAt`, which a retry that fails again moves on).
     pub sagas_failed_retention: Duration,
-    /// `KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS`, default 500 ms.
+    /// `SNODRA_SAGAS_RELAY_POLL_INTERVAL_MS`, default 500 ms.
     pub sagas_relay_poll_interval: Duration,
-    /// How long a saga's dispatch lease holds (`KRAKEN_SAGAS_RELAY_LEASE_MS`, default 30 s).
+    /// How long a saga's dispatch lease holds (`SNODRA_SAGAS_RELAY_LEASE_MS`, default 30 s).
     pub sagas_relay_lease: Duration,
-    /// Attempts of a saga command in all before `EXHAUSTED` (`KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS`,
+    /// Attempts of a saga command in all before `EXHAUSTED` (`SNODRA_SAGAS_RELAY_MAX_ATTEMPTS`,
     /// default 10).
     pub sagas_relay_max_attempts: u32,
-    /// `KRAKEN_SAGAS_RELAY_INITIAL_BACKOFF_MS`, default 1 s (doubling).
+    /// `SNODRA_SAGAS_RELAY_INITIAL_BACKOFF_MS`, default 1 s (doubling).
     pub sagas_relay_initial_backoff: Duration,
-    /// `KRAKEN_SAGAS_RELAY_MAX_BACKOFF_MS`, default 5 min.
+    /// `SNODRA_SAGAS_RELAY_MAX_BACKOFF_MS`, default 5 min.
     pub sagas_relay_max_backoff: Duration,
-    /// `KRAKEN_DEADLINES_POLL_INTERVAL_MS`, default 1 s.
+    /// `SNODRA_DEADLINES_POLL_INTERVAL_MS`, default 1 s.
     pub deadlines_poll_interval: Duration,
-    /// How long a claimed deadline stays reserved (`KRAKEN_DEADLINES_LEASE_MS`, default 30 s).
+    /// How long a claimed deadline stays reserved (`SNODRA_DEADLINES_LEASE_MS`, default 30 s).
     pub deadlines_lease: Duration,
-    /// How long a fired or cancelled deadline is kept (`KRAKEN_DEADLINES_RETENTION_MS`, default
+    /// How long a fired or cancelled deadline is kept (`SNODRA_DEADLINES_RETENTION_MS`, default
     /// 7 d).
     pub deadlines_retention: Duration,
     /// How long an idempotent call may take before its outcome counts as unknown
-    /// (`KRAKEN_EXTERNAL_CALLS_LEASE_MS`, default 5 min).
+    /// (`SNODRA_EXTERNAL_CALLS_LEASE_MS`, default 5 min).
     pub external_calls_lease: Duration,
-    /// How long an `external_calls` record is kept (`KRAKEN_EXTERNAL_CALLS_RETENTION_MS`,
+    /// How long an `external_calls` record is kept (`SNODRA_EXTERNAL_CALLS_RETENTION_MS`,
     /// default 30 d).
     pub external_calls_retention: Duration,
 }
@@ -306,42 +306,42 @@ impl Config {
         }
     }
 
-    /// `KRAKEN_SERVICE_NAME` is required; `KRAKEN_HUB_ADDRESS` defaults to
-    /// `static://kraken-hub:7000`. Optional:
-    /// `KRAKEN_INSTANCE_ID`, `KRAKEN_HUB_ENABLED`, `KRAKEN_EVENTS_SOURCE`, `KRAKEN_JWKS_URL`, `KRAKEN_ISSUER`, `KRAKEN_HUB_REQUEST_TIMEOUT_MS`,
-    /// `KRAKEN_HUB_STATUS_INTERVAL_MS`, `KRAKEN_RECONNECT_BACKOFF_MIN_MS`,
-    /// `KRAKEN_RECONNECT_BACKOFF_MAX_MS`,
-    /// `KRAKEN_MAX_CONCURRENT_HANDLERS`, `KRAKEN_CONSUMER_ENABLED`, `KRAKEN_CONSUMER_MAX_ATTEMPTS`,
-    /// `KRAKEN_EVENTS_DEAD_LETTER_MODE` (`collection`, `event-store` or `log`),
-    /// `KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS`,
-    /// `KRAKEN_OUTBOX_ENABLED`, `KRAKEN_OUTBOX_POLL_INTERVAL_MS`, `KRAKEN_OUTBOX_BATCH_SIZE`,
-    /// `KRAKEN_OUTBOX_MAX_ATTEMPTS`, `KRAKEN_OUTBOX_LEASE_MS`, `KRAKEN_STORE_INIT_SCHEMA`,
-    /// `KRAKEN_FORWARD_JWT`, `KRAKEN_HUB_LOAD_FACTOR`,
-    /// `KRAKEN_HUB_TAGS` (`k=v,k=v`), `KRAKEN_HUB_PRIORITIES` (`type=n,type=n`),
-    /// `KRAKEN_HUB_RETRY_ENABLED`, `KRAKEN_HUB_RETRY_MAX_ATTEMPTS`,
-    /// `KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS`, `KRAKEN_HUB_RETRY_MULTIPLIER`,
-    /// `KRAKEN_HUB_RETRY_MAX_BACKOFF_MS`, `KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS`,
-    /// `KRAKEN_HUB_TOKEN`, `KRAKEN_HUB_TOKEN_FILE`, `KRAKEN_HUB_TLS` (`true` turns TLS on),
-    /// `KRAKEN_HUB_TLS_CA`, `KRAKEN_HUB_TLS_SERVER_NAME` (both need `KRAKEN_HUB_TLS=true`),
-    /// `KRAKEN_HUB_TLS_CLIENT_CERT` and `KRAKEN_HUB_TLS_CLIENT_KEY` (a client certificate for
+    /// `SNODRA_SERVICE_NAME` is required; `SNODRA_SERVER_ADDRESS` defaults to
+    /// `static://snodra-server:7000`. Optional:
+    /// `SNODRA_INSTANCE_ID`, `SNODRA_SERVER_ENABLED`, `SNODRA_EVENTS_SOURCE`, `SNODRA_JWKS_URL`, `SNODRA_ISSUER`, `SNODRA_SERVER_REQUEST_TIMEOUT_MS`,
+    /// `SNODRA_SERVER_STATUS_INTERVAL_MS`, `SNODRA_RECONNECT_BACKOFF_MIN_MS`,
+    /// `SNODRA_RECONNECT_BACKOFF_MAX_MS`,
+    /// `SNODRA_MAX_CONCURRENT_HANDLERS`, `SNODRA_CONSUMER_ENABLED`, `SNODRA_CONSUMER_MAX_ATTEMPTS`,
+    /// `SNODRA_EVENTS_DEAD_LETTER_MODE` (`collection`, `event-store` or `log`),
+    /// `SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS`,
+    /// `SNODRA_OUTBOX_ENABLED`, `SNODRA_OUTBOX_POLL_INTERVAL_MS`, `SNODRA_OUTBOX_BATCH_SIZE`,
+    /// `SNODRA_OUTBOX_MAX_ATTEMPTS`, `SNODRA_OUTBOX_LEASE_MS`, `SNODRA_STORE_INIT_SCHEMA`,
+    /// `SNODRA_FORWARD_JWT`, `SNODRA_SERVER_LOAD_FACTOR`,
+    /// `SNODRA_SERVER_TAGS` (`k=v,k=v`), `SNODRA_SERVER_PRIORITIES` (`type=n,type=n`),
+    /// `SNODRA_SERVER_RETRY_ENABLED`, `SNODRA_SERVER_RETRY_MAX_ATTEMPTS`,
+    /// `SNODRA_SERVER_RETRY_INITIAL_BACKOFF_MS`, `SNODRA_SERVER_RETRY_MULTIPLIER`,
+    /// `SNODRA_SERVER_RETRY_MAX_BACKOFF_MS`, `SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS`,
+    /// `SNODRA_SERVER_TOKEN`, `SNODRA_SERVER_TOKEN_FILE`, `SNODRA_SERVER_TLS` (`true` turns TLS on),
+    /// `SNODRA_SERVER_TLS_CA`, `SNODRA_SERVER_TLS_SERVER_NAME` (both need `SNODRA_SERVER_TLS=true`),
+    /// `SNODRA_SERVER_TLS_CLIENT_CERT` and `SNODRA_SERVER_TLS_CLIENT_KEY` (a client certificate for
     /// mutual TLS, both or neither; they turn TLS on and exclude a hub token and OAuth2),
-    /// `KRAKEN_HUB_MAX_SUBSCRIPTIONS`, `KRAKEN_HUB_OAUTH2_TOKEN_URI` (turns JWT authentication on;
-    /// then `KRAKEN_HUB_OAUTH2_CLIENT_SECRET` or `KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE` is needed,
-    /// and `KRAKEN_HUB_OAUTH2_CLIENT_ID` defaults to the service name), `KRAKEN_HUB_OAUTH2_SCOPE`,
-    /// `KRAKEN_HUB_OAUTH2_CA`; the saga settings (ADR 0021) `KRAKEN_SAGAS_ENABLED`,
-    /// `KRAKEN_SAGAS_MAX_ATTEMPTS`, `KRAKEN_SAGAS_ENDED_RETENTION_MS`,
-    /// `KRAKEN_SAGAS_DISPATCH_RETENTION_MS`, `KRAKEN_SAGAS_FAILED_RETENTION_MS`,
-    /// `KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS`,
-    /// `KRAKEN_SAGAS_RELAY_LEASE_MS`, `KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS`,
-    /// `KRAKEN_SAGAS_RELAY_INITIAL_BACKOFF_MS`, `KRAKEN_SAGAS_RELAY_MAX_BACKOFF_MS`,
-    /// `KRAKEN_DEADLINES_POLL_INTERVAL_MS`, `KRAKEN_DEADLINES_LEASE_MS`,
-    /// `KRAKEN_DEADLINES_RETENTION_MS`, `KRAKEN_EXTERNAL_CALLS_LEASE_MS`,
-    /// `KRAKEN_EXTERNAL_CALLS_RETENTION_MS`.
-    /// `KRAKEN_HUB_RETRY_ENABLED=true` sets `hub_retry` to the
-    /// policy the other `KRAKEN_HUB_RETRY_*` variables describe (defaults: 3 attempts, 100 ms
+    /// `SNODRA_SERVER_MAX_SUBSCRIPTIONS`, `SNODRA_SERVER_OAUTH2_TOKEN_URI` (turns JWT authentication on;
+    /// then `SNODRA_SERVER_OAUTH2_CLIENT_SECRET` or `SNODRA_SERVER_OAUTH2_CLIENT_SECRET_FILE` is needed,
+    /// and `SNODRA_SERVER_OAUTH2_CLIENT_ID` defaults to the service name), `SNODRA_SERVER_OAUTH2_SCOPE`,
+    /// `SNODRA_SERVER_OAUTH2_CA`; the saga settings (ADR 0021) `SNODRA_SAGAS_ENABLED`,
+    /// `SNODRA_SAGAS_MAX_ATTEMPTS`, `SNODRA_SAGAS_ENDED_RETENTION_MS`,
+    /// `SNODRA_SAGAS_DISPATCH_RETENTION_MS`, `SNODRA_SAGAS_FAILED_RETENTION_MS`,
+    /// `SNODRA_SAGAS_RELAY_POLL_INTERVAL_MS`,
+    /// `SNODRA_SAGAS_RELAY_LEASE_MS`, `SNODRA_SAGAS_RELAY_MAX_ATTEMPTS`,
+    /// `SNODRA_SAGAS_RELAY_INITIAL_BACKOFF_MS`, `SNODRA_SAGAS_RELAY_MAX_BACKOFF_MS`,
+    /// `SNODRA_DEADLINES_POLL_INTERVAL_MS`, `SNODRA_DEADLINES_LEASE_MS`,
+    /// `SNODRA_DEADLINES_RETENTION_MS`, `SNODRA_EXTERNAL_CALLS_LEASE_MS`,
+    /// `SNODRA_EXTERNAL_CALLS_RETENTION_MS`.
+    /// `SNODRA_SERVER_RETRY_ENABLED=true` sets `hub_retry` to the
+    /// policy the other `SNODRA_SERVER_RETRY_*` variables describe (defaults: 3 attempts, 100 ms
     /// doubling to 2 s); those are validated whether or not retry is enabled.
-    /// A removed setting still set (`KRAKEN_KAFKA_TOPIC`, `KRAKEN_KAFKA_DEAD_LETTER_MODE`,
-    /// `KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS`) is an error naming every one and its replacement,
+    /// A removed setting still set (`SNODRA_KAFKA_TOPIC`, `SNODRA_KAFKA_DEAD_LETTER_MODE`,
+    /// `SNODRA_KAFKA_DEAD_LETTER_RETENTION_MS`) is an error naming every one and its replacement,
     /// and so is the old dead-letter mode `topic` (now `event-store`).
     pub fn from_env() -> Result<Config, MessagingError> {
         Self::from_lookup(|name| std::env::var(name).ok())
@@ -357,65 +357,67 @@ impl Config {
         };
         let optional = |name: &str| lookup(name).filter(|v| !v.trim().is_empty());
         let mut c = Config::new(
-            &required("KRAKEN_SERVICE_NAME")?,
-            &optional("KRAKEN_HUB_ADDRESS").unwrap_or_else(|| "static://kraken-hub:7000".into()),
+            &required("SNODRA_SERVICE_NAME")?,
+            &optional("SNODRA_SERVER_ADDRESS")
+                .unwrap_or_else(|| "static://snodra-server:7000".into()),
         );
-        if let Some(id) = optional("KRAKEN_INSTANCE_ID") {
+        if let Some(id) = optional("SNODRA_INSTANCE_ID") {
             c.instance_id = id;
         }
-        if let Some(v) = optional("KRAKEN_HUB_ENABLED") {
-            c.hub_enabled = flag("KRAKEN_HUB_ENABLED", &v)?;
+        if let Some(v) = optional("SNODRA_SERVER_ENABLED") {
+            c.hub_enabled = flag("SNODRA_SERVER_ENABLED", &v)?;
         }
-        if let Some(t) = optional("KRAKEN_EVENTS_SOURCE") {
+        if let Some(t) = optional("SNODRA_EVENTS_SOURCE") {
             c.events_source = t;
         }
-        c.jwks_url = optional("KRAKEN_JWKS_URL");
-        c.issuer = optional("KRAKEN_ISSUER");
-        if let Some(v) = optional("KRAKEN_HUB_REQUEST_TIMEOUT_MS") {
+        c.jwks_url = optional("SNODRA_JWKS_URL");
+        c.issuer = optional("SNODRA_ISSUER");
+        if let Some(v) = optional("SNODRA_SERVER_REQUEST_TIMEOUT_MS") {
             // 0 means "not chosen", like leaving it unset (the hub decides).
             c.hub_request_timeout =
-                Some(millis("KRAKEN_HUB_REQUEST_TIMEOUT_MS", &v)?).filter(|d| !d.is_zero());
+                Some(millis("SNODRA_SERVER_REQUEST_TIMEOUT_MS", &v)?).filter(|d| !d.is_zero());
         }
-        if let Some(v) = optional("KRAKEN_HUB_STATUS_INTERVAL_MS") {
-            c.hub_status_interval = millis("KRAKEN_HUB_STATUS_INTERVAL_MS", &v)?;
+        if let Some(v) = optional("SNODRA_SERVER_STATUS_INTERVAL_MS") {
+            c.hub_status_interval = millis("SNODRA_SERVER_STATUS_INTERVAL_MS", &v)?;
         }
-        if let Some(v) = optional("KRAKEN_RECONNECT_BACKOFF_MIN_MS") {
-            c.reconnect_backoff_min = millis("KRAKEN_RECONNECT_BACKOFF_MIN_MS", &v)?;
+        if let Some(v) = optional("SNODRA_RECONNECT_BACKOFF_MIN_MS") {
+            c.reconnect_backoff_min = millis("SNODRA_RECONNECT_BACKOFF_MIN_MS", &v)?;
         }
-        if let Some(v) = optional("KRAKEN_RECONNECT_BACKOFF_MAX_MS") {
-            c.reconnect_backoff_max = millis("KRAKEN_RECONNECT_BACKOFF_MAX_MS", &v)?;
+        if let Some(v) = optional("SNODRA_RECONNECT_BACKOFF_MAX_MS") {
+            c.reconnect_backoff_max = millis("SNODRA_RECONNECT_BACKOFF_MAX_MS", &v)?;
         }
-        if let Some(v) = optional("KRAKEN_MAX_CONCURRENT_HANDLERS") {
-            c.max_concurrent_handlers = number("KRAKEN_MAX_CONCURRENT_HANDLERS", &v)? as usize;
+        if let Some(v) = optional("SNODRA_MAX_CONCURRENT_HANDLERS") {
+            c.max_concurrent_handlers = number("SNODRA_MAX_CONCURRENT_HANDLERS", &v)? as usize;
         }
-        if let Some(v) = optional("KRAKEN_HUB_LOAD_FACTOR") {
-            c.hub_load_factor = number("KRAKEN_HUB_LOAD_FACTOR", &v)?.min(u32::MAX as u64) as u32;
+        if let Some(v) = optional("SNODRA_SERVER_LOAD_FACTOR") {
+            c.hub_load_factor =
+                number("SNODRA_SERVER_LOAD_FACTOR", &v)?.min(u32::MAX as u64) as u32;
         }
-        if let Some(v) = optional("KRAKEN_HUB_TAGS") {
-            c.hub_tags = pairs("KRAKEN_HUB_TAGS", &v, |s| Some(s.to_string()))?;
+        if let Some(v) = optional("SNODRA_SERVER_TAGS") {
+            c.hub_tags = pairs("SNODRA_SERVER_TAGS", &v, |s| Some(s.to_string()))?;
         }
-        if let Some(v) = optional("KRAKEN_HUB_PRIORITIES") {
-            c.hub_priorities = pairs("KRAKEN_HUB_PRIORITIES", &v, |s| s.parse::<i32>().ok())?;
+        if let Some(v) = optional("SNODRA_SERVER_PRIORITIES") {
+            c.hub_priorities = pairs("SNODRA_SERVER_PRIORITIES", &v, |s| s.parse::<i32>().ok())?;
         }
-        let retry_enabled = match optional("KRAKEN_HUB_RETRY_ENABLED") {
-            Some(v) => flag("KRAKEN_HUB_RETRY_ENABLED", &v)?,
+        let retry_enabled = match optional("SNODRA_SERVER_RETRY_ENABLED") {
+            Some(v) => flag("SNODRA_SERVER_RETRY_ENABLED", &v)?,
             None => false,
         };
         let mut retry = RetryPolicy::default();
-        if let Some(v) = optional("KRAKEN_HUB_RETRY_MAX_ATTEMPTS") {
-            retry.max_attempts = Some(number("KRAKEN_HUB_RETRY_MAX_ATTEMPTS", &v)?)
+        if let Some(v) = optional("SNODRA_SERVER_RETRY_MAX_ATTEMPTS") {
+            retry.max_attempts = Some(number("SNODRA_SERVER_RETRY_MAX_ATTEMPTS", &v)?)
                 .filter(|&n| n >= 1)
                 .ok_or_else(|| {
                     MessagingError::InvalidMessage(format!(
-                        "KRAKEN_HUB_RETRY_MAX_ATTEMPTS must be at least 1 (1 = no retry), got '{v}'"
+                        "SNODRA_SERVER_RETRY_MAX_ATTEMPTS must be at least 1 (1 = no retry), got '{v}'"
                     ))
                 })?
                 .min(u32::MAX as u64) as u32;
         }
-        if let Some(v) = optional("KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS") {
-            retry.initial_backoff = millis("KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS", &v)?;
+        if let Some(v) = optional("SNODRA_SERVER_RETRY_INITIAL_BACKOFF_MS") {
+            retry.initial_backoff = millis("SNODRA_SERVER_RETRY_INITIAL_BACKOFF_MS", &v)?;
         }
-        if let Some(v) = optional("KRAKEN_HUB_RETRY_MULTIPLIER") {
+        if let Some(v) = optional("SNODRA_SERVER_RETRY_MULTIPLIER") {
             retry.multiplier = v
                 .trim()
                 .parse::<f64>()
@@ -423,38 +425,39 @@ impl Config {
                 .filter(|m| m.is_finite() && *m >= 1.0)
                 .ok_or_else(|| {
                     MessagingError::InvalidMessage(format!(
-                        "KRAKEN_HUB_RETRY_MULTIPLIER must be a number >= 1, got '{v}'"
+                        "SNODRA_SERVER_RETRY_MULTIPLIER must be a number >= 1, got '{v}'"
                     ))
                 })?;
         }
-        if let Some(v) = optional("KRAKEN_HUB_RETRY_MAX_BACKOFF_MS") {
-            retry.max_backoff = millis("KRAKEN_HUB_RETRY_MAX_BACKOFF_MS", &v)?;
+        if let Some(v) = optional("SNODRA_SERVER_RETRY_MAX_BACKOFF_MS") {
+            retry.max_backoff = millis("SNODRA_SERVER_RETRY_MAX_BACKOFF_MS", &v)?;
         }
         retry.validate()?;
         c.hub_retry = retry_enabled.then_some(retry);
-        if let Some(v) = optional("KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS") {
-            c.hub_stream_credit_timeout = millis("KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS", &v)?;
+        if let Some(v) = optional("SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS") {
+            c.hub_stream_credit_timeout = millis("SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS", &v)?;
         }
-        if let Some(v) = optional("KRAKEN_HUB_MAX_SUBSCRIPTIONS") {
-            c.hub_max_subscriptions = number("KRAKEN_HUB_MAX_SUBSCRIPTIONS", &v)? as usize;
+        if let Some(v) = optional("SNODRA_SERVER_MAX_SUBSCRIPTIONS") {
+            c.hub_max_subscriptions = number("SNODRA_SERVER_MAX_SUBSCRIPTIONS", &v)? as usize;
         }
-        c.hub_token = optional("KRAKEN_HUB_TOKEN").map(|v| SecretString::new(v.trim()));
-        c.hub_token_file = optional("KRAKEN_HUB_TOKEN_FILE").map(|v| PathBuf::from(v.trim()));
-        let tls_flag = match optional("KRAKEN_HUB_TLS") {
-            Some(v) => Some(flag("KRAKEN_HUB_TLS", &v)?),
+        c.hub_token = optional("SNODRA_SERVER_TOKEN").map(|v| SecretString::new(v.trim()));
+        c.hub_token_file = optional("SNODRA_SERVER_TOKEN_FILE").map(|v| PathBuf::from(v.trim()));
+        let tls_flag = match optional("SNODRA_SERVER_TLS") {
+            Some(v) => Some(flag("SNODRA_SERVER_TLS", &v)?),
             None => None,
         };
-        let tls_ca = optional("KRAKEN_HUB_TLS_CA").map(|v| PathBuf::from(v.trim()));
-        let tls_name = optional("KRAKEN_HUB_TLS_SERVER_NAME").map(|v| v.trim().to_string());
-        let client_cert = optional("KRAKEN_HUB_TLS_CLIENT_CERT").map(|v| PathBuf::from(v.trim()));
-        let client_key = optional("KRAKEN_HUB_TLS_CLIENT_KEY").map(|v| PathBuf::from(v.trim()));
+        let tls_ca = optional("SNODRA_SERVER_TLS_CA").map(|v| PathBuf::from(v.trim()));
+        let tls_name = optional("SNODRA_SERVER_TLS_SERVER_NAME").map(|v| v.trim().to_string());
+        let client_cert =
+            optional("SNODRA_SERVER_TLS_CLIENT_CERT").map(|v| PathBuf::from(v.trim()));
+        let client_key = optional("SNODRA_SERVER_TLS_CLIENT_KEY").map(|v| PathBuf::from(v.trim()));
         let client_certificate = client_cert.is_some() || client_key.is_some();
         if client_certificate && tls_flag == Some(false) {
             return Err(MessagingError::InvalidMessage(
-                "KRAKEN_HUB_TLS_CLIENT_CERT and KRAKEN_HUB_TLS_CLIENT_KEY need TLS, but KRAKEN_HUB_TLS=false".into(),
+                "SNODRA_SERVER_TLS_CLIENT_CERT and SNODRA_SERVER_TLS_CLIENT_KEY need TLS, but SNODRA_SERVER_TLS=false".into(),
             ));
         }
-        // A client certificate implies TLS, as KRAKEN_HUB_TLS=true does.
+        // A client certificate implies TLS, as SNODRA_SERVER_TLS=true does.
         if tls_flag.unwrap_or(false) || client_certificate {
             c.hub_tls = Some(HubTls {
                 ca_file: tls_ca,
@@ -464,15 +467,15 @@ impl Config {
             });
         } else if tls_ca.is_some() || tls_name.is_some() {
             return Err(MessagingError::InvalidMessage(
-                "KRAKEN_HUB_TLS_CA and KRAKEN_HUB_TLS_SERVER_NAME need KRAKEN_HUB_TLS=true".into(),
+                "SNODRA_SERVER_TLS_CA and SNODRA_SERVER_TLS_SERVER_NAME need SNODRA_SERVER_TLS=true".into(),
             ));
         }
-        let oauth2_secret = optional("KRAKEN_HUB_OAUTH2_CLIENT_SECRET");
-        let oauth2_secret_file = optional("KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE");
-        let oauth2_client_id = optional("KRAKEN_HUB_OAUTH2_CLIENT_ID");
-        let oauth2_scope = optional("KRAKEN_HUB_OAUTH2_SCOPE");
-        let oauth2_ca = optional("KRAKEN_HUB_OAUTH2_CA");
-        match optional("KRAKEN_HUB_OAUTH2_TOKEN_URI") {
+        let oauth2_secret = optional("SNODRA_SERVER_OAUTH2_CLIENT_SECRET");
+        let oauth2_secret_file = optional("SNODRA_SERVER_OAUTH2_CLIENT_SECRET_FILE");
+        let oauth2_client_id = optional("SNODRA_SERVER_OAUTH2_CLIENT_ID");
+        let oauth2_scope = optional("SNODRA_SERVER_OAUTH2_SCOPE");
+        let oauth2_ca = optional("SNODRA_SERVER_OAUTH2_CA");
+        match optional("SNODRA_SERVER_OAUTH2_TOKEN_URI") {
             Some(uri) => {
                 c.hub_oauth2 = Some(HubOAuth2 {
                     token_uri: uri.trim().to_string(),
@@ -492,91 +495,92 @@ impl Config {
                 || oauth2_ca.is_some() =>
             {
                 return Err(MessagingError::InvalidMessage(
-                    "the KRAKEN_HUB_OAUTH2_* variables need KRAKEN_HUB_OAUTH2_TOKEN_URI".into(),
+                    "the SNODRA_SERVER_OAUTH2_* variables need SNODRA_SERVER_OAUTH2_TOKEN_URI"
+                        .into(),
                 ));
             }
             None => {}
         }
-        if let Some(v) = optional("KRAKEN_CONSUMER_ENABLED") {
-            c.consumer_enabled = flag("KRAKEN_CONSUMER_ENABLED", &v)?;
+        if let Some(v) = optional("SNODRA_CONSUMER_ENABLED") {
+            c.consumer_enabled = flag("SNODRA_CONSUMER_ENABLED", &v)?;
         }
-        if let Some(v) = optional("KRAKEN_CONSUMER_MAX_ATTEMPTS") {
-            c.consumer_max_attempts = number("KRAKEN_CONSUMER_MAX_ATTEMPTS", &v)? as u32;
+        if let Some(v) = optional("SNODRA_CONSUMER_MAX_ATTEMPTS") {
+            c.consumer_max_attempts = number("SNODRA_CONSUMER_MAX_ATTEMPTS", &v)? as u32;
         }
-        if let Some(v) = optional("KRAKEN_EVENTS_DEAD_LETTER_MODE") {
-            c.dead_letter_mode = DeadLetterMode::parse("KRAKEN_EVENTS_DEAD_LETTER_MODE", &v)?;
+        if let Some(v) = optional("SNODRA_EVENTS_DEAD_LETTER_MODE") {
+            c.dead_letter_mode = DeadLetterMode::parse("SNODRA_EVENTS_DEAD_LETTER_MODE", &v)?;
         }
-        if let Some(v) = optional("KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS") {
-            c.dead_letter_retention = millis("KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS", &v)?;
+        if let Some(v) = optional("SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS") {
+            c.dead_letter_retention = millis("SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS", &v)?;
         }
-        if let Some(v) = optional("KRAKEN_OUTBOX_ENABLED") {
-            c.outbox_enabled = flag("KRAKEN_OUTBOX_ENABLED", &v)?;
+        if let Some(v) = optional("SNODRA_OUTBOX_ENABLED") {
+            c.outbox_enabled = flag("SNODRA_OUTBOX_ENABLED", &v)?;
         }
-        if let Some(v) = optional("KRAKEN_OUTBOX_POLL_INTERVAL_MS") {
-            c.outbox_poll_interval = millis("KRAKEN_OUTBOX_POLL_INTERVAL_MS", &v)?;
+        if let Some(v) = optional("SNODRA_OUTBOX_POLL_INTERVAL_MS") {
+            c.outbox_poll_interval = millis("SNODRA_OUTBOX_POLL_INTERVAL_MS", &v)?;
         }
-        if let Some(v) = optional("KRAKEN_OUTBOX_BATCH_SIZE") {
-            c.outbox_batch_size = number("KRAKEN_OUTBOX_BATCH_SIZE", &v)? as usize;
+        if let Some(v) = optional("SNODRA_OUTBOX_BATCH_SIZE") {
+            c.outbox_batch_size = number("SNODRA_OUTBOX_BATCH_SIZE", &v)? as usize;
         }
-        if let Some(v) = optional("KRAKEN_OUTBOX_MAX_ATTEMPTS") {
-            c.outbox_max_attempts = number("KRAKEN_OUTBOX_MAX_ATTEMPTS", &v)? as u32;
+        if let Some(v) = optional("SNODRA_OUTBOX_MAX_ATTEMPTS") {
+            c.outbox_max_attempts = number("SNODRA_OUTBOX_MAX_ATTEMPTS", &v)? as u32;
         }
-        if let Some(v) = optional("KRAKEN_OUTBOX_LEASE_MS") {
-            c.outbox_lease = millis("KRAKEN_OUTBOX_LEASE_MS", &v)?;
+        if let Some(v) = optional("SNODRA_OUTBOX_LEASE_MS") {
+            c.outbox_lease = millis("SNODRA_OUTBOX_LEASE_MS", &v)?;
         }
-        if let Some(v) = optional("KRAKEN_STORE_INIT_SCHEMA") {
-            c.store_init_schema = flag("KRAKEN_STORE_INIT_SCHEMA", &v)?;
+        if let Some(v) = optional("SNODRA_STORE_INIT_SCHEMA") {
+            c.store_init_schema = flag("SNODRA_STORE_INIT_SCHEMA", &v)?;
         }
-        if let Some(v) = optional("KRAKEN_FORWARD_JWT") {
-            c.forward_jwt = flag("KRAKEN_FORWARD_JWT", &v)?;
+        if let Some(v) = optional("SNODRA_FORWARD_JWT") {
+            c.forward_jwt = flag("SNODRA_FORWARD_JWT", &v)?;
         }
-        if let Some(v) = optional("KRAKEN_SAGAS_ENABLED") {
-            c.sagas_enabled = flag("KRAKEN_SAGAS_ENABLED", &v)?;
+        if let Some(v) = optional("SNODRA_SAGAS_ENABLED") {
+            c.sagas_enabled = flag("SNODRA_SAGAS_ENABLED", &v)?;
         }
-        if let Some(v) = optional("KRAKEN_SAGAS_MAX_ATTEMPTS") {
-            c.sagas_max_attempts = small_number("KRAKEN_SAGAS_MAX_ATTEMPTS", &v)?;
+        if let Some(v) = optional("SNODRA_SAGAS_MAX_ATTEMPTS") {
+            c.sagas_max_attempts = small_number("SNODRA_SAGAS_MAX_ATTEMPTS", &v)?;
         }
-        if let Some(v) = optional("KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS") {
-            c.sagas_relay_max_attempts = small_number("KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS", &v)?;
+        if let Some(v) = optional("SNODRA_SAGAS_RELAY_MAX_ATTEMPTS") {
+            c.sagas_relay_max_attempts = small_number("SNODRA_SAGAS_RELAY_MAX_ATTEMPTS", &v)?;
         }
         for (name, field) in [
             (
-                "KRAKEN_SAGAS_ENDED_RETENTION_MS",
+                "SNODRA_SAGAS_ENDED_RETENTION_MS",
                 &mut c.sagas_ended_retention,
             ),
             (
-                "KRAKEN_SAGAS_DISPATCH_RETENTION_MS",
+                "SNODRA_SAGAS_DISPATCH_RETENTION_MS",
                 &mut c.sagas_dispatch_retention,
             ),
             (
-                "KRAKEN_SAGAS_FAILED_RETENTION_MS",
+                "SNODRA_SAGAS_FAILED_RETENTION_MS",
                 &mut c.sagas_failed_retention,
             ),
             (
-                "KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS",
+                "SNODRA_SAGAS_RELAY_POLL_INTERVAL_MS",
                 &mut c.sagas_relay_poll_interval,
             ),
-            ("KRAKEN_SAGAS_RELAY_LEASE_MS", &mut c.sagas_relay_lease),
+            ("SNODRA_SAGAS_RELAY_LEASE_MS", &mut c.sagas_relay_lease),
             (
-                "KRAKEN_SAGAS_RELAY_INITIAL_BACKOFF_MS",
+                "SNODRA_SAGAS_RELAY_INITIAL_BACKOFF_MS",
                 &mut c.sagas_relay_initial_backoff,
             ),
             (
-                "KRAKEN_SAGAS_RELAY_MAX_BACKOFF_MS",
+                "SNODRA_SAGAS_RELAY_MAX_BACKOFF_MS",
                 &mut c.sagas_relay_max_backoff,
             ),
             (
-                "KRAKEN_DEADLINES_POLL_INTERVAL_MS",
+                "SNODRA_DEADLINES_POLL_INTERVAL_MS",
                 &mut c.deadlines_poll_interval,
             ),
-            ("KRAKEN_DEADLINES_LEASE_MS", &mut c.deadlines_lease),
-            ("KRAKEN_DEADLINES_RETENTION_MS", &mut c.deadlines_retention),
+            ("SNODRA_DEADLINES_LEASE_MS", &mut c.deadlines_lease),
+            ("SNODRA_DEADLINES_RETENTION_MS", &mut c.deadlines_retention),
             (
-                "KRAKEN_EXTERNAL_CALLS_LEASE_MS",
+                "SNODRA_EXTERNAL_CALLS_LEASE_MS",
                 &mut c.external_calls_lease,
             ),
             (
-                "KRAKEN_EXTERNAL_CALLS_RETENTION_MS",
+                "SNODRA_EXTERNAL_CALLS_RETENTION_MS",
                 &mut c.external_calls_retention,
             ),
         ] {
@@ -597,9 +601,9 @@ impl Config {
     /// that is `http(s)://`, without a secret or with an unreadable secret file or CA file, a
     /// `hub_tls` client certificate without its key (or the reverse), together with a static hub
     /// token or `hub_oauth2`, or one the hub would refuse (unreadable files, a key that is not the
-    /// certificate's, a leaf that does not carry exactly one `kraken://service/<service_name>`
+    /// certificate's, a leaf that does not carry exactly one `snodra://service/<service_name>`
     /// URI SAN, an expired one).
-    /// Called by `from_env` and by `KrakenMessaging::builder`; error
+    /// Called by `from_env` and by `SnodraMessaging::builder`; error
     /// messages never carry the token.
     pub fn validate(&self) -> Result<(), MessagingError> {
         if self.service_name.trim().is_empty() {
@@ -609,38 +613,39 @@ impl Config {
         }
         if self.instance_id.trim().is_empty() {
             return Err(MessagingError::InvalidMessage(
-                "instance_id (KRAKEN_INSTANCE_ID) must not be empty".into(),
+                "instance_id (SNODRA_INSTANCE_ID) must not be empty".into(),
             ));
         }
         HubTargets::parse(&self.hub_address)?;
         if self.reconnect_backoff_max.is_zero() {
             return Err(MessagingError::InvalidMessage(
-                "reconnect_backoff_max (KRAKEN_RECONNECT_BACKOFF_MAX_MS) must be at least 1 ms"
+                "reconnect_backoff_max (SNODRA_RECONNECT_BACKOFF_MAX_MS) must be at least 1 ms"
                     .into(),
             ));
         }
         if self.reconnect_backoff_min.is_zero() {
             return Err(MessagingError::InvalidMessage(
-                "reconnect_backoff_min (KRAKEN_RECONNECT_BACKOFF_MIN_MS) must be at least 1 ms (0 doubles to 0 forever)"
+                "reconnect_backoff_min (SNODRA_RECONNECT_BACKOFF_MIN_MS) must be at least 1 ms (0 doubles to 0 forever)"
                     .into(),
             ));
         }
         if self.reconnect_backoff_min > self.reconnect_backoff_max {
             return Err(MessagingError::InvalidMessage(format!(
-                "reconnect_backoff_min (KRAKEN_RECONNECT_BACKOFF_MIN_MS, {:?}) must not exceed reconnect_backoff_max (KRAKEN_RECONNECT_BACKOFF_MAX_MS, {:?})",
+                "reconnect_backoff_min (SNODRA_RECONNECT_BACKOFF_MIN_MS, {:?}) must not exceed reconnect_backoff_max (SNODRA_RECONNECT_BACKOFF_MAX_MS, {:?})",
                 self.reconnect_backoff_min, self.reconnect_backoff_max
             )));
         }
         if self.outbox_lease <= crate::events::OUTBOX_SEND_TIMEOUT {
             return Err(MessagingError::InvalidMessage(format!(
-                "outbox_lease (KRAKEN_OUTBOX_LEASE_MS, {:?}) must be longer than a send ({} s)",
+                "outbox_lease (SNODRA_OUTBOX_LEASE_MS, {:?}) must be longer than a send ({} s)",
                 self.outbox_lease,
                 crate::events::OUTBOX_SEND_TIMEOUT.as_secs()
             )));
         }
         if self.hub_status_interval.is_zero() {
             return Err(MessagingError::InvalidMessage(
-                "hub_status_interval (KRAKEN_HUB_STATUS_INTERVAL_MS) must be at least 1 ms".into(),
+                "hub_status_interval (SNODRA_SERVER_STATUS_INTERVAL_MS) must be at least 1 ms"
+                    .into(),
             ));
         }
         if self.jwks_url.is_some() && self.issuer.is_none() {
@@ -650,7 +655,7 @@ impl Config {
         }
         if self.max_concurrent_handlers == 0 {
             return Err(MessagingError::InvalidMessage(
-                "max_concurrent_handlers (KRAKEN_MAX_CONCURRENT_HANDLERS) must be at least 1"
+                "max_concurrent_handlers (SNODRA_MAX_CONCURRENT_HANDLERS) must be at least 1"
                     .into(),
             ));
         }
@@ -659,25 +664,25 @@ impl Config {
         }
         if self.hub_stream_credit_timeout.is_zero() {
             return Err(MessagingError::InvalidMessage(
-                "hub_stream_credit_timeout (KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS) must be at least 1 ms"
+                "hub_stream_credit_timeout (SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS) must be at least 1 ms"
                     .into(),
             ));
         }
         if self.hub_max_subscriptions == 0 {
             return Err(MessagingError::InvalidMessage(
-                "hub_max_subscriptions (KRAKEN_HUB_MAX_SUBSCRIPTIONS) must be at least 1".into(),
+                "hub_max_subscriptions (SNODRA_SERVER_MAX_SUBSCRIPTIONS) must be at least 1".into(),
             ));
         }
         if let Some(path) = &self.hub_token_file {
             let token = crate::security::read_token_file(path).map_err(|e| {
                 MessagingError::InvalidMessage(format!(
-                    "hub_token_file (KRAKEN_HUB_TOKEN_FILE) '{}' cannot be read: {e}",
+                    "hub_token_file (SNODRA_SERVER_TOKEN_FILE) '{}' cannot be read: {e}",
                     path.display()
                 ))
             })?;
             if token.is_none() {
                 return Err(MessagingError::InvalidMessage(format!(
-                    "hub_token_file (KRAKEN_HUB_TOKEN_FILE) '{}' is empty",
+                    "hub_token_file (SNODRA_SERVER_TOKEN_FILE) '{}' is empty",
                     path.display()
                 )));
             }
@@ -685,7 +690,7 @@ impl Config {
         self.validate_sagas()?;
         if self.dead_letter_retention < Duration::from_secs(1) {
             return Err(MessagingError::InvalidMessage(
-                "dead_letter_retention (KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS) must be at least 1 s"
+                "dead_letter_retention (SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS) must be at least 1 s"
                     .into(),
             ));
         }
@@ -699,13 +704,13 @@ impl Config {
                 .is_some_and(|n| n.trim().is_empty())
             {
                 return Err(MessagingError::InvalidMessage(
-                    "hub_tls.server_name (KRAKEN_HUB_TLS_SERVER_NAME) must not be empty".into(),
+                    "hub_tls.server_name (SNODRA_SERVER_TLS_SERVER_NAME) must not be empty".into(),
                 ));
             }
             if let Some(ca) = &tls.ca_file {
                 crate::hub::read_ca_file(ca).map_err(|e| {
                     MessagingError::InvalidMessage(format!(
-                        "hub_tls.ca_file (KRAKEN_HUB_TLS_CA) '{}': {e}",
+                        "hub_tls.ca_file (SNODRA_SERVER_TLS_CA) '{}': {e}",
                         ca.display()
                     ))
                 })?;
@@ -726,12 +731,12 @@ impl Config {
         for (field, env, value) in [
             (
                 "sagas_max_attempts",
-                "KRAKEN_SAGAS_MAX_ATTEMPTS",
+                "SNODRA_SAGAS_MAX_ATTEMPTS",
                 self.sagas_max_attempts,
             ),
             (
                 "sagas_relay_max_attempts",
-                "KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS",
+                "SNODRA_SAGAS_RELAY_MAX_ATTEMPTS",
                 self.sagas_relay_max_attempts,
             ),
         ] {
@@ -742,37 +747,37 @@ impl Config {
         for (field, env, value) in [
             (
                 "sagas_relay_poll_interval",
-                "KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS",
+                "SNODRA_SAGAS_RELAY_POLL_INTERVAL_MS",
                 self.sagas_relay_poll_interval,
             ),
             (
                 "sagas_relay_lease",
-                "KRAKEN_SAGAS_RELAY_LEASE_MS",
+                "SNODRA_SAGAS_RELAY_LEASE_MS",
                 self.sagas_relay_lease,
             ),
             (
                 "sagas_relay_initial_backoff",
-                "KRAKEN_SAGAS_RELAY_INITIAL_BACKOFF_MS",
+                "SNODRA_SAGAS_RELAY_INITIAL_BACKOFF_MS",
                 self.sagas_relay_initial_backoff,
             ),
             (
                 "sagas_relay_max_backoff",
-                "KRAKEN_SAGAS_RELAY_MAX_BACKOFF_MS",
+                "SNODRA_SAGAS_RELAY_MAX_BACKOFF_MS",
                 self.sagas_relay_max_backoff,
             ),
             (
                 "deadlines_poll_interval",
-                "KRAKEN_DEADLINES_POLL_INTERVAL_MS",
+                "SNODRA_DEADLINES_POLL_INTERVAL_MS",
                 self.deadlines_poll_interval,
             ),
             (
                 "deadlines_lease",
-                "KRAKEN_DEADLINES_LEASE_MS",
+                "SNODRA_DEADLINES_LEASE_MS",
                 self.deadlines_lease,
             ),
             (
                 "external_calls_lease",
-                "KRAKEN_EXTERNAL_CALLS_LEASE_MS",
+                "SNODRA_EXTERNAL_CALLS_LEASE_MS",
                 self.external_calls_lease,
             ),
         ] {
@@ -783,27 +788,27 @@ impl Config {
         for (field, env, value) in [
             (
                 "sagas_ended_retention",
-                "KRAKEN_SAGAS_ENDED_RETENTION_MS",
+                "SNODRA_SAGAS_ENDED_RETENTION_MS",
                 self.sagas_ended_retention,
             ),
             (
                 "sagas_dispatch_retention",
-                "KRAKEN_SAGAS_DISPATCH_RETENTION_MS",
+                "SNODRA_SAGAS_DISPATCH_RETENTION_MS",
                 self.sagas_dispatch_retention,
             ),
             (
                 "sagas_failed_retention",
-                "KRAKEN_SAGAS_FAILED_RETENTION_MS",
+                "SNODRA_SAGAS_FAILED_RETENTION_MS",
                 self.sagas_failed_retention,
             ),
             (
                 "deadlines_retention",
-                "KRAKEN_DEADLINES_RETENTION_MS",
+                "SNODRA_DEADLINES_RETENTION_MS",
                 self.deadlines_retention,
             ),
             (
                 "external_calls_retention",
-                "KRAKEN_EXTERNAL_CALLS_RETENTION_MS",
+                "SNODRA_EXTERNAL_CALLS_RETENTION_MS",
                 self.external_calls_retention,
             ),
         ] {
@@ -815,7 +820,7 @@ impl Config {
         }
         if self.sagas_relay_initial_backoff > self.sagas_relay_max_backoff {
             return invalid(format!(
-                "sagas_relay_initial_backoff (KRAKEN_SAGAS_RELAY_INITIAL_BACKOFF_MS, {:?}) must not exceed sagas_relay_max_backoff (KRAKEN_SAGAS_RELAY_MAX_BACKOFF_MS, {:?})",
+                "sagas_relay_initial_backoff (SNODRA_SAGAS_RELAY_INITIAL_BACKOFF_MS, {:?}) must not exceed sagas_relay_max_backoff (SNODRA_SAGAS_RELAY_MAX_BACKOFF_MS, {:?})",
                 self.sagas_relay_initial_backoff, self.sagas_relay_max_backoff
             ));
         }
@@ -831,16 +836,16 @@ impl Config {
         let invalid = |m: String| Err(MessagingError::InvalidMessage(m));
         let (Some(cert), Some(key)) = (&tls.client_cert_file, &tls.client_key_file) else {
             return invalid(if tls.client_cert_file.is_none() {
-                "hub_tls.client_key_file (KRAKEN_HUB_TLS_CLIENT_KEY) is set without hub_tls.client_cert_file (KRAKEN_HUB_TLS_CLIENT_CERT): set both or neither".into()
+                "hub_tls.client_key_file (SNODRA_SERVER_TLS_CLIENT_KEY) is set without hub_tls.client_cert_file (SNODRA_SERVER_TLS_CLIENT_CERT): set both or neither".into()
             } else {
-                "hub_tls.client_cert_file (KRAKEN_HUB_TLS_CLIENT_CERT) is set without hub_tls.client_key_file (KRAKEN_HUB_TLS_CLIENT_KEY): set both or neither".into()
+                "hub_tls.client_cert_file (SNODRA_SERVER_TLS_CLIENT_CERT) is set without hub_tls.client_key_file (SNODRA_SERVER_TLS_CLIENT_KEY): set both or neither".into()
             });
         };
         if self.hub_token.as_ref().is_some_and(|t| !t.is_blank()) || self.hub_token_file.is_some() {
-            return invalid("a client certificate (hub_tls.client_cert_file, KRAKEN_HUB_TLS_CLIENT_CERT) and a static hub token (hub_token / hub_token_file, KRAKEN_HUB_TOKEN / KRAKEN_HUB_TOKEN_FILE) are both set: use one credential".into());
+            return invalid("a client certificate (hub_tls.client_cert_file, SNODRA_SERVER_TLS_CLIENT_CERT) and a static hub token (hub_token / hub_token_file, SNODRA_SERVER_TOKEN / SNODRA_SERVER_TOKEN_FILE) are both set: use one credential".into());
         }
         if self.hub_oauth2.is_some() {
-            return invalid("a client certificate (hub_tls.client_cert_file, KRAKEN_HUB_TLS_CLIENT_CERT) and hub_oauth2 (KRAKEN_HUB_OAUTH2_TOKEN_URI) are both set: use one credential".into());
+            return invalid("a client certificate (hub_tls.client_cert_file, SNODRA_SERVER_TLS_CLIENT_CERT) and hub_oauth2 (SNODRA_SERVER_OAUTH2_TOKEN_URI) are both set: use one credential".into());
         }
         let invalid = |e: crate::hub::LoadError| MessagingError::InvalidMessage(e.to_string());
         let identity =
@@ -851,19 +856,19 @@ impl Config {
     fn validate_oauth2(&self, oauth2: &HubOAuth2) -> Result<(), MessagingError> {
         let invalid = |m: String| Err(MessagingError::InvalidMessage(m));
         if self.hub_token.as_ref().is_some_and(|t| !t.is_blank()) || self.hub_token_file.is_some() {
-            return invalid("hub_oauth2 (KRAKEN_HUB_OAUTH2_TOKEN_URI) and a static hub token (hub_token / hub_token_file, KRAKEN_HUB_TOKEN / KRAKEN_HUB_TOKEN_FILE) are both set: use one".into());
+            return invalid("hub_oauth2 (SNODRA_SERVER_OAUTH2_TOKEN_URI) and a static hub token (hub_token / hub_token_file, SNODRA_SERVER_TOKEN / SNODRA_SERVER_TOKEN_FILE) are both set: use one".into());
         }
         let scheme_ok = reqwest::Url::parse(oauth2.token_uri.trim())
             .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some());
         if !scheme_ok {
             return invalid(format!(
-                "hub_oauth2.token_uri (KRAKEN_HUB_OAUTH2_TOKEN_URI) must be an http:// or https:// URL, got '{}'",
+                "hub_oauth2.token_uri (SNODRA_SERVER_OAUTH2_TOKEN_URI) must be an http:// or https:// URL, got '{}'",
                 oauth2.token_uri
             ));
         }
         if oauth2.client_id.trim().is_empty() {
             return invalid(
-                "hub_oauth2.client_id (KRAKEN_HUB_OAUTH2_CLIENT_ID) must not be empty".into(),
+                "hub_oauth2.client_id (SNODRA_SERVER_OAUTH2_CLIENT_ID) must not be empty".into(),
             );
         }
         let inline = oauth2.client_secret.as_ref().is_some_and(|s| !s.is_blank());
@@ -871,26 +876,26 @@ impl Config {
             Some(path) => {
                 let secret = crate::security::read_token_file(path).map_err(|e| {
                     MessagingError::InvalidMessage(format!(
-                        "hub_oauth2.client_secret_file (KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE) '{}' cannot be read: {e}",
+                        "hub_oauth2.client_secret_file (SNODRA_SERVER_OAUTH2_CLIENT_SECRET_FILE) '{}' cannot be read: {e}",
                         path.display()
                     ))
                 })?;
                 if secret.is_none() {
                     return invalid(format!(
-                        "hub_oauth2.client_secret_file (KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE) '{}' is empty",
+                        "hub_oauth2.client_secret_file (SNODRA_SERVER_OAUTH2_CLIENT_SECRET_FILE) '{}' is empty",
                         path.display()
                     ));
                 }
             }
             None if !inline => {
-                return invalid("hub_oauth2 needs a client secret: set hub_oauth2.client_secret (KRAKEN_HUB_OAUTH2_CLIENT_SECRET) or hub_oauth2.client_secret_file (KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE)".into());
+                return invalid("hub_oauth2 needs a client secret: set hub_oauth2.client_secret (SNODRA_SERVER_OAUTH2_CLIENT_SECRET) or hub_oauth2.client_secret_file (SNODRA_SERVER_OAUTH2_CLIENT_SECRET_FILE)".into());
             }
             None => {}
         }
         if let Some(ca) = &oauth2.ca_file {
             crate::hub::read_ca_file(ca).map_err(|e| {
                 MessagingError::InvalidMessage(format!(
-                    "hub_oauth2.ca_file (KRAKEN_HUB_OAUTH2_CA) '{}': {e}",
+                    "hub_oauth2.ca_file (SNODRA_SERVER_OAUTH2_CA) '{}': {e}",
                     ca.display()
                 ))
             })?;
@@ -939,17 +944,17 @@ fn pairs<T>(
 /// Settings the library read before the event store became an add-on (ADR 0027), each with what
 /// replaced it. They are not read (no alias before v1), and one still set fails
 /// [`Config::from_env`] ([`removed_settings`]): ignored, a source or a mode would misroute events.
-/// `KRAKEN_MONGODB_URI`, also no longer read, is not here: a service may keep it for its own
+/// `SNODRA_MONGODB_URI`, also no longer read, is not here: a service may keep it for its own
 /// MongoDB client.
 const REMOVED_SETTINGS: [(&str, &str); 3] = [
-    ("KRAKEN_KAFKA_TOPIC", "KRAKEN_EVENTS_SOURCE"),
+    ("SNODRA_KAFKA_TOPIC", "SNODRA_EVENTS_SOURCE"),
     (
-        "KRAKEN_KAFKA_DEAD_LETTER_MODE",
-        "KRAKEN_EVENTS_DEAD_LETTER_MODE, where `topic` is now `event-store`",
+        "SNODRA_KAFKA_DEAD_LETTER_MODE",
+        "SNODRA_EVENTS_DEAD_LETTER_MODE, where `topic` is now `event-store`",
     ),
     (
-        "KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS",
-        "KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS",
+        "SNODRA_KAFKA_DEAD_LETTER_RETENTION_MS",
+        "SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS",
     ),
 ];
 
@@ -990,7 +995,7 @@ mod tests {
     }
 
     fn try_from(vars: &[(&str, &str)]) -> Result<Config, MessagingError> {
-        let vars: Vec<(String, String)> = [("KRAKEN_SERVICE_NAME", "svc")]
+        let vars: Vec<(String, String)> = [("SNODRA_SERVICE_NAME", "svc")]
             .iter()
             .chain(vars)
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1014,7 +1019,7 @@ mod tests {
         assert_ne!(a.instance_id, b.instance_id, "one per Config");
         uuid::Uuid::parse_str(&from(&[]).instance_id).expect("a UUID from the environment too");
         assert_eq!(
-            from(&[("KRAKEN_INSTANCE_ID", "pod-7")]).instance_id,
+            from(&[("SNODRA_INSTANCE_ID", "pod-7")]).instance_id,
             "pod-7"
         );
         let mut c = code_config();
@@ -1026,11 +1031,11 @@ mod tests {
     fn zero_request_timeout_means_unset() {
         assert_eq!(from(&[]).hub_request_timeout, None);
         assert_eq!(
-            from(&[("KRAKEN_HUB_REQUEST_TIMEOUT_MS", "0")]).hub_request_timeout,
+            from(&[("SNODRA_SERVER_REQUEST_TIMEOUT_MS", "0")]).hub_request_timeout,
             None
         );
         assert_eq!(
-            from(&[("KRAKEN_HUB_REQUEST_TIMEOUT_MS", "2500")]).hub_request_timeout,
+            from(&[("SNODRA_SERVER_REQUEST_TIMEOUT_MS", "2500")]).hub_request_timeout,
             Some(Duration::from_millis(2500))
         );
     }
@@ -1046,13 +1051,13 @@ mod tests {
             Duration::from_secs(600)
         );
         assert_eq!(
-            from(&[("KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS", "2500")]).hub_stream_credit_timeout,
+            from(&[("SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS", "2500")]).hub_stream_credit_timeout,
             Duration::from_millis(2500)
         );
-        let e = try_from(&[("KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS", "0")]).unwrap_err();
+        let e = try_from(&[("SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS", "0")]).unwrap_err();
         assert!(
             e.to_string()
-                .contains("KRAKEN_HUB_STREAM_CREDIT_TIMEOUT_MS"),
+                .contains("SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS"),
             "{e}"
         );
         let mut c = code_config();
@@ -1065,13 +1070,13 @@ mod tests {
         assert_eq!(code_config().hub_max_subscriptions, 1024);
         assert_eq!(from(&[]).hub_max_subscriptions, 1024);
         assert_eq!(
-            from(&[("KRAKEN_HUB_MAX_SUBSCRIPTIONS", "5")]).hub_max_subscriptions,
+            from(&[("SNODRA_SERVER_MAX_SUBSCRIPTIONS", "5")]).hub_max_subscriptions,
             5
         );
         for value in ["0", "-1", "many"] {
-            let e = try_from(&[("KRAKEN_HUB_MAX_SUBSCRIPTIONS", value)]).unwrap_err();
+            let e = try_from(&[("SNODRA_SERVER_MAX_SUBSCRIPTIONS", value)]).unwrap_err();
             assert!(
-                e.to_string().contains("KRAKEN_HUB_MAX_SUBSCRIPTIONS"),
+                e.to_string().contains("SNODRA_SERVER_MAX_SUBSCRIPTIONS"),
                 "{value}: {e}"
             );
         }
@@ -1089,11 +1094,11 @@ mod tests {
         assert_eq!(c.hub_retry, None, "no retry unless configured");
         assert_eq!(from(&[]).hub_retry, None);
         assert_eq!(
-            from(&[("KRAKEN_HUB_RETRY_ENABLED", "false")]).hub_retry,
+            from(&[("SNODRA_SERVER_RETRY_ENABLED", "false")]).hub_retry,
             None
         );
         assert_eq!(
-            from(&[("KRAKEN_HUB_RETRY_ENABLED", "true")]).hub_retry,
+            from(&[("SNODRA_SERVER_RETRY_ENABLED", "true")]).hub_retry,
             Some(RetryPolicy::default()),
             "enabled alone: 3 attempts, 100 ms doubling to 2 s"
         );
@@ -1102,14 +1107,17 @@ mod tests {
     #[test]
     fn flow_control_routing_and_retry_from_env() {
         let c = from(&[
-            ("KRAKEN_HUB_LOAD_FACTOR", "250"),
-            ("KRAKEN_HUB_TAGS", " zone=eu-1 , tier = gold,"),
-            ("KRAKEN_HUB_PRIORITIES", "orders.Cancel=10,reports.Build=-5"),
-            ("KRAKEN_HUB_RETRY_ENABLED", "true"),
-            ("KRAKEN_HUB_RETRY_MAX_ATTEMPTS", "5"),
-            ("KRAKEN_HUB_RETRY_INITIAL_BACKOFF_MS", "50"),
-            ("KRAKEN_HUB_RETRY_MULTIPLIER", "1.5"),
-            ("KRAKEN_HUB_RETRY_MAX_BACKOFF_MS", "800"),
+            ("SNODRA_SERVER_LOAD_FACTOR", "250"),
+            ("SNODRA_SERVER_TAGS", " zone=eu-1 , tier = gold,"),
+            (
+                "SNODRA_SERVER_PRIORITIES",
+                "orders.Cancel=10,reports.Build=-5",
+            ),
+            ("SNODRA_SERVER_RETRY_ENABLED", "true"),
+            ("SNODRA_SERVER_RETRY_MAX_ATTEMPTS", "5"),
+            ("SNODRA_SERVER_RETRY_INITIAL_BACKOFF_MS", "50"),
+            ("SNODRA_SERVER_RETRY_MULTIPLIER", "1.5"),
+            ("SNODRA_SERVER_RETRY_MAX_BACKOFF_MS", "800"),
         ]);
         assert_eq!(c.hub_load_factor, 250);
         assert_eq!(
@@ -1141,25 +1149,25 @@ mod tests {
     fn zero_retry_attempts_or_a_bad_multiplier_are_rejected_enabled_or_not() {
         for enabled in [None, Some("false"), Some("true")] {
             for (name, value) in [
-                ("KRAKEN_HUB_RETRY_MAX_ATTEMPTS", "0"),
-                ("KRAKEN_HUB_RETRY_MULTIPLIER", "0.5"),
-                ("KRAKEN_HUB_RETRY_MULTIPLIER", "NaN"),
-                ("KRAKEN_HUB_RETRY_MULTIPLIER", "inf"),
-                ("KRAKEN_HUB_RETRY_MULTIPLIER", "-2"),
+                ("SNODRA_SERVER_RETRY_MAX_ATTEMPTS", "0"),
+                ("SNODRA_SERVER_RETRY_MULTIPLIER", "0.5"),
+                ("SNODRA_SERVER_RETRY_MULTIPLIER", "NaN"),
+                ("SNODRA_SERVER_RETRY_MULTIPLIER", "inf"),
+                ("SNODRA_SERVER_RETRY_MULTIPLIER", "-2"),
             ] {
                 let mut vars = vec![(name, value)];
-                vars.extend(enabled.map(|e| ("KRAKEN_HUB_RETRY_ENABLED", e)));
+                vars.extend(enabled.map(|e| ("SNODRA_SERVER_RETRY_ENABLED", e)));
                 let result = try_from(&vars);
                 assert!(
                     matches!(result, Err(MessagingError::InvalidMessage(ref m)) if m.contains(name)),
-                    "{name}={value} with KRAKEN_HUB_RETRY_ENABLED={enabled:?}: {result:?}"
+                    "{name}={value} with SNODRA_SERVER_RETRY_ENABLED={enabled:?}: {result:?}"
                 );
             }
         }
         // One attempt is valid: a configured policy that never retries.
         let one = from(&[
-            ("KRAKEN_HUB_RETRY_ENABLED", "true"),
-            ("KRAKEN_HUB_RETRY_MAX_ATTEMPTS", "1"),
+            ("SNODRA_SERVER_RETRY_ENABLED", "true"),
+            ("SNODRA_SERVER_RETRY_MAX_ATTEMPTS", "1"),
         ]);
         assert_eq!(one.hub_retry.map(|p| p.max_attempts), Some(1));
     }
@@ -1199,13 +1207,13 @@ mod tests {
     #[test]
     fn malformed_maps_are_rejected() {
         for (name, value) in [
-            ("KRAKEN_HUB_TAGS", "zone"),
-            ("KRAKEN_HUB_TAGS", "=x"),
-            ("KRAKEN_HUB_PRIORITIES", "t.X=high"),
-            ("KRAKEN_HUB_RETRY_MULTIPLIER", "fast"),
+            ("SNODRA_SERVER_TAGS", "zone"),
+            ("SNODRA_SERVER_TAGS", "=x"),
+            ("SNODRA_SERVER_PRIORITIES", "t.X=high"),
+            ("SNODRA_SERVER_RETRY_MULTIPLIER", "fast"),
         ] {
             let vars = [
-                ("KRAKEN_SERVICE_NAME".to_string(), "svc".to_string()),
+                ("SNODRA_SERVICE_NAME".to_string(), "svc".to_string()),
                 (name.to_string(), value.to_string()),
             ];
             let result =
@@ -1218,8 +1226,8 @@ mod tests {
     fn the_reconnect_backoff_must_have_a_positive_max_not_below_the_min() {
         for (min, max) in [("500", "0"), ("6000", "5000"), ("0", "0")] {
             let result = try_from(&[
-                ("KRAKEN_RECONNECT_BACKOFF_MIN_MS", min),
-                ("KRAKEN_RECONNECT_BACKOFF_MAX_MS", max),
+                ("SNODRA_RECONNECT_BACKOFF_MIN_MS", min),
+                ("SNODRA_RECONNECT_BACKOFF_MAX_MS", max),
             ]);
             assert!(
                 matches!(result, Err(MessagingError::InvalidMessage(ref m)) if m.contains("reconnect_backoff_max")),
@@ -1241,8 +1249,8 @@ mod tests {
             );
         }
         let c = from(&[
-            ("KRAKEN_RECONNECT_BACKOFF_MIN_MS", "1000"),
-            ("KRAKEN_RECONNECT_BACKOFF_MAX_MS", "1000"),
+            ("SNODRA_RECONNECT_BACKOFF_MIN_MS", "1000"),
+            ("SNODRA_RECONNECT_BACKOFF_MAX_MS", "1000"),
         ]);
         assert_eq!(c.reconnect_backoff_max, Duration::from_secs(1));
         assert!(code_config().validate().is_ok());
@@ -1252,8 +1260,8 @@ mod tests {
     fn a_zero_reconnect_backoff_min_is_rejected() {
         // 0 doubles to 0 forever: the same hot loop as a zero max.
         let result = try_from(&[
-            ("KRAKEN_RECONNECT_BACKOFF_MIN_MS", "0"),
-            ("KRAKEN_RECONNECT_BACKOFF_MAX_MS", "5000"),
+            ("SNODRA_RECONNECT_BACKOFF_MIN_MS", "0"),
+            ("SNODRA_RECONNECT_BACKOFF_MAX_MS", "5000"),
         ]);
         assert!(
             matches!(result, Err(MessagingError::InvalidMessage(ref m)) if m.contains("reconnect_backoff_min")),
@@ -1267,13 +1275,13 @@ mod tests {
             matches!(in_code.validate(), Err(MessagingError::InvalidMessage(ref m)) if m.contains("reconnect_backoff_min")),
             "min 0 accepted"
         );
-        let one = from(&[("KRAKEN_RECONNECT_BACKOFF_MIN_MS", "1")]);
+        let one = from(&[("SNODRA_RECONNECT_BACKOFF_MIN_MS", "1")]);
         assert_eq!(one.reconnect_backoff_min, Duration::from_millis(1));
     }
 
     #[test]
     fn zero_concurrent_handlers_are_rejected() {
-        let result = try_from(&[("KRAKEN_MAX_CONCURRENT_HANDLERS", "0")]);
+        let result = try_from(&[("SNODRA_MAX_CONCURRENT_HANDLERS", "0")]);
         assert!(
             matches!(result, Err(MessagingError::InvalidMessage(ref m)) if m.contains("max_concurrent_handlers")),
             "{result:?}"
@@ -1287,7 +1295,7 @@ mod tests {
             "max_concurrent_handlers 0 accepted"
         );
         assert_eq!(
-            from(&[("KRAKEN_MAX_CONCURRENT_HANDLERS", "1")]).max_concurrent_handlers,
+            from(&[("SNODRA_MAX_CONCURRENT_HANDLERS", "1")]).max_concurrent_handlers,
             1
         );
     }
@@ -1295,37 +1303,43 @@ mod tests {
     #[test]
     fn a_negative_load_factor_is_rejected_and_zero_is_kept_for_the_hub() {
         for value in ["-1", "-100"] {
-            let result = try_from(&[("KRAKEN_HUB_LOAD_FACTOR", value)]);
+            let result = try_from(&[("SNODRA_SERVER_LOAD_FACTOR", value)]);
             assert!(
-                matches!(result, Err(MessagingError::InvalidMessage(ref m)) if m.contains("KRAKEN_HUB_LOAD_FACTOR")),
+                matches!(result, Err(MessagingError::InvalidMessage(ref m)) if m.contains("SNODRA_SERVER_LOAD_FACTOR")),
                 "{value}: {result:?}"
             );
         }
         // 0 is sent as is; the hub reads it as 100.
-        assert_eq!(from(&[("KRAKEN_HUB_LOAD_FACTOR", "0")]).hub_load_factor, 0);
+        assert_eq!(
+            from(&[("SNODRA_SERVER_LOAD_FACTOR", "0")]).hub_load_factor,
+            0
+        );
     }
 
     #[test]
     fn hub_address_takes_a_list_or_a_dns_name_and_a_status_interval() {
         let c = from(&[]);
-        assert_eq!(c.hub_address, "static://kraken-hub:7000");
+        assert_eq!(c.hub_address, "static://snodra-server:7000");
         assert_eq!(c.hub_status_interval, Duration::from_secs(5));
         let c = from(&[
-            ("KRAKEN_HUB_ADDRESS", "static://hub:7000,hub-2:7000"),
-            ("KRAKEN_HUB_STATUS_INTERVAL_MS", "2500"),
+            ("SNODRA_SERVER_ADDRESS", "static://hub:7000,hub-2:7000"),
+            ("SNODRA_SERVER_STATUS_INTERVAL_MS", "2500"),
         ]);
         assert_eq!(c.hub_address, "static://hub:7000,hub-2:7000");
         assert_eq!(c.hub_status_interval, Duration::from_millis(2500));
         assert_eq!(
-            from(&[("KRAKEN_HUB_ADDRESS", "dns:///kraken-hub:7000")]).hub_address,
-            "dns:///kraken-hub:7000"
+            from(&[("SNODRA_SERVER_ADDRESS", "dns:///snodra-server:7000")]).hub_address,
+            "dns:///snodra-server:7000"
         );
         for (name, value) in [
-            ("KRAKEN_HUB_ADDRESS", "dns:///kraken-hub"),
-            ("KRAKEN_HUB_ADDRESS", "hub:7000,dns:///kraken-hub:7000"),
-            ("KRAKEN_HUB_ADDRESS", ","),
-            ("KRAKEN_HUB_STATUS_INTERVAL_MS", "0"),
-            ("KRAKEN_HUB_STATUS_INTERVAL_MS", "soon"),
+            ("SNODRA_SERVER_ADDRESS", "dns:///snodra-server"),
+            (
+                "SNODRA_SERVER_ADDRESS",
+                "hub:7000,dns:///snodra-server:7000",
+            ),
+            ("SNODRA_SERVER_ADDRESS", ","),
+            ("SNODRA_SERVER_STATUS_INTERVAL_MS", "0"),
+            ("SNODRA_SERVER_STATUS_INTERVAL_MS", "soon"),
         ] {
             let result = try_from(&[(name, value)]);
             assert!(
@@ -1351,7 +1365,7 @@ mod tests {
     }
 
     fn secret_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kraken-cfg-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("snodra-cfg-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1359,8 +1373,8 @@ mod tests {
     #[test]
     fn the_token_comes_from_the_environment_and_never_prints() {
         assert!(from(&[]).hub_token.is_none());
-        assert!(from(&[("KRAKEN_HUB_TOKEN", "  ")]).hub_token.is_none());
-        let c = from(&[("KRAKEN_HUB_TOKEN", "s3cr3t-token-value\n")]);
+        assert!(from(&[("SNODRA_SERVER_TOKEN", "  ")]).hub_token.is_none());
+        let c = from(&[("SNODRA_SERVER_TOKEN", "s3cr3t-token-value\n")]);
         assert_eq!(c.hub_token.as_ref().unwrap().expose(), "s3cr3t-token-value");
         for printed in [format!("{c:?}"), format!("{c:#?}")] {
             assert!(!printed.contains("s3cr3t-token-value"), "{printed}");
@@ -1372,13 +1386,13 @@ mod tests {
     fn the_token_file_is_read_by_validate_and_may_be_missing_only_if_unset() {
         let dir = secret_dir();
         let path = dir.join("token");
-        let missing = try_from(&[("KRAKEN_HUB_TOKEN_FILE", path.to_str().unwrap())]);
+        let missing = try_from(&[("SNODRA_SERVER_TOKEN_FILE", path.to_str().unwrap())]);
         assert!(
-            matches!(missing, Err(MessagingError::InvalidMessage(ref m)) if m.contains("KRAKEN_HUB_TOKEN_FILE")),
+            matches!(missing, Err(MessagingError::InvalidMessage(ref m)) if m.contains("SNODRA_SERVER_TOKEN_FILE")),
             "{missing:?}"
         );
         std::fs::write(&path, "from-the-file\n").unwrap();
-        let c = from(&[("KRAKEN_HUB_TOKEN_FILE", path.to_str().unwrap())]);
+        let c = from(&[("SNODRA_SERVER_TOKEN_FILE", path.to_str().unwrap())]);
         assert_eq!(c.hub_token_file.as_deref(), Some(path.as_path()));
         assert!(
             c.hub_token.is_none(),
@@ -1396,10 +1410,10 @@ mod tests {
         for (name, content) in [("empty", ""), ("blank", " \n\t\r\n")] {
             let path = dir.join(name);
             std::fs::write(&path, content).unwrap();
-            let refused = try_from(&[("KRAKEN_HUB_TOKEN_FILE", path.to_str().unwrap())]);
+            let refused = try_from(&[("SNODRA_SERVER_TOKEN_FILE", path.to_str().unwrap())]);
             assert!(
                 matches!(&refused, Err(MessagingError::InvalidMessage(m))
-                    if m.contains("KRAKEN_HUB_TOKEN_FILE") && m.contains(path.to_str().unwrap()) && m.contains("empty")),
+                    if m.contains("SNODRA_SERVER_TOKEN_FILE") && m.contains(path.to_str().unwrap()) && m.contains("empty")),
                 "{name}: {refused:?}"
             );
             let mut c = code_config();
@@ -1412,9 +1426,9 @@ mod tests {
     #[test]
     fn tls_is_off_unless_asked_and_its_options_need_it() {
         assert_eq!(from(&[]).hub_tls, None);
-        assert_eq!(from(&[("KRAKEN_HUB_TLS", "false")]).hub_tls, None);
+        assert_eq!(from(&[("SNODRA_SERVER_TLS", "false")]).hub_tls, None);
         assert_eq!(
-            from(&[("KRAKEN_HUB_TLS", "true")]).hub_tls,
+            from(&[("SNODRA_SERVER_TLS", "true")]).hub_tls,
             Some(HubTls::default())
         );
         let dir = secret_dir();
@@ -1425,25 +1439,25 @@ mod tests {
         )
         .unwrap();
         let c = from(&[
-            ("KRAKEN_HUB_TLS", "true"),
-            ("KRAKEN_HUB_TLS_CA", ca.to_str().unwrap()),
-            ("KRAKEN_HUB_TLS_SERVER_NAME", "kraken-hub"),
+            ("SNODRA_SERVER_TLS", "true"),
+            ("SNODRA_SERVER_TLS_CA", ca.to_str().unwrap()),
+            ("SNODRA_SERVER_TLS_SERVER_NAME", "snodra-server"),
         ]);
         assert_eq!(
             c.hub_tls,
             Some(HubTls {
                 ca_file: Some(ca.clone()),
-                server_name: Some("kraken-hub".into()),
+                server_name: Some("snodra-server".into()),
                 ..HubTls::default()
             })
         );
         for vars in [
-            vec![("KRAKEN_HUB_TLS_CA", ca.to_str().unwrap())],
-            vec![("KRAKEN_HUB_TLS_SERVER_NAME", "kraken-hub")],
-            vec![("KRAKEN_HUB_TLS", "maybe")],
+            vec![("SNODRA_SERVER_TLS_CA", ca.to_str().unwrap())],
+            vec![("SNODRA_SERVER_TLS_SERVER_NAME", "snodra-server")],
+            vec![("SNODRA_SERVER_TLS", "maybe")],
             vec![
-                ("KRAKEN_HUB_TLS", "true"),
-                ("KRAKEN_HUB_TLS_CA", "/no/such/ca.pem"),
+                ("SNODRA_SERVER_TLS", "true"),
+                ("SNODRA_SERVER_TLS_CA", "/no/such/ca.pem"),
             ],
         ] {
             assert!(
@@ -1456,8 +1470,8 @@ mod tests {
         std::fs::write(&junk, "not a certificate").unwrap();
         assert!(
             try_from(&[
-                ("KRAKEN_HUB_TLS", "true"),
-                ("KRAKEN_HUB_TLS_CA", junk.to_str().unwrap())
+                ("SNODRA_SERVER_TLS", "true"),
+                ("SNODRA_SERVER_TLS_CA", junk.to_str().unwrap())
             ])
             .is_err()
         );
@@ -1477,15 +1491,18 @@ mod tests {
         assert_eq!(from(&[]).hub_oauth2, None);
         let c = from(&[
             (
-                "KRAKEN_HUB_OAUTH2_TOKEN_URI",
-                "https://idp.example/realms/kraken/protocol/openid-connect/token",
+                "SNODRA_SERVER_OAUTH2_TOKEN_URI",
+                "https://idp.example/realms/snodra/protocol/openid-connect/token",
             ),
-            ("KRAKEN_HUB_OAUTH2_CLIENT_SECRET", " s3cr3t-client-secret\n"),
+            (
+                "SNODRA_SERVER_OAUTH2_CLIENT_SECRET",
+                " s3cr3t-client-secret\n",
+            ),
         ]);
         let o = c.hub_oauth2.as_ref().expect("oauth2 on");
         assert_eq!(
             o.token_uri,
-            "https://idp.example/realms/kraken/protocol/openid-connect/token"
+            "https://idp.example/realms/snodra/protocol/openid-connect/token"
         );
         assert_eq!(
             o.client_id, "svc",
@@ -1516,15 +1533,18 @@ mod tests {
         )
         .unwrap();
         let c = from(&[
-            ("KRAKEN_HUB_OAUTH2_TOKEN_URI", "http://keycloak:8080/token"),
-            ("KRAKEN_HUB_OAUTH2_CLIENT_ID", "orders-service"),
-            ("KRAKEN_HUB_OAUTH2_CLIENT_SECRET", "inline"),
             (
-                "KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE",
+                "SNODRA_SERVER_OAUTH2_TOKEN_URI",
+                "http://keycloak:8080/token",
+            ),
+            ("SNODRA_SERVER_OAUTH2_CLIENT_ID", "orders-service"),
+            ("SNODRA_SERVER_OAUTH2_CLIENT_SECRET", "inline"),
+            (
+                "SNODRA_SERVER_OAUTH2_CLIENT_SECRET_FILE",
                 secret.to_str().unwrap(),
             ),
-            ("KRAKEN_HUB_OAUTH2_SCOPE", "hub orders"),
-            ("KRAKEN_HUB_OAUTH2_CA", ca.to_str().unwrap()),
+            ("SNODRA_SERVER_OAUTH2_SCOPE", "hub orders"),
+            ("SNODRA_SERVER_OAUTH2_CA", ca.to_str().unwrap()),
         ]);
         let o = c.hub_oauth2.unwrap();
         assert_eq!(o.client_id, "orders-service");
@@ -1536,7 +1556,10 @@ mod tests {
 
     #[test]
     fn oauth2_needs_a_secret_a_readable_secret_file_and_an_http_token_uri() {
-        let uri = ("KRAKEN_HUB_OAUTH2_TOKEN_URI", "http://keycloak:8080/token");
+        let uri = (
+            "SNODRA_SERVER_OAUTH2_TOKEN_URI",
+            "http://keycloak:8080/token",
+        );
         let mentions = |vars: &[(&str, &str)], text: &str| {
             let r = try_from(vars);
             assert!(
@@ -1544,72 +1567,75 @@ mod tests {
                 "{vars:?}: {r:?}"
             );
         };
-        mentions(&[uri], "KRAKEN_HUB_OAUTH2_CLIENT_SECRET");
+        mentions(&[uri], "SNODRA_SERVER_OAUTH2_CLIENT_SECRET");
         mentions(
-            &[uri, ("KRAKEN_HUB_OAUTH2_CLIENT_SECRET", "  ")],
-            "KRAKEN_HUB_OAUTH2_CLIENT_SECRET",
+            &[uri, ("SNODRA_SERVER_OAUTH2_CLIENT_SECRET", "  ")],
+            "SNODRA_SERVER_OAUTH2_CLIENT_SECRET",
         );
         mentions(
             &[
                 uri,
-                ("KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE", "/no/such/secret"),
+                ("SNODRA_SERVER_OAUTH2_CLIENT_SECRET_FILE", "/no/such/secret"),
             ],
-            "KRAKEN_HUB_OAUTH2_CLIENT_SECRET_FILE",
+            "SNODRA_SERVER_OAUTH2_CLIENT_SECRET_FILE",
         );
         mentions(
             &[
-                ("KRAKEN_HUB_OAUTH2_TOKEN_URI", "ftp://keycloak/token"),
-                ("KRAKEN_HUB_OAUTH2_CLIENT_SECRET", "x"),
+                ("SNODRA_SERVER_OAUTH2_TOKEN_URI", "ftp://keycloak/token"),
+                ("SNODRA_SERVER_OAUTH2_CLIENT_SECRET", "x"),
             ],
-            "KRAKEN_HUB_OAUTH2_TOKEN_URI",
+            "SNODRA_SERVER_OAUTH2_TOKEN_URI",
         );
         mentions(
             &[
-                ("KRAKEN_HUB_OAUTH2_TOKEN_URI", "not a uri"),
-                ("KRAKEN_HUB_OAUTH2_CLIENT_SECRET", "x"),
+                ("SNODRA_SERVER_OAUTH2_TOKEN_URI", "not a uri"),
+                ("SNODRA_SERVER_OAUTH2_CLIENT_SECRET", "x"),
             ],
-            "KRAKEN_HUB_OAUTH2_TOKEN_URI",
+            "SNODRA_SERVER_OAUTH2_TOKEN_URI",
         );
         mentions(
             &[
                 uri,
-                ("KRAKEN_HUB_OAUTH2_CLIENT_SECRET", "x"),
-                ("KRAKEN_HUB_OAUTH2_CA", "/no/such/ca.pem"),
+                ("SNODRA_SERVER_OAUTH2_CLIENT_SECRET", "x"),
+                ("SNODRA_SERVER_OAUTH2_CA", "/no/such/ca.pem"),
             ],
-            "KRAKEN_HUB_OAUTH2_CA",
+            "SNODRA_SERVER_OAUTH2_CA",
         );
         // The other variables mean nothing without the token URI: a typo must not pass silently.
         mentions(
-            &[("KRAKEN_HUB_OAUTH2_CLIENT_SECRET", "x")],
-            "KRAKEN_HUB_OAUTH2_TOKEN_URI",
+            &[("SNODRA_SERVER_OAUTH2_CLIENT_SECRET", "x")],
+            "SNODRA_SERVER_OAUTH2_TOKEN_URI",
         );
     }
 
     #[test]
     fn oauth2_and_a_static_hub_token_together_are_a_startup_error_naming_both() {
         let oauth2 = [
-            ("KRAKEN_HUB_OAUTH2_TOKEN_URI", "http://keycloak:8080/token"),
-            ("KRAKEN_HUB_OAUTH2_CLIENT_SECRET", "x"),
+            (
+                "SNODRA_SERVER_OAUTH2_TOKEN_URI",
+                "http://keycloak:8080/token",
+            ),
+            ("SNODRA_SERVER_OAUTH2_CLIENT_SECRET", "x"),
         ];
         let dir = secret_dir();
         let file = dir.join("token");
         std::fs::write(&file, "tok\n").unwrap();
         for (name, value) in [
-            ("KRAKEN_HUB_TOKEN", "a-static-token"),
-            ("KRAKEN_HUB_TOKEN_FILE", file.to_str().unwrap()),
+            ("SNODRA_SERVER_TOKEN", "a-static-token"),
+            ("SNODRA_SERVER_TOKEN_FILE", file.to_str().unwrap()),
         ] {
             let mut vars = oauth2.to_vec();
             vars.push((name, value));
             let r = try_from(&vars);
             assert!(
                 matches!(r, Err(MessagingError::InvalidMessage(ref m))
-                    if m.contains("KRAKEN_HUB_OAUTH2_TOKEN_URI") && m.contains(name)),
+                    if m.contains("SNODRA_SERVER_OAUTH2_TOKEN_URI") && m.contains(name)),
                 "{name}: {r:?}"
             );
         }
         // A blank static token is no token (as everywhere else).
         let mut vars = oauth2.to_vec();
-        vars.push(("KRAKEN_HUB_TOKEN", " "));
+        vars.push(("SNODRA_SERVER_TOKEN", " "));
         assert!(try_from(&vars).is_ok());
         // Set in code, the same.
         let mut c = from(&oauth2);
@@ -1635,8 +1661,8 @@ mod tests {
     fn a_client_certificate_turns_tls_on_and_needs_both_files() {
         let (_dir, cert, key) = cert_pair("svc");
         let c = from(&[
-            ("KRAKEN_HUB_TLS_CLIENT_CERT", &cert),
-            ("KRAKEN_HUB_TLS_CLIENT_KEY", &key),
+            ("SNODRA_SERVER_TLS_CLIENT_CERT", &cert),
+            ("SNODRA_SERVER_TLS_CLIENT_KEY", &key),
         ]);
         assert_eq!(
             c.hub_tls,
@@ -1648,23 +1674,23 @@ mod tests {
         );
         // The other TLS settings stay as they were.
         let c = from(&[
-            ("KRAKEN_HUB_TLS", "true"),
-            ("KRAKEN_HUB_TLS_SERVER_NAME", "kraken-hub"),
-            ("KRAKEN_HUB_TLS_CLIENT_CERT", &cert),
-            ("KRAKEN_HUB_TLS_CLIENT_KEY", &key),
+            ("SNODRA_SERVER_TLS", "true"),
+            ("SNODRA_SERVER_TLS_SERVER_NAME", "snodra-server"),
+            ("SNODRA_SERVER_TLS_CLIENT_CERT", &cert),
+            ("SNODRA_SERVER_TLS_CLIENT_KEY", &key),
         ]);
         let tls = c.hub_tls.unwrap();
-        assert_eq!(tls.server_name.as_deref(), Some("kraken-hub"));
+        assert_eq!(tls.server_name.as_deref(), Some("snodra-server"));
         assert!(tls.client_cert_file.is_some() && tls.client_key_file.is_some());
         // One alone names the one that is missing.
         for (vars, missing) in [
             (
-                vec![("KRAKEN_HUB_TLS_CLIENT_CERT", cert.as_str())],
-                "KRAKEN_HUB_TLS_CLIENT_KEY",
+                vec![("SNODRA_SERVER_TLS_CLIENT_CERT", cert.as_str())],
+                "SNODRA_SERVER_TLS_CLIENT_KEY",
             ),
             (
-                vec![("KRAKEN_HUB_TLS_CLIENT_KEY", key.as_str())],
-                "KRAKEN_HUB_TLS_CLIENT_CERT",
+                vec![("SNODRA_SERVER_TLS_CLIENT_KEY", key.as_str())],
+                "SNODRA_SERVER_TLS_CLIENT_CERT",
             ),
         ] {
             let r = try_from(&vars);
@@ -1675,9 +1701,9 @@ mod tests {
         }
         // Explicitly off while a certificate is set contradicts itself.
         let r = try_from(&[
-            ("KRAKEN_HUB_TLS", "false"),
-            ("KRAKEN_HUB_TLS_CLIENT_CERT", &cert),
-            ("KRAKEN_HUB_TLS_CLIENT_KEY", &key),
+            ("SNODRA_SERVER_TLS", "false"),
+            ("SNODRA_SERVER_TLS_CLIENT_CERT", &cert),
+            ("SNODRA_SERVER_TLS_CLIENT_KEY", &key),
         ]);
         assert!(matches!(r, Err(MessagingError::InvalidMessage(_))), "{r:?}");
         // Set in code, one file alone is the same error.
@@ -1697,16 +1723,19 @@ mod tests {
         let token_file = dir.write("token", "tok\n");
         let token_file = token_file.to_str().unwrap().to_string();
         let certificate = [
-            ("KRAKEN_HUB_TLS_CLIENT_CERT", cert.as_str()),
-            ("KRAKEN_HUB_TLS_CLIENT_KEY", key.as_str()),
+            ("SNODRA_SERVER_TLS_CLIENT_CERT", cert.as_str()),
+            ("SNODRA_SERVER_TLS_CLIENT_KEY", key.as_str()),
         ];
         assert!(try_from(&certificate).is_ok());
         for extra in [
-            vec![("KRAKEN_HUB_TOKEN", "a-static-token")],
-            vec![("KRAKEN_HUB_TOKEN_FILE", token_file.as_str())],
+            vec![("SNODRA_SERVER_TOKEN", "a-static-token")],
+            vec![("SNODRA_SERVER_TOKEN_FILE", token_file.as_str())],
             vec![
-                ("KRAKEN_HUB_OAUTH2_TOKEN_URI", "http://keycloak:8080/token"),
-                ("KRAKEN_HUB_OAUTH2_CLIENT_SECRET", "x"),
+                (
+                    "SNODRA_SERVER_OAUTH2_TOKEN_URI",
+                    "http://keycloak:8080/token",
+                ),
+                ("SNODRA_SERVER_OAUTH2_CLIENT_SECRET", "x"),
             ],
         ] {
             let mut vars = certificate.to_vec();
@@ -1714,13 +1743,13 @@ mod tests {
             let r = try_from(&vars);
             assert!(
                 matches!(r, Err(MessagingError::InvalidMessage(ref m))
-                    if m.contains("KRAKEN_HUB_TLS_CLIENT_CERT") && m.contains(extra[0].0)),
+                    if m.contains("SNODRA_SERVER_TLS_CLIENT_CERT") && m.contains(extra[0].0)),
                 "{extra:?}: {r:?}"
             );
         }
         // A blank static token is no token.
         let mut vars = certificate.to_vec();
-        vars.push(("KRAKEN_HUB_TOKEN", " "));
+        vars.push(("SNODRA_SERVER_TOKEN", " "));
         assert!(try_from(&vars).is_ok());
         // Set in code, the same.
         let mut c = from(&certificate);
@@ -1734,8 +1763,8 @@ mod tests {
         use crate::hub::test_pki::{Spec, issue};
         let vars = |cert: &std::path::Path, key: &std::path::Path| {
             try_from(&[
-                ("KRAKEN_HUB_TLS_CLIENT_CERT", cert.to_str().unwrap()),
-                ("KRAKEN_HUB_TLS_CLIENT_KEY", key.to_str().unwrap()),
+                ("SNODRA_SERVER_TLS_CLIENT_CERT", cert.to_str().unwrap()),
+                ("SNODRA_SERVER_TLS_CLIENT_KEY", key.to_str().unwrap()),
             ])
         };
         let mentions = |r: Result<Config, MessagingError>, parts: &[&str]| {
@@ -1769,7 +1798,7 @@ mod tests {
             dir.write("c2.pem", &dns_only.cert_pem),
             dir.write("k2.pem", &dns_only.key_pem),
         );
-        mentions(vars(&c, &k), &["kraken://service/"]);
+        mentions(vars(&c, &k), &["snodra://service/"]);
         let orders = issue(&Spec::service("orders"));
         let (c, k) = (
             dir.write("c3.pem", &orders.cert_pem),
@@ -1824,21 +1853,21 @@ mod tests {
     #[test]
     fn every_saga_variable_is_read() {
         let c = from(&[
-            ("KRAKEN_SAGAS_ENABLED", "false"),
-            ("KRAKEN_SAGAS_MAX_ATTEMPTS", "7"),
-            ("KRAKEN_SAGAS_ENDED_RETENTION_MS", "86400000"),
-            ("KRAKEN_SAGAS_DISPATCH_RETENTION_MS", "3600000"),
-            ("KRAKEN_SAGAS_FAILED_RETENTION_MS", "172800000"),
-            ("KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS", "250"),
-            ("KRAKEN_SAGAS_RELAY_LEASE_MS", "10000"),
-            ("KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS", "4"),
-            ("KRAKEN_SAGAS_RELAY_INITIAL_BACKOFF_MS", "100"),
-            ("KRAKEN_SAGAS_RELAY_MAX_BACKOFF_MS", "2000"),
-            ("KRAKEN_DEADLINES_POLL_INTERVAL_MS", "300"),
-            ("KRAKEN_DEADLINES_LEASE_MS", "6000"),
-            ("KRAKEN_DEADLINES_RETENTION_MS", "7200000"),
-            ("KRAKEN_EXTERNAL_CALLS_LEASE_MS", "60000"),
-            ("KRAKEN_EXTERNAL_CALLS_RETENTION_MS", "1000"),
+            ("SNODRA_SAGAS_ENABLED", "false"),
+            ("SNODRA_SAGAS_MAX_ATTEMPTS", "7"),
+            ("SNODRA_SAGAS_ENDED_RETENTION_MS", "86400000"),
+            ("SNODRA_SAGAS_DISPATCH_RETENTION_MS", "3600000"),
+            ("SNODRA_SAGAS_FAILED_RETENTION_MS", "172800000"),
+            ("SNODRA_SAGAS_RELAY_POLL_INTERVAL_MS", "250"),
+            ("SNODRA_SAGAS_RELAY_LEASE_MS", "10000"),
+            ("SNODRA_SAGAS_RELAY_MAX_ATTEMPTS", "4"),
+            ("SNODRA_SAGAS_RELAY_INITIAL_BACKOFF_MS", "100"),
+            ("SNODRA_SAGAS_RELAY_MAX_BACKOFF_MS", "2000"),
+            ("SNODRA_DEADLINES_POLL_INTERVAL_MS", "300"),
+            ("SNODRA_DEADLINES_LEASE_MS", "6000"),
+            ("SNODRA_DEADLINES_RETENTION_MS", "7200000"),
+            ("SNODRA_EXTERNAL_CALLS_LEASE_MS", "60000"),
+            ("SNODRA_EXTERNAL_CALLS_RETENTION_MS", "1000"),
         ]);
         assert!(!c.sagas_enabled);
         assert_eq!(c.sagas_max_attempts, 7);
@@ -1863,25 +1892,25 @@ mod tests {
     #[test]
     fn invalid_saga_settings_are_rejected_naming_the_variable() {
         for (name, value) in [
-            ("KRAKEN_SAGAS_ENABLED", "maybe"),
-            ("KRAKEN_SAGAS_MAX_ATTEMPTS", "0"),
-            ("KRAKEN_SAGAS_MAX_ATTEMPTS", "five"),
-            ("KRAKEN_SAGAS_MAX_ATTEMPTS", "99999999999"),
-            ("KRAKEN_SAGAS_RELAY_MAX_ATTEMPTS", "0"),
-            ("KRAKEN_SAGAS_ENDED_RETENTION_MS", "999"),
-            ("KRAKEN_SAGAS_DISPATCH_RETENTION_MS", "0"),
-            ("KRAKEN_SAGAS_FAILED_RETENTION_MS", "0"),
-            ("KRAKEN_SAGAS_FAILED_RETENTION_MS", "999"),
-            ("KRAKEN_SAGAS_RELAY_POLL_INTERVAL_MS", "0"),
-            ("KRAKEN_SAGAS_RELAY_LEASE_MS", "0"),
-            ("KRAKEN_SAGAS_RELAY_INITIAL_BACKOFF_MS", "0"),
-            ("KRAKEN_SAGAS_RELAY_INITIAL_BACKOFF_MS", "600000"),
-            ("KRAKEN_SAGAS_RELAY_MAX_BACKOFF_MS", "-1"),
-            ("KRAKEN_DEADLINES_POLL_INTERVAL_MS", "0"),
-            ("KRAKEN_DEADLINES_LEASE_MS", "0"),
-            ("KRAKEN_DEADLINES_RETENTION_MS", "10"),
-            ("KRAKEN_EXTERNAL_CALLS_LEASE_MS", "0"),
-            ("KRAKEN_EXTERNAL_CALLS_RETENTION_MS", "soon"),
+            ("SNODRA_SAGAS_ENABLED", "maybe"),
+            ("SNODRA_SAGAS_MAX_ATTEMPTS", "0"),
+            ("SNODRA_SAGAS_MAX_ATTEMPTS", "five"),
+            ("SNODRA_SAGAS_MAX_ATTEMPTS", "99999999999"),
+            ("SNODRA_SAGAS_RELAY_MAX_ATTEMPTS", "0"),
+            ("SNODRA_SAGAS_ENDED_RETENTION_MS", "999"),
+            ("SNODRA_SAGAS_DISPATCH_RETENTION_MS", "0"),
+            ("SNODRA_SAGAS_FAILED_RETENTION_MS", "0"),
+            ("SNODRA_SAGAS_FAILED_RETENTION_MS", "999"),
+            ("SNODRA_SAGAS_RELAY_POLL_INTERVAL_MS", "0"),
+            ("SNODRA_SAGAS_RELAY_LEASE_MS", "0"),
+            ("SNODRA_SAGAS_RELAY_INITIAL_BACKOFF_MS", "0"),
+            ("SNODRA_SAGAS_RELAY_INITIAL_BACKOFF_MS", "600000"),
+            ("SNODRA_SAGAS_RELAY_MAX_BACKOFF_MS", "-1"),
+            ("SNODRA_DEADLINES_POLL_INTERVAL_MS", "0"),
+            ("SNODRA_DEADLINES_LEASE_MS", "0"),
+            ("SNODRA_DEADLINES_RETENTION_MS", "10"),
+            ("SNODRA_EXTERNAL_CALLS_LEASE_MS", "0"),
+            ("SNODRA_EXTERNAL_CALLS_RETENTION_MS", "soon"),
         ] {
             let e = try_from(&[(name, value)]).unwrap_err().to_string();
             assert!(e.contains(name), "{name}={value}: {e}");
@@ -1918,23 +1947,23 @@ mod tests {
             (" EVENT-STORE ", DeadLetterMode::EventStore),
             ("Log", DeadLetterMode::Log),
         ] {
-            let c = from(&[("KRAKEN_EVENTS_DEAD_LETTER_MODE", value)]);
+            let c = from(&[("SNODRA_EVENTS_DEAD_LETTER_MODE", value)]);
             assert_eq!(c.dead_letter_mode, mode, "{value}");
         }
         assert_eq!(DeadLetterMode::Collection.as_str(), "collection");
         assert_eq!(DeadLetterMode::EventStore.as_str(), "event-store");
         assert_eq!(DeadLetterMode::Log.as_str(), "log");
-        let c = from(&[("KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS", "1000")]);
+        let c = from(&[("SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS", "1000")]);
         assert_eq!(c.dead_letter_retention, Duration::from_secs(1));
     }
 
     #[test]
     fn an_unknown_mode_or_a_retention_under_one_second_is_rejected() {
         for (name, value) in [
-            ("KRAKEN_EVENTS_DEAD_LETTER_MODE", "queue"),
-            ("KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS", "999"),
-            ("KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS", "0"),
-            ("KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS", "later"),
+            ("SNODRA_EVENTS_DEAD_LETTER_MODE", "queue"),
+            ("SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS", "999"),
+            ("SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS", "0"),
+            ("SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS", "later"),
         ] {
             let e = try_from(&[(name, value)]).unwrap_err().to_string();
             assert!(e.contains(name), "{name}={value}: {e}");
@@ -1943,7 +1972,7 @@ mod tests {
         c.dead_letter_retention = Duration::from_millis(500);
         let e = c.validate().unwrap_err().to_string();
         assert!(e.contains("dead_letter_retention"), "{e}");
-        assert!(e.contains("KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS"), "{e}");
+        assert!(e.contains("SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS"), "{e}");
     }
 
     #[test]
@@ -1952,8 +1981,8 @@ mod tests {
         assert_eq!(c.outbox_lease, Duration::from_secs(120));
         assert!(c.store_init_schema);
         let c = from(&[
-            ("KRAKEN_OUTBOX_LEASE_MS", "90000"),
-            ("KRAKEN_STORE_INIT_SCHEMA", "false"),
+            ("SNODRA_OUTBOX_LEASE_MS", "90000"),
+            ("SNODRA_STORE_INIT_SCHEMA", "false"),
         ]);
         assert_eq!(c.outbox_lease, Duration::from_secs(90));
         assert!(!c.store_init_schema);
@@ -1962,17 +1991,17 @@ mod tests {
     #[test]
     fn the_hub_can_be_turned_off() {
         assert!(from(&[]).hub_enabled, "on by default");
-        assert!(!from(&[("KRAKEN_HUB_ENABLED", "false")]).hub_enabled);
-        assert!(try_from(&[("KRAKEN_HUB_ENABLED", "maybe")]).is_err());
+        assert!(!from(&[("SNODRA_SERVER_ENABLED", "false")]).hub_enabled);
+        assert!(try_from(&[("SNODRA_SERVER_ENABLED", "maybe")]).is_err());
     }
 
     #[test]
     fn an_outbox_lease_not_longer_than_a_send_is_rejected() {
-        let e = try_from(&[("KRAKEN_OUTBOX_LEASE_MS", "40000")])
+        let e = try_from(&[("SNODRA_OUTBOX_LEASE_MS", "40000")])
             .unwrap_err()
             .to_string();
         assert!(
-            e.contains("KRAKEN_OUTBOX_LEASE_MS") && e.contains("40 s"),
+            e.contains("SNODRA_OUTBOX_LEASE_MS") && e.contains("40 s"),
             "{e}"
         );
         let mut c = code_config();
@@ -1982,27 +2011,27 @@ mod tests {
 
     /// A removed setting still set fails the configuration, one message naming every offender
     /// and its replacement (a silently ignored source or mode would misroute events);
-    /// `KRAKEN_MONGODB_URI` is not one of them (a service may read it for its own client).
+    /// `SNODRA_MONGODB_URI` is not one of them (a service may read it for its own client).
     #[test]
     fn a_removed_setting_still_set_fails_naming_every_offender_and_its_replacement() {
         let removed = [
-            ("KRAKEN_KAFKA_TOPIC", "orders.events"),
-            ("KRAKEN_KAFKA_DEAD_LETTER_MODE", "topic"),
-            ("KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS", "1000"),
+            ("SNODRA_KAFKA_TOPIC", "orders.events"),
+            ("SNODRA_KAFKA_DEAD_LETTER_MODE", "topic"),
+            ("SNODRA_KAFKA_DEAD_LETTER_RETENTION_MS", "1000"),
         ];
         let refused = try_from(&removed);
         let Err(MessagingError::InvalidMessage(message)) = &refused else {
             panic!("{refused:?}");
         };
         for (name, replacement) in [
-            ("KRAKEN_KAFKA_TOPIC", "KRAKEN_EVENTS_SOURCE"),
+            ("SNODRA_KAFKA_TOPIC", "SNODRA_EVENTS_SOURCE"),
             (
-                "KRAKEN_KAFKA_DEAD_LETTER_MODE",
-                "KRAKEN_EVENTS_DEAD_LETTER_MODE",
+                "SNODRA_KAFKA_DEAD_LETTER_MODE",
+                "SNODRA_EVENTS_DEAD_LETTER_MODE",
             ),
             (
-                "KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS",
-                "KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS",
+                "SNODRA_KAFKA_DEAD_LETTER_RETENTION_MS",
+                "SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS",
             ),
         ] {
             assert!(
@@ -2013,24 +2042,24 @@ mod tests {
         assert_eq!(
             message,
             "removed settings are set; they are no longer read, unset them. \
-             KRAKEN_KAFKA_TOPIC: use KRAKEN_EVENTS_SOURCE; \
-             KRAKEN_KAFKA_DEAD_LETTER_MODE: use KRAKEN_EVENTS_DEAD_LETTER_MODE, where `topic` is now `event-store`; \
-             KRAKEN_KAFKA_DEAD_LETTER_RETENTION_MS: use KRAKEN_EVENTS_DEAD_LETTER_RETENTION_MS"
+             SNODRA_KAFKA_TOPIC: use SNODRA_EVENTS_SOURCE; \
+             SNODRA_KAFKA_DEAD_LETTER_MODE: use SNODRA_EVENTS_DEAD_LETTER_MODE, where `topic` is now `event-store`; \
+             SNODRA_KAFKA_DEAD_LETTER_RETENTION_MS: use SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS"
         );
         // One alone is refused too; blank is unset.
-        assert!(try_from(&[("KRAKEN_KAFKA_TOPIC", "t")]).is_err());
-        assert!(try_from(&[("KRAKEN_KAFKA_TOPIC", " ")]).is_ok());
+        assert!(try_from(&[("SNODRA_KAFKA_TOPIC", "t")]).is_err());
+        assert!(try_from(&[("SNODRA_KAFKA_TOPIC", " ")]).is_ok());
         // The service's own MongoDB URI is neither refused nor read.
-        assert!(try_from(&[("KRAKEN_MONGODB_URI", "mongodb://mongo:27017/orders")]).is_ok());
+        assert!(try_from(&[("SNODRA_MONGODB_URI", "mongodb://mongo:27017/orders")]).is_ok());
     }
 
     /// The v0.4.0 value `topic` of the dead-letter mode is refused naming its replacement.
     #[test]
     fn the_old_dead_letter_mode_topic_fails_naming_event_store() {
-        let refused = try_from(&[("KRAKEN_EVENTS_DEAD_LETTER_MODE", "topic")]);
+        let refused = try_from(&[("SNODRA_EVENTS_DEAD_LETTER_MODE", "topic")]);
         assert!(
             matches!(&refused, Err(MessagingError::InvalidMessage(m))
-                if m.contains("KRAKEN_EVENTS_DEAD_LETTER_MODE") && m.contains("`topic`") && m.contains("event-store")),
+                if m.contains("SNODRA_EVENTS_DEAD_LETTER_MODE") && m.contains("`topic`") && m.contains("event-store")),
             "{refused:?}"
         );
     }

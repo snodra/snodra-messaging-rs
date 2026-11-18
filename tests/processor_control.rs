@@ -1,4 +1,4 @@
-//! Processor control (ADR 0023, P6b) through `KrakenMessaging`, against a real Kafka and MongoDB
+//! Processor control (ADR 0023, P6b) through `SnodraMessaging`, against a real Kafka and MongoDB
 //! (and the in-process fake hub): positioned markers, pause and resume (persisted, converging,
 //! surviving a restart), the leased reset (prepare leaves the group, a second operation is
 //! LOCKED, the lease expires by itself, an active member is SUBSCRIBERS_ACTIVE, the replay of a
@@ -12,20 +12,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::TryStreamExt;
-use kraken_messaging::event_store::{ReplayRange, ResetTarget};
-use kraken_messaging::processors::{EventOptions, ResetContext};
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
+use snodra_messaging::event_store::{ReplayRange, ResetTarget};
+use snodra_messaging::processors::{EventOptions, ResetContext};
 
-use kraken_messaging::processors::RetryResult;
-use kraken_messaging::proto::control_reply::Result as Answer;
-use kraken_messaging::proto::control_request::Action;
-use kraken_messaging::proto::{
-    self, ControlRefusal, ControlReply, ProcessorState, ProcessorStatus, reset_target,
-};
-use kraken_messaging::{
-    Config, Event, KrakenMessaging, KrakenMessagingBuilder, MessagingError, message_type,
-};
 use mongodb::bson::{Bson, Document, doc};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
@@ -33,6 +24,15 @@ use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::{Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::processors::RetryResult;
+use snodra_messaging::proto::control_reply::Result as Answer;
+use snodra_messaging::proto::control_request::Action;
+use snodra_messaging::proto::{
+    self, ControlRefusal, ControlReply, ProcessorState, ProcessorStatus, reset_target,
+};
+use snodra_messaging::{
+    Config, Event, MessagingError, SnodraMessaging, SnodraMessagingBuilder, message_type,
+};
 use support::fake_hub::FakeHub;
 
 macro_rules! require_docker {
@@ -58,8 +58,8 @@ async fn builder(
     kafka: &str,
     mongo: &str,
     topic: &str,
-) -> KrakenMessagingBuilder {
-    KrakenMessaging::builder(config(service, hub, topic))
+) -> SnodraMessagingBuilder {
+    SnodraMessaging::builder(config(service, hub, topic))
         .await
         .unwrap()
         .store(support::mongo_store(mongo).await)
@@ -150,7 +150,7 @@ impl Handler {
         &self,
     ) -> impl Fn(
         Noted,
-        kraken_messaging::EventContext,
+        snodra_messaging::EventContext,
     ) -> futures::future::BoxFuture<'static, Result<(), MessagingError>>
     + Send
     + Sync
@@ -169,14 +169,14 @@ impl Handler {
     }
 }
 
-fn status(app: &KrakenMessaging, name: &str) -> ProcessorStatus {
+fn status(app: &SnodraMessaging, name: &str) -> ProcessorStatus {
     app.processors()
         .into_iter()
         .find(|p| p.name == name)
         .unwrap_or_else(|| panic!("no processor {name}"))
 }
 
-fn state(app: &KrakenMessaging, name: &str) -> ProcessorState {
+fn state(app: &SnodraMessaging, name: &str) -> ProcessorState {
     ProcessorState::try_from(status(app, name).state).unwrap()
 }
 
@@ -1418,7 +1418,7 @@ message_type!(Ping, "c.Ping");
 struct Pong {
     pong: bool,
 }
-impl kraken_messaging::Command for Ping {
+impl snodra_messaging::Command for Ping {
     type Reply = Pong;
 }
 
@@ -1432,7 +1432,7 @@ async fn audit_app(
     topic: &str,
     handler: &Handler,
     once: Option<&Handler>,
-) -> KrakenMessaging {
+) -> SnodraMessaging {
     let mut builder = builder(service, &hub.address(), kafka, uri, topic)
         .await
         .event_in::<Noted, _, _>("audit", handler.handle());
@@ -1754,8 +1754,8 @@ async fn a_letter_parked_during_a_replay_is_retried_as_a_replay() {
 /// as new records; neither ever sees the other's segment.
 #[tokio::test]
 async fn replay_range_survives_reassignment() {
-    let store = kraken_messaging::store::memory::MemoryStore::new();
-    use kraken_messaging::event_store::memory::{MemoryEventStore, MemoryEventStoreConfig};
+    let store = snodra_messaging::store::memory::MemoryStore::new();
+    use snodra_messaging::event_store::memory::{MemoryEventStore, MemoryEventStoreConfig};
     let events = MemoryEventStore::new(MemoryEventStoreConfig {
         segments: 2,
         ..MemoryEventStoreConfig::default()
@@ -1773,7 +1773,7 @@ async fn replay_range_survives_reassignment() {
             events.clone(),
         );
         async move {
-            KrakenMessaging::builder(config("svc-rr", "static://127.0.0.1:1", topic))
+            SnodraMessaging::builder(config("svc-rr", "static://127.0.0.1:1", topic))
                 .await
                 .unwrap()
                 .store(Arc::new(store))
@@ -1800,7 +1800,7 @@ async fn replay_range_survives_reassignment() {
     let publish = |note: &'static str| {
         let events = events.clone();
         async move {
-            use kraken_messaging::event_store::{EventStore, OutgoingEvent};
+            use snodra_messaging::event_store::{EventStore, OutgoingEvent};
             events
                 .publish(&OutgoingEvent {
                     source: topic.into(),
@@ -1869,7 +1869,7 @@ async fn replay_range_survives_reassignment() {
 
     // b joins while paused and takes segment 1 over; the ranges stay open on both owners.
     let b = start("b").await;
-    let segments = |app: &KrakenMessaging| -> Vec<(String, String)> {
+    let segments = |app: &SnodraMessaging| -> Vec<(String, String)> {
         status(app, "default")
             .segments
             .iter()
@@ -1899,7 +1899,7 @@ async fn replay_range_survives_reassignment() {
     assert_eq!(runs(&once, "a"), ["n-0", "n-1", "n-2", "n-3", "n-4"]);
     assert_eq!(runs(&once, "b"), ["n-5"], "only past the range");
     eventually("the ranges removed by their owners", WITHIN, || async {
-        use kraken_messaging::store::MessageStore;
+        use snodra_messaging::store::MessageStore;
         let control = store.processor_control();
         control.get("default").await.unwrap().replay.is_empty()
     })

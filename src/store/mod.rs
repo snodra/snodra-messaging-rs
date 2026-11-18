@@ -114,7 +114,7 @@ pub struct SagaStores {
 /// A store add-on: every store the library uses, in the service's own database, sharing one
 /// transaction.
 ///
-/// [`KrakenMessagingBuilder::start`](crate::KrakenMessagingBuilder::start) hands the store the
+/// [`SnodraMessagingBuilder::start`](crate::SnodraMessagingBuilder::start) hands the store the
 /// application's clock ([`use_clock`](Self::use_clock)), then prepares its schema
 /// ([`init_schema`](Self::init_schema)), or checks it when `Config::store_init_schema` is false
 /// ([`check_schema`](Self::check_schema)), then starts what it runs in the background

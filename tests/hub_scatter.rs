@@ -8,13 +8,13 @@ mod support;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kraken_messaging::hub::{
+use serde::{Deserialize, Serialize};
+use snodra_messaging::hub::{
     HubPool, HubSettings, Inbound, RegisteredTypes, RemoteError, ReplyTo, ScatterOptions,
     ScatterPart, Sender, SenderSettings,
 };
-use kraken_messaging::proto::{self, ClientMessage, ErrorCode, client_message, reply};
-use kraken_messaging::{MessagingError, Query, RetryPolicy, message_type};
-use serde::{Deserialize, Serialize};
+use snodra_messaging::proto::{self, ClientMessage, ErrorCode, client_message, reply};
+use snodra_messaging::{MessagingError, Query, RetryPolicy, message_type};
 use support::fake_hub::FakeHub;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
@@ -509,7 +509,7 @@ async fn parts_and_ends_of_unknown_requests_are_ignored() {
 #[tokio::test]
 async fn a_unary_query_ignores_parts_and_ends_carrying_its_id() {
     let hub = FakeHub::start().await;
-    // The hub answers a unary query with a part and an end first (never sent by kraken-hub),
+    // The hub answers a unary query with a part and an end first (never sent by snodra-server),
     // then the reply: only the reply completes it.
     let a = hub.address();
     let c = caller(&a).await;
@@ -523,7 +523,7 @@ async fn a_unary_query_ignores_parts_and_ends_carrying_its_id() {
     let sender = Arc::clone(&c.sender);
     let call = tokio::spawn(async move {
         sender
-            .send_query(&find(), kraken_messaging::SendOptions::default())
+            .send_query(&find(), snodra_messaging::SendOptions::default())
             .await
     });
     let id = loop {

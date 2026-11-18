@@ -1,9 +1,9 @@
-//! kraken messaging client for Rust: the counterpart of the Kotlin `kraken-messaging` starter.
+//! Snodra messaging client for Rust: the counterpart of the Kotlin `snodra-messaging` starter.
 //!
 //! Wire- and storage-compatible with it: same hub protocol (`proto/hub.proto`), same events on the
-//! event store (an add-on, ADR 0027: `kraken-messaging-kafka` or `kraken-messaging-rabbitmq`; the
+//! event store (an add-on, ADR 0027: `snodra-messaging-kafka` or `snodra-messaging-rabbitmq`; the
 //! in-memory [`event_store::memory`] for tests), same records in the message store (an add-on,
-//! ADR 0028: `kraken-messaging-mongo` or `kraken-messaging-sqlx` for PostgreSQL and MySQL; the
+//! ADR 0028: `snodra-messaging-mongo` or `snodra-messaging-sqlx` for PostgreSQL and MySQL; the
 //! in-memory [`store::memory`] for tests). See README.md.
 pub mod app;
 pub mod codec;
@@ -27,7 +27,7 @@ pub mod testing;
 pub mod time;
 pub mod types;
 
-pub use app::{KrakenMessaging, KrakenMessagingBuilder};
+pub use app::{SnodraMessaging, SnodraMessagingBuilder};
 pub use config::Config;
 pub use context::MessageContext;
 pub use error::MessagingError;

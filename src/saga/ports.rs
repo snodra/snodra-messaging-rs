@@ -57,7 +57,7 @@ pub trait SagaRepository: Send + Sync {
     ) -> BoxFuture<'a, Result<bool, StoreError>>;
 
     /// How many live (not ended) instances there are per saga type, outside any transaction
-    /// (the `kraken.sagas.active` gauge); a type without one is absent.
+    /// (the `snodra.sagas.active` gauge); a type without one is absent.
     fn count_live_by_type(&self) -> BoxFuture<'_, Result<HashMap<String, u64>, StoreError>>;
 }
 
@@ -122,7 +122,7 @@ pub trait DeadlineStore: Send + Sync {
     ) -> BoxFuture<'a, Result<Option<DeadlineDocument>, StoreError>>;
 
     /// How many SCHEDULED deadlines are due (`due_at_ms <= now_ms`), per name, claimed or not
-    /// (the `kraken.deadlines.due` gauge); a name without one is absent.
+    /// (the `snodra.deadlines.due` gauge); a name without one is absent.
     fn count_overdue_by_name(
         &self,
         now_ms: i64,
@@ -299,7 +299,7 @@ pub trait SagaDispatchStore: Send + Sync {
         owner: &'a str,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
-    /// How many entries are pending (the `kraken.saga.dispatch.pending` gauge).
+    /// How many entries are pending (the `snodra.saga.dispatch.pending` gauge).
     fn pending(&self) -> BoxFuture<'_, Result<u64, StoreError>>;
 }
 

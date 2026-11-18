@@ -3,11 +3,11 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kraken_messaging::MessagingError;
-use kraken_messaging::hub::{
+use snodra_messaging::MessagingError;
+use snodra_messaging::hub::{
     CLIENT_VERSION, HubConnection, HubSettings, Inbound, PERMIT_FLUSH_AFTER, RegisteredTypes,
 };
-use kraken_messaging::proto::{
+use snodra_messaging::proto::{
     self, ClientMessage, Heartbeat, Reply, ServerMessage, client_message, reply, server_message,
 };
 use support::fake_hub::{FakeHub, default_ack};
@@ -167,7 +167,7 @@ async fn invalid_argument_is_retried_at_max_backoff() {
     hub.stop();
 }
 
-/// Like kraken-hub, the fake hub closes a stream whose first `Register` offers no permits.
+/// Like snodra-server, the fake hub closes a stream whose first `Register` offers no permits.
 #[tokio::test]
 async fn the_hub_refuses_a_register_without_permits() {
     let hub = FakeHub::start().await;
@@ -309,7 +309,7 @@ async fn register_declares_the_client_version() {
     assert!(conn.await_registered(Duration::from_secs(5)).await);
     let r = &hub.registers().await[0];
     assert_eq!(r.client_version, CLIENT_VERSION);
-    assert!(r.client_version.starts_with("kraken-messaging-rs/"));
+    assert!(r.client_version.starts_with("snodra-messaging-rs/"));
     assert!(r.credentials.is_none());
     conn.shutdown().await;
     hub.stop();
@@ -446,7 +446,7 @@ fn reply_msg(id: &str) -> ClientMessage {
 
 async fn next_request(
     rx: &mut mpsc::Receiver<Inbound>,
-) -> (proto::Request, kraken_messaging::hub::ReplyTo) {
+) -> (proto::Request, snodra_messaging::hub::ReplyTo) {
     timeout(Duration::from_secs(3), async {
         loop {
             if let Some(Inbound::Request { request, reply_to }) = rx.recv().await {
@@ -573,7 +573,7 @@ async fn requests_in(
     hub: &FakeHub,
     rx: &mut mpsc::Receiver<Inbound>,
     n: usize,
-) -> Vec<kraken_messaging::hub::ReplyTo> {
+) -> Vec<snodra_messaging::hub::ReplyTo> {
     let mut handles = Vec::new();
     for i in 0..n {
         hub.send_to_clients(request(&format!("r{i}"))).await;
@@ -708,19 +708,19 @@ async fn wait_for_tcp_returns_once_the_port_accepts_and_gives_up_otherwise() {
     late.abort();
 }
 
-/// The application reads why a hub refuses the instance (`KrakenMessaging::hub_rejections`): by
+/// The application reads why a hub refuses the instance (`SnodraMessaging::hub_rejections`): by
 /// the target dialled while that hub never registered it, by its hub id once it did; gone once
-/// the hub accepts a registration again. `KrakenMessaging::latest_rejection` is the newest refusal
+/// the hub accepts a registration again. `SnodraMessaging::latest_rejection` is the newest refusal
 /// by any hub: replaced by a newer one only, never cleared by an acceptance.
 #[tokio::test]
 async fn the_application_reads_each_hubs_latest_rejection() {
     let hub = FakeHub::start().await;
     hub.reject_next_with_already_exists();
-    let mut config = kraken_messaging::Config::new("svc-rejected", &hub.address());
+    let mut config = snodra_messaging::Config::new("svc-rejected", &hub.address());
     config.outbox_enabled = false;
     config.reconnect_backoff_min = Duration::from_millis(50);
     config.reconnect_backoff_max = Duration::from_millis(300);
-    let app = kraken_messaging::KrakenMessaging::builder(config)
+    let app = snodra_messaging::SnodraMessaging::builder(config)
         .await
         .unwrap()
         .start()

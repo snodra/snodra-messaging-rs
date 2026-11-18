@@ -8,14 +8,14 @@ mod support;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use kraken_messaging::hub::{
+use serde::{Deserialize, Serialize};
+use snodra_messaging::hub::{
     AuthKind, Dispatcher, HandlerRegistry, HubConnection, HubPool, HubSettings, Inbound, ReplyTo,
     SendOptions, Sender, SenderSettings, SubscriptionOptions,
 };
-use kraken_messaging::identity::IdentityResolver;
-use kraken_messaging::proto::{self, ServerMessage, reply, server_message};
-use kraken_messaging::{Command, HubTls, SecretString, SubscriptionQuery, message_type};
-use serde::{Deserialize, Serialize};
+use snodra_messaging::identity::IdentityResolver;
+use snodra_messaging::proto::{self, ServerMessage, reply, server_message};
+use snodra_messaging::{Command, HubTls, SecretString, SubscriptionQuery, message_type};
 use support::fake_hub::{Event, FakeHub, default_ack};
 use support::logs::Captured;
 use support::pki::{ClientSpec, Pki, TempDir, fingerprint_of_pem};
@@ -31,7 +31,7 @@ struct World {
 
 async fn world(required: bool) -> World {
     let (dir, server_ca, client_ca) = (TempDir::new(), Pki::new("hub CA"), Pki::new("client CA"));
-    let (cert, key) = server_ca.server(&["kraken-hub"]);
+    let (cert, key) = server_ca.server(&["snodra-server"]);
     let hub = FakeHub::start_mtls(&cert, &key, &client_ca.ca_pem, required).await;
     World {
         dir,
@@ -532,7 +532,7 @@ async fn client(settings: HubSettings) -> Client {
 
 /// A fake mTLS hub that answers requests and names itself `id`.
 async fn hub_named(w: &World, id: &str) -> FakeHub {
-    let (cert, key) = w.server_ca.server(&["kraken-hub"]);
+    let (cert, key) = w.server_ca.server(&["snodra-server"]);
     let hub = FakeHub::start_mtls(&cert, &key, &w.client_ca.ca_pem, true).await;
     hub.set_ack(Some(proto::RegisterAck {
         hub_id: id.to_string(),
@@ -932,10 +932,10 @@ async fn with_one_hub_the_roll_has_a_short_gap_that_a_retry_policy_covers() {
     let sender = Sender::with_pool(
         Arc::clone(&pool),
         SenderSettings {
-            retry: Some(kraken_messaging::RetryPolicy {
+            retry: Some(snodra_messaging::RetryPolicy {
                 max_attempts: 5,
                 initial_backoff: Duration::from_millis(30),
-                ..kraken_messaging::RetryPolicy::default()
+                ..snodra_messaging::RetryPolicy::default()
             }),
             ..SenderSettings::default()
         },
@@ -1144,7 +1144,7 @@ async fn a_send_stops_waiting_for_the_roll_at_its_own_deadline() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, kraken_messaging::MessagingError::HubUnavailable(_)),
+        matches!(err, snodra_messaging::MessagingError::HubUnavailable(_)),
         "{err:?}"
     );
     let waited = started.elapsed();

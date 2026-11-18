@@ -9,16 +9,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kraken_messaging::hub::{
+use serde::{Deserialize, Serialize};
+use snodra_messaging::hub::{
     HubConnection, HubPool, HubSettings, Inbound, RegisteredTypes, ScatterOptions, SendOptions,
     Sender, SenderSettings, StreamOptions, SubscriptionOptions,
 };
-use kraken_messaging::proto::{self, ErrorCode};
-use kraken_messaging::{
+use snodra_messaging::proto::{self, ErrorCode};
+use snodra_messaging::{
     Command, Config, MessagingError, Query, RetryPolicy, SecretString, StreamingQuery,
     SubscriptionQuery, message_type,
 };
-use serde::{Deserialize, Serialize};
 use support::fake_hub::{Acl, AuthMode, FakeHub};
 use support::logs::Captured;
 use tokio::sync::mpsc;
@@ -88,7 +88,7 @@ fn connection(settings: HubSettings, service: &str) -> Arc<HubConnection> {
 }
 
 fn temp_file(content: &str) -> (PathBuf, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("kraken-auth-{}", uuid::Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!("snodra-auth-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("hub-token");
     std::fs::write(&path, content).unwrap();
@@ -967,6 +967,6 @@ fn permission_denied_maps_to_access_denied_and_is_not_retryable() {
     );
     assert!(matches!(e, MessagingError::AccessDenied(_)), "{e:?}");
     for kind in [proto::RequestKind::Command, proto::RequestKind::Query] {
-        assert!(!kraken_messaging::retry::is_retryable(kind, &e));
+        assert!(!snodra_messaging::retry::is_retryable(kind, &e));
     }
 }

@@ -10,14 +10,14 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use kraken_messaging::events::SagaStage;
-use kraken_messaging::saga::store::{Association, DeadlineStatus, DispatchKind};
-use kraken_messaging::saga::{
+use serde::{Deserialize, Serialize};
+use snodra_messaging::events::SagaStage;
+use snodra_messaging::saga::store::{Association, DeadlineStatus, DispatchKind};
+use snodra_messaging::saga::{
     EventOutcome, FailureReason, SagaCommandFailed, SagaDefinition, SagaRetry, SagaRuntime,
     SagaType,
 };
-use kraken_messaging::{Event, MessageType, RetryPolicy};
-use serde::{Deserialize, Serialize};
+use snodra_messaging::{Event, MessageType, RetryPolicy};
 use support::order_saga::*;
 use support::saga::{Store, event_ctx, state, t0};
 
@@ -86,7 +86,7 @@ impl Rt {
         deliver_to(&self.runtime, event, id, headers).await
     }
 
-    async fn saga(&self, order_id: &str) -> kraken_messaging::saga::store::SagaDocument {
+    async fn saga(&self, order_id: &str) -> snodra_messaging::saga::store::SagaDocument {
         let mut found: Vec<_> = self
             .store
             .sagas("rt.Order")
@@ -137,7 +137,7 @@ fn bump(order_id: &str, tag: &str) -> Bump {
 
 /// Epoch milliseconds.
 fn dt(t: std::time::SystemTime) -> i64 {
-    kraken_messaging::time::epoch_ms(t)
+    snodra_messaging::time::epoch_ms(t)
 }
 
 #[tokio::test]
@@ -775,7 +775,7 @@ struct Quiet {
 struct QuietStart {
     order_id: String,
 }
-kraken_messaging::message_type!(QuietStart, "rt.QuietStart");
+snodra_messaging::message_type!(QuietStart, "rt.QuietStart");
 impl Event for QuietStart {}
 
 fn quiet_saga() -> SagaType {
@@ -988,7 +988,7 @@ struct Handover {
 struct HandoverPlaced {
     order_id: String,
 }
-kraken_messaging::message_type!(HandoverPlaced, "rt.HandoverPlaced");
+snodra_messaging::message_type!(HandoverPlaced, "rt.HandoverPlaced");
 impl Event for HandoverPlaced {}
 
 /// Its start handler moves the instance from its start association to another one at once.

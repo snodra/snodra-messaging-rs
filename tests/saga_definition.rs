@@ -1,11 +1,11 @@
 //! Saga registration on the builder (S2-R1, S2-R2): the startup checks, which refuse before any
 //! connection is made, and the wire shape of `SagaCommandFailed`.
 
-use kraken_messaging::saga::{FailureReason, SagaCommandFailed};
-use kraken_messaging::{Config, Event, KrakenMessaging, KrakenMessagingBuilder, MessageType};
-use kraken_messaging::{MessagingError, SagaDefinition, message_type};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use snodra_messaging::saga::{FailureReason, SagaCommandFailed};
+use snodra_messaging::{Config, Event, MessageType, SnodraMessaging, SnodraMessagingBuilder};
+use snodra_messaging::{MessagingError, SagaDefinition, message_type};
 
 #[derive(Default, Serialize, Deserialize)]
 struct Payment {
@@ -25,22 +25,22 @@ fn order_id(e: &OrderPlaced) -> Option<String> {
 
 /// A builder that has not touched the network (the clients connect lazily), with a MongoDB store
 /// that is never reached.
-async fn builder() -> KrakenMessagingBuilder {
+async fn builder() -> SnodraMessagingBuilder {
     let config = Config::new("svc", "static://127.0.0.1:1");
     let client = mongodb::Client::with_uri_str("mongodb://127.0.0.1:1/db")
         .await
         .unwrap();
     let db = client.default_database().unwrap();
-    KrakenMessaging::builder(config)
+    SnodraMessaging::builder(config)
         .await
         .unwrap()
         .store(std::sync::Arc::new(
-            kraken_messaging_mongo::MongoStore::new(client, db),
+            snodra_messaging_mongo::MongoStore::new(client, db),
         ))
 }
 
 /// The error `start()` refuses with: the checks run before indexes or connections.
-async fn refused(builder: KrakenMessagingBuilder) -> String {
+async fn refused(builder: SnodraMessagingBuilder) -> String {
     match builder.start().await {
         Ok(_) => panic!("start() accepted a saga that must be refused"),
         Err(MessagingError::InvalidMessage(message)) => message,
@@ -139,7 +139,7 @@ fn saga_command_failed_serialises_with_the_kotlin_field_names() {
         reason: FailureReason::UnknownOutcome,
         message: "the printer hung up".into(),
     };
-    assert_eq!(SagaCommandFailed::TYPE, "kraken.SagaCommandFailed");
+    assert_eq!(SagaCommandFailed::TYPE, "snodra.SagaCommandFailed");
     assert_eq!(
         serde_json::to_value(&failed).unwrap(),
         json!({

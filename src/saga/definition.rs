@@ -115,7 +115,7 @@ enum Last {
 }
 
 /// The definition of one saga type, built with the closure given to
-/// [`KrakenMessagingBuilder::saga`](crate::KrakenMessagingBuilder::saga).
+/// [`SnodraMessagingBuilder::saga`](crate::SnodraMessagingBuilder::saga).
 ///
 /// Every handler is a synchronous closure `Fn(&mut S, &E, &mut SagaContext) -> Result<(), MessagingError>`:
 /// it changes the state and records what it wants done on the context; the runtime does the I/O
@@ -541,7 +541,7 @@ mod tests {
         assert!(t.deadlines.contains_key("charge-timeout"));
         assert!(t.command_failed.is_some());
         assert!(t.interested_in("t.OrderPlaced"));
-        assert!(t.interested_in("kraken.SagaCommandFailed"));
+        assert!(t.interested_in("snodra.SagaCommandFailed"));
         assert!(!t.interested_in("t.Unknown"));
         assert_eq!((t.new_state)(), r#"{"order_id":null,"log":[]}"#);
     }

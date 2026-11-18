@@ -1,4 +1,4 @@
-//! End to end with two real hubs (`KRAKEN_HUB_IMAGE`, default `kraken-hub:dev`, ADR 0017) and the
+//! End to end with two real hubs (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`, ADR 0017) and the
 //! multi-hub configuration (every instance on both hubs): a subscription gets its initial
 //! result from one owner instance and the updates of every instance of every owner (exclusive and
 //! shared types), a clean completion of the last owner ends it, a cancel (or a drop) mid-way
@@ -6,7 +6,7 @@
 //! subscription limit fails it with `HandlerBusy`, and an owner's shutdown completes its
 //! subscriptions with a clean end.
 //!
-//! The hub's `kraken_hub_subscriptions_open` gauge is an OTLP metric (nothing to scrape in a
+//! The hub's `snodra_hub_subscriptions_open` gauge is an OTLP metric (nothing to scrape in a
 //! test), so "the hub released the subscription" is observed where the gauge moves with it: the
 //! hub sends `Cancel{<id>#n}` to every target still serving and closes the gauge for each in
 //! the same step, so a target that stopped serving (its emitter has no subscription left) is the
@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use kraken_messaging::hub::SubscriptionOptions;
-use kraken_messaging::{Config, KrakenMessaging, MessagingError, SubscriptionQuery, message_type};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::hub::SubscriptionOptions;
+use snodra_messaging::{Config, MessagingError, SnodraMessaging, SubscriptionQuery, message_type};
 use support::containers::{HubContainer, HubOptions, hub_with};
 
 macro_rules! require_docker {
@@ -65,7 +65,7 @@ impl SubscriptionQuery for SharedPrices {
 const IDS: [&str; 2] = ["e2e-p4c-1", "e2e-p4c-2"];
 
 async fn two_hubs() -> (HubContainer, HubContainer) {
-    let start = |id: &'static str| hub_with(HubOptions::new().env("KRAKEN_HUB_ID", id));
+    let start = |id: &'static str| hub_with(HubOptions::new().env("SNODRA_SERVER_ID", id));
     tokio::join!(start(IDS[0]), start(IDS[1]))
 }
 
@@ -79,8 +79,8 @@ fn config(service: &str, hubs: &str) -> Config {
 }
 
 /// An instance of `service` owning `e2e.Prices` (exclusive) whose initial quote is `price`.
-async fn owner(cfg: Config, price: u32) -> KrakenMessaging {
-    KrakenMessaging::builder(cfg)
+async fn owner(cfg: Config, price: u32) -> SnodraMessaging {
+    SnodraMessaging::builder(cfg)
         .await
         .unwrap()
         .subscription_query::<Prices, _, _>(move |q, _| async move {
@@ -95,8 +95,8 @@ async fn owner(cfg: Config, price: u32) -> KrakenMessaging {
 }
 
 /// An instance of `service` owning `e2e.SharedPrices` (shared).
-async fn shared_owner(cfg: Config, price: u32) -> KrakenMessaging {
-    KrakenMessaging::builder(cfg)
+async fn shared_owner(cfg: Config, price: u32) -> SnodraMessaging {
+    SnodraMessaging::builder(cfg)
         .await
         .unwrap()
         .shared_subscription_query::<SharedPrices, _, _>(move |q, _| async move {
@@ -110,8 +110,8 @@ async fn shared_owner(cfg: Config, price: u32) -> KrakenMessaging {
         .unwrap()
 }
 
-async fn caller(cfg: Config) -> KrakenMessaging {
-    KrakenMessaging::builder(cfg)
+async fn caller(cfg: Config) -> SnodraMessaging {
+    SnodraMessaging::builder(cfg)
         .await
         .unwrap()
         .start()

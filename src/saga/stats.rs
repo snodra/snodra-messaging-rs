@@ -1,27 +1,27 @@
 //! Saga, deadline, dispatch and external-call statistics (S2-R7, ADR 0021 ruling 21): the Kotlin
 //! meters as counters and gauges behind accessors, with the same names and labels, which
 //! [`OtelSagaMetrics`](super::OtelSagaMetrics) also records on the meter (ADR 0026:
-//! `kraken.sagas.started{type}` is what Prometheus shows as `kraken_sagas_started_total{type}`).
+//! `snodra.sagas.started{type}` is what Prometheus shows as `snodra_sagas_started_total{type}`).
 //! Every label value is a saga type, a deadline name, a handler label, an outcome or a reason,
 //! never an id.
 //!
-//! - counters `kraken.sagas.started{type}`, `kraken.sagas.ended{type}`;
-//! - `kraken.saga.events{type,outcome}`, outcome `handled | no_match | conflict | parked`;
-//! - `kraken.deadlines.fired{name}` and the gauge `kraken.deadlines.due{name}` (the deadlines past
+//! - counters `snodra.sagas.started{type}`, `snodra.sagas.ended{type}`;
+//! - `snodra.saga.events{type,outcome}`, outcome `handled | no_match | conflict | parked`;
+//! - `snodra.deadlines.fired{name}` and the gauge `snodra.deadlines.due{name}` (the deadlines past
 //!   their due time, set by every scheduler poll and back to 0 when none is overdue);
-//! - `kraken.external.calls{handler,outcome}`, outcome `succeeded | replayed | failed | retryable
+//! - `snodra.external.calls{handler,outcome}`, outcome `succeeded | replayed | failed | retryable
 //!   | unknown` (the handler is its message's wire type name);
-//! - `kraken.saga.command.failures{type,reason}`: a `SagaCommandFailed` nobody handled (`type` is
+//! - `snodra.saga.command.failures{type,reason}`: a `SagaCommandFailed` nobody handled (`type` is
 //!   the failed command's wire type, `reason` the `FailureReason` name, e.g. `NO_HANDLER`), or a
 //!   saga event the outbox refuses (`type` the event's wire type, `reason` `INVALID`);
-//! - the gauges `kraken.sagas.active{type}` and `kraken.saga.dispatch.pending`, which no hook
+//! - the gauges `snodra.sagas.active{type}` and `snodra.saga.dispatch.pending`, which no hook
 //!   moves: [`SagaStats::sample_once`] counts them in the message store, and
 //!   [`SagaStats::start_sampler`] does so every [`SAMPLE_INTERVAL`] (15 s, as Kotlin). A failed
 //!   sample is logged and keeps the last values.
 //!
 //! [`SagaStats`] implements [`SagaMetrics`]; the application's runtime, relay, scheduler and
 //! idempotent handlers report to the [`OtelSagaMetrics`](super::OtelSagaMetrics) over it, and
-//! `KrakenMessaging::saga_stats()` hands it out.
+//! `SnodraMessaging::saga_stats()` hands it out.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, Weak};
@@ -38,15 +38,15 @@ use crate::error::MessagingError;
 /// How often the sampled gauges are counted (ruling 16: a constant).
 pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
 
-pub const SAGAS_STARTED: &str = "kraken.sagas.started";
-pub const SAGAS_ENDED: &str = "kraken.sagas.ended";
-pub const SAGA_EVENTS: &str = "kraken.saga.events";
-pub const DEADLINES_FIRED: &str = "kraken.deadlines.fired";
-pub const DEADLINES_DUE: &str = "kraken.deadlines.due";
-pub const EXTERNAL_CALLS: &str = "kraken.external.calls";
-pub const SAGA_COMMAND_FAILURES: &str = "kraken.saga.command.failures";
-pub const SAGAS_ACTIVE: &str = "kraken.sagas.active";
-pub const SAGA_DISPATCH_PENDING: &str = "kraken.saga.dispatch.pending";
+pub const SAGAS_STARTED: &str = "snodra.sagas.started";
+pub const SAGAS_ENDED: &str = "snodra.sagas.ended";
+pub const SAGA_EVENTS: &str = "snodra.saga.events";
+pub const DEADLINES_FIRED: &str = "snodra.deadlines.fired";
+pub const DEADLINES_DUE: &str = "snodra.deadlines.due";
+pub const EXTERNAL_CALLS: &str = "snodra.external.calls";
+pub const SAGA_COMMAND_FAILURES: &str = "snodra.saga.command.failures";
+pub const SAGAS_ACTIVE: &str = "snodra.sagas.active";
+pub const SAGA_DISPATCH_PENDING: &str = "snodra.saga.dispatch.pending";
 
 /// Whether a [`Sample`] counts up or is set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -152,7 +152,7 @@ impl SagaStats {
             .collect()
     }
 
-    /// Makes the `kraken.sagas.active` gauge of each of `saga_types` exist (at 0) before its
+    /// Makes the `snodra.sagas.active` gauge of each of `saga_types` exist (at 0) before its
     /// first sample, as Kotlin's.
     pub fn register_saga_types<'a>(&self, saga_types: impl IntoIterator<Item = &'a str>) {
         let mut inner = self.inner();

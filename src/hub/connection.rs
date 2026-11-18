@@ -82,7 +82,7 @@ pub const PERMIT_BATCH: u32 = 16;
 /// ... else this long after the first grant not sent yet.
 pub const PERMIT_FLUSH_AFTER: Duration = Duration::from_millis(50);
 /// `Register.client_version`, shown in the hub's topology view.
-pub const CLIENT_VERSION: &str = concat!("kraken-messaging-rs/", env!("CARGO_PKG_VERSION"));
+pub const CLIENT_VERSION: &str = concat!("snodra-messaging-rs/", env!("CARGO_PKG_VERSION"));
 
 /// HTTP/2 PING period on the hub channel.
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
@@ -145,7 +145,7 @@ pub struct HubSettings {
 impl Default for HubSettings {
     fn default() -> Self {
         HubSettings {
-            address: "static://kraken-hub:7000".into(),
+            address: "static://snodra-server:7000".into(),
             backoff_min: Duration::from_millis(500),
             backoff_max: Duration::from_secs(5),
             handshake_timeout: Duration::from_secs(10),
@@ -922,7 +922,7 @@ impl HubConnection {
     }
 
     /// The credential refreshes (`ClientMessage.credentials`) written to hubs so far
-    /// (`kraken_hub_client_credentials_refreshes_sent_total`).
+    /// (`snodra_hub_client_credentials_refreshes_sent_total`).
     pub fn credentials_refreshes_sent(&self) -> u64 {
         self.refreshes_sent.load(Ordering::Relaxed)
     }
@@ -1067,7 +1067,7 @@ impl HubConnection {
         Ok(())
     }
 
-    /// The first step of a graceful shutdown (kraken-messaging's `HubLifecycle.stop`): registers
+    /// The first step of a graceful shutdown (snodra-messaging's `HubLifecycle.stop`): registers
     /// no types from now on (a stream opened later registers none either) and writes that
     /// `Register` to the current handshaken stream, then waits at most `within` for the hub's
     /// ack. The hub stops routing to this instance and hands its queue to other instances at
@@ -1914,9 +1914,9 @@ fn is_rejection(code: Code) -> bool {
     )
 }
 
-const PLAIN_TEXT_HINT: &str = "the connection was dropped before the registration; a hub that serves TLS does that to plain text: set hub_tls / KRAKEN_HUB_TLS=true";
+const PLAIN_TEXT_HINT: &str = "the connection was dropped before the registration; a hub that serves TLS does that to plain text: set hub_tls / SNODRA_SERVER_TLS=true";
 
-const CLIENT_CERT_HINT: &str = "the connection was dropped before the registration; a hub that requires client certificates does that to a client that presents none: set hub_tls client_cert_file and client_key_file / KRAKEN_HUB_TLS_CLIENT_CERT and KRAKEN_HUB_TLS_CLIENT_KEY";
+const CLIENT_CERT_HINT: &str = "the connection was dropped before the registration; a hub that requires client certificates does that to a client that presents none: set hub_tls client_cert_file and client_key_file / SNODRA_SERVER_TLS_CLIENT_CERT and SNODRA_SERVER_TLS_CLIENT_KEY";
 
 /// What a connection that the peer drops before the registration most likely means.
 #[derive(Clone, Copy)]
@@ -2093,7 +2093,7 @@ mod tests {
 
     #[test]
     fn client_identity_constants() {
-        assert!(CLIENT_VERSION.starts_with("kraken-messaging-rs/"));
+        assert!(CLIENT_VERSION.starts_with("snodra-messaging-rs/"));
         assert_eq!(
             HubSettings::default().backoff_max,
             Duration::from_secs(5),

@@ -37,7 +37,7 @@ pub enum MessagingError {
     #[error("{0}")]
     HubRegistrationRejected(String),
     /// Hub code CANCELLED (ADR 0017, P4b): the hub ended a streaming query (it outlived
-    /// `KRAKEN_HUB_MAX_STREAM_DURATION`). Not retried.
+    /// `SNODRA_SERVER_MAX_STREAM_DURATION`). Not retried.
     #[error("{0}")]
     Cancelled(String),
     #[error("serialization error: {0}")]

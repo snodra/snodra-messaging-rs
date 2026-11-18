@@ -5,17 +5,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use kraken_messaging::config::DeadLetterMode;
-use kraken_messaging::event_store::{SubscriptionSpec, headers};
-use kraken_messaging::events::{
-    EventBus, EventConsumer, LocalEventDispatcher, NoSagas, OutboxPublisher,
-    OutboxPublisherSettings, ProcessorSettings,
-};
-use kraken_messaging::hub::HandlerRegistry;
-use kraken_messaging::metrics::{self, Metrics};
-use kraken_messaging::saga::Clock;
-use kraken_messaging::store::MessageStore;
-use kraken_messaging::{Event, message_type};
 use mongodb::bson::doc;
 use rdkafka::Message;
 use rdkafka::config::ClientConfig;
@@ -23,6 +12,17 @@ use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Headers;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::config::DeadLetterMode;
+use snodra_messaging::event_store::{SubscriptionSpec, headers};
+use snodra_messaging::events::{
+    EventBus, EventConsumer, LocalEventDispatcher, NoSagas, OutboxPublisher,
+    OutboxPublisherSettings, ProcessorSettings,
+};
+use snodra_messaging::hub::HandlerRegistry;
+use snodra_messaging::metrics::{self, Metrics};
+use snodra_messaging::saga::Clock;
+use snodra_messaging::store::MessageStore;
+use snodra_messaging::{Event, message_type};
 use support::metrics::TestMeter;
 use tokio_util::sync::CancellationToken;
 

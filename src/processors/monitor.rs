@@ -16,9 +16,9 @@
 //! [`compare`](EventStore::compare) only.
 //!
 //! The processor gauges (ADR 0026) read the same status when the meter collects:
-//! `kraken.processor.state{processor,state}` (every state, 1 for the current one),
-//! `kraken.processor.lag{processor,segment}` (each assigned segment whose lag is known) and
-//! `kraken.dead.letters{processor}`.
+//! `snodra.processor.state{processor,state}` (every state, 1 for the current one),
+//! `snodra.processor.lag{processor,segment}` (each assigned segment whose lag is known) and
+//! `snodra.dead.letters{processor}`.
 
 use std::cmp::Ordering as Order;
 use std::collections::{HashMap, HashSet};
@@ -36,7 +36,7 @@ use crate::metrics::{DEAD_LETTERS, Metrics, PROCESSOR_LAG, PROCESSOR_STATE};
 use crate::proto::{self, ProcessorState, ProcessorStatus};
 
 /// The states a processor reports, with their `state` label (the `ProcessorState` name without
-/// `PROCESSOR_`, lower case, as the hub's `kraken_hub_processor_state`).
+/// `PROCESSOR_`, lower case, as the hub's `snodra_hub_processor_state`).
 const STATES: [(ProcessorState, &str); 5] = [
     (ProcessorState::ProcessorStarting, "starting"),
     (ProcessorState::ProcessorRunning, "running"),

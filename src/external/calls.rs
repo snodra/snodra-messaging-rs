@@ -61,7 +61,7 @@ pub const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const MAX_BEGIN_ROUNDS: usize = 3;
 const MAX_ERROR_LENGTH: usize = 2000;
 
-/// Settings of `external_calls` (`KRAKEN_EXTERNAL_CALLS_LEASE_MS`): how long an `IN_PROGRESS`
+/// Settings of `external_calls` (`SNODRA_EXTERNAL_CALLS_LEASE_MS`): how long an `IN_PROGRESS`
 /// call may take before its outcome counts as unknown. Default 5 minutes (ruling 16).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExternalCallSettings {
@@ -528,7 +528,7 @@ fn stored_message(doc: &ExternalCall) -> String {
 }
 
 /// Where an idempotent handler finds the [`ExternalCalls`] it records in: registered handlers
-/// hold the handle, and [`KrakenMessagingBuilder::start`](crate::KrakenMessagingBuilder::start)
+/// hold the handle, and [`SnodraMessagingBuilder::start`](crate::SnodraMessagingBuilder::start)
 /// binds it (with the configured lease, the clock and the statistics), so a handler registered
 /// before the clock was set still uses it. A call through a handle that was never bound fails
 /// naming the handler (Kotlin's missing interceptor, ruling 41: with the builder it cannot happen).
@@ -556,7 +556,7 @@ impl ExternalCallsHandle {
             handler_error(
                 label,
                 format!(
-                    "Handler {label} is idempotent but no external calls are bound to it (KrakenMessagingBuilder::start binds them; with a bare HandlerRegistry pass ExternalCalls::handle())"
+                    "Handler {label} is idempotent but no external calls are bound to it (SnodraMessagingBuilder::start binds them; with a bare HandlerRegistry pass ExternalCalls::handle())"
                 ),
             )
         })

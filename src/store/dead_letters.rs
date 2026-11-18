@@ -9,7 +9,7 @@ use futures::future::BoxFuture;
 use super::{StoreError, Tx};
 use crate::error::MessagingError;
 
-/// The most characters of a letter's `error.message` (and of `kraken-dlt-error`).
+/// The most characters of a letter's `error.message` (and of `snodra-dlt-error`).
 pub const MAX_ERROR_MESSAGE_CHARS: usize = 2000;
 
 /// Why a record was parked.

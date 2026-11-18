@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
-use kraken_messaging::{MessageContext, MessageType, codec, message_type};
 use serde::{Deserialize, Serialize};
+use snodra_messaging::{MessageContext, MessageType, codec, message_type};
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct Ping {

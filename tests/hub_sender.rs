@@ -3,14 +3,14 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kraken_messaging::RetryPolicy;
-use kraken_messaging::context::CURRENT;
-use kraken_messaging::hub::{
+use serde::{Deserialize, Serialize};
+use snodra_messaging::RetryPolicy;
+use snodra_messaging::context::CURRENT;
+use snodra_messaging::hub::{
     HubConnection, HubSettings, Inbound, SendOptions, Sender, SenderSettings,
 };
-use kraken_messaging::proto::{self, ErrorCode, ServerMessage, reply, server_message};
-use kraken_messaging::{Command, MessageContext, MessagingError, Query, message_type};
-use serde::{Deserialize, Serialize};
+use snodra_messaging::proto::{self, ErrorCode, ServerMessage, reply, server_message};
+use snodra_messaging::{Command, MessageContext, MessagingError, Query, message_type};
 use support::fake_hub::{FakeHub, default_ack};
 use tokio::sync::mpsc;
 
@@ -124,7 +124,7 @@ async fn sender_with(
 /// that does not decode is `invalid_request`, as Kotlin's.
 #[tokio::test]
 async fn every_call_is_timed_by_kind_type_and_final_outcome() {
-    use kraken_messaging::metrics::{HUB_CLIENT_REQUEST_DURATION, Metrics};
+    use snodra_messaging::metrics::{HUB_CLIENT_REQUEST_DURATION, Metrics};
     let hub = FakeHub::start().await;
     hub.set_responder(|req| {
         Some(match req.r#type.as_str() {

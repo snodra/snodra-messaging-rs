@@ -2,7 +2,7 @@
 //! [`SagaTestFixture`](crate::saga::testing::SagaTestFixture) drives one saga definition with
 //! events and time over the crate's own [`SagaRuntime`] and the in-memory ports of
 //! [`InMemorySagaStore`](crate::saga::testing::InMemorySagaStore). The Rust form of the Kotlin
-//! `kraken-messaging-test` `SagaTestFixture`.
+//! `snodra-messaging-test` `SagaTestFixture`.
 //!
 //! ```ignore
 //! SagaTestFixture::new("examples.Payment", payment_saga) // the closure given to builder.saga(..)
@@ -125,7 +125,7 @@ const MAX_DEADLINES_PER_STEP: usize = 10_000;
 
 impl<S: Serialize + DeserializeOwned + Default + Send + 'static> SagaTestFixture<S> {
     /// A fixture for the saga `name` defined by `define`, the closure a service passes to
-    /// [`KrakenMessagingBuilder::saga`](crate::KrakenMessagingBuilder::saga).
+    /// [`SnodraMessagingBuilder::saga`](crate::SnodraMessagingBuilder::saga).
     ///
     /// # Panics
     /// When the definition fails the startup checks (S2-R2), with their message.

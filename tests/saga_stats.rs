@@ -10,20 +10,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use kraken_messaging::events::{EventBus, LocalEventDispatcher, SagaStage};
-use kraken_messaging::external::{ExternalCallSettings, ExternalCalls, IdempotencyKey};
-use kraken_messaging::hub::{HandlerRegistry, SendOptions};
-use kraken_messaging::saga::stats::{
+use serde::{Deserialize, Serialize};
+use snodra_messaging::events::{EventBus, LocalEventDispatcher, SagaStage};
+use snodra_messaging::external::{ExternalCallSettings, ExternalCalls, IdempotencyKey};
+use snodra_messaging::hub::{HandlerRegistry, SendOptions};
+use snodra_messaging::saga::stats::{
     DEADLINES_DUE, EXTERNAL_CALLS, SAGA_COMMAND_FAILURES, SAGA_DISPATCH_PENDING, SAGA_EVENTS,
     SAGAS_ACTIVE, SAGAS_STARTED, SagaStats,
 };
-use kraken_messaging::saga::{
+use snodra_messaging::saga::{
     DeadlineScheduler, DeadlineSettings, EventOutcome, ExternalOutcome, FailureReason,
     LocalRawCommandSender, RawCommandSender, RelaySettings, SagaDefinition, SagaDispatchRelay,
     SagaRetry, SagaRuntime, SagaType,
 };
-use kraken_messaging::{Command, Event, MessagingError, RetryPolicy, message_type};
-use serde::{Deserialize, Serialize};
+use snodra_messaging::{Command, Event, MessagingError, RetryPolicy, message_type};
 use support::order_saga::{Bump, Finish, Gate, OrderPlaced, broken_saga, order_saga};
 use support::saga::{Store, event_ctx, t0};
 
@@ -288,7 +288,7 @@ async fn the_pending_dispatch_and_active_saga_gauges_follow_the_stored_state() {
         },
     )
     .await;
-    let at = kraken_messaging::time::epoch_ms(t0());
+    let at = snodra_messaging::time::epoch_ms(t0());
     st.store.edit(|c| {
         c.dispatch
             .iter_mut()
