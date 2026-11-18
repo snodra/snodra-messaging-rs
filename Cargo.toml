@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "snodra-messaging-rs"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 rust-version = "1.99"
 description = "Snodra messaging client for Rust: hub client (commands, queries), events through an event-store add-on with the message store's outbox, identity"

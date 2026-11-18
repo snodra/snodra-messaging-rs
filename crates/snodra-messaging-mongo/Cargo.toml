@@ -1,6 +1,6 @@
 [package]
 name = "snodra-messaging-mongo"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 rust-version = "1.99"
 description = "Snodra messaging: the MongoDB message store (outbox, processed events, dead letters, processor control, external calls, sagas)"
@@ -12,14 +12,14 @@ keywords = ["mongodb","outbox","messaging","events"]
 categories = ["database"]
 
 [dependencies]
-snodra-messaging-rs = { path = "../..", version = "0.6.0" }
+snodra-messaging-rs = { path = "../..", version = "0.6.1" }
 mongodb = "3.9.1"
 futures = "0.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 
 [dev-dependencies]
-snodra-messaging-rs = { path = "../..", version = "0.6.0", features = ["testing"] }
+snodra-messaging-rs = { path = "../..", version = "0.6.1", features = ["testing"] }
 tokio = { version = "1.54.1", features = ["full"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15.0", features = ["mongo"] }
