@@ -920,7 +920,9 @@ impl SnodraMessagingBuilder {
         let dispatcher = Arc::new(
             Dispatcher::new(
                 Arc::clone(&registry),
-                Arc::new(IdentityResolver::new(verifier)),
+                Arc::new(
+                    IdentityResolver::new(verifier).with_roles_claim(&config.security_roles_claim),
+                ),
                 config.max_concurrent_handlers,
             )
             .stream_credit_timeout(config.hub_stream_credit_timeout)

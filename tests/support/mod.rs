@@ -35,7 +35,7 @@ pub fn sign(
         "iss": issuer,
         "exp": exp,
         "iat": now() - 10,
-        "realm_access": { "roles": roles },
+        "roles": roles,
     });
     encode(
         &header,
@@ -49,7 +49,8 @@ pub fn sign(
 pub fn token_with_audience(subject: &str, roles: &[&str], audience: &[&str]) -> String {
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some("k1".into());
-    let claims = json!({"sub": subject, "iss": ISSUER, "exp": now() + 300, "aud": audience, "realm_access": {"roles": roles}});
+    let claims =
+        json!({"sub": subject, "iss": ISSUER, "exp": now() + 300, "aud": audience, "roles": roles});
     encode(
         &header,
         &claims,
@@ -61,13 +62,13 @@ pub fn token_with_audience(subject: &str, roles: &[&str], audience: &[&str]) -> 
 /// `alg: none` token: two base64url segments and an empty signature.
 pub fn unsigned_token(subject: &str) -> String {
     let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
-    let claims = URL_SAFE_NO_PAD
-        .encode(json!({"sub": subject, "realm_access": {"roles": ["snodra-admin"]}}).to_string());
+    let claims =
+        URL_SAFE_NO_PAD.encode(json!({"sub": subject, "roles": ["snodra-admin"]}).to_string());
     format!("{header}.{claims}.")
 }
 
-/// A signed token whose claims lack `realm_access`.
-pub fn token_without_realm_access(subject: &str) -> String {
+/// A signed token whose claims carry no roles.
+pub fn token_without_roles(subject: &str) -> String {
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some("k1".into());
     let claims = json!({"sub": subject, "iss": ISSUER, "exp": now() + 300});

@@ -172,6 +172,10 @@ pub struct Config {
     pub issuer: Option<String>,
     /// Forward the current handler's bearer token on outgoing requests.
     pub forward_jwt: bool,
+    /// Where a forwarded token's roles come from (`SNODRA_SECURITY_ROLES_CLAIM`): a dotted claim
+    /// path, or `scope`. `roles` by default; `realm_access.roles` for Keycloak, `groups` for
+    /// providers that put them there.
+    pub security_roles_claim: String,
     /// Sagas (ADR 0021; `SNODRA_SAGAS_ENABLED`, default true): with `false` a service that
     /// registers sagas starts without their runtime, relay and scheduler (logged at warn).
     pub sagas_enabled: bool,
@@ -251,6 +255,7 @@ impl Config {
             jwks_url: None,
             issuer: None,
             forward_jwt: true,
+            security_roles_claim: "roles".to_string(),
             sagas_enabled: true,
             sagas_max_attempts: 5,
             sagas_ended_retention: Duration::from_secs(30 * 86_400),
@@ -369,6 +374,9 @@ impl Config {
         }
         if let Some(t) = optional("SNODRA_EVENTS_SOURCE") {
             c.events_source = t;
+        }
+        if let Some(v) = optional("SNODRA_SECURITY_ROLES_CLAIM") {
+            c.security_roles_claim = v;
         }
         c.jwks_url = optional("SNODRA_JWKS_URL");
         c.issuer = optional("SNODRA_ISSUER");

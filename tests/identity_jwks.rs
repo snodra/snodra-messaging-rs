@@ -44,9 +44,9 @@ async fn valid_token_is_verified_identity() {
 }
 
 #[tokio::test]
-async fn roles_empty_when_realm_access_missing_in_verified_token() {
+async fn roles_empty_when_the_claim_is_missing_in_a_verified_token() {
     let server = server_with(None).await;
-    let token = support::token_without_realm_access("u-2");
+    let token = support::token_without_roles("u-2");
     let id = resolver(&server)
         .resolve(Some(&format!("Bearer {token}")))
         .await
