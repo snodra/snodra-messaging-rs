@@ -16,9 +16,9 @@ use serde_json::{Map, Value};
 /// The acting user as seen by a handler.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Identity {
-    /// Keycloak subject (`sub`).
+    /// The token's subject (`sub`).
     pub user_id: Option<String>,
-    /// Realm roles (`realm_access.roles`), without any prefix.
+    /// The roles read from the configured claim ([RolesClaim]), without any prefix.
     pub roles: Vec<String>,
     /// True when the token's signature was verified by this process.
     pub verified: bool,
@@ -29,31 +29,88 @@ impl Identity {
         self.roles.iter().any(|r| r == role)
     }
 
-    pub(crate) fn from_claims(claims: &Map<String, Value>, verified: bool) -> Identity {
+    pub(crate) fn from_claims(
+        claims: &Map<String, Value>,
+        verified: bool,
+        roles_claim: &RolesClaim,
+    ) -> Identity {
         Identity {
             user_id: claims
                 .get("sub")
                 .and_then(Value::as_str)
                 .map(str::to_string),
-            roles: realm_roles(claims),
+            roles: roles_claim.roles(claims),
             verified,
         }
     }
 }
 
-/// Keycloak realm roles from `realm_access.roles`; empty when the claim is absent or malformed.
-pub fn realm_roles(claims: &Map<String, Value>) -> Vec<String> {
-    claims
-        .get("realm_access")
-        .and_then(Value::as_object)
-        .and_then(|ra| ra.get("roles"))
-        .and_then(Value::as_array)
-        .map(|roles| {
-            roles
-                .iter()
-                .filter_map(Value::as_str)
+/// Where a token's roles come from: a dotted path into the claims, or the space-separated `scope`.
+///
+/// Providers disagree, so the claim is configuration (`SNODRA_SECURITY_ROLES_CLAIM`): `roles` by
+/// default, `realm_access.roles` for Keycloak, `groups` for Okta/Dex, `scope` for OAuth2 scopes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RolesClaim {
+    Scope,
+    Path(Vec<String>),
+}
+
+impl Default for RolesClaim {
+    fn default() -> Self {
+        RolesClaim::Path(vec!["roles".to_string()])
+    }
+}
+
+impl RolesClaim {
+    /// Parses a claim path (`realm_access.roles`, `groups`, `scope`); blank means the default.
+    pub fn parse(value: &str) -> RolesClaim {
+        let value = value.trim();
+        if value.is_empty() {
+            return RolesClaim::default();
+        }
+        if value.eq_ignore_ascii_case("scope") {
+            return RolesClaim::Scope;
+        }
+        RolesClaim::Path(
+            value
+                .split('.')
+                .filter(|segment| !segment.is_empty())
                 .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+                .collect(),
+        )
+    }
+
+    /// The roles this claim holds for `claims`; empty when it is absent or malformed.
+    pub fn roles(&self, claims: &Map<String, Value>) -> Vec<String> {
+        match self {
+            RolesClaim::Scope => claims
+                .get("scope")
+                .and_then(Value::as_str)
+                .map(|scopes| {
+                    scopes
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            RolesClaim::Path(path) => {
+                let Some((first, rest)) = path.split_first() else {
+                    return Vec::new();
+                };
+                let mut node = claims.get(first);
+                for segment in rest {
+                    node = node.and_then(Value::as_object).and_then(|o| o.get(segment));
+                }
+                node.and_then(Value::as_array)
+                    .map(|roles| {
+                        roles
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+        }
+    }
 }

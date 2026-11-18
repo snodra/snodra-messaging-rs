@@ -6,7 +6,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Map, Value};
 
-use super::{Identity, JwksVerifier};
+use super::{Identity, JwksVerifier, RolesClaim};
 use crate::error::MessagingError;
 
 /// With a verifier: verified identities (`verified = true`), invalid tokens rejected. Without one:
@@ -17,6 +17,7 @@ use crate::error::MessagingError;
 pub struct IdentityResolver {
     verifier: Option<JwksVerifier>,
     warned: AtomicBool,
+    roles_claim: RolesClaim,
 }
 
 impl IdentityResolver {
@@ -24,7 +25,14 @@ impl IdentityResolver {
         IdentityResolver {
             verifier,
             warned: AtomicBool::new(false),
+            roles_claim: RolesClaim::default(),
         }
+    }
+
+    /// Reads roles from `value` (a dotted claim path, or `scope`) instead of `roles`.
+    pub fn with_roles_claim(mut self, value: &str) -> Self {
+        self.roles_claim = RolesClaim::parse(value);
+        self
     }
 
     pub async fn resolve(
@@ -46,6 +54,7 @@ impl IdentityResolver {
             Some(verifier) => Ok(Some(Identity::from_claims(
                 &verifier.verify(token).await?,
                 true,
+                &self.roles_claim,
             ))),
             None => {
                 if !self.warned.swap(true, Ordering::Relaxed) {
@@ -56,6 +65,7 @@ impl IdentityResolver {
                 Ok(Some(Identity::from_claims(
                     &unverified_claims(token)?,
                     false,
+                    &self.roles_claim,
                 )))
             }
         }

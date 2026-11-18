@@ -1,7 +1,7 @@
 mod support;
 
 use serde_json::json;
-use snodra_messaging::identity::{Guard, IdentityResolver, realm_roles};
+use snodra_messaging::identity::{Guard, IdentityResolver, RolesClaim};
 use snodra_messaging::{Identity, MessageContext, MessagingError};
 
 fn ctx() -> MessageContext {
@@ -13,18 +13,40 @@ fn resolver() -> IdentityResolver {
 }
 
 #[test]
-fn realm_roles_read_from_claims() {
-    let claims = json!({"realm_access": {"roles": ["snodra-user", "snodra-admin"]}});
+fn the_default_claim_is_roles() {
+    let claims = json!({"roles": ["snodra-user", "snodra-admin"]});
     assert_eq!(
-        realm_roles(claims.as_object().unwrap()),
+        RolesClaim::default().roles(claims.as_object().unwrap()),
         vec!["snodra-user", "snodra-admin"]
     );
 }
 
 #[test]
-fn roles_empty_when_realm_access_missing() {
+fn a_dotted_path_reads_a_nested_claim() {
+    let claims = json!({"realm_access": {"roles": ["snodra-user"]}, "roles": ["ignored"]});
+    assert_eq!(
+        RolesClaim::parse("realm_access.roles").roles(claims.as_object().unwrap()),
+        vec!["snodra-user"]
+    );
+}
+
+#[test]
+fn scope_is_space_separated() {
+    let claims = json!({"scope": "orders.read orders.write"});
+    assert_eq!(
+        RolesClaim::parse("scope").roles(claims.as_object().unwrap()),
+        vec!["orders.read", "orders.write"]
+    );
+}
+
+#[test]
+fn roles_empty_when_the_claim_is_missing() {
     let claims = json!({"sub": "u-1"});
-    assert!(realm_roles(claims.as_object().unwrap()).is_empty());
+    assert!(
+        RolesClaim::default()
+            .roles(claims.as_object().unwrap())
+            .is_empty()
+    );
 }
 
 #[test]
