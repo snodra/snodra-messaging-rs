@@ -1,5 +1,5 @@
 <p align="center">
-  <img alt="Snodra mascot" src="docs/assets/brand/svg/snodra.svg" width="160">
+  <img alt="Snodra Messaging for Rust mascot" src="docs/assets/brand/svg/snodra-messaging.svg" width="160">
 </p>
 
 <h1 align="center">Snodra Messaging (Rust)</h1>
