@@ -15,7 +15,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The package uploads attach to an existing release, so it is created first.
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          NOTES="crates.io: \`snodra-messaging-rs\`, \`-kafka\`, \`-mongo\`, \`-sqlx\`, \`-rabbitmq\` at \`$VERSION\`
+          Packages: the published \`.crate\` files below."
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$VERSION" --repo "$GITHUB_REPOSITORY" \
+              --title "${GITHUB_REPOSITORY#*/} $VERSION" --notes "$NOTES"
+          else
+            gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" \
+              --title "${GITHUB_REPOSITORY#*/} $VERSION" --generate-notes --notes "$NOTES"
+          fi
+
   publish:
+    needs: prepare
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -68,12 +88,10 @@ jobs:
             publish_crate "$crate"
           done
 
-      - name: GitHub release
+      - name: the published packages attach to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "${GITHUB_REPOSITORY#*/} $GITHUB_REF_NAME" \
-            --generate-notes \
-            --notes "crates.io: \`snodra-messaging-rs\`, \`-kafka\`, \`-mongo\`, \`-sqlx\`, \`-rabbitmq\` at \`$GITHUB_REF_NAME\`"
+          find target/package -maxdepth 1 -name '*.crate' -print0 \
+            | xargs -0 -r gh release upload "$GITHUB_REF_NAME" \
+                --repo "$GITHUB_REPOSITORY" --clobber
