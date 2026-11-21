@@ -1,4 +1,4 @@
-//! The `processor_control` collection (ADR 0023): one document per processor, `_id` its name.
+//! The `processor_control` collection: one document per processor, `_id` its name.
 //! Every field is always written (`null` or `[]` when there is nothing), as Kotlin writes it; a
 //! reader takes a missing field for `null`, `false` or `[]`, and a missing document for a
 //! processor that is not paused, not locked and not replaying.

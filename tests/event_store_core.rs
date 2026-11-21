@@ -1,4 +1,4 @@
-//! The core over the event-store interface (ADR 0027), on the in-process event store double
+//! The core over the event-store interface, on the in-process event store double
 //! (`support::event_store`): a broken subscription is subscribed again, a control action the event
 //! store's capabilities do not cover is refused `UNSUPPORTED`, and the processor status names the
 //! event store and its capabilities. No container: the message store is the in-memory one.

@@ -1,4 +1,4 @@
-//! The saga definition API (S2-R1) and the erased model the runtime works with.
+//! The saga definition API and the erased model the runtime works with.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -33,7 +33,7 @@ pub(crate) enum ValueSource {
 /// One event handler of a saga, with the state and the event typed away: `invoke` decodes the
 /// state (JSON text) into the saga's `S` and the payload into the event, calls the user's closure
 /// and writes the state back as text, only when the closure succeeded. The text is the codec's
-/// exact output (ADR 0021 ruling 25), never a `serde_json::Value` in between, so a number or a
+/// exact output, never a `serde_json::Value` in between, so a number or a
 /// map key survives as written.
 pub(crate) struct ErasedHandler {
     pub event_type: &'static str,
@@ -74,7 +74,7 @@ pub(crate) struct ErasedDeadlineHandler {
 
 /// A registered saga type: its wire name, its handlers by event type name (each list in
 /// registration order, the order they run in), its deadline handlers by deadline name, the
-/// handler of [`SagaCommandFailed`] (routed by `sagaId`, ruling 27, so it is not in `handlers`) and
+/// handler of [`SagaCommandFailed`] (routed by `sagaId`, so it is not in `handlers`) and
 /// a fresh instance's state text.
 ///
 /// Opaque outside the crate: build one with [`SagaDefinition::build`] and hand it to
@@ -117,10 +117,10 @@ enum Last {
 /// The definition of one saga type, built with the closure given to
 /// [`SnodraMessagingBuilder::saga`](crate::SnodraMessagingBuilder::saga).
 ///
-/// Every handler is a synchronous closure `Fn(&mut S, &E, &mut SagaContext) -> Result<(), MessagingError>`:
-/// it changes the state and records what it wants done on the context; the runtime does the I/O
-/// after the saga's transaction committed. Handlers of one event type run in registration order
-/// (Kotlin runs them in method-name order, a reflection limit: an S2 divergence).
+/// Every handler is a synchronous closure `Fn(&mut S, &E, &mut SagaContext) -> Result<(),
+/// MessagingError>`: it changes the state and records what it wants done on the context; the
+/// runtime does the I/O after the saga's transaction committed. Handlers of one event type run in
+/// registration order (Kotlin runs them in method-name order, a reflection limit).
 ///
 /// The association of a handler is `key = value`: the handler runs on the live instances of this
 /// saga type that are associated with it. `start_on` handlers may create an instance when no live
@@ -323,8 +323,8 @@ impl<S: Serialize + DeserializeOwned + Default + Send + 'static> SagaDefinition<
     }
 
     /// The handler of [`SagaCommandFailed`] for this saga's own commands. The runtime routes it
-    /// by `saga_id` to the instance that sent the command, with no association needed (ADR 0021
-    /// ruling 27); an ended instance is not reached.
+    /// by `saga_id` to the instance that sent the command, with no association needed; an ended
+    /// instance is not reached.
     pub fn on_command_failed(
         mut self,
         handler: impl Fn(&mut S, &SagaCommandFailed, &mut SagaContext) -> Result<(), MessagingError>
@@ -352,7 +352,7 @@ impl<S: Serialize + DeserializeOwned + Default + Send + 'static> SagaDefinition<
         self
     }
 
-    /// The startup checks (S2-R2), then the erased type; the error names the saga and the handler.
+    /// The startup checks, then the erased type; the error names the saga and the handler.
     pub fn build(self) -> Result<SagaType, MessagingError> {
         let name = self.name;
         let invalid = |message: String| Err(MessagingError::InvalidMessage(message));

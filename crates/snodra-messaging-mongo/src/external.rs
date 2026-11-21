@@ -1,4 +1,4 @@
-//! The `external_calls` collection (ADR 0021): one record per idempotency key (`_id`), with
+//! The `external_calls` collection: one record per idempotency key (`_id`), with
 //! `status` (`IN_PROGRESS`, `SUCCEEDED`, `FAILED`, `UNKNOWN`), `reply` and `error` as JSON text,
 //! `attempts`, `updatedAt`, and `leaseUntil` and `owner` while a call runs. An absent field is
 //! absent (never null). Every write is a single-document write of its own, outside any session.

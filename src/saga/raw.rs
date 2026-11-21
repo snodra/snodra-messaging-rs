@@ -1,4 +1,4 @@
-//! Raw command sending for the saga relay (ADR 0021 rulings 8, 10, 12, 14, 29 and 34): a command
+//! Raw command sending for the saga relay: a command
 //! known only by its wire type name and JSON bytes, delivered to this instance's own handler
 //! directly (no hub: spec decision 5) or through the hub, and answered with a classified
 //! [`RawOutcome`] instead of a decoded reply. Kept apart from the public command API.
@@ -15,10 +15,10 @@ use crate::hub::{AbortOnDrop, HandlerRegistry, SendOptions, Sender, invocation_e
 
 /// What an adapter's error carries in `details` when the external call failed for a reason a
 /// later attempt may cure: the relay reads it to tell a transient failure from an ordinary
-/// handler failure, whether the adapter ran in this service or in another (ruling 12; the Kotlin
+/// handler failure, whether the adapter ran in this service or in another (the Kotlin
 /// marker, byte for byte).
 pub const RETRYABLE_MARKER: &[u8] = br#"{"snodra":"retryable"}"#;
-/// What an adapter's error carries in `details` when the call's outcome is unknown (ruling 12).
+/// What an adapter's error carries in `details` when the call's outcome is unknown.
 pub const UNKNOWN_OUTCOME_MARKER: &[u8] = br#"{"snodra":"unknown-outcome"}"#;
 
 /// What a raw send reports, classified for the relay.
@@ -36,7 +36,7 @@ fn has_marker(details: &[u8], marker: &[u8]) -> bool {
     String::from_utf8_lossy(details).trim().as_bytes() == marker
 }
 
-/// The retry taxonomy of ADR 0021 (rulings 9 and 10; the relay does not share the buses' retry
+/// The retry taxonomy (the relay does not share the buses' retry
 /// classification): a send that may not have reached the handler, or whose outcome the
 /// idempotency key makes safe to repeat, is transient; the handler's own answers are permanent.
 /// Anything that is not a messaging failure (the sender's or the store's own) is transient and
@@ -95,7 +95,7 @@ pub trait RawCommandSender: Send + Sync {
 }
 
 /// Delivers to this service's own command handlers only: what a service with no hub does (an
-/// unknown type is a permanent `NO_HANDLER`, ruling 34), and the local half of
+/// unknown type is a permanent `NO_HANDLER`), and the local half of
 /// [`LocalFirstSender`]. The handler runs on a task of its own (a panic is its failure), outside
 /// the dispatcher's concurrency permits.
 pub struct LocalRawCommandSender {
@@ -177,7 +177,7 @@ impl RawCommandSender for LocalRawCommandSender {
     }
 }
 
-/// What the saga relay sends with (S2-R5): a command type this instance handles is delivered to
+/// What the saga relay sends with: a command type this instance handles is delivered to
 /// its own handler directly, with no hub (spec decision 5: the adapter lives in the service that
 /// owns the saga); every other type goes through the hub ([`Sender::send_raw`]), where `NO_HANDLER`
 /// is transient. The crate's ordinary senders never short-circuit; only the relay does.

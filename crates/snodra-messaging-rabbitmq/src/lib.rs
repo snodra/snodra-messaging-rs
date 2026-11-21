@@ -1,4 +1,4 @@
-//! The RabbitMQ Streams event store add-on (ADR 0027): [`RabbitEventStore`] implements the
+//! The RabbitMQ Streams event store add-on: [`RabbitEventStore`] implements the
 //! core's [`EventStore`] on RabbitMQ 3.13 or later with the stream plugin, through the stream
 //! protocol (`rabbitmq-stream-client`), and [`RabbitBrowser`] is its event browser.
 //!

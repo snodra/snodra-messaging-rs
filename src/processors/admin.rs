@@ -1,4 +1,4 @@
-//! The dead-letter admin API (ADR 0022): [`DeadLetters`], from
+//! The dead-letter admin API: [`DeadLetters`], from
 //! [`SnodraMessaging::dead_letters`](crate::SnodraMessaging::dead_letters), on any instance of the
 //! service that runs the letter's processor.
 
@@ -179,7 +179,7 @@ impl DeadLetters {
             Box::pin(async move { Ok(letters.delete_in(tx, &letter_id).await?) })
         });
         let payload = letter.payload.clone();
-        // The retry is the record's stage 1: its marker carries the record's position (ADR 0023).
+        // The retry is the record's stage 1: its marker carries the record's position.
         let position = MarkerPosition {
             processor: letter.processor.clone(),
             source: letter.source.clone(),

@@ -1,4 +1,4 @@
-//! The dead-letter admin API (ADR 0022): list, get, count, retry (each result), retry_all and
+//! The dead-letter admin API: list, get, count, retry (each result), retry_all and
 //! discard against a real MongoDB replica set, with letters inserted as the consumer parks them.
 //! A retry runs the processor's stage 1 in the marker transaction, the letter's deletion included.
 

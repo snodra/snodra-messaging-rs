@@ -1,4 +1,4 @@
-//! TLS on the hub channel (roadmap P5a, ADR 0018): tonic's rustls with the `ring` provider (the one
+//! TLS on the hub channel: tonic's rustls with the `ring` provider (the one
 //! the hub uses; selected by tonic's `tls-ring` feature, which applies unless the application has
 //! installed a process-wide rustls provider of its own), the platform's root certificates unless a
 //! CA file is configured. The same channel setup serves every address form (a static list,
@@ -35,7 +35,7 @@ pub(crate) fn effective(configured: Option<&HubTls>, address: &str) -> Option<Hu
     }
 }
 
-/// Adds TLS to `endpoint`, presenting `identity` (mutual TLS, P5c) when there is one. The CA file
+/// Adds TLS to `endpoint`, presenting `identity` (mutual TLS) when there is one. The CA file
 /// is read now, so a rotated CA applies at the next connect.
 pub(crate) fn configure(
     endpoint: Endpoint,

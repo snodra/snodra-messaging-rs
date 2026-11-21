@@ -1,4 +1,4 @@
-//! The dead letters (ADR 0022, mode `collection`): records that exhausted their attempts, parked
+//! The dead letters (mode `collection`): records that exhausted their attempts, parked
 //! and sequenced per (processor, key). Every operation is a write of its own, outside any
 //! transaction, but a retry's [`delete_in`](DeadLetterStore::delete_in).
 
@@ -126,7 +126,7 @@ pub struct DeadLetter {
     pub last_attempt_at_ms: i64,
     /// `parked_at_ms` + retention: the store removes the letter then (which unblocks its key).
     pub expire_at_ms: i64,
-    /// The record was parked while its processor replayed it (ADR 0023).
+    /// The record was parked while its processor replayed it.
     pub replay: bool,
 }
 

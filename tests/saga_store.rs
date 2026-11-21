@@ -1,9 +1,9 @@
-//! The storage contract of ADR 0021 for sagas (S2) in the MongoDB message store: the documents of
+//! The storage contract for sagas in the MongoDB message store: the documents of
 //! `sagas`, `saga_dispatch`, `saga_dispatch_leases`, `deadlines`, `saga_failures` and
 //! `external_calls` (`snodra_messaging_mongo::documents`, read back into the core's records), and
 //! their indexes.
-//! The fixtures in `tests/fixtures/saga_contract` are written by hand from the ADR's table, in the
-//! shape Spring Data writes them (`_class` included); Rust writes no `_class` and no nulls.
+//! The fixtures in `tests/fixtures/saga_contract` are written by hand from the contract's table, in
+//! the shape Spring Data writes them (`_class` included); Rust writes no `_class` and no nulls.
 
 mod support;
 

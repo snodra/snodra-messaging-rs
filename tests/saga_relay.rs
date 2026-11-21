@@ -1,6 +1,6 @@
-//! The saga dispatch relay (S2 Task 6, ADR 0021 rulings 7-11, 28-31, 34): an ordered, after-commit
-//! relay of what sagas recorded in `saga_dispatch`, on the in-memory message store. The Rust form of the
-//! Kotlin `SagaDispatchRelayTest`.
+//! The saga dispatch relay: an ordered, after-commit
+//! relay of what sagas recorded in `saga_dispatch`, on the in-memory message store. The Rust form
+//! of the Kotlin `SagaDispatchRelayTest`.
 #![cfg(feature = "testing")]
 
 mod support;

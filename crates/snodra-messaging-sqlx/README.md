@@ -1,6 +1,6 @@
 # snodra-messaging-sqlx
 
-The SQL message store (ADR 0028) of snodra-messaging-rs: the outbox, the processed events, the dead letters, the processor
+The SQL message store of snodra-messaging-rs: the outbox, the processed events, the dead letters, the processor
 control, the external calls and the sagas in the service's own **PostgreSQL** (feature `postgres`) or **MySQL** (feature
 `mysql`) database, through [`sqlx`](https://docs.rs/sqlx) 0.9. It writes the tables of the Kotlin module
 `snodra-messaging-jdbc` with the same values and the same meanings, so a Kotlin service and a Rust service can share one

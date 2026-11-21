@@ -1,4 +1,4 @@
-//! The in-memory event store (`event_store::memory`, ADR 0027): the conformance kit on it, with
+//! The in-memory event store (`event_store::memory`): the conformance kit on it, with
 //! no container, and what the kit cannot see (its settings, misuse without panics, a dropped
 //! subscription, paused time, its bounds). Needs the feature `testing`.
 #![cfg(feature = "testing")]

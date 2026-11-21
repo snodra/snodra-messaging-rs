@@ -1,7 +1,7 @@
-//! Saga, deadline, dispatch and external-call statistics (S2-R7, ADR 0021 ruling 21): the Kotlin
+//! Saga, deadline, dispatch and external-call statistics: the Kotlin
 //! meters as counters and gauges behind accessors, with the same names and labels, which
-//! [`OtelSagaMetrics`](super::OtelSagaMetrics) also records on the meter (ADR 0026:
-//! `snodra.sagas.started{type}` is what Prometheus shows as `snodra_sagas_started_total{type}`).
+//! [`OtelSagaMetrics`](super::OtelSagaMetrics) also records on the meter
+//! (`snodra.sagas.started{type}` is what Prometheus shows as `snodra_sagas_started_total{type}`).
 //! Every label value is a saga type, a deadline name, a handler label, an outcome or a reason,
 //! never an id.
 //!
@@ -35,7 +35,7 @@ use super::metrics::{EventOutcome, ExternalOutcome, SagaMetrics};
 use super::ports::{SagaDispatchStore, SagaRepository};
 use crate::error::MessagingError;
 
-/// How often the sampled gauges are counted (ruling 16: a constant).
+/// How often the sampled gauges are counted (a constant).
 pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
 
 pub const SAGAS_STARTED: &str = "snodra.sagas.started";

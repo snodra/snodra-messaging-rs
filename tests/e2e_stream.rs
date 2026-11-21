@@ -1,4 +1,4 @@
-//! End to end with two real hubs (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`, ADR 0017) and the
+//! End to end with two real hubs (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`) and the
 //! multi-hub configuration (every instance on both hubs): one service streams 1 000 rows under a
 //! credit window of 8 and another collects them all in order (the stream pins one instance and one
 //! hub, which count it in flight until the end); a stream dropped mid-way is cancelled at the hub

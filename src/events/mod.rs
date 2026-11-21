@@ -1,4 +1,4 @@
-//! Events through the event store (ADR 0027) with the message store's outbox (ADR 0028):
+//! Events through the event store with the message store's outbox:
 //! [`EventBus`] appends to the outbox, [`OutboxPublisher`] relays it with
 //! [`EventStore::publish`](crate::event_store::EventStore::publish), and each event processor's
 //! [`EventConsumer`] reads its subscription, idempotently. The records are byte-compatible with
@@ -26,5 +26,5 @@ pub(crate) use resubscribe::{Ended, Resubscribing, keep_subscribed};
 pub use resubscribe::{RESUBSCRIBE_MAX, RESUBSCRIBE_MIN};
 
 /// The source a service's events go to unless `SNODRA_EVENTS_SOURCE` names another (on Kafka,
-/// the topic of ADR 0003).
+/// the topic).
 pub const EVENTS_SOURCE: &str = "snodra.events";

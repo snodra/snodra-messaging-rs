@@ -1,4 +1,4 @@
-//! The saga runtime (S2 Task 5, ADR 0021 rulings 1, 3-6, 25, 26, 27, 33, 35, 37): one transaction
+//! The saga runtime: one transaction
 //! per (event, saga type) with an exactly-once marker, association routing, start keys,
 //! version-checked writes, dispatch entries, deadlines and parking. The Rust form of the Kotlin
 //! `SagaRuntimeTest`, on the in-memory message store and its transactions (no container).
@@ -1025,7 +1025,7 @@ async fn a_start_handler_that_removes_its_own_start_association_leaves_the_start
     );
     assert_eq!(
         first[0].start_key, None,
-        "the start key went with the start association, as on an update (ruling 35)"
+        "the start key went with the start association, as on an update"
     );
 
     deliver_to(&runtime, &placed, "e-h2", &[]).await;

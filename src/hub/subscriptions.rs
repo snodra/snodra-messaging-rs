@@ -1,4 +1,4 @@
-//! The subscriptions this instance serves (ADR 0017, P4c) and the [`QueryUpdateEmitter`] that
+//! The subscriptions this instance serves and the [`QueryUpdateEmitter`] that
 //! feeds them. A `Request{mode = SUBSCRIPTION}` registers one (the decoded query, the request id
 //! `<id>#n`, the hub stream it arrived on); every `emit` whose filter the query passes becomes a
 //! `ReplyPart` on that stream (`seq` from 1 per subscription; the hub renumbers), `complete` and
@@ -434,7 +434,7 @@ async fn pump(
     }
 }
 
-/// Pushes updates to the subscriptions of this instance (ADR 0017, P4c). Obtained from
+/// Pushes updates to the subscriptions of this instance. Obtained from
 /// `SnodraMessaging::emitter()` (or the builder's, so handlers can capture it) or from
 /// `Dispatcher::emitter()`; clones share the same subscriptions.
 ///

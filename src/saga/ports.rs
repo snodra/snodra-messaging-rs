@@ -151,7 +151,7 @@ pub trait FailureStore: Send + Sync {
     /// Records that a retry of the failure `id` failed again: `attempts` grows by `attempts`,
     /// `error` and `lastFailedAt` are replaced. **Never inserts**: false when the failure no longer
     /// exists (a `discard` or a concurrent retry got there first), so the bookkeeping of a failed
-    /// retry cannot bring a discarded failure back (ruling 36).
+    /// retry cannot bring a discarded failure back.
     fn failed_again<'a>(
         &'a self,
         tx: &'a mut Tx,

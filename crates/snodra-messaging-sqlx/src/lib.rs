@@ -1,4 +1,4 @@
-//! The SQL message store (ADR 0028): every store of `snodra_messaging::store` over the service's
+//! The SQL message store: every store of `snodra_messaging::store` over the service's
 //! own PostgreSQL (13 or later, feature `postgres`) or MySQL (8.0.17 or later, InnoDB, feature
 //! `mysql`) database through [`sqlx`], in the tables snodra-messaging-jdbc (the Kotlin twin)
 //! writes: same tables, same values, same meanings, so a Kotlin service and a Rust service can

@@ -1,9 +1,9 @@
-//! The saga records (ADR 0021): what the saga ports store, field for field the storage contract
+//! The saga records: what the saga ports store, field for field the storage contract
 //! both libraries keep.
 //!
 //! Times are epoch milliseconds (`_ms`), enums their Kotlin names, ids strings, and the saga
 //! `state`, the dispatch and failure `payload` and a deadline `payload` are JSON **text** (the
-//! codec's exact output, ruling 25). How a store keeps them is the store's own: the MongoDB
+//! codec's exact output). How a store keeps them is the store's own: the MongoDB
 //! add-on writes the documents both libraries have always written (dates as BSON datetimes, an
 //! absent field for `None`), so Kotlin and Rust read each other's records.
 
@@ -63,7 +63,7 @@ pub enum DispatchKind {
 /// (`saga_dispatch`). `seq` orders the entries of one saga (`version * 1000 + index`); the id
 /// `"<sagaId>:<seq>"` is the command's idempotency key. A command given up on carries its
 /// outcome (`failure_reason`, `failure_message`, written with `failed_at_ms`), and
-/// `notice_pending` is true until the `SagaCommandFailed` was delivered locally (ruling 28).
+/// `notice_pending` is true until the `SagaCommandFailed` was delivered locally.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SagaDispatchDocument {
     pub id: String,
@@ -103,7 +103,7 @@ pub enum DeadlineStatus {
 /// JSON value) and `payload_type` its type name, both absent when there is none. A scheduler
 /// claims a due deadline with `claimed_by` and `claimed_until_ms` (a lease: an expired one lets it
 /// fire again); `finished_at_ms` is set when it is `FIRED` or `CANCELLED`; `correlation_id` is the
-/// correlation id of the message that scheduled it (ruling 37).
+/// correlation id of the message that scheduled it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeadlineDocument {
     pub id: String,

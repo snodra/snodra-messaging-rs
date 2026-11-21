@@ -39,7 +39,7 @@ pub(crate) type EventHandler =
 pub(crate) type QueryDecoder =
     Arc<dyn Fn(&[u8]) -> Result<Box<dyn Any + Send + Sync>, Invocation> + Send + Sync>;
 
-/// A subscription query's handler (ADR 0017, P4c): the initial result, answered like a unary
+/// A subscription query's handler: the initial result, answered like a unary
 /// query, and the decoder of the query a `Request{mode = SUBSCRIPTION}` registers.
 #[derive(Clone)]
 pub(crate) struct SubscriptionHandler {
@@ -64,15 +64,15 @@ pub struct EventContext {
 pub struct HandlerRegistry {
     commands: HashMap<&'static str, RequestHandler>,
     queries: HashMap<&'static str, RequestHandler>,
-    /// Streaming queries (ADR 0017, P4b), served only for `mode = STREAMING`.
+    /// Streaming queries, served only for `mode = STREAMING`.
     streams: HashMap<&'static str, StreamHandler>,
-    /// Subscription queries (ADR 0017, P4c): the initial result for `<id>#0` (`mode = UNARY`),
+    /// Subscription queries: the initial result for `<id>#0` (`mode = UNARY`),
     /// the subscription for `mode = SUBSCRIPTION`.
     subscriptions: HashMap<&'static str, SubscriptionHandler>,
     /// The query types registered as shared (their handlers are in `queries`, `streams` or
     /// `subscriptions`).
     shared: HashSet<&'static str>,
-    /// Each with whether it runs in a replay (ADR 0023: false for `disallow_replay`).
+    /// Each with whether it runs in a replay (false for `disallow_replay`).
     events: HashMap<&'static str, Vec<(EventHandler, bool)>>,
     guards: HashMap<&'static str, Guard>,
     /// The labels (wire type names) of the idempotent handlers, sorted on read.
@@ -107,7 +107,7 @@ impl HandlerRegistry {
             .insert(Q::TYPE, erase_request::<Q, Q::Reply, F, Fut>(handler));
     }
 
-    /// A shared query (`Register.shared_query_types`, ADR 0017): several services may own it. A
+    /// A shared query (`Register.shared_query_types`): several services may own it. A
     /// point query goes to one instance of any owner; a scatter-gather to every instance of every
     /// owner. Each instance of each owner serves it like any query (a scatter-gather target gets
     /// an ordinary request with id `<id>#<n>`).
@@ -130,7 +130,7 @@ impl HandlerRegistry {
         self.shared.insert(Q::TYPE);
     }
 
-    /// An exclusive streaming query (ADR 0017, P4b): the handler returns a stream of items the
+    /// An exclusive streaming query: the handler returns a stream of items the
     /// library sends one `ReplyPart` at a time under the sender's credits (the stream is polled
     /// at most one item ahead of the credit; its end is sent at once, with or without credit),
     /// then a `ReplyEnd`. An `Err` item ends the stream with
@@ -173,7 +173,7 @@ impl HandlerRegistry {
         self.shared.insert(Q::TYPE);
     }
 
-    /// An exclusive subscription query (ADR 0017, P4c): `handler` answers the initial result
+    /// An exclusive subscription query: `handler` answers the initial result
     /// (the hub asks one instance with `Request{id = <id>#0, mode = UNARY}`, served like
     /// any unary query, permit included); every instance listing the type also gets
     /// `Request{id = <id>#n, mode = SUBSCRIPTION}`, which registers a subscription here (the
@@ -226,7 +226,7 @@ impl HandlerRegistry {
     }
 
     /// [`event`](Self::event) for a handler that does not run again when its processor replays a
-    /// range after a reset (ADR 0023, Kotlin's `@DisallowReplay`): a handler with effects outside
+    /// range after a reset (Kotlin's `@DisallowReplay`): a handler with effects outside
     /// the service (an e-mail, a payment) that must happen once per record.
     pub fn event_disallowing_replay<E, F, Fut>(&mut self, handler: F)
     where
@@ -261,7 +261,7 @@ impl HandlerRegistry {
             .push((erased, replayed));
     }
 
-    /// An idempotent command handler: an adapter to an external system (ADR 0021 ruling 17; the
+    /// An idempotent command handler: an adapter to an external system (the
     /// `@IdempotentHandler @CommandHandler` of Rust). Each call is recorded in `external_calls`
     /// under `key` (by default the `idempotency-key` header the saga relay sets), so a repeat of
     /// the key never runs `handler` twice: a success replays the stored reply, a failure returns
@@ -304,7 +304,7 @@ impl HandlerRegistry {
 
     /// An idempotent event handler (an `@IdempotentHandler @EventHandler`): as
     /// [`idempotent_command`](Self::idempotent_command), with the event's reply always `()`. Its
-    /// body runs inside stage 1's transaction (ruling 43: a slow external call there holds the
+    /// body runs inside stage 1's transaction (a slow external call there holds the
     /// transaction open, prefer a command handler for those); the call record is written apart, so
     /// a rolled-back stage 1 does not forget a call that happened and the redelivery replays it.
     pub fn idempotent_event<E, F, Fut>(

@@ -1,4 +1,4 @@
-//! Multi-hub (ADR 0016) against in-process fake hubs: one connection per hub with the identical
+//! Multi-hub against in-process fake hubs: one connection per hub with the identical
 //! registration, permits split, routing (round-robin, rendezvous by key), failover of requests
 //! never written, `HubConnectionLost` for written ones, dedupe by hub id, `InstanceStatus` to every
 //! hub, and `dns:///` re-resolution.
@@ -764,7 +764,7 @@ async fn the_hub_client_gauges_count_live_hubs_and_running_handlers() {
     c.shutdown().await;
 }
 
-/// ADR 0022: the processor status rides on every hub's `InstanceStatus`.
+/// The processor status rides on every hub's `InstanceStatus`.
 #[tokio::test]
 async fn processor_status_goes_to_every_hub() {
     let (a, b) = (answering("hub-a").await, answering("hub-b").await);

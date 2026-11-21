@@ -1,4 +1,4 @@
-//! The MongoDB message store (ADR 0028): every store of `snodra_messaging::store` over the
+//! The MongoDB message store: every store of `snodra_messaging::store` over the
 //! service's own MongoDB database, in the collections and with the document fields the library
 //! has always written (`outbox`, `processed_events`, `dead_letters`, `processor_control`,
 //! `external_calls`, `sagas`, `saga_dispatch`, `deadlines`, `saga_failures`), so existing data

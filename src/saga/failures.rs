@@ -1,4 +1,4 @@
-//! Admin API over the parked saga events (the store's saga failures, ADR 0021 rulings 3 and 36): an event
+//! Admin API over the parked saga events (the store's saga failures): an event
 //! whose saga handler failed all its attempts waits here until the cause is fixed, then is retried
 //! (re-delivered to the saga type that failed, applied once) or discarded.
 //!
@@ -7,9 +7,9 @@
 //! applies the event, so concurrent retries apply it once. A failure that fails again stays, with
 //! `attempts` increased and the new error. A discarded event keeps its marker: redelivering the
 //! record does not apply it either, and a `discard` is final even when it lands while a retry is
-//! failing (ruling 36). A parked event whose saga type does not run in this service (not
+//! failing. A parked event whose saga type does not run in this service (not
 //! registered, or sagas disabled) is not retried: the retry is refused and the event keeps its
-//! error and attempts (amended in H1).
+//! error and attempts.
 
 use std::sync::Arc;
 

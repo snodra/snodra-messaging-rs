@@ -9,7 +9,7 @@
 //!   handler is not paced by the flush timer, a full queue answers `HandlerBusy` and a retried
 //!   command gets through once it drains, retry never repeats a handler error or a timed-out
 //!   command, and queued requests are served by priority.
-//! - Status (ADR 0016, ADR 0022): one target through a `HubPool` reports `InstanceStatus`, with the
+//! - Status: one target through a `HubPool` reports `InstanceStatus`, with the
 //!   event processors' status, and the hub shows both in its topology.
 //!
 //! No Kafka or MongoDB: the participants are a `HubConnection` and a `Sender` each; a pass-through
@@ -526,7 +526,7 @@ struct PermitTap {
     address: String,
     permits: Arc<AtomicU64>,
     statuses: Arc<AtomicU64>,
-    /// `InstanceStatus` messages that carried processors (ADR 0022).
+    /// `InstanceStatus` messages that carried processors.
     with_processors: Arc<AtomicU64>,
 }
 
@@ -986,7 +986,7 @@ async fn a_single_target_pool_reports_its_status_to_the_hub() {
     b.shutdown().await;
 }
 
-/// The processors' status (ADR 0022) rides on `InstanceStatus`: the hub keeps and shows it.
+/// The processors' status rides on `InstanceStatus`: the hub keeps and shows it.
 #[tokio::test]
 async fn the_hub_gets_and_shows_the_processor_status() {
     require_docker!();

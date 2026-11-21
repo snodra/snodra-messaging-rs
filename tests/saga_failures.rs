@@ -1,4 +1,4 @@
-//! The failure admin (S2 Task 8, ADR 0021 rulings 3 and 36): parked saga events are listed,
+//! The failure admin: parked saga events are listed,
 //! retried and discarded, on the in-memory message store. The Rust form of the Kotlin
 //! `SagaFailuresTest`.
 #![cfg(feature = "testing")]

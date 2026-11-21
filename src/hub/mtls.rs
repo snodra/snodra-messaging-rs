@@ -1,4 +1,4 @@
-//! The client certificate of a mutual-TLS setup (roadmap P5c, hub ADR 0020): reading and checking
+//! The client certificate of a mutual-TLS setup: reading and checking
 //! the certificate and key files, the identity the hub will read from the leaf (exactly one URI SAN
 //! `snodra://service/<name>`), and when to warn that it is about to expire.
 //!

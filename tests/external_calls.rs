@@ -1,5 +1,5 @@
-//! Idempotent adapter handlers over `external_calls` (S2 Task 9, ADR 0021 rulings 12, 17, 38, 39,
-//! 41-43): the Rust form of the Kotlin `IdempotentHandlerTest`, on the in-memory message store.
+//! Idempotent adapter handlers over `external_calls`: the Rust form of the Kotlin
+//! `IdempotentHandlerTest`, on the in-memory message store.
 #![cfg(feature = "testing")]
 
 mod support;
@@ -615,7 +615,7 @@ async fn the_call_record_is_written_apart_from_the_callers_transaction() {
     let payload = br#"{"jobId":"j9"}"#;
     ex.adapter.fail_stamp_watcher.store(1, Ordering::SeqCst);
 
-    // The adapter runs inside stage 1's transaction (ruling 43); the handler after it fails, so
+    // The adapter runs inside stage 1's transaction; the handler after it fails, so
     // that transaction and its marker roll back.
     let failed = local
         .dispatch(

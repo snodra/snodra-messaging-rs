@@ -1,5 +1,5 @@
-//! Request headers (`SendOptions.headers`, S2-R4) and the saga relay's raw, local-first command
-//! sender (S2-R5): ADR 0021 rulings 8, 10, 12, 13, 14, 29 and 34.
+//! Request headers (`SendOptions.headers`) and the saga relay's raw, local-first command
+//! sender.
 
 mod support;
 

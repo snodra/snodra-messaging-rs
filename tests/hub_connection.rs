@@ -67,7 +67,7 @@ async fn registers_shared_query_types_apart() {
         commands: vec!["t.Cmd".into()],
         queries: vec!["t.Q".into()],
         shared_queries: vec!["t.S2".into(), "t.S1".into()],
-        // Exclusive streaming queries are query types to the hub (P4b): announced with `t.Q`.
+        // Exclusive streaming queries are query types to the hub: announced with `t.Q`.
         streaming_queries: vec!["t.A".into()],
         subscription_queries: vec![],
     });
@@ -383,7 +383,7 @@ async fn send_returns_the_stream_it_wrote_to() {
     hub.stop();
 }
 
-/// Streaming (P4b) writes `Flow` and `Cancel` for a request to the very stream it was written to:
+/// Streaming writes `Flow` and `Cancel` for a request to the very stream it was written to:
 /// `send_on` refuses any other stream (the request is gone with it), and the hub's `Flow` and
 /// `Cancel` reach the owner as inbound messages.
 #[tokio::test]
@@ -546,7 +546,7 @@ async fn backoff_restarts_from_the_floor_after_a_handshaken_stream() {
     hub.stop();
 }
 
-// ---- flow control (P1) ----
+// ---- flow control ----
 
 #[tokio::test]
 async fn register_offers_permits_load_factor_and_tags() {

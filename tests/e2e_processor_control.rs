@@ -1,7 +1,7 @@
 //! End to end against the real hub image (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`): the hub's
 //! HTTP API, with its write token, pauses and resumes a service's named processor, resets it to
 //! `earliest` (the range replayed, the reset handler run once, the handler that disallows replay
-//! skipped) and retries its dead letter (ADR 0023).
+//! skipped) and retries its dead letter.
 
 mod support;
 

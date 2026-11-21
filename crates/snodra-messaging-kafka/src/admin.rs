@@ -1,4 +1,4 @@
-//! The reset side of a subscription (ADR 0023, capability `replay`): rdkafka has no admin call to
+//! The reset side of a subscription (capability `replay`): rdkafka has no admin call to
 //! alter a group's offsets, so the admin commits them with a consumer of the group that never
 //! subscribes (an assign-mode consumer, generation -1), which the broker refuses while the group
 //! has members (`UNKNOWN_MEMBER_ID`, `ILLEGAL_GENERATION` or `REBALANCE_IN_PROGRESS`:

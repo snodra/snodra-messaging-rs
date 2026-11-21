@@ -13,18 +13,18 @@
 //! each wait jittered by ±20 % and clamped to `backoff_max`; at the cap 80-100 % of it), reset to `backoff_min` once an attempt
 //! reached the handshake. A stream the hub closes with `ALREADY_EXISTS`, `INVALID_ARGUMENT`,
 //! `UNAUTHENTICATED` or `PERMISSION_DENIED` is a registration rejection (the last two are the hub's
-//! access control, ADR 0018): it is kept in [`HubConnection::last_rejection`] (until a stream
+//! access control): it is kept in [`HubConnection::last_rejection`] (until a stream
 //! registers), retried at `backoff_max` and logged at `error` once per distinct message, then at
 //! `debug`. The exception is a session that reached the handshake with a client certificate
 //! configured and that the hub ends with `UNAUTHENTICATED` (its "certificate expired" close at the
 //! certificate's notAfter): that is a normal reconnect at the normal backoff, logged at `info`,
 //! not a rejection (the files are read again at the reconnect).
 //!
-//! Access control (P5a): the static token, from `HubSettings::token` or, winning over it, read from
+//! Access control: the static token, from `HubSettings::token` or, winning over it, read from
 //! `HubSettings::token_file` before every connect, goes in `Register.credentials.token` of every
 //! stream; it is never logged. `HubSettings::tls` (or an `https://` address) makes the channel TLS.
 //!
-//! JWT authentication (P5b, ADR 0019): with `HubSettings::token_provider` every new stream asks the
+//! JWT authentication: with `HubSettings::token_provider` every new stream asks the
 //! provider for an access token before it connects and registers with it in
 //! `Register.credentials.jwt`; if the provider cannot get one the stream is not opened, the attempt
 //! fails locally with the endpoint's error (kept in [`HubConnection::last_rejection`], logged at
@@ -126,7 +126,7 @@ pub struct HubSettings {
     pub token_file: Option<PathBuf>,
     /// TLS to the hub (`Config.hub_tls`); `None` is plain text unless the address is `https://`.
     pub tls: Option<HubTls>,
-    /// The OAuth2 client-credentials token provider (`Config.hub_oauth2`, ADR 0019): every stream
+    /// The OAuth2 client-credentials token provider (`Config.hub_oauth2`): every stream
     /// registers with a JWT from it in `Register.credentials.jwt`, and the tokens it refreshes go
     /// to the hubs on the live streams. Share one provider between every connection
     /// of the process (a [`super::HubPool`] clones these settings for each of its hubs). Wins over
@@ -389,13 +389,13 @@ impl ReplyTo {
 /// The types an instance announces in every `Register`.
 ///
 /// `queries` are exclusive (one owning service), `shared_queries` may be owned by many services
-/// (ADR 0017). Every registrant of a type must agree on exclusive vs shared: the hub rejects the
+///. Every registrant of a type must agree on exclusive vs shared: the hub rejects the
 /// later `Register` with `ALREADY_EXISTS` otherwise.
 ///
-/// A streaming query (P4b) is a query type to the hub: the mode is the sender's choice.
+/// A streaming query is a query type to the hub: the mode is the sender's choice.
 /// `streaming_queries` are the
 /// exclusive ones, announced in `Register.query_types` next to `queries`; a shared streaming
-/// query is listed in `shared_queries` like any shared query. A subscription query (P4c) is the
+/// query is listed in `shared_queries` like any shared query. A subscription query is the
 /// same: `subscription_queries` are the exclusive ones, a shared one is in `shared_queries`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RegisteredTypes {
@@ -441,20 +441,20 @@ pub enum Inbound {
     Reply(proto::Reply),
     Error(proto::Error),
     /// One answer of a scatter-gather, or one part of a streaming query, this client sent
-    /// (ADR 0017).
+    ///.
     Part(proto::ReplyPart),
     /// The end of a scatter-gather or of a streaming query this client sent.
     End(proto::ReplyEnd),
-    /// Credits for a streaming query this instance handles (P4b): `request_id` is the
+    /// Credits for a streaming query this instance handles: `request_id` is the
     /// handler-side id (`<id>#1`).
     Flow(proto::Flow),
-    /// The hub asks this instance to act on one of its event processors (ADR 0023): answered
+    /// The hub asks this instance to act on one of its event processors: answered
     /// with one `ControlReply` on `reply_to`, the stream it arrived on.
     Control {
         request: proto::ControlRequest,
         reply_to: ReplyTo,
     },
-    /// The hub cancels a request this instance handles (P4b): a streaming query (the sender
+    /// The hub cancels a request this instance handles: a streaming query (the sender
     /// left or stopped reading, the hub's limits), or a unary / scatter-gather target whose
     /// gather ended early. Nothing is to be sent for it any more.
     Cancel(proto::Cancel),
@@ -1489,7 +1489,7 @@ impl HubConnection {
                         server_message::Message::End(e) => self.forward(Inbound::End(e)).await?,
                         server_message::Message::Flow(x) => self.forward(Inbound::Flow(x)).await?,
                         server_message::Message::Cancel(c) => self.forward(Inbound::Cancel(c)).await?,
-                        // Processor control (ADR 0023): answered on this stream.
+                        // Processor control: answered on this stream.
                         server_message::Message::Control(request) => {
                             self.forward(Inbound::Control { request, reply_to: reply_to.clone() }).await?
                         }
@@ -1903,7 +1903,7 @@ pub(crate) fn grpc_target(address: &str) -> String {
 }
 
 /// The status codes with which a hub closes a stream to refuse the registration: the hub's
-/// existing refusals and its access control (ADR 0018).
+/// existing refusals and its access control.
 fn is_rejection(code: Code) -> bool {
     matches!(
         code,

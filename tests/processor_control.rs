@@ -1,4 +1,4 @@
-//! Processor control (ADR 0023, P6b) through `SnodraMessaging`, against a real Kafka and MongoDB
+//! Processor control through `SnodraMessaging`, against a real Kafka and MongoDB
 //! (and the in-process fake hub): positioned markers, pause and resume (persisted, converging,
 //! surviving a restart), the leased reset (prepare leaves the group, a second operation is
 //! LOCKED, the lease expires by itself, an active member is SUBSCRIBERS_ACTIVE, the replay of a
@@ -1510,7 +1510,7 @@ async fn a_late_renewal_never_takes_the_lock_again() {
         .unwrap();
     let (code, message) = refused(hub.control("audit", prepare("op-2", 30_000), ASK).await);
     assert_eq!(code, ControlRefusal::NotPrepared, "{message}");
-    // Whichever notices the lost lock first answers (ADR 0023 ruling 19): the renewal ("lock
+    // Whichever notices the lost lock first answers: the renewal ("lock
     // lost"), or the control poll, which forgets op-2 so this prepare is a late one ("already
     // finished"). Either way the lock is not taken (below).
     assert!(
@@ -1745,7 +1745,7 @@ async fn a_letter_parked_during_a_replay_is_retried_as_a_replay() {
     app.shutdown().await;
 }
 
-/// Review focus 4 (ADR 0027): segments reassigned during an open replay range keep replaying up
+/// Review focus 4: segments reassigned during an open replay range keep replaying up
 /// to `replay_until` on their new owner and nowhere else, on the in-memory stores (no container).
 /// One instance holds both segments of the event store when it resets them to earliest (the ranges
 /// end at the two records each already handled), and gets its consumer back paused; a second

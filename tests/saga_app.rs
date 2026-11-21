@@ -1,4 +1,4 @@
-//! Saga, deadline and external wiring on the builder (S2 Task 13): through `SnodraMessaging`
+//! Saga, deadline and external wiring on the builder: through `SnodraMessaging`
 //! alone, an event on Kafka starts a saga, the relay delivers its command to this service's own
 //! idempotent adapter, a deadline fires, a webhook event reaches a saga, and a service that
 //! registers none of it builds none of it. Mongo + Kafka + the in-process fake hub.

@@ -1,9 +1,9 @@
 //! The saga dispatch relay: sends what sagas recorded in `saga_dispatch` after their transactions
-//! committed, in order per saga (ADR 0021 rulings 7-11, 28-31, 34).
+//! committed, in order per saga.
 //!
 //! The saga-side outbox lives in the message store, behind [`SagaDispatchStore`]. A poll finds the
 //! sagas whose first pending entry (lowest `seq` neither dispatched nor failed) is due, oldest
-//! work first (ruling 31), claims each one with a lease (so two service instances never dispatch
+//! work first, claims each one with a lease (so two service instances never dispatch
 //! one saga's entries at once) and works through its entries
 //! in `seq` order; different sagas go in parallel. An ended saga's entries are dispatched like any.
 //!
@@ -11,9 +11,9 @@
 //!   exactly once. [`SagaDispatchStore::record`] already refuses an entry the outbox would refuse,
 //!   so one whose payload cannot become an outbox entry (not a JSON object, or one the store cannot
 //!   hold) can only be an entry recorded before that contract: as a backstop, it fails for good
-//!   (`failed_at`, `INVALID`, logged at error) and the saga's later entries continue (ruling 69).
+//!   (`failed_at`, `INVALID`, logged at error) and the saga's later entries continue.
 //! - A COMMAND entry is sent as raw bytes by wire type name ([`RawCommandSender`]; the sender owns
-//!   the no-retry rule, ruling 29) with the headers `idempotency-key` = `<sagaId>:<seq>` (the
+//!   the no-retry rule) with the headers `idempotency-key` = `<sagaId>:<seq>` (the
 //!   entry's id) and `saga-id`, the entry's routing key and the correlation id of the message that
 //!   caused it as the request's correlation, with no caller identity. It is marked dispatched
 //!   after the reply, so a crash in between re-sends it with the same key (an idempotent adapter
@@ -26,10 +26,10 @@
 //!   notice that cannot be delivered (an ordinary handler fails, the store is down) is retried by
 //!   the poll with its own bounded backoff (`noticeAttempts`, `noticeNextAt`;
 //!   `max_attempts` in all, then logged at error and counted). Later entries of the saga continue
-//!   after a failed one: the saga decides what the failure means (ruling 9).
+//!   after a failed one: the saga decides what the failure means.
 //! - An error outside the send (the store is down, a mark fails) leaves the entry untouched: it is
 //!   due again at the next poll.
-//! - A send that is alive owns its saga (ruling 30): the lease is renewed every third of
+//! - A send that is alive owns its saga: the lease is renewed every third of
 //!   [`RelaySettings::lease`] while it runs, a saga and a notice already in flight on this
 //!   instance are skipped, and the polling task never waits for sends.
 //!
@@ -371,7 +371,7 @@ impl SagaDispatchRelay {
                 outbox
             }
             // The payload can never become an outbox entry: retrying would hold back the saga's
-            // later entries forever, so the entry fails for good (ruling 69).
+            // later entries forever, so the entry fails for good.
             Err(e) => return self.fail_event(entry, &e.to_string()).await,
         };
         let mut tx = self.tx.begin().await?;
@@ -407,7 +407,7 @@ impl SagaDispatchRelay {
     /// Gives up an EVENT entry whose payload cannot become an outbox entry: `failed_at`, the
     /// reason `INVALID` and the message, logged at error and counted on
     /// `snodra.saga.command.failures{reason=INVALID}`. No failure notice: `SagaCommandFailed`
-    /// is about commands. The saga's later entries continue, as after a failed command (ruling 9).
+    /// is about commands. The saga's later entries continue, as after a failed command.
     async fn fail_event(
         &self,
         entry: &SagaDispatchDocument,

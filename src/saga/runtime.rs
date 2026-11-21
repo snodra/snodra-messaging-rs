@@ -1,27 +1,27 @@
 //! The saga runtime: the saga stage of local event dispatch, and the deadline and parked-event
 //! entry points the scheduler and the failure admin call.
 //!
-//! Per (event, saga type) (ADR 0021 ruling 1) one transaction runs: the marker `processed_events`
+//! Per (event, saga type) one transaction runs: the marker `processed_events`
 //! id `saga:<sagaType>:<eventId>` is inserted first (an existing one skips the event); the live
 //! instances associated with the event are resolved per handler (`key = value`); when none
 //! matches, a start handler creates one with `startKey = "<type>|<key>=<value>"` (the parts
 //! percent-escaped, [`start_key_of`]; a force-new handler always creates one, without a start
 //! key); each instance's handlers run in registration order, a handler running only on instances
-//! associated with its own key and value (ruling 4).
+//! associated with its own key and value.
 //! Handlers see one [`SagaContext`] per instance that only records; once every handler returned,
 //! the state is written with an optimistic version check (`version + 1`; 0 means just created),
 //! the recorded dispatch entries (`seq = version * 1000 + index`) and deadline changes are
-//! written, and an ended instance cancels its scheduled deadlines (ruling 6). A conflict (version,
+//! written, and an ended instance cancels its scheduled deadlines. A conflict (version,
 //! start key, write conflict) or any handler error rolls the whole transaction back and the event
-//! is retried with [`SagaRetry`] (ruling 33); after the last attempt it is parked in
-//! `saga_failures` together with the marker and the stage moves on (ruling 3). The only error
+//! is retried with [`SagaRetry`]; after the last attempt it is parked in
+//! `saga_failures` together with the marker and the stage moves on. The only error
 //! [`SagaStage::process`] returns is a failure to park (the store is down): the consumer then
 //! redelivers the record instead of losing it.
 //!
 //! Handlers run on the calling task inside a `tracing` span with the fields `saga_type`,
-//! `saga_id` and `correlation_id` (the Rust form of S1's MDC keys). They are synchronous and must
-//! stay short: a slow one holds the consumer's partition. A handler that panics is a handler
-//! error.
+//! `saga_id` and `correlation_id` (the Rust form of the Kotlin library's MDC keys). They are
+//! synchronous and must stay short: a slow one holds the consumer's partition. A handler that
+//! panics is a handler error.
 
 use std::collections::{BTreeSet, HashMap};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -175,7 +175,7 @@ impl SagaRuntime {
     }
 
     /// Delivers the `SagaCommandFailed` the relay produced to the saga that sent the command
-    /// (ruling 27): what the stage does for the event, for callers that hold the typed event.
+    ///: what the stage does for the event, for callers that hold the typed event.
     pub async fn deliver_command_failed(
         &self,
         failed: &SagaCommandFailed,
@@ -188,7 +188,7 @@ impl SagaRuntime {
 
     /// Re-delivers a parked event (from the failure admin) to its saga type, ignoring the marker
     /// (it exists by design): in one transaction the failure is deleted and the event applied,
-    /// with the retries of ruling 33. `true` when it was applied (or no longer matches anything),
+    /// with the saga runtime's retries. `true` when it was applied (or no longer matches anything),
     /// `false` when it failed again (the failure stays with `attempts` increased and the new
     /// error) or was no longer parked (a concurrent retry or discard: it is then not brought
     /// back). `InvalidMessage` without writing anything when its saga type does not run here
@@ -324,7 +324,7 @@ impl SagaRuntime {
     }
 
     /// Runs `attempt` (one attempt, in its own transaction) until it succeeds, with the retry
-    /// rules of ruling 33: a conflict is retried up to `max_attempts` attempts in all with the
+    /// rules: a conflict is retried up to `max_attempts` attempts in all with the
     /// backoff of [`SagaRetry::conflict_pause`]; any other failure gets at most
     /// [`SagaRetry::HANDLER_ATTEMPTS`] attempts with only a quick pause between them (waiting
     /// does not cure a handler that fails).
@@ -442,7 +442,7 @@ impl SagaRuntime {
             }
         }
         // A SagaCommandFailed also reaches the saga that sent the command, by its id: no
-        // association needed (ruling 27).
+        // association needed.
         if event_type == SagaCommandFailed::TYPE {
             let failed: SagaCommandFailed = codec::decode(payload)?;
             let owner = self.ports.sagas.find_by_id(tx, &failed.saga_id).await?;
@@ -955,7 +955,7 @@ fn plan(
     }
     let ended = effects.end;
     // The start key lives and dies with its association: remove that one and the key is free for
-    // a new instance (ruling 35), also when the start handler itself removes it (ruling 68).
+    // a new instance, also when the start handler itself removes it.
     let start_key = match doc {
         Some(d) => d.start_key.clone(),
         None => start_key,
@@ -1100,7 +1100,7 @@ fn describe(e: &StoreError) -> String {
 
 /// The start key of a saga started by `key = value`: `<type>|<key>=<value>` with `%`, `|` and `=`
 /// percent-escaped in each part (`%25`, `%7C`, `%3D`), so two different pairs never build the same
-/// key; the same bytes as Kotlin's `SagaRuntime.startKey` (ADR 0021 ruling 73).
+/// key; the same bytes as Kotlin's `SagaRuntime.startKey`.
 pub(crate) fn start_key_of(type_name: &str, key: &str, value: &str) -> String {
     fn escape(part: &str) -> String {
         part.replace('%', "%25")
@@ -1115,7 +1115,7 @@ mod tests {
     use super::start_key_of;
 
     /// The same inputs and expected strings as Kotlin's `SagaRuntimeTest` (start keys whose parts
-    /// contain the separators stay apart): both libraries build the same key (ADR 0021 ruling 73).
+    /// contain the separators stay apart): both libraries build the same key.
     #[test]
     fn start_keys_whose_parts_contain_the_separators_stay_apart() {
         assert_eq!(start_key_of("rt.Escape", "k=x", "1"), "rt.Escape|k%3Dx=1");

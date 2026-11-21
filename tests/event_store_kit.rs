@@ -1,4 +1,4 @@
-//! The event-store conformance kit's own test (ADR 0027): the kit runs on the in-memory event
+//! The event-store conformance kit's own test: the kit runs on the in-memory event
 //! store (`event_store::memory`, with its message store), and fails as it should on a store that
 //! declares fewer capabilities or never answers (the fault-injecting double of
 //! `support::event_store`). An event-store add-on proves itself by running the same kit; the

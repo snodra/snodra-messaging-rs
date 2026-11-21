@@ -4,7 +4,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-/// The headers every event carries (ADR 0027), as the event store's native metadata.
+/// The headers every event carries, as the event store's native metadata.
 pub mod headers {
     /// The event's type name.
     pub const TYPE: &str = "type";
@@ -63,7 +63,7 @@ pub fn dead_letter_source(source: &str) -> String {
     format!("{source}.dlt")
 }
 
-/// What an event store may offer beyond the required contract (ADR 0027); the hub and the
+/// What an event store may offer beyond the required contract; the hub and the
 /// dashboard offer only what an event store declares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Capability {

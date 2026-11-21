@@ -1,4 +1,4 @@
-//! service-c's named event processor (P6a, ADR 0022) and the example-only admin edge around it.
+//! service-c's named event processor and the example-only admin edge around it.
 //!
 //! The `audit` processor is its own subscription of the event store, `service-c.audit` (on Kafka
 //! its consumer group), markers
@@ -13,8 +13,9 @@
 //! - `GET /audit/dead-letters[?processor=&limit=]`, `GET /audit/dead-letters/count[?processor=]`,
 //!   `POST /audit/dead-letters/{id}/retry`, `POST /audit/dead-letters/retry-all[?processor=audit]`,
 //!   `DELETE /audit/dead-letters/{id}` (404 for an unknown letter): the library's `DeadLetters`.
-//! - `GET /audit/resets`: the resets of the processor that replayed something (P6b, ADR 0023), as
-//!   its reset handler saw them: `[{"operationId","target","ranges":[{"partition","from","until"}]}]`.
+//! - `GET /audit/resets`: the resets of the processor that replayed something, as
+//!   its reset handler saw them:
+//! `[{"operationId","target","ranges":[{"partition","from","until"}]}]`.
 //! - `GET /audit/notified`: the notes the processor's second handler handled, the one registered
 //!   with `disallow_replay` (a replay adds nothing): `[{"key","text","at"}]`.
 //!
@@ -107,7 +108,7 @@ impl From<&ResetContext> for ResetView {
 }
 
 /// The `audit` processor's registrations on `builder`: its handler, a second handler there that a
-/// replay never runs again (P6b), and its reset handler, all reporting to `audit`.
+/// replay never runs again, and its reset handler, all reporting to `audit`.
 pub fn register(builder: SnodraMessagingBuilder, audit: &Audit) -> SnodraMessagingBuilder {
     let (handler, notifier, resets) = (audit.clone(), audit.clone(), audit.clone());
     builder

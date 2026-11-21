@@ -1,4 +1,4 @@
-//! Mutual TLS to the hub (roadmap P5c, hub ADR 0020) against the in-process fake hub, which
+//! Mutual TLS to the hub against the in-process fake hub, which
 //! verifies client certificates against a CA generated at test time: the connection presents its
 //! certificate and sends no credentials, a client without one fails at the transport, a pair that
 //! names another service or has expired is refused before a stream is opened, the files are read
@@ -452,8 +452,7 @@ async fn without_a_good_pair_to_fall_back_on_the_attempt_fails_and_nothing_is_of
     w.hub.stop();
 }
 
-// Rotation: a renewed pair rolls the pool's connections over, one hub at a time (ADR 0020, the
-// client slice of P5c).
+// Rotation: a renewed pair rolls the pool's connections over, one hub at a time.
 
 #[derive(Serialize, Deserialize)]
 struct Ping {}

@@ -1,5 +1,5 @@
 //! The deadline scheduler: fires the due deadlines of this service's sagas, at least once
-//! (ADR 0021 rulings 15, 37).
+//!.
 //!
 //! A poll claims due deadlines one at a time ([`DeadlineStore::claim_due`]: SCHEDULED,
 //! `due_at <= now`, not claimed or the claim expired; it sets `claimed_by` and

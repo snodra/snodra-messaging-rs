@@ -1,4 +1,4 @@
-//! The in-memory message store (`store::memory`, ADR 0028): the store conformance kit on it, with
+//! The in-memory message store (`store::memory`): the store conformance kit on it, with
 //! no container, and its transactions beyond what the kit sees (isolation, conflicts, misuse,
 //! paused time). Needs the feature `testing`.
 #![cfg(feature = "testing")]

@@ -36,7 +36,7 @@ pub enum MessagingError {
     HubConnectionLost(String),
     #[error("{0}")]
     HubRegistrationRejected(String),
-    /// Hub code CANCELLED (ADR 0017, P4b): the hub ended a streaming query (it outlived
+    /// Hub code CANCELLED: the hub ended a streaming query (it outlived
     /// `SNODRA_SERVER_MAX_STREAM_DURATION`). Not retried.
     #[error("{0}")]
     Cancelled(String),
@@ -49,7 +49,7 @@ pub enum MessagingError {
     /// An adapter's external call failed in a way a later attempt may cure (a timeout, a 503, a
     /// rate limit): Kotlin's `RetryableExternalException`. Adapters never retry internally; the
     /// saga relay owns the backoff. It crosses the hub as `HANDLER_ERROR` with the
-    /// [`RETRYABLE_MARKER`](crate::saga::RETRYABLE_MARKER) in `details` (ADR 0021 ruling 12), and an
+    /// [`RETRYABLE_MARKER`](crate::saga::RETRYABLE_MARKER) in `details`, and an
     /// idempotent handler resets its call record for it, so the next attempt runs the body.
     #[error("{0}")]
     RetryableExternal(String),
@@ -57,8 +57,8 @@ pub enum MessagingError {
     /// out, or an earlier call of the key crashed mid-way): Kotlin's
     /// `ExternalCallUnknownOutcomeException`. It crosses the hub as `HANDLER_ERROR` with the
     /// [`UNKNOWN_OUTCOME_MARKER`](crate::saga::UNKNOWN_OUTCOME_MARKER) in `details`; the relay
-    /// reports it as `SagaCommandFailed(UNKNOWN_OUTCOME)`, and an idempotent handler never calls the
-    /// key's body again (ruling 39).
+    /// reports it as `SagaCommandFailed(UNKNOWN_OUTCOME)`, and an idempotent handler never calls
+    /// the key's body again.
     #[error("{0}")]
     UnknownOutcome(String),
 }
@@ -74,7 +74,7 @@ impl MessagingError {
             ErrorCode::InvalidRequest => Self::InvalidMessage(message.to_string()),
             ErrorCode::PermissionDenied => Self::AccessDenied(message.to_string()),
             ErrorCode::ResourceExhausted => Self::HandlerBusy(type_name.to_string()),
-            // The hub ended a streaming query (P4b).
+            // The hub ended a streaming query.
             ErrorCode::Cancelled => Self::Cancelled(format!("'{type_name}': {message}")),
             ErrorCode::HandlerError | ErrorCode::Unspecified => Self::RemoteHandler {
                 type_name: type_name.to_string(),
@@ -85,7 +85,7 @@ impl MessagingError {
     }
 
     /// The `details` a handler's error carries inside a `Reply`: an adapter's failure kind
-    /// (ruling 12), or what a remote handler sent.
+    ///, or what a remote handler sent.
     pub fn reply_details(&self) -> Vec<u8> {
         match self {
             Self::RemoteHandler { details, .. } => details.clone(),
@@ -96,7 +96,7 @@ impl MessagingError {
     }
 
     /// The variant's name (`"Storage"`, `"RemoteHandler"`, ...): a dead letter's `error.type`
-    /// (ADR 0022), the Rust form of Kotlin's exception simple name.
+    ///, the Rust form of Kotlin's exception simple name.
     pub fn variant_name(&self) -> &'static str {
         match self {
             Self::NoHandler(_) => "NoHandler",

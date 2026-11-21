@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 snodra-messaging-rs = { path = "../.." }
-# The message store (ADR 0028): the service's own PostgreSQL database, through the SQL add-on.
+# The message store: the service's own PostgreSQL database, through the SQL add-on.
 snodra-messaging-sqlx = { path = "../../crates/snodra-messaging-sqlx", default-features = false, features = ["postgres"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres"] }
 tokio = { version = "1.54.1", features = ["full"] }

@@ -1,4 +1,4 @@
-//! End to end with two real hubs (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`, ADR 0017) and the
+//! End to end with two real hubs (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`) and the
 //! multi-hub configuration (every instance on both hubs): a scatter-gather over three instances of
 //! two services owning a shared query gets three parts, a unary query on the shared type reaches
 //! every instance of both owners, and a gather whose hub dies before its end fails with

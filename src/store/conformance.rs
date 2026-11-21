@@ -1,4 +1,4 @@
-//! The store conformance kit (ADR 0028, feature `testing`): the checks every [`MessageStore`]
+//! The store conformance kit (feature `testing`): the checks every [`MessageStore`]
 //! add-on passes. An add-on's own test hands a ready store (its schema or indexes in place) to
 //! [`run_store_conformance`]:
 //!

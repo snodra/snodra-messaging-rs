@@ -1,4 +1,4 @@
-//! The webhook side of the integration toolkit (ADR 0021 ruling 18, spec "Inbound 2"): a service
+//! The webhook side of the integration toolkit: a service
 //! exposes its own endpoint, verifies the request with [`verify`](super::webhook::verify), turns
 //! the body into an event and calls [`ExternalEventIngress::accept`]. The Rust form of the Kotlin
 //! `ExternalEventIngress`.

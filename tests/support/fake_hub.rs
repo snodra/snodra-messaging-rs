@@ -16,7 +16,7 @@
 //! never past the stream's cap. The cap starts at `initial_permits` and a `Permits.grant` above it
 //! raises it first (never lowers it).
 //!
-//! Scatter-gather like snodra-server (ADR 0017): a `Request` with `mode = SCATTER_GATHER` goes to
+//! Scatter-gather like snodra-server: a `Request` with `mode = SCATTER_GATHER` goes to
 //! every stream whose `Register` lists the type in `query_types` or
 //! `shared_query_types` (ordered by service, then instance id) as a unary request `<id>#<n>`; each
 //! answer goes back to the sender as a `ReplyPart` in arrival order, then one `ReplyEnd` once every
@@ -27,7 +27,7 @@
 //! "invalid request: unknown request mode N". A gather that ends early (`max_results`, the
 //! deadline, the sender gone) sends `Cancel{<id>#<n>, reason}` to each still-outstanding target.
 //!
-//! Streaming like snodra-server (ADR 0017, P4b): a `Request` with `mode = STREAMING`: a command
+//! Streaming like snodra-server: a `Request` with `mode = STREAMING`: a command
 //! `INVALID_REQUEST`, no owner `NO_HANDLER`, a duplicate id `INVALID_REQUEST`; else one owner
 //! instance (round-robin over them, by service then instance id) gets
 //! `Request{<id>#1, mode = STREAMING, initial_credit (0 reads as 64), max_results 0}`. Its
@@ -42,7 +42,7 @@
 //! `HANDLER_DISCONNECTED`, the sender leaving cancels the handler (`"sender disconnected"`).
 //! Client-sent parts, ends, flows and cancels are recorded per stream.
 //!
-//! Subscriptions like snodra-server (ADR 0017, P4c): a `Request` with `mode = SUBSCRIPTION`: a
+//! Subscriptions like snodra-server: a `Request` with `mode = SUBSCRIPTION`: a
 //! command `INVALID_REQUEST`, no owner `NO_HANDLER`, a duplicate id `INVALID_REQUEST`, a target
 //! already serving `set_max_subscriptions_per_instance` (1024) subscriptions
 //! `RESOURCE_EXHAUSTED`. Else every instance listing the type (by service, then instance id) gets
@@ -64,7 +64,7 @@
 //! was the last (`HANDLER_DISCONNECTED`). `set_subscription_max_duration(Some(d))` ends one open
 //! longer with `CANCELLED "max subscription duration (<d>) exceeded"`. No idle timeout.
 
-//! Access control like snodra-server (ADR 0018, P5a): `set_auth(mode, &[(token, Acl)])`. In `Enforce`
+//! Access control like snodra-server: `set_auth(mode, &[(token, Acl)])`. In `Enforce`
 //! the first `Register` of a stream must carry a token the table knows (else the stream is closed
 //! with `UNAUTHENTICATED`), the service name must be the entry's (else `PERMISSION_DENIED`) and
 //! every command, query and shared query type must match its `handle` patterns (else
@@ -76,7 +76,7 @@
 //! [`FakeHub::rejections`] with the token it carried and when it arrived. A session without a
 //! valid token (permissive) is not judged per request. Patterns as the hub parses them: exact,
 //! `prefix.*` (a type longer than `prefix.`), `*`; `Acl::new` panics on any other wildcard.
-//! JWT credentials (P5b, ADR 0019): `set_services(&[Acl])` is the `[[service]]` table. A `Register`
+//! JWT credentials: `set_services(&[Acl])` is the `[[service]]` table. A `Register`
 //! (or refresh) carrying `jwt` is decoded without verifying the signature: its `azp` must be the
 //! `Register.service_name` (else `PERMISSION_DENIED` "token azp ... is not service ...") and name
 //! an entry of that table (else `PERMISSION_DENIED` "no ACL entry for service ..."); until
@@ -139,7 +139,7 @@ struct Route {
     tx: Outbound,
 }
 
-/// A subscription in progress (P4c).
+/// A subscription in progress.
 struct SubState {
     sender: Outbound,
     sender_no: usize,
@@ -158,7 +158,7 @@ struct SubState {
     buffered: VecDeque<(Vec<u8>, String, String)>,
 }
 
-/// A streaming query in progress (P4b).
+/// A streaming query in progress.
 struct StreamState {
     sender: Outbound,
     sender_no: usize,
@@ -397,7 +397,7 @@ pub struct State {
     jwt_refusal: StdMutex<Option<(tonic::Code, String)>>,
     /// The status the next [`FakeHub::close_streams_with`] ends the open streams with.
     close_with: StdMutex<Option<(tonic::Code, String)>>,
-    /// `ClientMessage.credentials` (P5b): (stream number, the new credential).
+    /// `ClientMessage.credentials`: (stream number, the new credential).
     refreshes: StdMutex<Vec<(usize, proto::Credentials)>>,
     /// The leaf certificate each stream presented in the TLS handshake (DER), mutual TLS only.
     peers: StdMutex<Vec<(usize, Vec<u8>)>>,
@@ -1857,7 +1857,7 @@ impl Hub for Service {
                                     }
                                 }
                             }
-                            // Multi-part messages of streaming queries (P4b) and subscriptions (P4c).
+                            // Multi-part messages of streaming queries and subscriptions.
                             client_message::Message::Part(p) => {
                                 state.parts.lock().unwrap().push((stream_no, p.clone()));
                                 let msgs = match state.on_sub_part(stream_no, p.clone()) {

@@ -1,4 +1,4 @@
-//! The event browser (ADR 0027, capability [`Browse`](super::Capability::Browse)): reading an
+//! The event browser (capability [`Browse`](super::Capability::Browse)): reading an
 //! event store's sources the way an operator does, never as a subscription. An event store that
 //! declares `browse` gives an [`EventBrowser`]
 //! ([`EventStore::browser`](super::EventStore::browser)).
@@ -123,7 +123,7 @@
 //!
 //! - **It never moves a position.** Browsing never commits, acknowledges or resets anything, and
 //!   never joins a subscription: no subscription's members or committed positions change, and the
-//!   browser has no subscription of its own (ADR 0025's rule, for every event store).
+//!   browser has no subscription of its own (the rule for every event store).
 //! - **It is bounded** by its [`BrowseSettings`] (the sources it reads, records scanned, results,
 //!   time, calls at once, tail duration and buffer, payload size) and by the bounds a request
 //!   adds, which may only lower them.

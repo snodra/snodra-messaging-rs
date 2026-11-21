@@ -1,4 +1,4 @@
-//! The processor control state (ADR 0023): per processor its pause, its reset lock and its
+//! The processor control state: per processor its pause, its reset lock and its
 //! replay ranges, the source of truth of all three (the hub keeps none of them). Every operation
 //! is a write of its own, outside any transaction; times are the caller's clock, epoch
 //! milliseconds.

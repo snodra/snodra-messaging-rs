@@ -1,4 +1,4 @@
-//! One event processor under control (ADR 0023): its consumer, started and stopped by what its
+//! One event processor under control: its consumer, started and stopped by what its
 //! `processor_control` document says, and the leased reset.
 //!
 //! The runner reads the document before the consumer first reads and then every
@@ -417,7 +417,7 @@ impl ProcessorRunner {
     }
 
     /// The renewal of the operation this instance holds, answered without waiting for `serial`
-    /// (ADR 0023: never queued behind an execute); `None` when it is not a renewal.
+    /// (never queued behind an execute); `None` when it is not a renewal.
     pub(crate) async fn renew(
         &self,
         operation: &str,
@@ -440,7 +440,7 @@ impl ProcessorRunner {
                 Some(Ok("lease renewed".into()))
             }
             // The lock is gone (its lease passed and it was cleared, or the operation finished
-            // meanwhile): never taken again by a late renewal (ADR 0023).
+            // meanwhile): never taken again by a late renewal.
             Ok(false) => {
                 {
                     let mut held = self.held.lock().unwrap();

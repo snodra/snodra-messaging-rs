@@ -9,9 +9,9 @@ publish = false
 
 [dependencies]
 snodra-messaging-rs = { path = "../.." }
-# The message store (ADR 0028): its own MongoDB database, through the MongoDB add-on.
+# The message store: its own MongoDB database, through the MongoDB add-on.
 snodra-messaging-mongo = { path = "../../crates/snodra-messaging-mongo" }
-# The event store (ADR 0027): Kafka, through the Kafka add-on (also the printer's partner topic).
+# The event store: Kafka, through the Kafka add-on (also the printer's partner topic).
 snodra-messaging-kafka = { path = "../../crates/snodra-messaging-kafka" }
 mongodb = "3.9.1"
 tokio = { version = "1.54.1", features = ["full"] }
@@ -20,8 +20,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# The metrics export (ADR 0026): the OTLP meter provider the library's metrics go to when
-# SNODRA_OTLP_ENDPOINT is set (the versions snodra-server and files-service use).
+# The metrics export: the OTLP meter provider the library's metrics go to when
+# SNODRA_OTLP_ENDPOINT is set (the versions snodra-server uses).
 opentelemetry = { version = "0.33.1", default-features = false, features = ["metrics"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["metrics", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["grpc-tonic", "metrics"] }

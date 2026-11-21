@@ -1,4 +1,4 @@
-//! Hub access control, client side (roadmap P5a, ADR 0018) against the in-process fake hub, which
+//! Hub access control, client side against the in-process fake hub, which
 //! answers like the real hub in `enforce` and `permissive` mode: the token goes in every
 //! `Register`, a refusal closed with `UNAUTHENTICATED` or `PERMISSION_DENIED` is a registration
 //! rejection retried at the backoff cap and logged once, the token file is re-read on reconnect,

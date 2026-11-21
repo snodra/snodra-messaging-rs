@@ -1,4 +1,4 @@
-//! Streaming queries (ADR 0017, P4b) against in-process fake hubs: the handler side (parts under
+//! Streaming queries against in-process fake hubs: the handler side (parts under
 //! credit, the end, error items, the hub's `Cancel` for streams and for unary handlers, the
 //! permit held for the whole stream) and the sender side (`Sender::stream`: items in order,
 //! credit refills, `max_results`, the idle timeout, errors, the drop guard's `Cancel`, retries

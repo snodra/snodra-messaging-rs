@@ -1,5 +1,5 @@
-//! Named event processors (ADR 0022, P6a): each processor is its own subscription of the event
-//! store (ADR 0027), with its own markers, dead letters and status.
+//! Named event processors: each processor is its own subscription of the event
+//! store, with its own markers, dead letters and status.
 //!
 //! - Every processor's subscription is `<service>.<name>` (on Kafka its consumer group, the name
 //!   it always had) and its markers `processor:<name>:<eventId>`, `default` included.
@@ -8,7 +8,7 @@
 //! - A named processor holds the handlers registered with
 //!   [`event_in`](crate::SnodraMessagingBuilder::event_in). It runs stage 1 only (no sagas).
 //!
-//! Processor control (ADR 0023, P6b): a processor is paused and resumed on every instance, and
+//! Processor control: a processor is paused and resumed on every instance, and
 //! reset to a position as a leased operation (its range replayed), through its state in the
 //! message store ([`ProcessorControlStore`](crate::store::ProcessorControlStore)); the hub sends
 //! the requests ([`ProcessorControl`]).
@@ -30,8 +30,8 @@ pub use runner::ProcessorRunner;
 
 /// How an event handler is registered
 /// ([`event_with`](crate::SnodraMessagingBuilder::event_with)): the processor it belongs to
-/// (`default` unless named, ADR 0022) and whether it runs again when that processor replays a
-/// range after a reset (ADR 0023; Kotlin's `@DisallowReplay`).
+/// (`default` unless named) and whether it runs again when that processor replays a
+/// range after a reset (Kotlin's `@DisallowReplay`).
 ///
 /// ```ignore
 /// builder.event_with::<OrderPlaced, _, _>(

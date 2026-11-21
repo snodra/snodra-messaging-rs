@@ -1,4 +1,4 @@
-//! A test identity provider for the hub JWT tests (P5b): an OAuth2 token endpoint that answers the
+//! A test identity provider for the hub JWT tests: an OAuth2 token endpoint that answers the
 //! client-credentials grant (HTTP Basic client authentication, `invalid_client` as a
 //! 401 JSON body) with ES256 access tokens, and the JWKS that verifies them. The signing key is
 //! generated at test time (rcgen); nothing is checked in.

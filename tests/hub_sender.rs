@@ -516,7 +516,7 @@ async fn dropped_caller_future_leaves_no_pending_entry() {
     hub.stop();
 }
 
-// ---- priority and retry (P1) ----
+// ---- priority and retry ----
 
 #[tokio::test]
 async fn priority_comes_from_send_options_then_config_then_zero() {

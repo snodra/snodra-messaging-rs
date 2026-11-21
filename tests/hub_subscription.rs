@@ -1,4 +1,4 @@
-//! Subscription queries (ADR 0017, P4c) against in-process fake hubs: the handler side (the
+//! Subscription queries against in-process fake hubs: the handler side (the
 //! initial result answered like a unary query, the `QueryUpdateEmitter`'s parts and ends, the
 //! hub's `Cancel`, a lost hub stream, the per-instance limit, no permit held) and the sender side
 //! (`Sender::subscribe`: the initial result, the updates of every owner instance, credit refills,

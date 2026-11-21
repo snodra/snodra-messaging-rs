@@ -1,4 +1,4 @@
-//! The local event dispatcher (S2 Task 4, ADR 0021 rulings 2 and 26): stage 1 runs the ordinary
+//! The local event dispatcher: stage 1 runs the ordinary
 //! `event` handlers in one transaction with the idempotency marker, stage 2 hands the event to the
 //! saga stage after it committed, and stage 2 runs even when stage 1 failed.
 
@@ -527,7 +527,7 @@ async fn the_consumer_hands_a_record_only_a_saga_wants_to_the_saga_stage() {
     );
 }
 
-// ---- P6a (ADR 0022): a named processor's markers and the stages one by one ----
+// ---- a named processor's markers and the stages one by one ----
 
 /// Every processor's dispatcher keys its markers `processor:<name>:<eventId>`, the unnamed one
 /// `processor:default:<eventId>`, so two processors never share a marker.
@@ -642,7 +642,7 @@ async fn dispatch_stages_reports_each_stage_and_can_skip_stage_one() {
     assert!(stages.stage_one.is_none() && stages.stage_two.is_none());
 }
 
-/// ADR 0022 (with the Kotlin slice's ruling): a local dispatch from another entry point (a partner
+/// A local dispatch from another entry point (a partner
 /// topic, a webhook, a relay notice) reaches every processor's stage 1, each in its own
 /// transaction with its own marker, and the sagas once; the Kafka consumer's own path does not
 /// fan out.

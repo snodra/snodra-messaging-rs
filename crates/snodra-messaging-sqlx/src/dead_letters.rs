@@ -1,4 +1,4 @@
-//! `snodra_dead_letters` (ADR 0022). Every write but [`DeadLetterStore::delete_in`] commits on
+//! `snodra_dead_letters`. Every write but [`DeadLetterStore::delete_in`] commits on
 //! its own (READ COMMITTED). A letter whose `expire_at` passed is gone at once for every read and
 //! write here (it no longer blocks its key), and the purge deletes it. Positions are ordered as
 //! [`POSITION_ORDER`] says: decimal ones by value, then the others by their bytes; a bound

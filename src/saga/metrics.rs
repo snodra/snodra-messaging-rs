@@ -1,6 +1,6 @@
 //! What the saga runtime, relay and scheduler report: a trait. The application's is
 //! [`OtelSagaMetrics`](super::OtelSagaMetrics) (the meter and the [`SagaStats`](super::SagaStats)
-//! behind `SnodraMessaging::saga_stats()`, ADR 0026); [`NoopSagaMetrics`] reports nothing. Every
+//! behind `SnodraMessaging::saga_stats()`); [`NoopSagaMetrics`] reports nothing. Every
 //! method has an empty default so hooks can be added without breaking implementations.
 
 use std::collections::HashMap;

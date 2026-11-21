@@ -1,4 +1,4 @@
-//! The in-memory event store (ADR 0027): the whole event-store contract inside one process, for
+//! The in-memory event store: the whole event-store contract inside one process, for
 //! tests, local runs and single-process demos, with no infrastructure.
 //!
 //! ```no_run

@@ -1,4 +1,4 @@
-//! JWT authentication, client side (roadmap P5b, ADR 0019) against the in-process fake hub and a
+//! JWT authentication, client side against the in-process fake hub and a
 //! test OAuth2 token endpoint: the client-credentials token goes in `Register.credentials.jwt`,
 //! one provider serves every hub connection, a refreshed token reaches the hubs that offer
 //! `credentials-refresh` as `ClientMessage.credentials`, and nothing secret is ever logged.

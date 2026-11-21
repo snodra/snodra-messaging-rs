@@ -1,4 +1,4 @@
-//! The in-memory message store (ADR 0028): every store of [`crate::store`] in the process's
+//! The in-memory message store: every store of [`crate::store`] in the process's
 //! memory, for tests, local runs and single-process demos, with no database.
 //!
 //! ```no_run

@@ -1,4 +1,4 @@
-//! The hubs an instance connects to (`SNODRA_SERVER_ADDRESS`, ADR 0016), and the pure rules that
+//! The hubs an instance connects to (`SNODRA_SERVER_ADDRESS`), and the pure rules that
 //! pick one of them for a request.
 //!
 //! - **Targets**: a comma-separated list of `host:port` (`static://` or `http(s)://` prefix

@@ -1,4 +1,4 @@
-//! Hub access control, client side (roadmap P5a, ADR 0018): the static token a service presents in
+//! Hub access control, client side: the static token a service presents in
 //! `Register.credentials.token`, where it comes from, and the TLS settings of the hub channel.
 
 use std::fmt;
@@ -46,7 +46,7 @@ impl From<&str> for SecretString {
 /// TLS towards the hubs (`SNODRA_SERVER_TLS=true`), rustls with the platform's root certificates
 /// unless `ca_file` names the CA to trust instead. Applies to every address form (a static list,
 /// `dns:///`). With `client_cert_file` and `client_key_file` the service also presents a client
-/// certificate (mutual TLS, roadmap P5c, hub ADR 0020). Build `HubTls` with `..HubTls::default()`
+/// certificate (mutual TLS). Build `HubTls` with `..HubTls::default()`
 /// so the fields added later do not break you.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HubTls {
@@ -76,7 +76,7 @@ impl HubTls {
 }
 
 /// The OAuth2 client-credentials setup that authenticates this service to the hubs with an OAuth2
-/// access token (JWT; roadmap P5b, hub ADR 0019). `Config.hub_oauth2`; mutually exclusive with a
+/// access token (JWT). `Config.hub_oauth2`; mutually exclusive with a
 /// static hub token. Build it with `..HubOAuth2::default()` so fields added later do not break you.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HubOAuth2 {

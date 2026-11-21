@@ -1,4 +1,4 @@
-//! The `dead_letters` collection (ADR 0022, mode `collection`): the document, field for field the
+//! The `dead_letters` collection (mode `collection`): the document, field for field the
 //! contract both libraries write. A letter's `_id` is `<processor>:<source>:<segment>:<position>`
 //! (`<processor>:<topic>:<partition>:<offset>` on Kafka), so parking the same record twice finds
 //! the first letter (a duplicate key means "already parked"). Dates are BSON datetimes; `topic` is

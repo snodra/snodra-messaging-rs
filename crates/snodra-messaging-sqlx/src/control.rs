@@ -1,4 +1,4 @@
-//! `snodra_processor_control` (ADR 0023): one row per processor, created by the first write that
+//! `snodra_processor_control`: one row per processor, created by the first write that
 //! needs it (not paused, no operation, no replay). Every write commits on its own (READ
 //! COMMITTED); each method is one transaction, so a lock taken, renewed or released is atomic (a
 //! conditional `UPDATE` on the row). The replay ranges are a JSON array of

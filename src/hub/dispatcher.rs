@@ -1,7 +1,7 @@
 //! Incoming hub requests: identity, lookup, guard, decode, handler, reply. Streaming queries
-//! (ADR 0017, P4b): the handler's stream pulled under the sender's credits, one `ReplyPart` per
+//!: the handler's stream pulled under the sender's credits, one `ReplyPart` per
 //! item, then the `ReplyEnd`. The hub's `Flow` and `Cancel` reach the running request by id.
-//! Subscription queries (P4c): `mode = SUBSCRIPTION` registers a subscription (see
+//! Subscription queries: `mode = SUBSCRIPTION` registers a subscription (see
 //! [`super::subscriptions`]), the initial result (`<id>#0`, `mode = UNARY`) is served like any
 //! unary request.
 
@@ -74,7 +74,7 @@ pub struct Dispatcher {
     running: Mutex<HashMap<String, Control>>,
     /// The longest a streaming handler waits for credit (`Config.hub_stream_credit_timeout`).
     stream_credit_timeout: Duration,
-    /// The subscriptions served here (P4c), shared with the [`QueryUpdateEmitter`]s.
+    /// The subscriptions served here, shared with the [`QueryUpdateEmitter`]s.
     subscriptions: Arc<Subscriptions>,
     /// Awaited by a subscription request before its identity is resolved (tests: a slow
     /// identity check, to hold requests in admission).
@@ -206,7 +206,7 @@ impl Dispatcher {
 
     /// The hub's `Cancel{request_id, reason}`: the running handler (unary, a scatter-gather
     /// target, or streaming) is aborted and nothing more is sent for the request; its permits go
-    /// back. A subscription (`<id>#n`, P4c) is removed: nothing more is emitted to it. Ignored
+    /// back. A subscription (`<id>#n`) is removed: nothing more is emitted to it. Ignored
     /// for an unknown id (it already ended).
     pub fn cancel(&self, request_id: &str, reason: &str) {
         let control = self.running.lock().unwrap().remove(request_id);
@@ -266,7 +266,7 @@ impl Dispatcher {
     /// `Cancel` for its id that follows it at once still finds it. A unary request gets its
     /// `Reply`; a streaming one (`mode = STREAMING`) its parts under the credits and its end.
     /// One permit goes back to the hub at the end, whatever the end. A subscription request
-    /// (`mode = SUBSCRIPTION`, P4c) registers a subscription instead, also before the returned
+    /// (`mode = SUBSCRIPTION`) registers a subscription instead, also before the returned
     /// future runs, pending its admission: it is passive (no running handler, no permit here or
     /// at the hub) and gets a `ReplyEnd{error}` only when refused.
     pub fn serve(
@@ -387,7 +387,7 @@ impl Dispatcher {
                         req.r#type
                     )));
                 }
-                // A subscription's initial result is the unary request `<id>#0` (P4c): the
+                // A subscription's initial result is the unary request `<id>#0`: the
                 // subscription handler answers it; any other unary request used the wrong mode.
                 //
                 // Recognised by the id's `#0` suffix alone, which collides with scatter-gather:
@@ -768,7 +768,7 @@ pub(crate) fn invocation_error(type_name: &str, invocation: Invocation) -> Messa
             message,
             details,
         },
-        // An adapter's failure kind travels as a handler error with its marker (ruling 12).
+        // An adapter's failure kind travels as a handler error with its marker.
         Invocation::Handler(
             e @ (MessagingError::RetryableExternal(_) | MessagingError::UnknownOutcome(_)),
         ) => MessagingError::RemoteHandler {

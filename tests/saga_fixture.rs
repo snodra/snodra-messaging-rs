@@ -1,7 +1,7 @@
-//! `SagaTestFixture` (S2-R6): the spec's PaymentSaga driven with events and time, in memory, over
+//! `SagaTestFixture`: the spec's PaymentSaga driven with events and time, in memory, over
 //! the real saga runtime. The Rust form of the Kotlin `SagaTestFixtureTest`. Needs the feature
-//! `testing` (`cargo test --all-features`); without it the file compiles to nothing, so the manifest
-//! names no test target and a build that copies only `src/` works (ruling 71).
+//! `testing` (`cargo test --all-features`); without it the file compiles to nothing, so the
+//! manifest names no test target and a build that copies only `src/` works.
 #![cfg(feature = "testing")]
 
 use std::collections::HashMap;

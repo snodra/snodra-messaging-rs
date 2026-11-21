@@ -11,20 +11,20 @@
 //! routing key); one that could not be written to that hub's stream is written to the next hub
 //! with the same id (it was never sent), so `HubUnavailable` means no hub took it.
 //!
-//! Scatter-gather (ADR 0017, [`Sender::scatter_gather`]): one `Request` with
+//! Scatter-gather ([`Sender::scatter_gather`]): one `Request` with
 //! `mode = SCATTER_GATHER` to one hub (unkeyed round-robin), answered by `ReplyPart`s in arrival
 //! order and one `ReplyEnd`. Its pending entry collects the parts until the end; the local guard covers the whole gather. If its stream breaks before
 //! the end, the gather fails with `HubConnectionLost` (parts already received are not kept).
 //!
-//! Streaming queries (ADR 0017 P4b, [`Sender::stream`], [`Sender::stream_owned`]): one `Request`
-//! with `mode = STREAMING` and the initial credit to one hub, answered by one handler's `ReplyPart`s
-//! and one `ReplyEnd`. The pending entry lives until the end; the caller's stream
+//! Streaming queries ([`Sender::stream`], [`Sender::stream_owned`]): one `Request`
+//! with `mode = STREAMING` and the initial credit to one hub, answered by one handler's
+//! `ReplyPart`s and one `ReplyEnd`. The pending entry lives until the end; the caller's stream
 //! refills credit as it consumes (`Flow`), and dropping it before the end sends `Cancel`. The
 //! local guard is an idle guard (reset by every part), like the hub's idle timeout, with twice
 //! the bound for the first part (the hub bounds a queue wait by the timeout, then restarts the
 //! idle clock at the forward); when it fires the stream is cancelled at the hub, best effort.
 //!
-//! Subscription queries (ADR 0017 P4c, [`Sender::subscribe`]): the same machinery with
+//! Subscription queries ([`Sender::subscribe`]): the same machinery with
 //! `mode = SUBSCRIPTION` to one hub. The first part is the initial
 //! result (bounded by the timeout like a unary request, local guard: the hub's bound plus the
 //! margin); every later part is an update, with no idle timeout and no guard at all (a quiet
@@ -111,7 +111,7 @@ pub fn request_timing(
 
 /// The local guard of a streaming query's first part, from its idle guard (the hub's bound plus
 /// [`LOCAL_GUARD_MARGIN`]): twice the bound plus the margin. The hub bounds a queue wait by the
-/// request's timeout and restarts the idle clock at the forward (ADR 0017, P4b), so the first
+/// request's timeout and restarts the idle clock at the forward, so the first
 /// part may legitimately take up to twice the timeout.
 fn first_part_guard(idle_guard: Duration) -> Duration {
     idle_guard + idle_guard.saturating_sub(LOCAL_GUARD_MARGIN)
@@ -1095,15 +1095,15 @@ impl Sender {
     }
 
     /// Sends a command known only by its wire type name and JSON bytes, through the hub, for the
-    /// saga relay (ADR 0021 ruling 8): the reply is not decoded and a failure is returned
+    /// saga relay: the reply is not decoded and a failure is returned
     /// classified ([`classify_failure`]), except that the hub's `NO_HANDLER` is transient here (a
-    /// rolling redeploy of the target service looks the same as a mistake, ruling 34).
+    /// rolling redeploy of the target service looks the same as a mistake).
     ///
     /// The send carries **no caller**: no bearer token, whoever's handler it runs in (a saga's
-    /// triggering event is not a caller, ruling 14); the correlation id and trace parent of the
+    /// triggering event is not a caller); the correlation id and trace parent of the
     /// current handler context do travel. `options.headers` are sent; `options.authorization` is
     /// ignored. **No retry**, whatever `Config.hub_retry` says and `options.retry` asks: the relay
-    /// owns the backoff and the attempt limit (ruling 29), a retry here would multiply them.
+    /// owns the backoff and the attempt limit, a retry here would multiply them.
     pub async fn send_raw(
         &self,
         type_name: &str,
@@ -1209,7 +1209,7 @@ impl Sender {
         }
     }
 
-    /// Asks every live instance of every owner of `Q` (ADR 0017) and collects their answers until
+    /// Asks every live instance of every owner of `Q` and collects their answers until
     /// the hub's `ReplyEnd`: one [`ScatterPart`] per answer in arrival order, with the counts of
     /// failed parts and of targets that timed out. Partial answers are answers: a gather where
     /// some targets failed or timed out still succeeds.
@@ -1303,7 +1303,7 @@ impl Sender {
         })
     }
 
-    /// Streams the result of `Q` from one instance of an owner (ADR 0017, P4b): one `Request` with
+    /// Streams the result of `Q` from one instance of an owner: one `Request` with
     /// `mode = STREAMING` to one hub (unkeyed round-robin), answered by the handler's parts under
     /// this caller's credits and one end.
     ///
@@ -1417,7 +1417,7 @@ impl Sender {
         Ok(items.boxed())
     }
 
-    /// Subscribes to `Q` (ADR 0017, P4c): one `Request` with `mode = SUBSCRIPTION` to one hub
+    /// Subscribes to `Q`: one `Request` with `mode = SUBSCRIPTION` to one hub
     /// (unkeyed round-robin). The hub asks one owner instance for the initial result and
     /// subscribes every instance of every owner to the updates, as they are at this moment: an instance registering later is not added and one
     /// that leaves is not replaced (updates are delivered at most once; the hub never

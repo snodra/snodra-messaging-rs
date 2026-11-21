@@ -7,11 +7,11 @@
 //! one's entries are relayed after its lease. A batch stops before its lease could run out under
 //! a send ([`OUTBOX_SEND_TIMEOUT`] before its end, by the injected clock); the next poll claims
 //! again, which renews the lease of what this publisher still holds. Order holds per key for what
-//! one instance relays (ADR 0028). A publish the event store rejects for good
+//! one instance relays. A publish the event store rejects for good
 //! ([`EventStoreError::Rejected`], or `Invalid`) marks the entry failed at once; any other failure
 //! is tried again, up to the attempts.
 //!
-//! Metrics (ADR 0026): every publish attempt counts in `snodra.outbox.published{outcome}`; the
+//! Metrics: every publish attempt counts in `snodra.outbox.published{outcome}`; the
 //! gauges `snodra.outbox.pending` and `snodra.outbox.oldest.age` read what the last poll saw (the
 //! batch it claimed, or, when the batch is full, the store's count of every pending entry and its
 //! oldest one, [`OutboxStore::pending`] and [`OutboxStore::oldest_pending`]), less what it relayed

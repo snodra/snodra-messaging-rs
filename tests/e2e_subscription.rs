@@ -1,4 +1,4 @@
-//! End to end with two real hubs (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`, ADR 0017) and the
+//! End to end with two real hubs (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`) and the
 //! multi-hub configuration (every instance on both hubs): a subscription gets its initial
 //! result from one owner instance and the updates of every instance of every owner (exclusive and
 //! shared types), a clean completion of the last owner ends it, a cancel (or a drop) mid-way

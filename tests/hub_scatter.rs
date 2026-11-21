@@ -1,4 +1,4 @@
-//! Scatter-gather queries and shared query types (ADR 0017) against in-process fake hubs: shared
+//! Scatter-gather queries and shared query types against in-process fake hubs: shared
 //! registration, one part per target in arrival order and the end, failed and timed-out targets,
 //! `max_results`, the request fields, errors before any target, parts and ends of unknown
 //! requests, a lost stream, a gather dropped while its write is blocked, the retry policy over the

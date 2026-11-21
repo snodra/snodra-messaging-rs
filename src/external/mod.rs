@@ -1,4 +1,4 @@
-//! The integration toolkit of ADR 0021 (S2): idempotent adapter handlers over `external_calls`
+//! The integration toolkit: idempotent adapter handlers over `external_calls`
 //! ([`calls`]), partner sources as local events ([`sources`], read through an event-store
 //! add-on's [`ExternalSourceProvider`]), and the webhook ingress with its signature verifier
 //! ([`ingress`], [`webhook`]). The Rust form of the Kotlin `external` package.
@@ -14,7 +14,7 @@ pub use sources::{
     ExternalRecord, ExternalSourceProvider, ExternalSources, TranslatedEvent, Translator,
 };
 
-/// Source names an external source (a partner source or a webhook source) may not have (ADR 0022):
+/// Source names an external source (a partner source or a webhook source) may not have:
 /// the library's own families, the `processor:`, `saga:` and `ingress:` markers in
 /// `processed_events` and the relay's `failed:<entry id>` dedupe ids, which a source's dedupe ids
 /// `<source>:...` must never look like.

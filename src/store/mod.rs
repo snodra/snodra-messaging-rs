@@ -1,4 +1,4 @@
-//! The message store (ADR 0028): everything the library keeps in the service's own database,
+//! The message store: everything the library keeps in the service's own database,
 //! behind one interface per collection, with one add-on per database implementing all of them
 //! ([`MessageStore`]). The outbox and the processed events join the service's transaction
 //! ([`Tx`]), so they commit or roll back with the service's own writes.
@@ -100,7 +100,7 @@ impl From<serde_json::Error> for StoreError {
     }
 }
 
-/// The saga ports (ADR 0021) a store provides; their transaction is the store's
+/// The saga ports a store provides; their transaction is the store's
 /// [`MessageStore::tx`].
 #[derive(Clone)]
 pub struct SagaStores {

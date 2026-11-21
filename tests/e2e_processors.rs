@@ -1,6 +1,6 @@
 //! End to end against the real hub image (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`): a
 //! service's event processors, a parked letter and the lag reach the hub's `GET /api/v1/processors`
-//! and topology (ADR 0022).
+//! and topology.
 
 mod support;
 

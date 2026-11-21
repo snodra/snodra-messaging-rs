@@ -1,4 +1,4 @@
-//! The outbox (ADR 0005): events appended in the service's transaction, relayed to the event
+//! The outbox: events appended in the service's transaction, relayed to the event
 //! store by whichever instance claims them.
 
 use std::collections::HashMap;

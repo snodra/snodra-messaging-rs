@@ -1,4 +1,4 @@
-//! The saga metrics on the OpenTelemetry meter (ADR 0026): [`OtelSagaMetrics`] is the
+//! The saga metrics on the OpenTelemetry meter: [`OtelSagaMetrics`] is the
 //! [`SagaMetrics`] the application's runtime, relay, scheduler and idempotent handlers report to.
 //! Each hook moves the [`SagaStats`] (so `SnodraMessaging::saga_stats()` keeps its values) and
 //! the counter of the same name and labels on the meter; the gauges are observed from the

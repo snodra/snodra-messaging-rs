@@ -1,14 +1,14 @@
 //! The local event dispatcher: runs one event inside this service, first through its ordinary
 //! `event` handlers (stage 1), then through the saga stage (stage 2). Shared by the processors'
 //! [`EventConsumer`](super::EventConsumer), the external sources, the webhook ingress and the
-//! relay's `SagaCommandFailed` notices (ADR 0021 ruling 2).
+//! relay's `SagaCommandFailed` notices.
 //!
 //! Stage 1 is the consumer's own behaviour: the idempotency marker (the message store's processed
 //! events, id `processor:<processor>:<dedupe_id>`) is recorded and the handlers run inside one
 //! transaction of the store; a duplicate marker skips the stage, a handler failure rolls the
 //! marker back. Stage 2 runs after stage 1 committed,
 //! with markers and transactions of its own, so a redelivered record whose stage 1 is done goes
-//! straight to it. **Stage 2 runs even when stage 1 failed** (ruling 26): the failure is held,
+//! straight to it. **Stage 2 runs even when stage 1 failed**: the failure is held,
 //! stage 2 runs, and then the failure is returned, so the caller redelivers or skips the record by
 //! its own rules; a record that is skipped has still been seen by the sagas, and a redelivery
 //! applies nothing twice because stage 2's markers decide. Both stages finish before the caller
@@ -40,7 +40,7 @@ pub enum Outcome {
     /// No ordinary handler and no saga wants the type: nothing was done and no marker written.
     NoInterest,
     /// No ordinary handler, and the saga stage is interested in the type but the event reached no
-    /// saga instance (ruling 27: the relay logs and counts a `SagaCommandFailed` nobody got).
+    /// saga instance (the relay logs and counts a `SagaCommandFailed` nobody got).
     Unclaimed,
 }
 
@@ -49,12 +49,12 @@ pub enum Outcome {
 /// `process` hands the event to every interested saga type, each in its own transaction. By
 /// contract `process` fails only when parking a failed event itself fails (the store is down, so
 /// the record is redelivered instead of lost), never for a failing saga handler: such an event is
-/// parked in `saga_failures` (ruling 3). It returns whether the event reached at least one saga
+/// parked in `saga_failures`. It returns whether the event reached at least one saga
 /// instance: applied, already applied before, or parked because its handler failed.
 pub trait SagaStage: Send + Sync {
     fn interested(&self, type_name: &str) -> bool;
 
-    /// The event types some saga type reacts to, for the processor status (ADR 0022); none by
+    /// The event types some saga type reacts to, for the processor status; none by
     /// default.
     fn event_types(&self) -> Vec<String> {
         Vec::new()
@@ -92,9 +92,9 @@ pub struct LocalEventDispatcher {
     store: Option<Arc<dyn MessageStore>>,
     registry: Arc<HandlerRegistry>,
     stage: Arc<dyn SagaStage>,
-    /// Put before every stage-1 marker id: `processor:<name>:` (ADR 0022).
+    /// Put before every stage-1 marker id: `processor:<name>:`.
     marker_prefix: String,
-    /// The named processors whose stage 1 a [`dispatch`](Self::dispatch) also runs (ADR 0022):
+    /// The named processors whose stage 1 a [`dispatch`](Self::dispatch) also runs:
     /// the local entry points reach every processor's handlers.
     fan_out: Vec<Arc<LocalEventDispatcher>>,
 }
@@ -119,7 +119,7 @@ pub struct Stages {
     pub stage_one_took: Option<Duration>,
 }
 
-/// Where the record of a stage-1 marker sits (ADR 0023): the processors' markers (and a dead
+/// Where the record of a stage-1 marker sits: the processors' markers (and a dead
 /// letter's retry, which is that record's stage 1) carry it, so a replay deletes exactly the
 /// markers of its range. Markers of local dispatch, sagas, ingress and failure notices have none.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,7 +137,7 @@ pub struct RecordDispatch<'a> {
     pub position: Option<&'a MarkerPosition>,
     /// Run stage 1 (false for a SEQUENCED record, which only the sagas see).
     pub stage_one: bool,
-    /// The record is in a replay range (ADR 0023): stage 1 runs without the handlers registered
+    /// The record is in a replay range: stage 1 runs without the handlers registered
     /// with `disallow_replay`, and stage 2 (the sagas) does not run.
     pub replay: bool,
 }
@@ -175,7 +175,7 @@ impl LocalEventDispatcher {
         }
     }
 
-    /// The named processors' dispatchers (ADR 0022): [`dispatch`](Self::dispatch), the path of
+    /// The named processors' dispatchers: [`dispatch`](Self::dispatch), the path of
     /// the external sources, the webhook ingress and the relay's notices, runs each one's stage 1
     /// too (its own transaction and marker family), the sagas still once. The processor's consumer's
     /// [`dispatch_stages`](Self::dispatch_stages) stays with this dispatcher's own handlers.
@@ -184,8 +184,8 @@ impl LocalEventDispatcher {
         self
     }
 
-    /// Prefixes every stage-1 marker id with `prefix` (`processor:<name>:` of a named processor,
-    /// ADR 0022); `processor:default:` unless set.
+    /// Prefixes every stage-1 marker id with `prefix` (`processor:<name>:` of a named processor);
+    /// `processor:default:` unless set.
     pub fn with_marker_prefix(mut self, prefix: String) -> LocalEventDispatcher {
         self.marker_prefix = prefix;
         self
@@ -317,8 +317,8 @@ impl LocalEventDispatcher {
 
     /// [`dispatch`](Self::dispatch) with each stage's result apart: stage 1 (the ordinary
     /// handlers, when `run_stage_one` and one wants the type), then stage 2 (the sagas, when one is
-    /// interested), which runs whatever stage 1 did (ruling 26). The processor's consumer parks a record
-    /// only for stage 1's failure, and runs a SEQUENCED record through stage 2 alone (ADR 0022).
+    /// interested), which runs whatever stage 1 did. The processor's consumer parks a record
+    /// only for stage 1's failure, and runs a SEQUENCED record through stage 2 alone.
     pub async fn dispatch_stages(
         &self,
         dedupe_id: &str,
@@ -340,9 +340,9 @@ impl LocalEventDispatcher {
         .await
     }
 
-    /// [`dispatch_stages`](Self::dispatch_stages) for a processor's record: stage 1's marker carries
-    /// the record's position, and a record of a replay range runs stage 1 without the handlers
-    /// that disallow replay and skips stage 2 (ADR 0023).
+    /// [`dispatch_stages`](Self::dispatch_stages) for a processor's record: stage 1's marker
+    /// carries the record's position, and a record of a replay range runs stage 1 without the
+    /// handlers that disallow replay and skips stage 2.
     pub async fn dispatch_record(
         &self,
         dedupe_id: &str,
@@ -376,10 +376,10 @@ impl LocalEventDispatcher {
     }
 
     /// Stage 1 alone, with `finish` run in its transaction after the handlers succeeded (a dead
-    /// letter's retry deletes the letter there, ADR 0022): the marker, the handlers' effects and
+    /// letter's retry deletes the letter there): the marker, the handlers' effects and
     /// `finish`'s writes commit together or not at all. Stage 2 does not run. `record`: the
     /// letter's position, and `replay` when the record was parked while its processor replayed
-    /// it, so the handlers that disallow replay are left out (ADR 0023).
+    /// it, so the handlers that disallow replay are left out.
     pub(crate) async fn stage_one_then(
         &self,
         dedupe_id: &str,

@@ -1,4 +1,4 @@
-//! The Kafka event browser (ADR 0025's reads, behind the core's [`EventBrowser`]): search, one
+//! The Kafka event browser (the reads behind the core's [`EventBrowser`]): search, one
 //! record, the topics, the consumer groups' lag and the tail, on the topics of
 //! [`BrowseSettings::sources`] only. A source is a topic, a segment a partition, a position an
 //! offset (both in decimal); a subscription is a consumer group.

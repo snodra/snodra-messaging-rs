@@ -67,15 +67,15 @@ const SUBSCRIPTION_END_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a graceful shutdown waits for the hubs to ack its empty registration (as
 /// snodra-messaging's `HubLifecycle.stop`).
 pub const DEREGISTER_TIMEOUT: Duration = Duration::from_secs(1);
-/// How long a shutdown waits for the saga relay, the deadline scheduler and the sampler (ruling 64).
+/// How long a shutdown waits for the saga relay, the deadline scheduler and the sampler.
 const SAGA_STOP_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct SnodraMessagingBuilder {
     config: Config,
     registry: HandlerRegistry,
-    /// The message store (ADR 0028); none for a service with commands and queries only.
+    /// The message store; none for a service with commands and queries only.
     store: Option<Arc<dyn MessageStore>>,
-    /// The event store (ADR 0027); none for a service that neither publishes nor handles events.
+    /// The event store; none for a service that neither publishes nor handles events.
     event_store: Option<Arc<dyn EventStore>>,
     events: EventBus,
     hubs: Arc<HubPool>,
@@ -92,13 +92,13 @@ pub struct SnodraMessagingBuilder {
     stats: SagaStats,
     /// "Now" for the saga runtime, relay, scheduler, idempotent handlers and ingress.
     clock: Clock,
-    /// What the library records its metrics on (ADR 0026).
+    /// What the library records its metrics on.
     metrics: Metrics,
-    /// The named event processors' handlers (ADR 0022), by processor name.
+    /// The named event processors' handlers, by processor name.
     processors: std::collections::BTreeMap<String, HandlerRegistry>,
     /// Invalid processor names given to `event_in`, returned by `start()`.
     processor_errors: Vec<MessagingError>,
-    /// The reset handlers (ADR 0023), by processor name, in registration order.
+    /// The reset handlers, by processor name, in registration order.
     reset_handlers: Vec<(String, ResetHandler)>,
 }
 
@@ -131,7 +131,7 @@ pub struct SnodraMessaging {
 
 impl SnodraMessaging {
     /// Prepares the connections (nothing starts yet) so handlers can capture `events()` and the
-    /// senders. The metrics (ADR 0026) are recorded on
+    /// senders. The metrics are recorded on
     /// `opentelemetry::global::meter("snodra-messaging-rs")` as the global meter provider is now:
     /// install the application's provider before this call; with none, nothing is recorded.
     pub async fn builder(config: Config) -> Result<SnodraMessagingBuilder, MessagingError> {
@@ -191,14 +191,14 @@ impl SnodraMessaging {
         })
     }
 
-    /// The dead-letter admin API (ADR 0022): list, get, count, retry, retry_all and discard the
-    /// letters in `dead_letters` of the processors this instance runs. In modes `event-store` and `log`
-    /// every call is an error naming the mode. See [`DeadLetters`].
+    /// The dead-letter admin API: list, get, count, retry, retry_all and discard the
+    /// letters in `dead_letters` of the processors this instance runs. In modes `event-store` and
+    /// `log` every call is an error naming the mode. See [`DeadLetters`].
     pub fn dead_letters(&self) -> DeadLetters {
         self.dead_letters.clone()
     }
 
-    /// Processor control (ADR 0023): pause and resume a processor on every instance (through its
+    /// Processor control: pause and resume a processor on every instance (through its
     /// `processor_control` document), and the handling of the hub's control requests. See
     /// [`ProcessorControl`].
     pub fn processor_control(&self) -> ProcessorControl {
@@ -234,14 +234,13 @@ impl SnodraMessaging {
         &self.events
     }
 
-    /// The emitter that pushes updates to the subscription queries this instance serves (ADR
-    /// 0017, P4c): the same one the builder's `emitter()` gave to handlers. See
-    /// [`QueryUpdateEmitter`].
+    /// The emitter that pushes updates to the subscription queries this instance serves: the same
+    /// one the builder's `emitter()` gave to handlers. See [`QueryUpdateEmitter`].
     pub fn emitter(&self) -> QueryUpdateEmitter {
         self.emitter.clone()
     }
 
-    /// The webhook ingress (ADR 0021 ruling 18): a service's webhook endpoint verifies the
+    /// The webhook ingress: a service's webhook endpoint verifies the
     /// request ([`webhook::verify`](crate::external::webhook::verify)), turns the body into an
     /// event and hands it to [`ExternalEventIngress::accept`], which dispatches it locally (the
     /// event handlers, then the sagas) before returning.
@@ -260,10 +259,10 @@ impl SnodraMessaging {
         self.ingress.clone()
     }
 
-    /// The admin API over the parked saga events (the store's saga failures, ADR 0021 rulings 3,
-    /// 36): list, retry and discard. In a service without sagas (or with them disabled) it lists
-    /// what the store holds and a retry is refused (`InvalidMessage`), leaving the event as it
-    /// was; without a store every call fails.
+    /// The admin API over the parked saga events (the store's saga failures): list, retry and
+    /// discard. In a service without sagas (or with them disabled) it lists what the store holds
+    /// and a retry is refused (`InvalidMessage`), leaving the event as it was; without a store
+    /// every call fails.
     pub fn saga_failures(&self) -> SagaFailures {
         if let Some(runtime) = &self.runtime {
             return SagaFailures::new(Arc::clone(runtime));
@@ -280,8 +279,8 @@ impl SnodraMessaging {
         }
     }
 
-    /// The saga, deadline, dispatch and external-call statistics (S2-R7): the values the saga
-    /// metrics export (ADR 0026), as counters and gauges in memory, see [`SagaStats`] and
+    /// The saga, deadline, dispatch and external-call statistics: the values the saga
+    /// metrics export, as counters and gauges in memory, see [`SagaStats`] and
     /// [`crate::saga::stats`]. All zero in a service without sagas or idempotent handlers.
     pub fn saga_stats(&self) -> SagaStats {
         self.stats.clone()
@@ -316,7 +315,7 @@ impl SnodraMessaging {
     }
 
     /// How this instance authenticates to the hubs: `none`, a static `token`, a `jwt`
-    /// (OAuth2 client credentials, ADR 0019) or a client `certificate` (mutual TLS, ADR 0020),
+    /// (OAuth2 client credentials) or a client `certificate` (mutual TLS),
     /// the current access token's expiry, the last token fetch error and the token fetch counts by
     /// result (`snodra_hub_client_token_fetches_total{result}`); for a certificate, the one
     /// presented (fingerprint, `notAfter`, rotations).
@@ -427,7 +426,7 @@ impl SnodraMessagingBuilder {
         self
     }
 
-    /// A shared query handler (ADR 0017): several services may own `Q`; a point query goes to one
+    /// A shared query handler: several services may own `Q`; a point query goes to one
     /// instance of any owner, a scatter-gather ([`Sender::scatter_gather`]) to all of them. Every
     /// service registering `Q` must register it shared, or the hub rejects the later registration
     /// with `ALREADY_EXISTS`. See [`HandlerRegistry::shared_query`].
@@ -444,7 +443,7 @@ impl SnodraMessagingBuilder {
         self
     }
 
-    /// A streaming query handler (ADR 0017, P4b): `Q` is served to [`Sender::stream`] callers
+    /// A streaming query handler: `Q` is served to [`Sender::stream`] callers
     /// as a stream of `Q::Item`s under their credits; this service is its only owner. See
     /// [`HandlerRegistry::streaming_query`].
     ///
@@ -491,7 +490,7 @@ impl SnodraMessagingBuilder {
 
     /// An event handler registered with `options`: its processor (`default` unless
     /// [`EventOptions::processor`], as [`event_in`](Self::event_in)) and whether it runs again for
-    /// a record its processor replays after a reset ([`EventOptions::disallow_replay`], ADR 0023,
+    /// a record its processor replays after a reset ([`EventOptions::disallow_replay`],
     /// Kotlin's `@DisallowReplay`).
     ///
     /// ```ignore
@@ -524,8 +523,8 @@ impl SnodraMessagingBuilder {
         self
     }
 
-    /// A reset handler of processor `processor` (`default`, or a name given to `event_in`; ADR
-    /// 0023, Kotlin's `@ResetHandler`): runs once per reset that replays a range, on the instance
+    /// A reset handler of processor `processor` (`default`, or a name given to `event_in`;
+    /// Kotlin's `@ResetHandler`): runs once per reset that replays a range, on the instance
     /// executing it, before the markers and the positions change, with the target and the ranges.
     /// The handlers of a processor run in registration order; an error (or a panic) refuses the
     /// reset (`RESET_HANDLER_FAILED`) with nothing changed. A processor without event handlers
@@ -544,7 +543,7 @@ impl SnodraMessagingBuilder {
         self
     }
 
-    /// An event handler in the named processor `processor` (ADR 0022):
+    /// An event handler in the named processor `processor`:
     /// its own subscription `<service>.<processor>` of the event store, its own markers
     /// (`processor:<processor>:<eventId>`), position, dead letters and failure domain, so a slow
     /// or failing handler there never holds the other processors. Stage 1 only: sagas run in
@@ -564,7 +563,7 @@ impl SnodraMessagingBuilder {
         self.event_with::<E, F, Fut>(EventOptions::new().processor(processor), handler)
     }
 
-    /// A subscription query handler (ADR 0017, P4c): `handler` answers the initial result of
+    /// A subscription query handler: `handler` answers the initial result of
     /// `Q` for [`Sender::subscribe`] callers; this service is its only owner. The updates come
     /// from the [`QueryUpdateEmitter`] (`emitter()`), called by whatever changes the data. See
     /// [`HandlerRegistry::subscription_query`].
@@ -598,7 +597,7 @@ impl SnodraMessagingBuilder {
         self
     }
 
-    /// Registers a saga (ADR 0021): `name` is its wire type name in `sagas.type`, `S` its state
+    /// Registers a saga: `name` is its wire type name in `sagas.type`, `S` its state
     /// (stored as JSON text, so it must be `Serialize + Deserialize` and round-trip from its
     /// `Default`), `define` its handlers. A definition error (no start handler, two sagas of one
     /// name, a state that does not round-trip, `ending()` before any handler) is returned by
@@ -632,7 +631,7 @@ impl SnodraMessagingBuilder {
         self
     }
 
-    /// An idempotent command handler, an adapter to an external system (ADR 0021 ruling 17, the
+    /// An idempotent command handler, an adapter to an external system (the
     /// `@IdempotentHandler @CommandHandler` of Rust): each call is recorded in `external_calls`
     /// under `key` (`IdempotencyKey::default()` is the `idempotency-key` header the saga relay
     /// sets), so a repeat of the key never runs `handler` twice. Return
@@ -672,7 +671,7 @@ impl SnodraMessagingBuilder {
 
     /// An idempotent event handler (an `@IdempotentHandler @EventHandler`): see
     /// [`idempotent_command`](Self::idempotent_command). Its body runs inside the ordinary
-    /// handlers' transaction (ruling 43), so a slow external call holds it open: prefer a command
+    /// handlers' transaction, so a slow external call holds it open: prefer a command
     /// handler for slow calls.
     pub fn idempotent_event<E, F, Fut>(
         mut self,
@@ -694,8 +693,8 @@ impl SnodraMessagingBuilder {
         self
     }
 
-    /// A partner source whose records become local snodra events (ADR 0021 ruling 20, spec
-    /// "Inbound 1"), read through an event-store add-on's `provider` (the Kafka add-on's
+    /// A partner source whose records become local snodra events, read through an event-store
+    /// add-on's `provider` (the Kafka add-on's
     /// `KafkaExternalSource` for a partner's topic), whatever the service's own event store is:
     /// `translator` turns each record into an event (`Ok(None)` ignores it, an error retries it up
     /// to `SNODRA_CONSUMER_MAX_ATTEMPTS` times and then skips it, an `InvalidMessage` skips it at
@@ -755,14 +754,14 @@ impl SnodraMessagingBuilder {
         Arc::clone(&self.sender)
     }
 
-    /// The emitter that pushes updates to the subscription queries this instance serves (ADR
-    /// 0017, P4c), to capture in the code that changes the data: `app.emitter()` is the same
-    /// one. See [`QueryUpdateEmitter`].
+    /// The emitter that pushes updates to the subscription queries this instance serves, to capture
+    /// in the code that changes the data: `app.emitter()` is the same one. See
+    /// [`QueryUpdateEmitter`].
     pub fn emitter(&self) -> QueryUpdateEmitter {
         self.emitter.clone()
     }
 
-    /// The message store (ADR 0028): the service's own database, through a store add-on (e.g.
+    /// The message store: the service's own database, through a store add-on (e.g.
     /// `snodra-messaging-mongo`'s `MongoStore`), where the outbox, the processed events, the dead
     /// letters, the processor control, the external calls and the sagas live; the event bus
     /// (also one taken before this call) appends to its outbox. Publishing an event, an event
@@ -777,7 +776,7 @@ impl SnodraMessagingBuilder {
         self
     }
 
-    /// The event store (ADR 0027): where the service's events go (the outbox relay publishes
+    /// The event store: where the service's events go (the outbox relay publishes
     /// them there) and where its event processors read them, through an event-store add-on (e.g.
     /// `snodra-messaging-kafka`'s `KafkaEventStore`). An event handler and a saga need one
     /// ([`start`](Self::start) fails naming what needs it), and so does publishing an event;
@@ -838,7 +837,7 @@ impl SnodraMessagingBuilder {
         } else {
             Vec::new()
         };
-        // The in-memory stores lose everything when the process ends: say so (ADR 0028), named
+        // The in-memory stores lose everything when the process ends: say so, named
         // by their reserved name, whatever the profile.
         if store
             .as_ref()
@@ -894,7 +893,7 @@ impl SnodraMessagingBuilder {
             Some(runtime) => runtime.clone(),
             None => Arc::new(NoSagas),
         };
-        // The named event processors' dispatchers (ADR 0022): their own handlers and marker
+        // The named event processors' dispatchers: their own handlers and marker
         // family, no sagas.
         let named: Vec<(String, Arc<LocalEventDispatcher>)> = named_registries
             .into_iter()
@@ -939,7 +938,7 @@ impl SnodraMessagingBuilder {
             tasks.push(tokio::spawn(background));
         }
 
-        // The event processors (ADR 0022): `default` (the ordinary handlers and the sagas; the
+        // The event processors: `default` (the ordinary handlers and the sagas; the
         // consumer also runs for a service whose events only sagas handle), then the named ones.
         let mut planned: Vec<(String, Arc<LocalEventDispatcher>)> = Vec::new();
         if !registry.event_types().is_empty() || runtime.is_some() {
@@ -961,7 +960,7 @@ impl SnodraMessagingBuilder {
             config.dead_letter_mode,
             planned.clone(),
         );
-        // Each processor's consumer runs under its control document (ADR 0023).
+        // Each processor's consumer runs under its control document.
         let mut runners = Vec::new();
         // A processor exists only with event handlers or sagas, which have both stores.
         if let (Some(store), Some(events)) = (
@@ -1031,7 +1030,7 @@ impl SnodraMessagingBuilder {
                     Inbound::Request { request, reply_to } => {
                         loop_handlers.spawn(loop_dispatcher.serve(request, reply_to));
                     }
-                    // Off the read loop and this one (ADR 0023): a reset may take minutes. The
+                    // Off the read loop and this one: a reset may take minutes. The
                     // answer goes back on the stream the request arrived on.
                     Inbound::Control { request, reply_to } => {
                         let control = loop_control.clone();
@@ -1158,8 +1157,8 @@ const MEMORY_STORE_HINT: &str =
 /// What the missing-event-store messages add.
 const MEMORY_EVENT_STORE_HINT: &str = "event_store::memory::MemoryEventStore runs the in-memory one, not durable: tests and local runs";
 
-/// Without a store: the first registration that needs one, as the error naming it (ADR 0028:
-/// commands, queries and subscription queries need none).
+/// Without a store: the first registration that needs one, as the error naming it (commands,
+/// queries and subscription queries need none).
 fn needs_store(
     registry: &HandlerRegistry,
     named: &std::collections::BTreeMap<String, HandlerRegistry>,
@@ -1194,8 +1193,8 @@ fn needs_store(
     Ok(())
 }
 
-/// Without an event store: the first registration that needs one, as the error naming it (ADR
-/// 0027: commands, queries and subscription queries need none).
+/// Without an event store: the first registration that needs one, as the error naming it (commands,
+/// queries and subscription queries need none).
 fn needs_event_store(
     registry: &HandlerRegistry,
     named: &std::collections::BTreeMap<String, HandlerRegistry>,
@@ -1316,11 +1315,7 @@ mod shutdown_tests {
 
         stop_saga_tasks(tasks, SAGA_STOP_TIMEOUT).await;
 
-        assert_eq!(
-            started.elapsed(),
-            SAGA_STOP_TIMEOUT,
-            "one shared deadline (ruling 64)"
-        );
+        assert_eq!(started.elapsed(), SAGA_STOP_TIMEOUT, "one shared deadline");
     }
 
     #[tokio::test(start_paused = true)]

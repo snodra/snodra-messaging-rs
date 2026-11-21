@@ -10,7 +10,7 @@ use crate::event_store::ReplayRange;
 /// (`processor:<name>:<eventId>`, `saga:<type>:<eventId>`, `ingress:<source>:<key>`, ...),
 /// `type_name` the event's type, `processed_at_ms` when it was handled (the retention counts from
 /// it). A stage-1 marker of a delivered event also carries its `processor`, `source`, `segment`
-/// and `position` (ADR 0023, the event store's opaque strings), so a reset deletes exactly the
+/// and `position` (the event store's opaque strings), so a reset deletes exactly the
 /// markers of its replay range ([`ProcessedEventStore::delete_markers`]); every other marker
 /// leaves them `None` and is never deleted by a reset.
 #[derive(Clone, Debug, PartialEq, Eq)]

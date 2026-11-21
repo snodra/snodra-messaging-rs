@@ -1,4 +1,4 @@
-//! The processor status (ADR 0022) against a real Kafka (the Kafka event store add-on): the
+//! The processor status against a real Kafka (the Kafka event store add-on): the
 //! committed position and the head are read off the processor's task (a handler that blocks does
 //! not stop them), so the lag of records produced while the service was stopped shows; the
 //! segments follow a reassignment.

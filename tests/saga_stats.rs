@@ -1,4 +1,4 @@
-//! Saga statistics (S2 Task 12, S2-R7, ADR 0021 ruling 21): every counter and gauge of the Kotlin
+//! Saga statistics: every counter and gauge of the Kotlin
 //! meters moves on the matching action of a real runtime, scheduler, relay and idempotent adapter
 //! on the in-memory message store. The Rust form of the Kotlin `SagaMetricsTest`.
 #![cfg(feature = "testing")]

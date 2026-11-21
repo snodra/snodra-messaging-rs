@@ -1,4 +1,4 @@
-//! The Kafka event browser (ADR 0025's reads behind the core's `EventBrowser`) against a real
+//! The Kafka event browser (the reads behind the core's `EventBrowser`) against a real
 //! Kafka: search by every filter, newest first over the partitions, with a cursor; the budgets
 //! and the concurrency bounds; one record; the tail; the consumer groups' lag; and what happens
 //! when Kafka is unreachable or silent. Every test keeps its broker in a local, dropped at its end.

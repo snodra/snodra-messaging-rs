@@ -2,13 +2,13 @@
 //! `examples.Reverse` (query), publishes `examples.TextShouted` / `examples.TextReversed` while
 //! handling them, and logs `examples.GreetingDelivered` from service-b. Shares the query
 //! `examples.Inventory`, the streaming query `examples.Rows` and the subscription query
-//! `examples.WatchCounter` (and `examples.OpenSubscriptions`) with service-b (ADR 0017). Owns the
+//! `examples.WatchCounter` (and `examples.OpenSubscriptions`) with service-b. Owns the
 //! command `examples.IncrementCounter`, which drives its counters. Prints every shouted text as a
-//! banner on the sandbox's fake printer through a saga (`banner.rs`, sagas S2), with its own
+//! banner on the sandbox's fake printer through a saga (`banner.rs`), with its own
 //! idempotent printer adapters, the printer's topic as an external source and a small HTTP side for
 //! the printer's webhook and the banner outcomes (`http.rs`), which also sends service-b's
 //! `examples.CountGreetings` through the hub (the sandbox's call from Rust to Kotlin). Runs a
-//! named event processor, `audit` (`audit.rs`, P6a), whose failures become dead letters the
+//! named event processor, `audit` (`audit.rs`), whose failures become dead letters the
 //! example's admin endpoints retry and discard.
 
 mod audit;

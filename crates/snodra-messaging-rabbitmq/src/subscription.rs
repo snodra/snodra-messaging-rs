@@ -51,7 +51,7 @@ use crate::conn::{Broker, Chunk, Conn, Frame, Nodes, failed, lock};
 use crate::read;
 use crate::wire;
 
-/// How long the status refresher waits between two reads of the heads (ADR 0022: at most every
+/// How long the status refresher waits between two reads of the heads (at most every
 /// 5 s).
 pub const OFFSETS_REFRESH: Duration = Duration::from_secs(5);
 /// Until every active partition's head is known: how long between two reads.

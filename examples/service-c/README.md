@@ -3,13 +3,13 @@
 The Rust participant of the examples sandbox (see `snodra-messaging/examples/README.md` for the whole
 picture and the curl walkthrough). Handles `examples.Shout` and `examples.Reverse`, publishes
 `examples.TextShouted` / `examples.TextReversed` through its outbox, logs `examples.GreetingDelivered`.
-Shares the query `examples.Inventory` with service-b (`shared_query`, ADR 0017): it answers with its
+Shares the query `examples.Inventory` with service-b (`shared_query`): it answers with its
 service name, its host name (the container id under Docker), a fixed count of 3 and how many
 Inventory queries it answered. Shares the streaming query `examples.Rows` with service-b too
-(`shared_streaming_query`, ADR 0017 P4b): it streams the rows `1..=count`, each naming the service
+(`shared_streaming_query`): it streams the rows `1..=count`, each naming the service
 and instance, lazily under the sender's credits; with `failAt > 0` the item for that row is an
 `Err` (`HANDLER_ERROR` "Rows failed at row n") and the stream ends there. Serves the shared
-subscription query `examples.WatchCounter` too (`shared_subscription_query`, ADR 0017 P4c): an
+subscription query `examples.WatchCounter` too (`shared_subscription_query`): an
 in-memory counter per name; the handler answers the initial result (the current value, 0 for a
 name nobody incremented) and the command `examples.IncrementCounter(name, service)` (c owns it
 alone; service-b increments through its own HTTP endpoint) adds one and pushes a
@@ -18,7 +18,7 @@ order of the values (the counters have no database write to commit first, so it 
 right away). It also answers the shared query `examples.OpenSubscriptions` with
 `emitter.open_subscriptions()`.
 
-## The banner saga (sagas S2)
+## The banner saga
 
 Every shouted text is printed as a banner by the sandbox's fake printer (`snodra-messaging/examples/fake-printer`),
 through the Rust form of service-b's postcard saga with service-c's own types (`src/banner.rs`):
@@ -46,7 +46,7 @@ The saga is unit-tested with `SagaTestFixture` (the crate's feature `testing`), 
 secret), `PRINTER_REPLY_WEBHOOK` (default `http://localhost:<port>/printer/webhook`), `PRINTER_BANNER_TOPIC`
 (`printer.banner.events`).
 
-## The audit processor and the dead letters (P6a)
+## The audit processor and the dead letters
 
 service-c runs a named event processor, `audit` (`src/audit.rs`): `builder.event_in::<ShoutAudit, _, _>("audit", ...)`, its own
 Kafka consumer in the group `service-c.audit` with the markers `processor:audit:<eventId>` and its own dead letters
@@ -62,7 +62,7 @@ Kafka consumer in the group `service-c.audit` with the markers `processor:audit:
   `POST /audit/dead-letters/{id}/retry` (`{"result","detail"}`), `POST /audit/dead-letters/retry-all[?processor=audit]` and
   `DELETE /audit/dead-letters/{id}` call `app.dead_letters()`: `list`, `count`, `retry`, `retry_all` and `discard`. Same paths and
   JSON as service-b's; the sandbox is closed, a real service puts its own authorization in front of such endpoints.
-- Processor control (P6b, ADR 0023): the hub pauses, resumes and resets `audit` (its HTTP API with the write token). The
+- Processor control: the hub pauses, resumes and resets `audit` (its HTTP API with the write token). The
   processor has a second handler, registered with `EventOptions::new().processor("audit").disallow_replay()`, and a reset
   handler: `GET /audit/resets` lists the resets that replayed something as the reset handler saw them
   (`[{"operationId","target","ranges":[{"partition","from","until"}]}]`, `target` `earliest`, `latest`, `timestamp <ms>` or
@@ -94,7 +94,7 @@ Configuration is the crate's `Config::from_env`: `SNODRA_SERVICE_NAME` (`service
 `SNODRA_MONGODB_URI` (its database, the message store of `snodra-messaging-mongo`, whose indexes `start()` creates
 with the config's retentions).
 
-Metrics (ADR 0026, the crate README's "Metrics"): with `SNODRA_OTLP_ENDPOINT` set (OTLP/gRPC, e.g.
+Metrics (the crate README's "Metrics"): with `SNODRA_OTLP_ENDPOINT` set (OTLP/gRPC, e.g.
 `http://otel-lgtm:4317`) `src/telemetry.rs` installs an OTLP meter provider as the global one before the messaging is
 built, with the resource `service.name` = `SNODRA_SERVICE_NAME` and `service.instance.id` = the instance id the hub
 sees, and exports every 60 s (`OTEL_METRIC_EXPORT_INTERVAL`, ms, changes it); the library's series then reach

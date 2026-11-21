@@ -1,4 +1,4 @@
-//! A subscription's positions, moved by a reset (ADR 0023, capability
+//! A subscription's positions, moved by a reset (capability
 //! [`Replay`](super::Capability::Replay)).
 
 use super::EventStoreError;

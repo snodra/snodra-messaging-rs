@@ -1,4 +1,4 @@
-//! The banner saga (sagas S2): every shouted text is printed as a banner by the sandbox's fake
+//! The banner saga: every shouted text is printed as a banner by the sandbox's fake
 //! printer, whatever way the printer answers. The Rust counterpart of service-b's postcard saga,
 //! with service-c's own message types (a command type has one owner).
 //!

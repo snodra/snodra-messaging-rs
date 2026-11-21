@@ -1,4 +1,4 @@
-//! Idempotent adapter handlers (ADR 0021 rulings 12, 17, 38, 39, 41-43): a command or event
+//! Idempotent adapter handlers: a command or event
 //! handler that calls an external system, recorded in the message store's external calls
 //! ([`ExternalCallStore`]) under its idempotency key
 //! so a repeat of the key never reaches the external system twice. The Rust form of the Kotlin
@@ -14,12 +14,12 @@
 //!    outcome; with it (the partner de-duplicates by the key the adapter passes it) the call takes
 //!    the record over (`attempts + 1`) and runs the body.
 //! 3. After the body: `SUCCEEDED` with the reply as JSON text (when that write fails the call is
-//!    an unknown outcome, never a failed one, ruling 38); a `RetryableExternal` deletes the record
+//!    an unknown outcome, never a failed one); a `RetryableExternal` deletes the record
 //!    (the next call starts afresh, the relay owns the backoff); an `UnknownOutcome` returned by
-//!    the adapter itself leaves the record `UNKNOWN` (ruling 39); any other failure (a panic
+//!    the adapter itself leaves the record `UNKNOWN`; any other failure (a panic
 //!    included) is `FAILED` with `{"code","message"}`.
 //!
-//! 4. Ownership (ruling 70, amended in H1): every write after `begin` filters on the key,
+//! 4. Ownership: every write after `begin` filters on the key,
 //!    `IN_PROGRESS` and the `owner` token this call wrote (a random id, at the insert or the
 //!    takeover), so a call whose lease ran out never overwrites or deletes the record of the call
 //!    that took it over, gave it up as `UNKNOWN`, or began it afresh after a retryable reset (the
@@ -33,9 +33,9 @@
 //! Every write of the record is a write of its own, outside any transaction: a
 //! rollback of the caller's transaction (an event handler runs inside stage 1's) never forgets a
 //! call that happened. The body itself runs where the caller runs it: an event handler's inside
-//! stage 1's transaction (ruling 43, so a slow call there holds that transaction open), a command
+//! stage 1's transaction (so a slow call there holds that transaction open), a command
 //! handler's (what the saga relay calls) in none. Every handler of a saga command must be
-//! idempotent by its `idempotency-key` (ruling 42): the relay re-sends after a timeout or a crash.
+//! idempotent by its `idempotency-key`: the relay re-sends after a timeout or a crash.
 //! `idempotency-key` is a plain header any sender can set, so adapters must stay internal.
 
 use std::future::Future;
@@ -62,7 +62,7 @@ const MAX_BEGIN_ROUNDS: usize = 3;
 const MAX_ERROR_LENGTH: usize = 2000;
 
 /// Settings of `external_calls` (`SNODRA_EXTERNAL_CALLS_LEASE_MS`): how long an `IN_PROGRESS`
-/// call may take before its outcome counts as unknown. Default 5 minutes (ruling 16).
+/// call may take before its outcome counts as unknown. Default 5 minutes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExternalCallSettings {
     pub lease: Duration,
@@ -411,7 +411,7 @@ impl ExternalCalls {
     }
 
     /// The body returned but its `SUCCEEDED` could not be written: the external system acted and
-    /// the record cannot say so, an unknown outcome and never a failed call (ruling 38). With
+    /// the record cannot say so, an unknown outcome and never a failed call. With
     /// `external_idempotent` the partner de-duplicates a repeat, so it is retryable (the record
     /// stays `IN_PROGRESS`, its lease settles it); otherwise the record is moved to `UNKNOWN` (best
     /// effort: if that fails too the lease does it later).
@@ -493,7 +493,7 @@ impl ExternalCalls {
 /// The record a running call owns: its key and the `owner` token the call wrote when it inserted
 /// or took the record over (`attempts`, its count then, is for the log). Every write after `begin`
 /// filters on the token and on `IN_PROGRESS`, so a call whose lease ran out never writes over (or
-/// deletes) the record of the call that took it over, settled it or began it afresh (ruling 70).
+/// deletes) the record of the call that took it over, settled it or began it afresh.
 struct Owned<'a> {
     key: &'a str,
     attempts: i32,
@@ -531,7 +531,7 @@ fn stored_message(doc: &ExternalCall) -> String {
 /// hold the handle, and [`SnodraMessagingBuilder::start`](crate::SnodraMessagingBuilder::start)
 /// binds it (with the configured lease, the clock and the statistics), so a handler registered
 /// before the clock was set still uses it. A call through a handle that was never bound fails
-/// naming the handler (Kotlin's missing interceptor, ruling 41: with the builder it cannot happen).
+/// naming the handler (Kotlin's missing interceptor: with the builder it cannot happen).
 #[derive(Clone, Default)]
 pub struct ExternalCallsHandle(Arc<OnceLock<Arc<ExternalCalls>>>);
 

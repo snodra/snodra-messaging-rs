@@ -1,6 +1,6 @@
-//! The message store is required by what keeps state (ADR 0028): an event handler, a saga, an
+//! The message store is required by what keeps state: an event handler, a saga, an
 //! idempotent handler and publishing an event need one; and the event store by what reads or
-//! writes events (ADR 0027): an event handler, a saga and publishing an event. A service with
+//! writes events: an event handler, a saga and publishing an event. A service with
 //! commands and queries only runs without either.
 
 mod support;

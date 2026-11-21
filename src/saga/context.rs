@@ -1,6 +1,6 @@
 //! `SagaContext`: what a saga handler is handed. It only records; the runtime applies the recorded
 //! [`Effects`], in one transaction, after every handler of the attempt returned, so a handler that
-//! fails leaves nothing behind (ADR 0021 ruling 6).
+//! fails leaves nothing behind.
 
 use std::time::{Duration, SystemTime};
 
@@ -12,7 +12,7 @@ use crate::error::MessagingError;
 use crate::types::{Command, Event};
 
 /// Entries of one saga handling take `seq = version * SEQ_STRIDE + index`, so the index must stay
-/// below it (ruling 6: at most 999 messages per handling).
+/// below it (at most 999 messages per handling).
 pub(crate) const SEQ_STRIDE: i64 = 1000;
 
 /// A command or event a handler recorded; the runtime turns it into a `saga_dispatch` entry.
@@ -63,7 +63,7 @@ pub(crate) struct Effects {
 /// What a saga handler can do to its own instance, and the commands, events and deadlines it
 /// wants: a handler parameter, built per call by the saga runtime. Handlers are synchronous and
 /// get no `Sender` or `EventBus`: sending from inside the saga's transaction is impossible by
-/// construction (ADR 0021 ruling 32); a closure that captures one anyway is a bug (it would send
+/// construction; a closure that captures one anyway is a bug (it would send
 /// for a state that may roll back, without order, retry or idempotency key).
 pub struct SagaContext {
     saga_id: String,
@@ -134,7 +134,7 @@ impl SagaContext {
     ) -> Result<(), MessagingError> {
         // The relay turns the entry into an outbox entry: what cannot become one (a unit struct,
         // a payload that is no JSON object, an integer above i64::MAX) fails the handler now,
-        // naming the event, instead of the entry later (ruling 69). The store's
+        // naming the event, instead of the entry later. The store's
         // `SagaDispatchStore::record` refuses it too, in the saga's transaction.
         crate::events::check_payload(E::TYPE, &serde_json::to_value(event)?)?;
         self.record(DispatchKind::Event, E::TYPE, event, key)

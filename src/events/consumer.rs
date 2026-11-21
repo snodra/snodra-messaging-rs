@@ -1,4 +1,4 @@
-//! Reads one event processor's subscription of the event store (ADR 0022, ADR 0027): one record
+//! Reads one event processor's subscription of the event store: one record
 //! at a time; the dedupe marker is recorded first, then the handlers run, all in one transaction
 //! of the message store; the record is acknowledged after. A record whose handlers fail on every
 //! attempt, a malformed one and, in mode `collection`, one whose key has a parked letter go to the
@@ -12,7 +12,7 @@
 //! status. What the subscription recovered from by itself ([`Subscription::take_error`]) shows
 //! there too.
 //!
-//! Processor control (ADR 0023) reaches it through its [`ConsumerControl`]: paused, it pauses its
+//! Processor control reaches it through its [`ConsumerControl`]: paused, it pauses its
 //! subscription (which keeps its segments, and pauses every segment assigned later); a record of a
 //! replay range is handled without the handlers that disallow replay and without the sagas.
 
@@ -107,7 +107,7 @@ pub fn classify_with(
     }
 }
 
-/// How often the processor's dead letters are counted (ADR 0022: every 30 s).
+/// How often the processor's dead letters are counted (every 30 s).
 pub const DEAD_LETTERS_SAMPLE: Duration = Duration::from_secs(30);
 /// How often the subscription's segment statuses are copied into the processor's status (they
 /// also are after every acknowledgement).
@@ -115,7 +115,7 @@ const STATUS_REFRESH: Duration = Duration::from_secs(1);
 /// Between a record the dead letters could not take (a park, a dead-letter publish or a
 /// sequencing read failed) and its redelivery.
 const PARK_RETRY: Duration = Duration::from_secs(1);
-/// What a processor's consumer is (ADR 0022): its name, its subscription on the event store,
+/// What a processor's consumer is: its name, its subscription on the event store,
 /// its dead-letter mode and where its letters go.
 #[derive(Clone)]
 pub struct ProcessorSettings {
@@ -134,11 +134,11 @@ pub struct ProcessorSettings {
     /// The message store's dead letters (mode `collection`).
     pub dead_letters: Option<Arc<dyn DeadLetterStore>>,
     /// What the consumer records `snodra.events.consumed` and `snodra.event.handler.duration`
-    /// on (ADR 0026).
+    /// on.
     pub metrics: Metrics,
 }
 
-/// What processor control (ADR 0023) tells a processor's consumer, shared by its every run: the
+/// What processor control tells a processor's consumer, shared by its every run: the
 /// pause and the open replay ranges.
 pub struct ConsumerControl {
     paused: AtomicBool,
@@ -200,7 +200,7 @@ enum Sink {
     },
 }
 
-/// The keys this processor has a letter for on its segments (sequencing, ADR 0022), loaded for
+/// The keys this processor has a letter for on its segments (sequencing), loaded for
 /// the assignment of `generation`.
 #[derive(Default)]
 struct ParkedKeys {
@@ -210,7 +210,7 @@ struct ParkedKeys {
 
 /// A record that failed on every attempt and whose letter could not be written yet, remembered
 /// for the assignment of `generation`: its redelivery goes straight to the dead letters, without
-/// running the handlers again (Kotlin's ruling 4).
+/// running the handlers again.
 struct PendingLetter {
     generation: u64,
     error: DeadLetterError,
@@ -257,7 +257,7 @@ enum Step {
 }
 
 impl EventConsumer {
-    /// The consumer of one event processor (ADR 0022): its subscription, its dispatcher (whose
+    /// The consumer of one event processor: its subscription, its dispatcher (whose
     /// marker prefix and handlers are the processor's) and its dead letters.
     pub fn processor(
         settings: ProcessorSettings,
@@ -274,7 +274,7 @@ impl EventConsumer {
         Self::controlled(settings, dispatcher, monitor, control)
     }
 
-    /// One run of a controlled processor's consumer (ADR 0023): its monitor and its control
+    /// One run of a controlled processor's consumer: its monitor and its control
     /// outlive the run, which ends (and leaves the subscription) when its task ends.
     pub fn controlled(
         settings: ProcessorSettings,
@@ -503,7 +503,7 @@ impl EventConsumer {
                 self.consumed(&type_label, Consumed::Skipped);
                 return Done::Ack { processed: false };
             }
-            // Malformed: a letter that blocks nothing (ADR 0022 INVALID).
+            // Malformed: a letter that blocks nothing.
             RecordDisposition::Skip(reason) => {
                 tracing::warn!(processor = %self.name, source = %source, segment = %record.segment, position = %record.position, "invalid record: {reason}");
                 let taken = self
@@ -550,11 +550,11 @@ impl EventConsumer {
                         return Done::Again;
                     };
                     self.consumed(&type_label, outcome);
-                    // A replay never reaches the sagas (ADR 0023).
+                    // A replay never reaches the sagas.
                     if replay {
                         return Done::Ack { processed: false };
                     }
-                    // Stage 2 still sees it (ADR 0021 ruling 26).
+                    // Stage 2 still sees it.
                     return self
                         .stage_two_only(&type_name, &id, payload, &ctx, cancel)
                         .await;
@@ -613,7 +613,7 @@ impl EventConsumer {
             self.monitor
                 .exhausted(&format!("{}: {failure}", failure.variant_name()));
             if !in_stage_one {
-                // Stage 1 is done; the saga stage could not even park its failure (ADR 0021): logged
+                // Stage 1 is done; the saga stage could not even park its failure: logged
                 // and skipped, no letter (a retry would find the marker and do nothing).
                 tracing::error!(processor = %self.name, r#type = %type_name, id = %id, source = %source, segment = %record.segment, position = %record.position, attempts = attempt, "saga stage failed, record skipped: {failure}");
                 self.consumed(&type_label, Consumed::Failed);
@@ -812,7 +812,7 @@ impl EventConsumer {
                 }
             }
             Sink::Collection { store, retention } => {
-                // Parked in a replay: its retry must be one too (ADR 0023).
+                // Parked in a replay: its retry must be one too.
                 let replay = self
                     .control
                     .replays(source, &record.segment, &record.position);

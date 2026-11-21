@@ -1,4 +1,4 @@
-//! Connections to every hub (multi-hub high availability, ADR 0016).
+//! Connections to every hub (multi-hub high availability).
 //!
 //! The hubs never talk to each other; availability comes from every instance registering on every
 //! hub. A [`HubPool`] holds one [`HubConnection`] per target of `hub_address` ([`HubTargets`]),
@@ -26,14 +26,14 @@
 //!   gets nothing. Permits are never revoked when N grows. The local concurrency guard stays the
 //!   total.
 //! - **Status.** Every `status_interval` an `InstanceStatus` (acknowledged hub ids, handlers in
-//!   flight, the event processors' status, ADR 0022) goes to every live hub.
+//!   flight, the event processors' status) goes to every live hub.
 //! - **DNS.** A `dns:///name:port` target is resolved at start and every `dns_refresh` into
 //!   `ip:port` targets of one family (IPv4 when any, else IPv6, [`resolved_targets`]): a new
 //!   address gets a connection; a vanished one leaves the routing at once, gets an empty
 //!   `Register` (the hub stops routing to the instance there) and is closed once idle (no request
 //!   of ours written to it unanswered, no handler of its requests running), at most
 //!   [`DRAIN_LIMIT`] later. A failed or empty resolution keeps the current hubs.
-//! - **Client certificate rotation** (mutual TLS, P5c). With `hub_tls.client_cert_file` the pool
+//! - **Client certificate rotation** (mutual TLS). With `hub_tls.client_cert_file` the pool
 //!   reads the files every `HubSettings::certificate_check_interval` (3 s, as the Kotlin client
 //!   does). When they hold a valid pair (not expired, and past its notBefore) that a live
 //!   connection is not presenting (the content changed), it waits a random delay (uniform in
@@ -196,7 +196,7 @@ struct CertificateWatch {
     tick_failure: Option<String>,
 }
 
-/// What the status tick reads the event processors' status from (ADR 0022): an in-memory
+/// What the status tick reads the event processors' status from: an in-memory
 /// snapshot, never a Kafka or Mongo call.
 pub type ProcessorStatusSource = Arc<dyn Fn() -> Vec<ProcessorStatus> + Send + Sync>;
 
@@ -351,7 +351,7 @@ impl HubPool {
         }
     }
 
-    /// Where every status tick reads the event processors' status (ADR 0022). Without one (the
+    /// Where every status tick reads the event processors' status. Without one (the
     /// default) the field is always empty.
     pub fn set_processor_status(&self, source: ProcessorStatusSource) {
         *self.processor_status.lock().unwrap() = Some(source);
@@ -481,7 +481,7 @@ impl HubPool {
         self.live().into_iter().map(|l| l.hub_id).collect()
     }
 
-    /// How the pool authenticates (ADR 0019): the kind, and for a JWT the expiry of the current
+    /// How the pool authenticates: the kind, and for a JWT the expiry of the current
     /// access token and the last token fetch error. The same for every hub.
     pub fn auth(&self) -> AuthStatus {
         match self.members().first() {
@@ -496,7 +496,7 @@ impl HubPool {
         self.refreshes_sent.load(Ordering::Relaxed)
     }
 
-    /// Registers the hub client gauges and counters on `metrics` (ADR 0026), read from memory
+    /// Registers the hub client gauges and counters on `metrics`, read from memory
     /// when the meter collects, while the pool lives: `snodra.hub.client.connected.hubs` (the
     /// live hubs), `snodra.hub.client.handlers.in.flight` ([`handlers_in_flight`]),
     /// `snodra.hub.client.credentials.refreshes.sent`, and with OAuth2
@@ -967,7 +967,7 @@ impl HubPool {
                 ids.push(l.hub_id.clone());
             }
         }
-        // The processors' status (ADR 0022), read once.
+        // The processors' status, read once.
         let source = self.processor_status.lock().unwrap().clone();
         let status = InstanceStatus {
             connected_hub_ids: ids,

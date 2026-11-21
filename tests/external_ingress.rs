@@ -1,4 +1,4 @@
-//! The webhook ingress and the signature verifier (S2 Task 11, ADR 0021 rulings 18, 19): the Rust
+//! The webhook ingress and the signature verifier: the Rust
 //! form of the Kotlin `WebhookIngressTest`. The ingress runs on the in-memory message store;
 //! the verifier needs nothing.
 #![cfg(feature = "testing")]

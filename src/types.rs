@@ -21,7 +21,7 @@ pub trait Query: MessageType + Serialize + DeserializeOwned + Send + Sync + 'sta
 }
 
 /// A read request whose result is a flow of `Item`s from one instance of one owning service,
-/// under the caller's back-pressure (ADR 0017, P4b: `Request.mode = STREAMING`, credits). Routed
+/// under the caller's back-pressure (`Request.mode = STREAMING`, credits). Routed
 /// through the hub to an instance whose library negotiated `streaming`.
 pub trait StreamingQuery:
     MessageType + Serialize + DeserializeOwned + Send + Sync + 'static
@@ -30,7 +30,7 @@ pub trait StreamingQuery:
 }
 
 /// A read request whose result is an initial value followed by the updates every owner instance
-/// pushes, until the subscriber cancels or the emitters complete (ADR 0017, P4c: `Request.mode =
+/// pushes, until the subscriber cancels or the emitters complete (`Request.mode =
 /// SUBSCRIPTION`). Routed through the hub to every instance whose library negotiated
 /// `subscription` and lists the type; one of them also answers the initial result.
 pub trait SubscriptionQuery:

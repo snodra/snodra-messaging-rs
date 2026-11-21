@@ -1,4 +1,4 @@
-//! Named event processors and dead letters through `SnodraMessaging` (ADR 0022, P6a), against a
+//! Named event processors and dead letters through `SnodraMessaging`, against a
 //! real Kafka and MongoDB (and the in-process fake hub): each processor its own group and marker
 //! family, one event in two processors, failure isolation, sagas only in `default`, every letter
 //! reason, sequencing per key (stage 2 still runs, a miss after a remote discard handles

@@ -1,4 +1,4 @@
-//! JWT authentication, client side (roadmap P5b, hub ADR 0019): the OAuth2 client-credentials token
+//! JWT authentication, client side: the OAuth2 client-credentials token
 //! provider. One [`TokenProvider`] per process serves every hub connection:
 //!
 //! - `POST <token_uri>` with `grant_type=client_credentials` (+ `scope`), client authentication
@@ -227,7 +227,7 @@ pub enum AuthKind {
     Token,
     /// An OAuth2 client-credentials access token (`hub_oauth2`).
     Jwt,
-    /// A client certificate (`hub_tls.client_cert_file`, mutual TLS, ADR 0020).
+    /// A client certificate (`hub_tls.client_cert_file`, mutual TLS).
     Certificate,
 }
 
@@ -258,7 +258,7 @@ pub struct AuthStatus {
     pub certificate: Option<CertificateStatus>,
 }
 
-/// The client certificate in use (hub ADR 0020). The certificate itself is never shown, only the
+/// The client certificate in use. The certificate itself is never shown, only the
 /// first 8 hex characters of the SHA-256 of its DER, as the hub shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CertificateStatus {

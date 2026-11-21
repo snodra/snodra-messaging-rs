@@ -46,7 +46,7 @@ use crate::external::reject_fixed_keys;
 use crate::{consumer_config, failed};
 
 /// How long the status refresher waits between two reads of the committed offsets and the high
-/// watermarks (ADR 0022: at most every 5 s).
+/// watermarks (at most every 5 s).
 pub const OFFSETS_REFRESH: Duration = Duration::from_secs(5);
 /// Until the first read of an assignment's offsets: how long between two tries.
 const OFFSETS_FIRST: Duration = Duration::from_millis(500);

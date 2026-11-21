@@ -1,4 +1,4 @@
-//! The saga collections (ADR 0021's storage contract, field for field, [`crate::documents`]):
+//! The saga collections (the storage contract, field for field, [`crate::documents`]):
 //! `sagas`, `saga_dispatch`, `saga_dispatch_leases`, `deadlines`, `saga_failures`, and the saga
 //! stage's markers in `processed_events`. The runtime's ports join its transaction (the [`Tx`]'s
 //! session); the scheduler's, the relay's and the statistics' write on their own.

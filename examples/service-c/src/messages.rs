@@ -30,7 +30,7 @@ impl Query for Reverse {
     type Reply = Reversed;
 }
 
-/// A shared query type (ADR 0017): service-b (Kotlin) owns it too, so a point query goes to one of
+/// A shared query type: service-b (Kotlin) owns it too, so a point query goes to one of
 /// them and a scatter-gather asks both.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Inventory {
@@ -93,7 +93,7 @@ pub struct GreetingDelivered {
 message_type!(GreetingDelivered, "examples.GreetingDelivered");
 impl Event for GreetingDelivered {}
 
-/// A shared streaming query type (ADR 0017, P4b): service-b (Kotlin) owns it too, so a stream goes
+/// A shared streaming query type: service-b (Kotlin) owns it too, so a stream goes
 /// to one instance of either. `fail_at > 0` makes the handler fail on reaching that row.
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -115,7 +115,7 @@ impl StreamingQuery for Rows {
     type Item = Row;
 }
 
-/// A shared subscription query type (ADR 0017, P4c): service-b (Kotlin) serves it too, so a
+/// A shared subscription query type: service-b (Kotlin) serves it too, so a
 /// subscription gets the current value of one of them as its initial result and then the changes
 /// of both.
 #[derive(Serialize, Deserialize, Debug)]
@@ -175,7 +175,7 @@ impl Query for OpenSubscriptions {
     type Reply = SubscriptionCount;
 }
 
-/// service-c's banner saga (sagas S2): print the shouted text as a banner on the fake printer.
+/// service-c's banner saga: print the shouted text as a banner on the fake printer.
 /// Owned by service-c alone (its own idempotent adapter handles it; the saga relay delivers it
 /// locally). `text` is what the printer prints and decides by (`webhook-*`, `topic-*`, `poll-*`,
 /// `silent-*`, `crash-*`).

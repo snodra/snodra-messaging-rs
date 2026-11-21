@@ -1,4 +1,4 @@
-//! The library's metrics (ADR 0026), through the OpenTelemetry metrics API: the library records,
+//! The library's metrics, through the OpenTelemetry metrics API: the library records,
 //! the application installs the meter provider (the SDK with an exporter, e.g. OTLP to
 //! otel-lgtm). [`SnodraMessaging::builder`](crate::SnodraMessaging::builder) records on
 //! `opentelemetry::global::meter("snodra-messaging-rs")` as the global provider is when it runs,

@@ -1,4 +1,4 @@
-//! End to end with two real hubs (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`, ADR 0016): every
+//! End to end with two real hubs (`SNODRA_SERVER_IMAGE`, default `snodra-server:dev`): every
 //! instance registers on both, reports its connected hubs to both, spreads unkeyed requests over
 //! both, survives one hub stopping mid-traffic and is back on it within the backoff cap once it
 //! restarts, and moves a stopped hub's permits to the other one (`Permits.grant`) without revoking

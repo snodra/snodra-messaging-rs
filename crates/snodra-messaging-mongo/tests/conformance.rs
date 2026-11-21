@@ -107,7 +107,8 @@ async fn markers_without_position_behave_as_before() {
     let at = DateTime::now();
     markers
         .insert_many([
-            // Written before E0 by either library, for the record at offset 4 of partition 1.
+            // Written by an older version of either library, for the record at offset 4 of
+            // partition 1.
             doc! { "_id": "processor:default:old-4", "type": "t.E", "processedAt": at,
             "processor": "default", "topic": "snodra.events", "partition": 1_i32,
             "offset": 4_i64 },
@@ -163,7 +164,7 @@ async fn markers_without_position_behave_as_before() {
             .await
             .expect("delete"),
         2,
-        "the marker from before E0 and the textual one"
+        "the marker from an older version and the textual one"
     );
     for (id, kept) in [
         ("processor:default:old-4", false),

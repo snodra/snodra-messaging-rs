@@ -1,4 +1,4 @@
-//! The reset of a processor (ADR 0023): its target, the replay ranges it makes and the reset
+//! The reset of a processor: its target, the replay ranges it makes and the reset
 //! handlers' context. The event store moves the positions
 //! ([`SubscriptionAdmin`](crate::event_store::SubscriptionAdmin), capability `replay`); positions
 //! are ordered by its [`compare`](crate::event_store::EventStore::compare) only.

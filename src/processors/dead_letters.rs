@@ -1,4 +1,4 @@
-//! Parking a record (ADR 0022, mode `collection`): the letter a record the processor gave up on
+//! Parking a record (mode `collection`): the letter a record the processor gave up on
 //! becomes, kept by the message store's [`DeadLetterStore`](crate::store::DeadLetterStore).
 //!
 //! A letter's id is `<processor>:<source>:<segment>:<position>` ([`letter_id`]), so parking the

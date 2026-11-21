@@ -1,5 +1,4 @@
-//! Partner sources as local snodra events (ADR 0021 rulings 20, 40, 44a; ADR 0027; spec "Inbound
-//! 1"): the Rust form of the Kotlin external sources.
+//! Partner sources as local snodra events: the Rust form of the Kotlin external sources.
 //!
 //! Each source registered with
 //! [`SnodraMessagingBuilder::external_source`](crate::SnodraMessagingBuilder::external_source)
@@ -12,10 +11,10 @@
 //! `<name>:<segment>:<position>` (on Kafka `<name>:<partition>:<offset>`, as always), or
 //! `<name>:<dedupeKey>` when the translator gives one; it keys the dispatcher's markers, so a
 //! record seen twice is applied once. (A partner that recreates its source within the markers'
-//! retention makes the default id skip the new records: such a partner needs a dedupe key, ruling
-//! 44a.) The handlers' `MessageContext` has that id as `message_id` and in the `id` header, the
-//! source's name in `source`, the event's type in `type` and the record's own headers; the
-//! correlation id is the record's `correlationId` header, else the dedupe id.
+//! retention makes the default id skip the new records: such a partner needs a dedupe key.) The
+//! handlers' `MessageContext` has that id as `message_id` and in the `id` header, the source's name
+//! in `source`, the event's type in `type` and the record's own headers; the correlation id is the
+//! record's `correlationId` header, else the dedupe id.
 //!
 //! Delivery is the processors': the record is acknowledged after the dispatch returned (at least
 //! once); a translator error (or panic) or a handler failure retries the record up to

@@ -31,7 +31,7 @@ pub const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(15);
 pub const MIN_HEARTBEAT: Duration = Duration::from_millis(100);
 /// ...and the longest.
 pub const MAX_HEARTBEAT: Duration = Duration::from_secs(3600);
-/// The most results a browser may be set to return per page (ADR 0025 ruling 21).
+/// The most results a browser may be set to return per page.
 pub const MAX_RESULTS_SETTING: usize = 1000;
 /// The longest time a browser may be set to give a call.
 pub const MAX_TIMEOUT_SETTING: Duration = Duration::from_secs(5 * 60);
@@ -111,7 +111,7 @@ impl From<BrowseError> for MessagingError {
     }
 }
 
-/// The bounds of a browser (ADR 0025's, as defaults) and the sources it reads: settings of the
+/// The bounds of a browser (the defaults) and the sources it reads: settings of the
 /// add-on's browser, which the calls' own bounds (`limit`, `maxScanned`, `timeoutMs`,
 /// `maxDurationMs`) may only lower.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,7 +355,7 @@ pub struct GetRequest {
     pub source: Option<String>,
     pub segment: String,
     pub position: String,
-    /// Carry the payload (the hub asks only under the payload rules of ADR 0025).
+    /// Carry the payload (the hub asks only under the payload rules).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub payload: bool,
 }

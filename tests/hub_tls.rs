@@ -1,4 +1,4 @@
-//! TLS to the hub (roadmap P5a, ADR 0018) against the in-process fake hub serving TLS with a
+//! TLS to the hub against the in-process fake hub serving TLS with a
 //! certificate generated at test time: the configured CA is trusted (and re-read on reconnect),
 //! another CA is not, `server_name` is what the certificate is checked against, every address form
 //! (a static list, `dns:///`, `https://`) uses TLS, and a plain-text client against a TLS hub, or

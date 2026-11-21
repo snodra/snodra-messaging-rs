@@ -1,4 +1,4 @@
-//! The event-store conformance kit (ADR 0027, feature `testing`): the checks every
+//! The event-store conformance kit (feature `testing`): the checks every
 //! [`EventStore`] add-on passes, a third party's included. An add-on's own test hands the kit a
 //! source it prepared, a way to make the add-on (one call per service instance) and a message
 //! store (for the at-least-once check):
@@ -538,7 +538,7 @@ pub async fn unacked_delivery_is_redelivered(kit: &EventStoreKit<'_>) {
 /// comes again, its processed-event marker (recorded in that transaction, its id built from the
 /// delivered `id` header as the core builds it) makes it a duplicate, and once acknowledged it
 /// does not come again. The core's own marker path over an event store is proven by the add-on's
-/// and the core's suites (E0-R2, E0-R3); this check pins what the event store owes it.
+/// and the core's suites; this check pins what the event store owes it.
 pub async fn redelivered_after_commit_is_skipped(kit: &EventStoreKit<'_>) {
     let events = kit.instance();
     let spec = kit.spec();

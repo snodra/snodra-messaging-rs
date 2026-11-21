@@ -1,4 +1,4 @@
-//! The records of idempotent external calls (ADR 0021 rulings 12, 17, 38, 39, 41-43, 70), keyed
+//! The records of idempotent external calls, keyed
 //! by their idempotency key. Every operation is a write of its own, outside any transaction (a
 //! rolled-back handler never forgets a call that happened); times are the caller's clock, epoch
 //! milliseconds.

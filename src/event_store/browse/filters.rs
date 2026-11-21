@@ -51,7 +51,7 @@ pub struct EventFilter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
     /// A case-sensitive byte substring of the payload. The browser searches payloads when asked;
-    /// whether the caller may is the hub's rule (ADR 0025).
+    /// whether the caller may is the hub's rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub q: Option<String>,
 }

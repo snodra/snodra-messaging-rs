@@ -15,8 +15,8 @@ use crate::security::{HubOAuth2, HubTls, SecretString};
 /// itself.
 pub const DEFAULT_STREAM_CREDIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-/// What happens to a record an event processor cannot handle (ADR 0022,
-/// `SNODRA_EVENTS_DEAD_LETTER_MODE`, case-insensitive).
+/// What happens to a record an event processor cannot handle
+/// (`SNODRA_EVENTS_DEAD_LETTER_MODE`, case-insensitive).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum DeadLetterMode {
     /// Parked in the `dead_letters` collection, sequenced per key, with the admin API
@@ -62,10 +62,10 @@ pub struct Config {
     /// subscription names (`<service_name>.<processor>`, `default` included).
     pub service_name: String,
     /// This instance's id: its hub `Register.instance_id` and the `service.instance.id` the
-    /// application gives its meter provider's resource (ADR 0026). A fresh UUID per `Config`
+    /// application gives its meter provider's resource. A fresh UUID per `Config`
     /// unless set (`SNODRA_INSTANCE_ID`, e.g. a pod name); unique among the service's instances.
     pub instance_id: String,
-    /// The hubs to connect to (ADR 0016): `host:port` (`static://` prefix optional), a
+    /// The hubs to connect to: `host:port` (`static://` prefix optional), a
     /// comma-separated list of them, or one `dns:///name:port` whose addresses are re-resolved
     /// every 30 s. One address is the single-hub setup.
     pub hub_address: String,
@@ -109,17 +109,17 @@ pub struct Config {
     /// would otherwise leave the handler task waiting for ever). Default 10 minutes, the hub's
     /// default `SNODRA_SERVER_MAX_STREAM_DURATION`; at least 1 ms ([`Config::validate`]).
     pub hub_stream_credit_timeout: Duration,
-    /// The most subscription queries (ADR 0017, P4c) this instance serves at once: a
+    /// The most subscription queries this instance serves at once: a
     /// subscription request beyond it is refused with `ReplyEnd{error = RESOURCE_EXHAUSTED
     /// "subscription limit (N) reached"}`. Subscriptions hold no handler permit, so this is
     /// their only bound here (the hub has its own per-instance limit,
     /// `SNODRA_SERVER_MAX_SUBSCRIPTIONS_PER_INSTANCE`, 1024). Default 1024; at least 1
     /// ([`Config::validate`]).
     pub hub_max_subscriptions: usize,
-    /// The static token sent in `Register.credentials.token` on every hub stream (ADR 0018;
-    /// `SNODRA_SERVER_TOKEN`). Needed when the hub runs with `SNODRA_SERVER_AUTH_MODE=enforce`; ignored
-    /// by a hub in `off` mode. Never logged (`Debug` prints `"***"`).
-    /// An empty token is the same as none. Overridden by `hub_token_file` when that is set.
+    /// The static token sent in `Register.credentials.token` on every hub stream
+    /// (`SNODRA_SERVER_TOKEN`). Needed when the hub runs with `SNODRA_SERVER_AUTH_MODE=enforce`;
+    /// ignored by a hub in `off` mode. Never logged (`Debug` prints `"***"`). An empty token is the
+    /// same as none. Overridden by `hub_token_file` when that is set.
     pub hub_token: Option<SecretString>,
     /// A file holding the token (`SNODRA_SERVER_TOKEN_FILE`), for container secrets. Read at
     /// startup ([`Config::validate`]) and again on every reconnect, so a rotated secret is picked
@@ -133,7 +133,7 @@ pub struct Config {
     /// `SNODRA_SERVER_TLS_CERT`.
     pub hub_tls: Option<HubTls>,
     /// Authenticate to the hubs with an OAuth2 client-credentials access token (JWT) instead of a
-    /// static token (`SNODRA_SERVER_OAUTH2_TOKEN_URI` set makes it `Some`; ADR 0019). One token
+    /// static token (`SNODRA_SERVER_OAUTH2_TOKEN_URI` set makes it `Some`). One token
     /// provider serves every hub connection and refreshes the token before it expires. Mutually
     /// exclusive with `hub_token` / `hub_token_file` ([`Config::validate`]).
     pub hub_oauth2: Option<HubOAuth2>,
@@ -142,8 +142,8 @@ pub struct Config {
     pub events_source: String,
     pub consumer_enabled: bool,
     pub consumer_max_attempts: u32,
-    /// Where a record goes that an event processor cannot handle (ADR 0022;
-    /// `SNODRA_EVENTS_DEAD_LETTER_MODE`, default `collection`).
+    /// Where a record goes that an event processor cannot handle (`SNODRA_EVENTS_DEAD_LETTER_MODE`,
+    /// default `collection`).
     pub dead_letter_mode: DeadLetterMode,
     /// How long a dead letter is kept (`SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS`, default 30 d, at
     /// least 1 s): the TTL index on `expireAt` removes it then, which unblocks its key.
@@ -163,7 +163,7 @@ pub struct Config {
     pub store_init_schema: bool,
     /// The retentions (`outbox_retention`, `idempotency_retention`, `sagas_*_retention`,
     /// `deadlines_retention`, `external_calls_retention`) are the message store's to apply as it
-    /// can (ADR 0028: the MongoDB add-on's TTL indexes, built from this config); the core only
+    /// can (the MongoDB add-on's TTL indexes, built from this config); the core only
     /// reads `dead_letter_retention` (a letter's expiry).
     pub outbox_retention: Duration,
     pub idempotency_retention: Duration,
@@ -176,7 +176,7 @@ pub struct Config {
     /// path, or `scope`. `roles` by default; `realm_access.roles` for providers that nest them, `groups` for
     /// providers that put them there.
     pub security_roles_claim: String,
-    /// Sagas (ADR 0021; `SNODRA_SAGAS_ENABLED`, default true): with `false` a service that
+    /// Sagas (`SNODRA_SAGAS_ENABLED`, default true): with `false` a service that
     /// registers sagas starts without their runtime, relay and scheduler (logged at warn).
     pub sagas_enabled: bool,
     /// Attempts of one (event, saga type) before the event is parked in `saga_failures`
@@ -274,8 +274,8 @@ impl Config {
         }
     }
 
-    /// The dispatch relay's settings: the `sagas_relay_*` fields, with the constants of ruling
-    /// 16 (multiplier 2, parallelism 4, batch size 100).
+    /// The dispatch relay's settings: the `sagas_relay_*` fields, with fixed
+    /// values: multiplier 2, parallelism 4 and batch size 100.
     pub fn relay_settings(&self) -> crate::saga::RelaySettings {
         crate::saga::RelaySettings {
             poll_interval: self.sagas_relay_poll_interval,
@@ -296,7 +296,7 @@ impl Config {
         }
     }
 
-    /// The saga runtime's retry: `sagas_max_attempts`, 200 ms doubling to 5 s (ruling 16).
+    /// The saga runtime's retry: `sagas_max_attempts`, 200 ms doubling to 5 s.
     pub fn saga_retry(&self) -> crate::saga::SagaRetry {
         crate::saga::SagaRetry::new(RetryPolicy {
             max_attempts: self.sagas_max_attempts,
@@ -330,10 +330,11 @@ impl Config {
     /// `SNODRA_SERVER_TLS_CA`, `SNODRA_SERVER_TLS_SERVER_NAME` (both need `SNODRA_SERVER_TLS=true`),
     /// `SNODRA_SERVER_TLS_CLIENT_CERT` and `SNODRA_SERVER_TLS_CLIENT_KEY` (a client certificate for
     /// mutual TLS, both or neither; they turn TLS on and exclude a hub token and OAuth2),
-    /// `SNODRA_SERVER_MAX_SUBSCRIPTIONS`, `SNODRA_SERVER_OAUTH2_TOKEN_URI` (turns JWT authentication on;
-    /// then `SNODRA_SERVER_OAUTH2_CLIENT_SECRET` or `SNODRA_SERVER_OAUTH2_CLIENT_SECRET_FILE` is needed,
-    /// and `SNODRA_SERVER_OAUTH2_CLIENT_ID` defaults to the service name), `SNODRA_SERVER_OAUTH2_SCOPE`,
-    /// `SNODRA_SERVER_OAUTH2_CA`; the saga settings (ADR 0021) `SNODRA_SAGAS_ENABLED`,
+    /// `SNODRA_SERVER_MAX_SUBSCRIPTIONS`, `SNODRA_SERVER_OAUTH2_TOKEN_URI` (turns JWT
+    /// authentication on; then `SNODRA_SERVER_OAUTH2_CLIENT_SECRET` or
+    /// `SNODRA_SERVER_OAUTH2_CLIENT_SECRET_FILE` is needed, and `SNODRA_SERVER_OAUTH2_CLIENT_ID`
+    /// defaults to the service name), `SNODRA_SERVER_OAUTH2_SCOPE`,
+    /// `SNODRA_SERVER_OAUTH2_CA`; the saga settings `SNODRA_SAGAS_ENABLED`,
     /// `SNODRA_SAGAS_MAX_ATTEMPTS`, `SNODRA_SAGAS_ENDED_RETENTION_MS`,
     /// `SNODRA_SAGAS_DISPATCH_RETENTION_MS`, `SNODRA_SAGAS_FAILED_RETENTION_MS`,
     /// `SNODRA_SAGAS_RELAY_POLL_INTERVAL_MS`,
@@ -730,7 +731,7 @@ impl Config {
         Ok(())
     }
 
-    /// The saga, deadline and external-call settings (ADR 0021 ruling 16): attempts at least 1,
+    /// The saga, deadline and external-call settings: attempts at least 1,
     /// intervals, leases and backoffs at least 1 ms, the relay's initial backoff not above its
     /// maximum, retentions at least 1 s (a TTL index counts in seconds). Checked whether or not
     /// sagas are registered, so a typo is found before the first saga is.
@@ -837,7 +838,7 @@ impl Config {
         self.external_call_settings().validate()
     }
 
-    /// The client certificate (mTLS, ADR 0020): both files, no other credential, and a pair the
+    /// The client certificate (mTLS): both files, no other credential, and a pair the
     /// hub would accept (it parses, the key is the certificate's, the leaf names this service, it
     /// has not expired).
     fn validate_client_certificate(&self, tls: &HubTls) -> Result<(), MessagingError> {
@@ -949,7 +950,7 @@ fn pairs<T>(
     Ok(out)
 }
 
-/// Settings the library read before the event store became an add-on (ADR 0027), each with what
+/// Settings the library read before the event store became an add-on, each with what
 /// replaced it. They are not read (no alias before v1), and one still set fails
 /// [`Config::from_env`] ([`removed_settings`]): ignored, a source or a mode would misroute events.
 /// `SNODRA_MONGODB_URI`, also no longer read, is not here: a service may keep it for its own

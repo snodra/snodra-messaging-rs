@@ -1,4 +1,4 @@
-//! The bounded retry of one saga event inside stage 2 (ADR 0021 rulings 3 and 33). Only a
+//! The bounded retry of one saga event inside stage 2. Only a
 //! **conflict** (a version check, a start-key duplicate, a store write conflict or a transient
 //! transaction error) backs off: it is retried up to `max_attempts` attempts in all with the
 //! policy's jittered exponential backoff (default 5 attempts, 200 ms doubling up to 5 s). Any
@@ -44,7 +44,7 @@ impl SagaRetry {
 }
 
 impl SagaRetry {
-    /// The default policy: 5 attempts, 200 ms doubling up to 5 s (ruling 16: only the attempts
+    /// The default policy: 5 attempts, 200 ms doubling up to 5 s (only the attempts
     /// are configurable, `SNODRA_SAGAS_MAX_ATTEMPTS`).
     pub fn default_policy() -> RetryPolicy {
         RetryPolicy {

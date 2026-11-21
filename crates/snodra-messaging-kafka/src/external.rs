@@ -1,4 +1,4 @@
-//! A partner's Kafka topic as a source of records (ADR 0021 rulings 20, 40, 44a): the Kafka half
+//! A partner's Kafka topic as a source of records: the Kafka half
 //! of the external sources. [`KafkaExternalSource`] is the core's [`ExternalSourceProvider`]: a
 //! [`Subscription`] over the topic in the partner's own consumer group, with the offset acknowledged after the core dispatched the
 //! record (at least once); translating a record into an event, the retries and the dedupe id
@@ -7,7 +7,7 @@
 //! A source's group is its `group_id`, by default `<service-name>.external.<name>`; its consumer
 //! properties are the source's `properties` on top of `auto.offset.reset=earliest`, with the
 //! servers, the group and auto-commit fixed by the library: a `properties` entry for a fixed key
-//! is refused (ruling 40).
+//! is refused.
 
 use std::collections::HashMap;
 

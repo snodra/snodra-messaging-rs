@@ -1,10 +1,10 @@
-//! The storage contract of ADR 0022 for dead letters: the `dead_letters` document and its indexes.
-//! The fixtures in `tests/fixtures/dead_letters_contract` are written by hand from the ADR's table
-//! and are byte for byte the Kotlin library's (`src/test/resources/dead_letters_contract`): this
-//! library writes each of them from its record and reads each of them back through its store and
-//! admin API, so a letter one library parks is one the other can list, retry and discard. Neither
-//! library writes `_class` or a null, an absent field stays absent, and a blank `id` or `type`
-//! header is an absent `eventId` or `eventType`. `replay` (ADR 0023: parked while its processor
+//! The storage contract for dead letters: the `dead_letters` document and its indexes.
+//! The fixtures in `tests/fixtures/dead_letters_contract` are written by hand from the contract's
+//! table and are byte for byte the Kotlin library's (`src/test/resources/dead_letters_contract`):
+//! this library writes each of them from its record and reads each of them back through its store
+//! and admin API, so a letter one library parks is one the other can list, retry and discard.
+//! Neither library writes `_class` or a null, an absent field stays absent, and a blank `id` or
+//! `type` header is an absent `eventId` or `eventType`. `replay` (parked while its processor
 //! replayed the record) is written only when true.
 
 mod support;

@@ -1,4 +1,4 @@
-//! Saga registration on the builder (S2-R1, S2-R2): the startup checks, which refuse before any
+//! Saga registration on the builder: the startup checks, which refuse before any
 //! connection is made, and the wire shape of `SagaCommandFailed`.
 
 use serde::{Deserialize, Serialize};

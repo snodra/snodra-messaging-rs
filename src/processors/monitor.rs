@@ -1,10 +1,10 @@
-//! What one processor reports in `InstanceStatus.processors` (ADR 0022): kept in memory by the
+//! What one processor reports in `InstanceStatus.processors`: kept in memory by the
 //! processor's consumer (the assignment changes its subscription reports, and the subscription's
 //! segment statuses it copies), and read by the hub pool's status tick under a short lock (never
 //! an event-store or store call).
 //!
 //! State: STOPPED while its consumer does not run (stopping at shutdown, or out of its
-//! subscription for a reset, ADR 0023); else PAUSED while its control document says so; else
+//! subscription for a reset); else PAUSED while its control document says so; else
 //! FAILING for 60 s after a record exhausted its attempts, a letter could not be parked or the
 //! subscription reported an error; else STARTING before the first assignment (an empty one
 //! counts) and between a revoke and the next assign; else RUNNING. `operation_id` names the reset
@@ -15,7 +15,7 @@
 //! [`segment_order`]; positions are compared with the event store's
 //! [`compare`](EventStore::compare) only.
 //!
-//! The processor gauges (ADR 0026) read the same status when the meter collects:
+//! The processor gauges read the same status when the meter collects:
 //! `snodra.processor.state{processor,state}` (every state, 1 for the current one),
 //! `snodra.processor.lag{processor,segment}` (each assigned segment whose lag is known) and
 //! `snodra.dead.letters{processor}`.

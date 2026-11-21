@@ -1,4 +1,4 @@
-//! Partner Kafka topics become local snodra events (S2 Task 10, ADR 0021 rulings 20, 40; ADR 0027):
+//! Partner Kafka topics become local snodra events:
 //! the core's external sources over the Kafka add-on's `KafkaExternalSource`, the Rust form of the
 //! Kotlin `ExternalKafkaSourcesTest`, against a real Kafka (the in-memory message store keeps the rest). One broker serves every
 //! scenario (each on a topic and source of its own).
@@ -271,7 +271,7 @@ fn a_properties_entry_for_a_key_the_library_fixes_fails_the_startup_naming_the_s
     );
 }
 
-/// ADR 0022: the marker families `processor:`, `saga:`, `ingress:` and `failed:` are the
+/// The marker families `processor:`, `saga:`, `ingress:` and `failed:` are the
 /// library's own; a source of one of those names could collide with them.
 #[test]
 fn a_reserved_source_name_fails_the_startup_naming_it() {

@@ -1,4 +1,4 @@
-//! The Kafka event store add-on (ADR 0027): [`KafkaEventStore`] implements the core's
+//! The Kafka event store add-on: [`KafkaEventStore`] implements the core's
 //! [`EventStore`] on Apache Kafka, and [`KafkaExternalSource`] reads a partner's topic.
 //!
 //! On Kafka a source is a topic, a segment a partition and a position an offset (both in
@@ -97,7 +97,7 @@ pub struct KafkaConfig {
     /// Extra librdkafka properties for the consumers only (the subscriptions, the admins and the
     /// browser; the producer would log them as ignored), never one of [`FIXED_KEYS`].
     pub consumer_properties: HashMap<String, String>,
-    /// The browser's topics (the first is the default) and bounds (ADR 0025's by default, on
+    /// The browser's topics (the first is the default) and bounds (the defaults, on
     /// `snodra.events`).
     pub browse: BrowseSettings,
 }

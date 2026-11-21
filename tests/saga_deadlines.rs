@@ -1,4 +1,4 @@
-//! The deadline scheduler (S2 Task 7, ADR 0021 rulings 15 and 37): due deadlines fire at least
+//! The deadline scheduler: due deadlines fire at least
 //! once from a leased poller, on the in-memory message store. The Rust form of the Kotlin
 //! `DeadlineSchedulerTest`.
 #![cfg(feature = "testing")]
