@@ -92,6 +92,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          find target/package -maxdepth 1 -name '*.crate' -print0 \
-            | xargs -0 -r gh release upload "$GITHUB_REF_NAME" \
-                --repo "$GITHUB_REPOSITORY" --clobber
+          # A re-run skips the crates already on crates.io, so the directory may not exist.
+          if [ -d target/package ]; then
+            find target/package -maxdepth 1 -name '*.crate' -print0 \
+              | xargs -0 -r gh release upload "$GITHUB_REF_NAME" \
+                  --repo "$GITHUB_REPOSITORY" --clobber
+          fi
