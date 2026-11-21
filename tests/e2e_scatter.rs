@@ -37,7 +37,7 @@ impl Query for Find {
     type Reply = Found;
 }
 
-const IDS: [&str; 2] = ["e2e-p4a-1", "e2e-p4a-2"];
+const IDS: [&str; 2] = ["e2e-scatter-1", "e2e-scatter-2"];
 
 async fn two_hubs() -> (HubContainer, HubContainer) {
     let start = |id: &'static str| hub_with(HubOptions::new().env("SNODRA_SERVER_ID", id));

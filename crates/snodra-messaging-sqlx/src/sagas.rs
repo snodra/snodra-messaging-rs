@@ -35,7 +35,7 @@ use crate::limits;
 use crate::outbox::marker_exists;
 
 /// The first key of the transaction-scoped advisory lock that serialises the start of sagas per
-/// start key on PostgreSQL (`'KRKN'`).
+/// start key on PostgreSQL (0x4B52_4B4E = 1263684430; shared with the Kotlin library).
 #[cfg(feature = "postgres")]
 const SAGA_START_LOCK: i32 = 0x4B52_4B4E;
 

@@ -49,9 +49,9 @@ impl Query for GetInvoice {
 }
 
 #[derive(Serialize, Deserialize)]
-struct ListFiles {}
-message_type!(ListFiles, "files.ListFiles");
-impl Query for ListFiles {
+struct ListItems {}
+message_type!(ListItems, "inventory.ListItems");
+impl Query for ListItems {
     type Reply = ();
 }
 
@@ -267,11 +267,11 @@ async fn a_send_outside_the_service_entry_is_access_denied() {
     registered(&f, &billing).await;
     let denied = billing
         .sender
-        .send_query(&ListFiles {}, SendOptions::default())
+        .send_query(&ListItems {}, SendOptions::default())
         .await
         .expect_err("the billing entry sends nothing");
     assert!(
-        matches!(denied, MessagingError::AccessDenied(ref m) if m.contains("files.ListFiles")),
+        matches!(denied, MessagingError::AccessDenied(ref m) if m.contains("inventory.ListItems")),
         "{denied:?}"
     );
     billing.conn.shutdown().await;

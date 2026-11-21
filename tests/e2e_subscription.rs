@@ -62,7 +62,7 @@ impl SubscriptionQuery for SharedPrices {
     type Update = Tick;
 }
 
-const IDS: [&str; 2] = ["e2e-p4c-1", "e2e-p4c-2"];
+const IDS: [&str; 2] = ["e2e-subscription-1", "e2e-subscription-2"];
 
 async fn two_hubs() -> (HubContainer, HubContainer) {
     let start = |id: &'static str| hub_with(HubOptions::new().env("SNODRA_SERVER_ID", id));

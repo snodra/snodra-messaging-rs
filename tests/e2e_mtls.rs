@@ -47,9 +47,9 @@ impl Query for GetInvoice {
 }
 
 #[derive(Serialize, Deserialize)]
-struct ListFiles {}
-message_type!(ListFiles, "files.ListFiles");
-impl Query for ListFiles {
+struct ListItems {}
+message_type!(ListItems, "inventory.ListItems");
+impl Query for ListItems {
     type Reply = ();
 }
 
@@ -252,11 +252,11 @@ async fn a_send_outside_the_certificates_service_entry_is_access_denied() {
     assert!(orders.conn.await_registered(Duration::from_secs(15)).await);
     let denied = orders
         .sender
-        .send_query(&ListFiles {}, SendOptions::default())
+        .send_query(&ListItems {}, SendOptions::default())
         .await
-        .expect_err("files.* is outside orders' send list");
+        .expect_err("inventory.* is outside orders' send list");
     assert!(
-        matches!(denied, MessagingError::AccessDenied(ref m) if m.contains("files.ListFiles")),
+        matches!(denied, MessagingError::AccessDenied(ref m) if m.contains("inventory.ListItems")),
         "{denied:?}"
     );
     orders.conn.shutdown().await;

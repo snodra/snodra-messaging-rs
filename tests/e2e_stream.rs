@@ -41,7 +41,7 @@ impl StreamingQuery for Export {
     type Item = Row;
 }
 
-const IDS: [&str; 2] = ["e2e-p4b-1", "e2e-p4b-2"];
+const IDS: [&str; 2] = ["e2e-stream-1", "e2e-stream-2"];
 
 async fn two_hubs() -> (HubContainer, HubContainer) {
     let start = |id: &'static str| hub_with(HubOptions::new().env("SNODRA_SERVER_ID", id));
