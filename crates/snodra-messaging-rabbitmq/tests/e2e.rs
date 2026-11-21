@@ -109,8 +109,13 @@ async fn a_service_of_two_instances_runs_on_rabbitmq_streams() {
     let hub = support::hub(WRITE_TOKEN).await;
     let store = MemoryStore::new();
     let seen: Seen = Arc::default();
-    let a = instance("a", &hub, &rabbit, &store, &seen).await;
-    let b = instance("b", &hub, &rabbit, &store, &seen).await;
+    // Both instances must be members of the consumer group before the broker assigns the
+    // partitions: joining one after the other can hand every partition to the first one, and
+    // a single-active-consumer group does not rebalance on its own.
+    let (a, b) = tokio::join!(
+        instance("a", &hub, &rabbit, &store, &seen),
+        instance("b", &hub, &rabbit, &store, &seen),
+    );
     assert!(
         a.await_hub(Duration::from_secs(30)).await && b.await_hub(Duration::from_secs(30)).await
     );
