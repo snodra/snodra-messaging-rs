@@ -15,7 +15,7 @@
 //!   `DELETE /audit/dead-letters/{id}` (404 for an unknown letter): the library's `DeadLetters`.
 //! - `GET /audit/resets`: the resets of the processor that replayed something, as
 //!   its reset handler saw them:
-//! `[{"operationId","target","ranges":[{"partition","from","until"}]}]`.
+//!   `[{"operationId","target","ranges":[{"partition","from","until"}]}]`.
 //! - `GET /audit/notified`: the notes the processor's second handler handled, the one registered
 //!   with `disallow_replay` (a replay adds nothing): `[{"key","text","at"}]`.
 //!
