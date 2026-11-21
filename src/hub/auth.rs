@@ -846,7 +846,8 @@ mod tests {
         assert!(local("http://localhost:8180/token"));
         assert!(local("http://127.0.0.1:8180/token"));
         assert!(local("http://[::1]:8180/token"));
-        assert!(local("http://auth.example:8080/token"));
+        assert!(local("http://auth:8080/token"));
+        assert!(!local("http://auth.example:8080/token"));
         assert!(!local("http://auth.internal.example:8080/token"));
         assert!(!local("http://10.1.2.3/token"));
     }
