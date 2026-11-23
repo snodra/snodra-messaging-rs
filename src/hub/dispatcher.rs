@@ -509,38 +509,37 @@ impl Dispatcher {
         }
     }
 
-    /// The handler of a subscription request: `INVALID_REQUEST` when the type's handler answers
-    /// another mode (a unary or streaming handler: the sender used the wrong call, which no
-    /// retry fixes), `NO_HANDLER` for a type not served here.
+    /// The handler of a subscription request, the type's query handler whatever the request's
+    /// kind: `INVALID_REQUEST` when the type's handler answers another mode (a unary or streaming
+    /// handler: the sender used the wrong call, which no retry fixes), and `INVALID_REQUEST` too
+    /// for a type with no subscription handler here (a command, or not served at all).
     fn subscription_handler(
         &self,
         req: &proto::Request,
     ) -> Result<SubscriptionHandler, MessagingError> {
-        match kind(req)? {
-            RequestKind::Query => match self.registry.subscription_handler(&req.r#type) {
-                Some(handler) => Ok(handler.clone()),
-                None if self.registry.query_handler(&req.r#type).is_some() => {
-                    Err(MessagingError::InvalidMessage(format!(
-                        "{} is not a subscription query handler (it answers mode UNARY)",
-                        req.r#type
-                    )))
-                }
-                None if self.registry.stream_handler(&req.r#type).is_some() => {
-                    Err(MessagingError::InvalidMessage(format!(
-                        "{} is not a subscription query handler (it answers mode STREAMING)",
-                        req.r#type
-                    )))
-                }
-                None => Err(MessagingError::NoHandler(req.r#type.clone())),
-            },
-            _ => Err(MessagingError::NoHandler(req.r#type.clone())),
+        let type_name = &req.r#type;
+        match self.registry.subscription_handler(type_name) {
+            Some(handler) => Ok(handler.clone()),
+            None if self.registry.query_handler(type_name).is_some() => {
+                Err(MessagingError::InvalidMessage(format!(
+                    "{type_name} is not a subscription query handler (it answers mode UNARY)"
+                )))
+            }
+            None if self.registry.stream_handler(type_name).is_some() => {
+                Err(MessagingError::InvalidMessage(format!(
+                    "{type_name} is not a subscription query handler (it answers mode STREAMING)"
+                )))
+            }
+            None => Err(MessagingError::InvalidMessage(format!(
+                "no subscription handler for {type_name} on this instance"
+            ))),
         }
     }
 
     /// The admission of a subscription request (`<id>#n`, `mode = SUBSCRIPTION`) that
     /// [`register_subscription`](Self::register_subscription) read: admitted, so what emits
     /// matched meanwhile is delivered, or refused with a `ReplyEnd{error}`: `INVALID_REQUEST`
-    /// when the type's handler answers another mode, `NO_HANDLER` for a type not served here,
+    /// when the type's handler answers another mode or the type has no subscription handler here,
     /// `RESOURCE_EXHAUSTED` `subscription limit (N) reached` beyond `max_subscriptions`, the
     /// guard's code, or `INVALID_REQUEST` for a query that does not decode. A hub `Cancel` or a
     /// lost stream meanwhile removed it: the outcome is dropped and nothing is sent.
@@ -704,27 +703,30 @@ impl Dispatcher {
         CURRENT.scope(ctx, pumping).await;
     }
 
-    /// Admits a streaming request and runs its handler to the stream of items.
+    /// Admits a streaming request and runs its handler to the stream of items. The handler is the
+    /// type's query handler whatever the request's kind: `INVALID_REQUEST` when it answers another
+    /// mode (unary or subscription), `NO_HANDLER` when the type has no query handler here.
     async fn open(
         &self,
         req: proto::Request,
     ) -> Result<(OwnedSemaphorePermit, MessageContext, ItemStream), MessagingError> {
         let identity = self.identity(&req).await?;
-        let handler = match kind(&req)? {
-            RequestKind::Query => match self.registry.stream_handler(&req.r#type) {
-                Some(handler) => Some(handler.clone()),
-                // The caller used the wrong mode: not retryable, unlike NO_HANDLER.
-                None if self.registry.query_handler(&req.r#type).is_some() => {
-                    return Err(MessagingError::InvalidMessage(format!(
-                        "{} is not a streaming query handler (it answers mode UNARY)",
-                        req.r#type
-                    )));
-                }
-                None => None,
-            },
-            _ => None,
-        }
-        .ok_or_else(|| MessagingError::NoHandler(req.r#type.clone()))?;
+        let type_name = &req.r#type;
+        let handler = match self.registry.stream_handler(type_name) {
+            Some(handler) => handler.clone(),
+            // The caller used the wrong mode: not retryable, unlike NO_HANDLER.
+            None if self.registry.query_handler(type_name).is_some() => {
+                return Err(MessagingError::InvalidMessage(format!(
+                    "{type_name} is not a streaming query handler (it answers mode UNARY)"
+                )));
+            }
+            None if self.registry.subscription_handler(type_name).is_some() => {
+                return Err(MessagingError::InvalidMessage(format!(
+                    "{type_name} is not a streaming query handler (it answers mode SUBSCRIPTION)"
+                )));
+            }
+            None => return Err(MessagingError::NoHandler(type_name.clone())),
+        };
         let type_name = req.r#type.clone();
         let (ctx, permit, payload) = self.admit(req, identity).await?;
         let items = CURRENT

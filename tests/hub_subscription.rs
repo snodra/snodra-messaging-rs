@@ -832,7 +832,13 @@ async fn a_subscription_request_the_type_cannot_serve_is_refused_with_an_end() {
             ErrorCode::InvalidRequest,
             "t.Export is not a subscription query handler (it answers mode STREAMING)",
         ),
-        ("n#1", "t.Nope", b"{}", ErrorCode::NoHandler, "t.Nope"),
+        (
+            "n#1",
+            "t.Nope",
+            b"{}",
+            ErrorCode::InvalidRequest,
+            "no subscription handler for t.Nope on this instance",
+        ),
         ("g#1", "t.Admin", b"{}", ErrorCode::Unauthenticated, ""),
         (
             "d#1",
@@ -841,7 +847,13 @@ async fn a_subscription_request_the_type_cannot_serve_is_refused_with_an_end() {
             ErrorCode::InvalidRequest,
             "cannot decode payload",
         ),
-        ("c#1", "t.Fill", b"{}", ErrorCode::NoHandler, "t.Fill"),
+        (
+            "c#1",
+            "t.Fill",
+            b"{}",
+            ErrorCode::InvalidRequest,
+            "no subscription handler for t.Fill on this instance",
+        ),
     ];
     for (n, (id, type_name, payload, code, message)) in cases.iter().enumerate() {
         hub.send_to_clients(forwarded(id, type_name, payload, true))
@@ -853,14 +865,244 @@ async fn a_subscription_request_the_type_cannot_serve_is_refused_with_an_end() {
         assert!(end_message(end).contains(message), "{id}: {end:?}");
     }
     assert_eq!(a.emitter.open_subscriptions(), 0);
-    // A command kind serves no subscription, whatever the type (the hub gates it before).
-    let mut as_command = forwarded("k#1", "t.Prices", b"{}", true);
-    if let Some(server_message::Message::Request(r)) = &mut as_command.message {
-        r.kind = proto::RequestKind::Command as i32;
+    a.shutdown().await;
+}
+
+/// What a forwarded request gets back.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Answer {
+    /// A `Reply` with this error.
+    ReplyError(ErrorCode),
+    /// A `ReplyEnd` with this error.
+    EndError(ErrorCode),
+    /// A `ReplyEnd` without an error (the streaming handler ran).
+    EndOk,
+    /// Nothing: the subscription was admitted.
+    Admitted,
+}
+
+/// Every combination of mode, request kind and the kind of handler the type has here: the mode
+/// decides the frame (`UNARY`: a `Reply`; `STREAMING` and `SUBSCRIPTION`: a `ReplyEnd`). A
+/// unary request takes the handler of its kind; a streaming or subscription request takes the
+/// type's query handler whatever its kind. A type served in another mode is `INVALID_REQUEST`;
+/// a type with no handler of the request's kind is `NO_HANDLER`, except for a subscription,
+/// where it is `INVALID_REQUEST` too (no subscription handler on this instance).
+#[tokio::test]
+async fn a_request_in_a_mode_its_handler_does_not_serve_gets_the_reference_answer() {
+    use Answer::*;
+    use proto::RequestKind::{Command as K_CMD, Query as K_QUERY, Unspecified as K_NONE};
+    use proto::RequestMode::{
+        Streaming as STREAMING, Subscription as SUBSCRIPTION, Unary as UNARY,
+    };
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let mut r = registry("a1", &probe); // t.Prices (subscription), t.Lookup (unary)
+    r.streaming_query::<Export, _, _, _>(|_, _| async move {
+        Ok(tokio_stream::empty::<Result<Tick, MessagingError>>())
+    });
+    r.command::<Fill, _, _>(|_, _| async move { Ok(()) });
+    let a = node_with(
+        &hub.address(),
+        "svc-a",
+        "a1",
+        r,
+        8,
+        SenderSettings::default(),
+        None,
+    )
+    .await;
+    let payload = |type_name: &str| -> Vec<u8> {
+        match type_name {
+            "t.Prices" => serde_json::to_vec(&prices("acme")).unwrap(),
+            "t.Fill" => br#"{"data":"x"}"#.to_vec(),
+            _ => b"{}".to_vec(),
+        }
+    };
+    let cases = [
+        // UNARY: the handler of the request's kind.
+        (
+            UNARY,
+            K_QUERY,
+            "t.Export",
+            ReplyError(ErrorCode::InvalidRequest),
+        ),
+        (
+            UNARY,
+            K_QUERY,
+            "t.Prices",
+            ReplyError(ErrorCode::InvalidRequest),
+        ),
+        (UNARY, K_QUERY, "t.Fill", ReplyError(ErrorCode::NoHandler)),
+        (UNARY, K_QUERY, "t.Nope", ReplyError(ErrorCode::NoHandler)),
+        (UNARY, K_CMD, "t.Lookup", ReplyError(ErrorCode::NoHandler)),
+        (UNARY, K_CMD, "t.Export", ReplyError(ErrorCode::NoHandler)),
+        (UNARY, K_CMD, "t.Prices", ReplyError(ErrorCode::NoHandler)),
+        (UNARY, K_CMD, "t.Nope", ReplyError(ErrorCode::NoHandler)),
+        (
+            UNARY,
+            K_NONE,
+            "t.Lookup",
+            ReplyError(ErrorCode::InvalidRequest),
+        ),
+        (
+            UNARY,
+            K_NONE,
+            "t.Nope",
+            ReplyError(ErrorCode::InvalidRequest),
+        ),
+        // STREAMING: the type's query handler, whatever the kind.
+        (
+            STREAMING,
+            K_QUERY,
+            "t.Lookup",
+            EndError(ErrorCode::InvalidRequest),
+        ),
+        (
+            STREAMING,
+            K_QUERY,
+            "t.Prices",
+            EndError(ErrorCode::InvalidRequest),
+        ),
+        (STREAMING, K_QUERY, "t.Fill", EndError(ErrorCode::NoHandler)),
+        (STREAMING, K_QUERY, "t.Nope", EndError(ErrorCode::NoHandler)),
+        (STREAMING, K_CMD, "t.Export", EndOk),
+        (
+            STREAMING,
+            K_CMD,
+            "t.Lookup",
+            EndError(ErrorCode::InvalidRequest),
+        ),
+        (
+            STREAMING,
+            K_CMD,
+            "t.Prices",
+            EndError(ErrorCode::InvalidRequest),
+        ),
+        (STREAMING, K_CMD, "t.Fill", EndError(ErrorCode::NoHandler)),
+        (STREAMING, K_CMD, "t.Nope", EndError(ErrorCode::NoHandler)),
+        (STREAMING, K_NONE, "t.Export", EndOk),
+        (
+            STREAMING,
+            K_NONE,
+            "t.Lookup",
+            EndError(ErrorCode::InvalidRequest),
+        ),
+        (STREAMING, K_NONE, "t.Nope", EndError(ErrorCode::NoHandler)),
+        // SUBSCRIPTION: the type's query handler, whatever the kind; none is INVALID_REQUEST.
+        (
+            SUBSCRIPTION,
+            K_QUERY,
+            "t.Lookup",
+            EndError(ErrorCode::InvalidRequest),
+        ),
+        (
+            SUBSCRIPTION,
+            K_QUERY,
+            "t.Export",
+            EndError(ErrorCode::InvalidRequest),
+        ),
+        (
+            SUBSCRIPTION,
+            K_QUERY,
+            "t.Fill",
+            EndError(ErrorCode::InvalidRequest),
+        ),
+        (
+            SUBSCRIPTION,
+            K_QUERY,
+            "t.Nope",
+            EndError(ErrorCode::InvalidRequest),
+        ),
+        (SUBSCRIPTION, K_CMD, "t.Prices", Admitted),
+        (
+            SUBSCRIPTION,
+            K_CMD,
+            "t.Lookup",
+            EndError(ErrorCode::InvalidRequest),
+        ),
+        (
+            SUBSCRIPTION,
+            K_CMD,
+            "t.Fill",
+            EndError(ErrorCode::InvalidRequest),
+        ),
+        (
+            SUBSCRIPTION,
+            K_CMD,
+            "t.Nope",
+            EndError(ErrorCode::InvalidRequest),
+        ),
+        (SUBSCRIPTION, K_NONE, "t.Prices", Admitted),
+        (
+            SUBSCRIPTION,
+            K_NONE,
+            "t.Export",
+            EndError(ErrorCode::InvalidRequest),
+        ),
+        (
+            SUBSCRIPTION,
+            K_NONE,
+            "t.Nope",
+            EndError(ErrorCode::InvalidRequest),
+        ),
+    ];
+    let mut expected_frames = 0;
+    for (n, (mode, kind, type_name, _)) in cases.iter().enumerate() {
+        hub.send_to_clients(ServerMessage {
+            message: Some(server_message::Message::Request(proto::Request {
+                id: format!("m{n}#1"),
+                kind: *kind as i32,
+                r#type: type_name.to_string(),
+                payload: payload(type_name),
+                mode: *mode as i32,
+                initial_credit: if *mode == STREAMING { 4 } else { 0 },
+                ..Default::default()
+            })),
+        })
+        .await;
     }
-    hub.send_to_clients(as_command).await;
-    eventually("the end", async || hub.ends().len() == 7).await;
-    assert_eq!(end_code(&hub.ends()[6].1), Some(ErrorCode::NoHandler));
+    for (_, _, _, answer) in &cases {
+        if *answer != Admitted {
+            expected_frames += 1;
+        }
+    }
+    eventually("every frame", async || {
+        hub.replies().await.len() + hub.ends().len() >= expected_frames
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (replies, ends) = (hub.replies().await, hub.ends());
+    let mut wrong = Vec::new();
+    for (n, (mode, kind, type_name, want)) in cases.iter().enumerate() {
+        let id = format!("m{n}#1");
+        let reply = replies.iter().find(|r| r.request_id == id);
+        let end = ends
+            .iter()
+            .find(|(_, e)| e.request_id == id)
+            .map(|(_, e)| e);
+        let got = match (reply, end) {
+            (Some(r), None) => match &r.result {
+                Some(proto::reply::Result::Error(e)) => {
+                    ReplyError(ErrorCode::try_from(e.code).unwrap())
+                }
+                other => panic!("{id}: a reply without an error: {other:?}"),
+            },
+            (None, Some(e)) => match end_code(e) {
+                Some(code) => EndError(code),
+                None => EndOk,
+            },
+            (None, None) => Admitted,
+            (Some(_), Some(_)) => panic!("{id}: both a reply and an end"),
+        };
+        if got != *want {
+            wrong.push(format!(
+                "{mode:?} {kind:?} {type_name}: got {got:?}, want {want:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    assert_eq!(a.emitter.open_subscriptions(), 2, "the two admitted");
+    assert_eq!(probe.initials.load(Ordering::SeqCst), 0, "no initial ran");
     a.shutdown().await;
 }
 
