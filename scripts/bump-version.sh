@@ -13,9 +13,12 @@ set -eu
 core=snodra-messaging-rs
 
 version=${1:-}
-case $version in
-  '' | *[!0-9.]* ) echo "usage: $0 X.Y.Z" >&2; exit 2 ;;
-esac
+# Strictly N.N.N without leading zeros, as next-version.sh computes it.
+if ! printf '%s\n' "$version" | grep -Eqx '(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)' \
+  || [ "$(printf '%s\n' "$version" | wc -l)" -ne 1 ]; then
+  echo "usage: $0 X.Y.Z" >&2
+  exit 2
+fi
 minor=${version%.*}
 
 # rewrite FILE AWK-PROGRAM [NAME]: the program sets done=1 when it replaced the version.

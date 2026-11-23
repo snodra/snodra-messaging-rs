@@ -89,6 +89,18 @@ if sh scripts/bump-version.sh 9.9.0 2>/dev/null; then fail "a core dependency wi
 printf '[package]\nname = "x"\nversion = "1.0.0"\n' >Cargo.toml
 if sh scripts/bump-version.sh 9.9.0 2>/dev/null; then fail "a missing workspace version fails"; else echo "ok   a missing workspace version fails"; fi
 
-if sh scripts/bump-version.sh 1.x 2>/dev/null; then fail "a malformed version fails"; else echo "ok   a malformed version fails"; fi
+# Only N.N.N is a version; nothing is written for anything else.
+cp Cargo.lock.good Cargo.lock
+printf '[workspace.package]\nversion = "1.0.0"\n' >Cargo.toml
+for bad in 1.x 0.7 1..2 . 0.07.0 1.2.3.4 '' '1.2.3
+4.5.6'; do
+  if sh scripts/bump-version.sh "$bad" 2>/dev/null; then
+    fail "the version '$bad' is refused"
+  elif grep -q '1\.0\.0' Cargo.toml; then
+    echo "ok   the version '$bad' is refused"
+  else
+    fail "the version '$bad' changed Cargo.toml"
+  fi
+done
 
 exit $failed
