@@ -22,9 +22,10 @@
 //! access control): it is kept in [`HubConnection::last_rejection`] (until a stream
 //! registers), retried at `backoff_max` and logged at `error` once per distinct message, then at
 //! `debug`. The exception is a session that reached the handshake with a client certificate
-//! configured and that the hub ends with `UNAUTHENTICATED` (its "certificate expired" close at the
-//! certificate's notAfter): that is a normal reconnect at the normal backoff, logged at `info`,
-//! not a rejection (the files are read again at the reconnect).
+//! configured and that the hub ends with `UNAUTHENTICATED` and the message "certificate expired"
+//! (its close at the certificate's notAfter): that is a normal reconnect from the backoff floor,
+//! logged at `info`, not a rejection (the files are read again at the reconnect). Any other
+//! `UNAUTHENTICATED` close of such a session is a rejection.
 //!
 //! Access control: the static token, from `HubSettings::token` or, winning over it, read from
 //! `HubSettings::token_file` before every connect, goes in `Register.credentials.token` of every
@@ -1266,14 +1267,15 @@ impl HubConnection {
             } else if reached_handshake
                 && status.code() == Code::Unauthenticated
                 && self.presents_certificate()
+                && status.message().contains(CERTIFICATE_EXPIRED)
             {
                 // The hub ends a certificate session at the certificate's notAfter ("certificate
-                // expired", no grace): not a refusal of the registration. Back at the normal
-                // backoff, reading the files again (a renewed pair is presented; the expired one
-                // fails the next attempt at the pair check, which is logged as such).
-                let wait = jittered(backoff, max, random_unit());
+                // expired", no grace): not a refusal of the registration. Back from the backoff
+                // floor, reading the files again (a renewed pair is presented; the expired one
+                // fails the next attempt at the pair check, which is logged as such). Any other
+                // UNAUTHENTICATED close is a refusal.
+                let wait = jittered(self.settings.backoff_min, max, random_unit());
                 tracing::info!(service = %self.service_name, instance = %self.instance_id, address = %self.settings.address, reason = status.message(), retry_in = ?wait, "the hub ended the certificate session; reconnecting with the certificate in the files");
-                backoff = (backoff * 2).min(max);
                 wait
             } else if is_rejection(status.code()) {
                 *self.last_rejection.lock().unwrap() = Some(status.message().to_string());
@@ -1968,6 +1970,9 @@ fn is_rejection(code: Code) -> bool {
             | Code::PermissionDenied
     )
 }
+
+/// The hub's message when it ends a certificate session at the certificate's notAfter.
+const CERTIFICATE_EXPIRED: &str = "certificate expired";
 
 const PLAIN_TEXT_HINT: &str = "the connection was dropped before the registration; a hub that serves TLS does that to plain text: set hub_tls / SNODRA_SERVER_TLS=true";
 

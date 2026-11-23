@@ -358,6 +358,50 @@ async fn the_hubs_certificate_expired_close_is_a_normal_reconnect_not_a_rejectio
     w.hub.stop();
 }
 
+/// Only the hub's "certificate expired" close is the ordinary reconnect of a certificate session:
+/// another UNAUTHENTICATED close of it is a refusal (kept, retried at the backoff ceiling).
+#[tokio::test]
+async fn another_unauthenticated_close_of_a_certificate_session_is_a_refusal() {
+    let w = world(true).await;
+    let (tls, _) = w.issue("svc", &ClientSpec::service("svc"));
+    let conn = connection(
+        HubSettings {
+            backoff_max: Duration::from_secs(2),
+            ..settings(w.hub.address(), tls.clone())
+        },
+        "svc",
+    );
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    w.hub
+        .close_streams_with(tonic::Code::Unauthenticated, "session revoked");
+    let closed = Instant::now();
+    let deadline = closed + Duration::from_secs(5);
+    while conn.last_rejection().is_none() {
+        assert!(Instant::now() < deadline, "not kept as a refusal");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(conn.last_rejection().as_deref(), Some("session revoked"));
+    assert!(
+        conn.latest_rejection()
+            .is_some_and(|r| r.code == "UNAUTHENTICATED"),
+        "{:?}",
+        conn.latest_rejection()
+    );
+    // Retried at the ceiling (2 s, jittered down by at most 20 %), not from the floor.
+    while w.hub.peer_fingerprints().len() < 2 {
+        assert!(Instant::now() < closed + Duration::from_secs(6), "no retry");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        closed.elapsed() >= Duration::from_millis(1500),
+        "retried after {:?}",
+        closed.elapsed()
+    );
+    conn.shutdown().await;
+    w.hub.stop();
+}
+
 #[tokio::test]
 async fn files_caught_half_way_through_a_rotation_keep_the_last_good_pair() {
     let w = world(true).await;
