@@ -571,6 +571,59 @@ async fn requests_still_buffered_when_a_stream_is_lost_go_to_another_hub() {
     c.shutdown().await;
 }
 
+/// A request still buffered when its stream is lost moves to another hub only while the caller's
+/// timeout has not passed: once it has, no new hop starts and the call fails as never sent.
+#[tokio::test]
+async fn no_move_starts_after_the_callers_timeout() {
+    let a = FakeHub::start_with_id("hub-a").await;
+    let b = answering("hub-b").await;
+    let c = client(settings(addresses(&[&a, &b]))).await;
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    let key_on_a = (0..)
+        .map(|i| format!("k{i}"))
+        .find(|k| rendezvous_score("hub-a", k) > rendezvous_score("hub-b", k))
+        .unwrap();
+    a.set_stall_reads(true);
+    let calls: Vec<_> = (0..40)
+        .map(|_| {
+            let sender = Arc::clone(&c.sender);
+            let opts = SendOptions {
+                routing_key: Some(key_on_a.clone()),
+                retry: Some(RetryPolicy::NONE),
+                timeout: Some(Duration::from_millis(300)),
+                ..Default::default()
+            };
+            tokio::spawn(async move {
+                let blob = Blob {
+                    data: "x".repeat(256 * 1024),
+                };
+                sender.send_command(&blob, opts).await
+            })
+        })
+        .collect();
+    eventually("all 40 handed to hub-a's stream", async || {
+        c.sender.in_flight() == 40
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await; // past every call's 300 ms
+    a.drop_streams();
+    let (mut never_sent, mut lost) = (0, 0);
+    for call in calls {
+        match tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("every call ends at once")
+            .unwrap()
+        {
+            Err(MessagingError::HubUnavailable(_)) => never_sent += 1,
+            Err(MessagingError::HubConnectionLost(_)) => lost += 1,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(never_sent >= 28, "{never_sent} never sent, {lost} lost");
+    assert!(b.requests().await.is_empty(), "nothing moved to hub-b");
+    c.shutdown().await;
+}
+
 #[tokio::test]
 async fn two_addresses_of_one_hub_keep_one_connection() {
     // Two hubs answering the same id stand for two addresses of one hub.

@@ -462,6 +462,24 @@ enum GatherEvent {
 /// written; past that it fails with `HubUnavailable` (nothing was written).
 const MAX_UNWRITTEN_MOVES: usize = 8;
 
+/// A request not written yet moves to another hub only while the caller's timeout (else
+/// [`DEFAULT_REQUEST_TIMEOUT`]) since the call's first hop has not passed: no new hop starts after
+/// it, so a call ends within about twice its timeout plus [`LOCAL_GUARD_MARGIN`]. Each hop sends
+/// the full chosen timeout. `HubUnavailable` (never sent) once it has passed.
+fn next_hop(
+    type_name: &str,
+    started: tokio::time::Instant,
+    chosen: Option<Duration>,
+) -> Result<(), MessagingError> {
+    let wait = chosen.unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+    if started.elapsed() >= wait {
+        return Err(MessagingError::HubUnavailable(format!(
+            "'{type_name}' not written: no hub took it within {wait:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Removes a request's pending entry when the call ends, however it ends: a reply, an error, the
 /// local guard, or the caller dropping the future (while the write is blocked or while it awaits
 /// the answer). Removing an entry that was already taken is a no-op.
@@ -489,6 +507,8 @@ struct Gathering<'a> {
     events: mpsc::UnboundedReceiver<GatherEvent>,
     /// The local guard: the hub's bound for the gather plus [`LOCAL_GUARD_MARGIN`].
     deadline: tokio::time::Instant,
+    /// When the first hop started ([`next_hop`]).
+    started: tokio::time::Instant,
     moves: usize,
     end: Option<proto::ReplyEnd>,
     done: bool,
@@ -531,6 +551,9 @@ impl Gathering<'_> {
                             "'{}' not written: {} hub streams lost before it was",
                             self.call.type_name, self.moves
                         )));
+                    }
+                    if let Err(e) = next_hop(self.call.type_name, self.started, self.chosen) {
+                        return self.fail(e);
                     }
                     tracing::debug!(r#type = self.call.type_name, request = %self.id, "stream lost before the scatter-gather was written; trying the next hub");
                     match self
@@ -632,6 +655,8 @@ struct Streaming<'a> {
     guard: Duration,
     /// No part arrived yet.
     first: bool,
+    /// When the first hop started ([`next_hop`]).
+    started: tokio::time::Instant,
     moves: usize,
     written: bool,
     done: bool,
@@ -750,6 +775,9 @@ impl Streaming<'_> {
                             "'{}' not written: {} hub streams lost before it was",
                             self.call.type_name, self.moves
                         )));
+                    }
+                    if let Err(e) = next_hop(self.call.type_name, self.started, self.chosen) {
+                        return self.fail(e);
                     }
                     self.written = false;
                     tracing::debug!(r#type = self.call.type_name, request = %self.id, "stream lost before the streaming query was written; trying the next hub");
@@ -1618,6 +1646,7 @@ impl Sender {
             events,
             guard: Duration::ZERO,
             first: true,
+            started: tokio::time::Instant::now(),
             moves: 0,
             written: false,
             done: false,
@@ -1743,6 +1772,7 @@ impl Sender {
             id: uuid::Uuid::new_v4().to_string(),
             events,
             deadline: tokio::time::Instant::now(),
+            started: tokio::time::Instant::now(),
             moves: 0,
             end: None,
             done: false,
@@ -1866,6 +1896,8 @@ impl Sender {
         // Hubs that answered `NO_HANDLER` (the request was never delivered there), and the last such
         // answer: the other live hubs get the request in turn, each at most once, within `chosen`.
         let started = tokio::time::Instant::now();
+        // The caller's timeout for the hop rule ([`next_hop`]); `chosen` below is a hop's.
+        let call_timeout = chosen;
         let mut declined: Vec<String> = Vec::new();
         let mut no_handler = false;
         loop {
@@ -1936,6 +1968,7 @@ impl Sender {
                             "'{type_name}' not written: {moves} hub streams lost before it was"
                         )));
                     }
+                    next_hop(type_name, started, call_timeout)?;
                     tracing::debug!(r#type = type_name, request = %id, "stream lost before the request was written; trying the next hub");
                 }
                 Ok(Err(_)) => return Err(MessagingError::HubUnavailable("sender closed".into())),
