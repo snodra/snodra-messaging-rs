@@ -367,6 +367,41 @@ async fn a_hub_that_never_echoes_is_dropped_after_three_unanswered_heartbeats() 
     hub.stop();
 }
 
+/// A late echo starts the silence over: the hub echoes one heartbeat 1.5 intervals late, then
+/// nothing; the stream is dropped more than three intervals after that late echo (not after the
+/// heartbeat it answers), on the tick after the third heartbeat sent since it.
+#[tokio::test]
+async fn a_late_echo_starts_the_silence_over() {
+    let hub = FakeHub::start().await;
+    hub.set_ack(Some(proto::RegisterAck {
+        heartbeat_interval_ms: 100,
+        ..default_ack()
+    }));
+    let (conn, mut rx) = connection(settings(hub.address(), 50, 100));
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    sleep(Duration::from_millis(250)).await; // a few echoed heartbeats
+    hub.echo_once_late(Duration::from_millis(150));
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(Inbound::Disconnected { .. }) = rx.recv().await {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the stream is dropped once the hub went silent");
+    let dropped = std::time::Instant::now();
+    let late = hub.late_echo_at().expect("the late echo was written");
+    let after = dropped - late;
+    assert!(
+        after > Duration::from_millis(300) && after < Duration::from_millis(500),
+        "dropped {after:?} after the late echo: not between three and four intervals"
+    );
+    conn.shutdown().await;
+    hub.stop();
+}
+
 /// Before the `RegisterAck` nothing counts as silence: a hub that takes longer than three
 /// heartbeat intervals (3 s each before the ack) to acknowledge, and echoes nothing meanwhile,
 /// is waited for until the handshake timeout.

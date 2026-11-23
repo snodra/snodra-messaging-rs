@@ -339,6 +339,10 @@ pub struct State {
     reject_next: AtomicBool,
     reject_invalid_next: AtomicBool,
     echo_heartbeats: AtomicBool,
+    /// `echo_once_late`: the delay of the next echo in ms (0: none pending).
+    late_echo_ms: AtomicU64,
+    /// When the late echo was written.
+    late_echo_at: StdMutex<Option<std::time::Instant>>,
     drop_tx: broadcast::Sender<()>,
     /// Open streams: (stream number, outbound).
     clients: Mutex<Vec<(usize, Outbound)>>,
@@ -1799,7 +1803,17 @@ impl Hub for Service {
                             }
                             client_message::Message::Heartbeat(h) => {
                                 state.heartbeats.fetch_add(1, Ordering::SeqCst);
-                                if state.echo_heartbeats.load(Ordering::SeqCst) {
+                                let late = state.late_echo_ms.swap(0, Ordering::SeqCst);
+                                if late > 0 && state.echo_heartbeats.swap(false, Ordering::SeqCst) {
+                                    let (tx, state) = (tx.clone(), Arc::clone(&state));
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(std::time::Duration::from_millis(late)).await;
+                                        let echo = ServerMessage { message: Some(server_message::Message::Heartbeat(h)) };
+                                        if tx.send(Ok(echo)).await.is_ok() {
+                                            *state.late_echo_at.lock().unwrap() = Some(std::time::Instant::now());
+                                        }
+                                    });
+                                } else if state.echo_heartbeats.load(Ordering::SeqCst) {
                                     let echo = ServerMessage { message: Some(server_message::Message::Heartbeat(h)) };
                                     if tx.send(Ok(echo)).await.is_err() { break; }
                                 }
@@ -2003,6 +2017,8 @@ impl FakeHub {
             reject_next: AtomicBool::new(false),
             reject_invalid_next: AtomicBool::new(false),
             echo_heartbeats: AtomicBool::new(true),
+            late_echo_ms: AtomicU64::new(0),
+            late_echo_at: StdMutex::new(None),
             drop_tx,
             clients: Mutex::new(vec![]),
             responder: Mutex::new(None),
@@ -2417,6 +2433,19 @@ impl FakeHub {
     /// Whether heartbeats are echoed (default `true`); `false` is a hub that stopped answering.
     pub fn set_echo_heartbeats(&self, echo: bool) {
         self.state.echo_heartbeats.store(echo, Ordering::SeqCst);
+    }
+
+    /// The next heartbeat is echoed `delay` late, and none after it (a hub that answers late once,
+    /// then goes silent).
+    pub fn echo_once_late(&self, delay: Duration) {
+        self.state
+            .late_echo_ms
+            .store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    /// When the late echo of [`echo_once_late`](Self::echo_once_late) was written.
+    pub fn late_echo_at(&self) -> Option<std::time::Instant> {
+        *self.state.late_echo_at.lock().unwrap()
     }
 
     /// Pushes a server message (typically a Request) to every connected client.
