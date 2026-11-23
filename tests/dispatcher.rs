@@ -255,7 +255,13 @@ async fn unspecified_kind_is_invalid_request() {
         .await;
     let (code, message) = error_code(&reply);
     assert_eq!(code, ErrorCode::InvalidRequest);
-    assert!(message.contains("unsupported request kind"));
+    assert_eq!(message, "unsupported request kind REQUEST_KIND_UNSPECIFIED");
+    // A value the protocol does not define is named as such.
+    let mut unknown = request(RequestKind::Command, "t.Ping", r#"{"text":"hi"}"#, &[]);
+    unknown.kind = 42;
+    let (code, message) = error_code(&dispatcher().handle(unknown).await);
+    assert_eq!(code, ErrorCode::InvalidRequest);
+    assert_eq!(message, "unsupported request kind UNRECOGNIZED");
 }
 
 #[tokio::test]

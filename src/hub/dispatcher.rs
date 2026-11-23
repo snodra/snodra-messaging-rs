@@ -802,7 +802,7 @@ fn kind(req: &proto::Request) -> Result<RequestKind, MessagingError> {
     match RequestKind::try_from(req.kind).unwrap_or(RequestKind::Unspecified) {
         RequestKind::Unspecified => Err(MessagingError::InvalidMessage(format!(
             "unsupported request kind {}",
-            req.kind
+            RequestKind::try_from(req.kind).map_or("UNRECOGNIZED", |k| k.as_str_name())
         ))),
         kind => Ok(kind),
     }
