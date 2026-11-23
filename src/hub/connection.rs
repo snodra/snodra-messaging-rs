@@ -44,9 +44,10 @@
 //! ([`ReplyTo::grant`]), on the stream it arrived on. Per stream the client counts `initial` (the
 //! permits its `Register` offered), `received` (requests that arrived), `returned` (permits
 //! written) and `pending` (completed, not written yet); the hub still holds
-//! `initial - received + returned` permits for it. A completion writes the pending grants in one
-//! `Permits` message at once when that count is at or below the low-water mark
-//! `min(PERMIT_BATCH, initial / 2)` (with one permit: every completion) or when [`PERMIT_BATCH`]
+//! `initial - received + returned` permits for it (a top-up raises `initial`). A completion writes
+//! the pending grants in one `Permits` message at once when that count is at or below the
+//! low-water mark `min(PERMIT_BATCH, initial_permits / 2)` of the `Register` (a top-up does not
+//! move it; with one permit: every completion) or when [`PERMIT_BATCH`]
 //! grants are pending; otherwise they go [`PERMIT_FLUSH_AFTER`] after the first one not sent yet. Requests may arrive before the ack; their grants follow the same rule.
 //!
 //! The channel sends HTTP/2 keepalive pings (every 10 s, 5 s to answer, also while idle) so a
@@ -196,8 +197,10 @@ pub(crate) fn hub_id(ack: &RegisterAck, address: &str) -> String {
 /// The permit accounting of one stream.
 #[derive(Debug)]
 struct GrantState {
-    /// `Register.initial_permits` sent on this stream.
+    /// The permits this stream offered: its `Register.initial_permits` plus the top-ups.
     initial: u32,
+    /// Its `Register.initial_permits` alone: the low-water mark is computed from it.
+    registered: u32,
     /// Requests that arrived on this stream.
     received: u64,
     /// Permits written in `Permits` messages on this stream.
@@ -224,13 +227,14 @@ impl GrantState {
     }
 
     /// The flush rule for pending grants: at once when the hub is down to the low-water mark
-    /// (`min(PERMIT_BATCH, initial / 2)` permits) or [`PERMIT_BATCH`] grants are pending, else
+    /// (`min(PERMIT_BATCH, initial_permits / 2)` permits, from the `Register` alone: a top-up
+    /// raises what the hub holds, not the mark) or [`PERMIT_BATCH`] grants are pending, else
     /// with the timer (armed once).
     fn next(&mut self) -> Flush {
         if self.pending == 0 {
             return Flush::Nothing;
         }
-        let low_water = i128::from(PERMIT_BATCH.min(self.initial / 2));
+        let low_water = i128::from(PERMIT_BATCH.min(self.registered / 2));
         if self.hub_held() <= low_water || self.pending >= PERMIT_BATCH {
             Flush::Now(self.take())
         } else if !self.timer {
@@ -274,6 +278,7 @@ impl Grants {
             tx,
             state: Mutex::new(GrantState {
                 initial,
+                registered: initial,
                 received: 0,
                 returned: 0,
                 pending: 0,
@@ -2137,6 +2142,24 @@ mod tests {
         assert!(permits_in(&mut rx).is_empty(), "above the mark: batched");
         tokio::time::sleep(AFTER_TIMER).await;
         assert_eq!(permits_in(&mut rx), [1], "the timer flushes the rest");
+    }
+
+    /// A top-up raises what the hub holds, not the mark: a stream that registered with 4 permits
+    /// (mark 2) and was topped up to 64 still batches while the hub holds 14.
+    #[tokio::test(start_paused = true)]
+    async fn the_low_water_mark_is_the_registers_initial_permits_whatever_the_top_ups() {
+        let (grants, _tx, mut rx) = offered(4, 0);
+        assert_eq!(grants.raise(64), 60);
+        for _ in 0..50 {
+            grants.received();
+        }
+        grants.grant().await; // the hub holds 64 - 50 = 14: above 2
+        assert!(
+            permits_in(&mut rx).is_empty(),
+            "above the Register's mark: batched"
+        );
+        tokio::time::sleep(AFTER_TIMER).await;
+        assert_eq!(permits_in(&mut rx), [1], "the timer flushes it");
     }
 
     /// Below 32 permits the mark is half of them: 8 permits, mark 4.
