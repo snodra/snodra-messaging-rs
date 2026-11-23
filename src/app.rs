@@ -1027,7 +1027,9 @@ impl SnodraMessagingBuilder {
 
         hubs.set_registered_types(registry.registered_types());
         // The requests this instance sends to its own types are answered in-process from now on.
-        if !config.hub_always_route_through_hub {
+        // Routing everything through the hub means nothing while the hub is turned off.
+        let through_hub = config.hub_always_route_through_hub && config.hub_enabled;
+        if !through_hub {
             sender.answer_locally(Arc::clone(&dispatcher));
         }
         if !config.hub_enabled {
@@ -1107,7 +1109,7 @@ impl SnodraMessagingBuilder {
             let sagas = store.sagas();
             let commands: Arc<dyn RawCommandSender> = Arc::new(
                 LocalFirstSender::new(Arc::clone(&registry), Arc::clone(&sender))
-                    .always_through_hub(config.hub_always_route_through_hub),
+                    .always_through_hub(through_hub),
             );
             let relay = SagaDispatchRelay::new(
                 store.tx(),

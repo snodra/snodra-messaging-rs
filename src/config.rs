@@ -85,7 +85,9 @@ pub struct Config {
     /// this instance's handler, without the hub, and its routing key is ignored. On: the hub
     /// routes it like any other request, so a routing key keeps its instance affinity across the
     /// instances of this service, and the request gets the hub's flow control, priorities,
-    /// deadline and metrics. Covers the saga relay's commands too.
+    /// deadline and metrics. Covers the saga relay's commands too. No effect while the hub is
+    /// turned off ([`hub_enabled`](Self::hub_enabled) false): own types are then answered
+    /// in-process.
     pub hub_always_route_through_hub: bool,
     /// How often an `InstanceStatus` goes to every hub (default 5 s, at least 1 ms).
     pub hub_status_interval: Duration,

@@ -311,3 +311,84 @@ async fn awaiting_a_hub_that_is_off_answers_false_at_once() {
     );
     app.shutdown().await;
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Ship {
+    order: String,
+}
+message_type!(Ship, "zero.Ship");
+impl snodra_messaging::Command for Ship {
+    type Reply = ();
+}
+
+/// With the hub turned off, routing everything through the hub has no effect: an own command
+/// sent by the application and an own command sent by a saga's relay are both delivered to
+/// this instance's handler.
+#[tokio::test]
+async fn with_the_hub_off_the_routing_option_changes_nothing() {
+    #[derive(Default, Serialize, Deserialize)]
+    struct Shipping {
+        order: String,
+    }
+    let stores = InMemoryStores::new();
+    let mut config = stores.config("zero");
+    config.hub_always_route_through_hub = true;
+    let shipped: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = Arc::clone(&shipped);
+    let app = stores
+        .install(SnodraMessaging::builder(config).await.unwrap())
+        .command::<Ship, _, _>(move |c, _| {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.lock().unwrap().push(c.order);
+                Ok(())
+            }
+        })
+        .saga::<Shipping>("zero.Shipping", |saga| {
+            saga.start_on::<OrderPlaced>(
+                "order",
+                |e| Some(e.order.clone()),
+                |s, e, ctx| {
+                    s.order = e.order.clone();
+                    ctx.send(
+                        &Ship {
+                            order: e.order.clone(),
+                        },
+                        None,
+                    )?;
+                    ctx.end();
+                    Ok(())
+                },
+            )
+        })
+        .start()
+        .await
+        .unwrap();
+    app.commands()
+        .send_command(
+            &Ship {
+                order: "direct".into(),
+            },
+            SendOptions::default(),
+        )
+        .await
+        .unwrap();
+    stores
+        .publish(
+            &OrderPlaced {
+                order: "o-9".into(),
+            },
+            Some("o-9"),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(WITHIN, async {
+        while shipped.lock().unwrap().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both delivered");
+    assert_eq!(*shipped.lock().unwrap(), ["direct", "o-9"]);
+    app.shutdown().await;
+}

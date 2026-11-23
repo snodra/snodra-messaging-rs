@@ -526,3 +526,108 @@ async fn before_start_the_sender_goes_through_the_hub() {
     assert_eq!(n, 1, "the same sender answers locally once started");
     app.shutdown().await;
 }
+
+#[derive(Serialize, Deserialize)]
+struct Outer {}
+message_type!(Outer, "local.Outer");
+impl Command for Outer {
+    type Reply = ();
+}
+
+#[derive(Serialize, Deserialize)]
+struct Inner {}
+message_type!(Inner, "local.Inner");
+impl Command for Inner {
+    type Reply = ();
+}
+
+/// What the nested handler saw.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Nested {
+    user: Option<String>,
+    correlation: String,
+    traceparent: Option<String>,
+    authorization: Option<String>,
+}
+
+/// A handler serving a hub request sends a command of its own instance: answered in-process,
+/// the callee sees the forwarded caller (verified, so its guard passes), the same correlation id
+/// and the same trace parent.
+#[tokio::test]
+async fn a_nested_call_from_a_handler_keeps_the_caller_the_correlation_and_the_trace() {
+    let (hub, jwks) = (hub().await, jwks().await);
+    let seen: Arc<std::sync::Mutex<Option<Nested>>> = Arc::default();
+    let builder = SnodraMessaging::builder(config(&hub, &jwks)).await.unwrap();
+    let sender = builder.sender();
+    let record = Arc::clone(&seen);
+    let app = builder
+        .command::<Outer, _, _>(move |_, _| {
+            let sender = Arc::clone(&sender);
+            async move { sender.send_command(&Inner {}, SendOptions::default()).await }
+        })
+        .command::<Inner, _, _>(move |_, ctx| {
+            let record = Arc::clone(&record);
+            async move {
+                *record.lock().unwrap() = Some(Nested {
+                    user: ctx.identity.as_ref().and_then(|i| i.user_id.clone()),
+                    correlation: ctx.correlation_id.clone(),
+                    traceparent: ctx.traceparent().map(str::to_string),
+                    authorization: ctx.authorization.clone(),
+                });
+                Ok(())
+            }
+        })
+        .requires::<Inner>(Guard::role("admin"))
+        .start()
+        .await
+        .unwrap();
+    assert!(app.await_hub(Duration::from_secs(5)).await);
+    let bearer = format!(
+        "Bearer {}",
+        support::token("alice", &["admin"], support::ISSUER, support::now() + 300)
+    );
+    let traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+    hub.send_to_clients(ServerMessage {
+        message: Some(server_message::Message::Request(proto::Request {
+            id: "outer-1".into(),
+            kind: proto::RequestKind::Command as i32,
+            r#type: "local.Outer".into(),
+            payload: b"{}".to_vec(),
+            headers: [
+                ("authorization".to_string(), bearer.clone()),
+                ("correlationId".to_string(), "corr-7".to_string()),
+                ("traceparent".to_string(), traceparent.to_string()),
+            ]
+            .into(),
+            ..Default::default()
+        })),
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while hub.replies().await.is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "no reply");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let reply = hub.replies().await.remove(0);
+    assert!(
+        matches!(reply.result, Some(reply::Result::Payload(_))),
+        "{reply:?}"
+    );
+    assert_eq!(
+        seen.lock()
+            .unwrap()
+            .clone()
+            .expect("the nested handler ran"),
+        Nested {
+            user: Some("alice".into()),
+            correlation: "corr-7".into(),
+            traceparent: Some(traceparent.into()),
+            authorization: Some(bearer),
+        }
+    );
+    assert!(
+        hub.requests().await.is_empty(),
+        "the nested call never reached the hub"
+    );
+    app.shutdown().await;
+}
