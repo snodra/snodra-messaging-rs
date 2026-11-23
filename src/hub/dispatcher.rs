@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use futures::future::BoxFuture;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -291,9 +291,15 @@ impl Dispatcher {
             let Some((running, credits)) = accepted else {
                 return;
             };
+            // Dropped when the handler's task has ended (completed, failed or aborted) or never
+            // started: the hub's permit goes back only then.
+            let (ended, handler_ended) = oneshot::channel::<()>();
             if streaming {
-                me.stream(&running, request, credits, &reply_to).await;
-            } else if let Some(reply) = me.unary(request, Some(&running.cancel), Permit::Take).await
+                me.stream(&running, request, credits, &reply_to, ended)
+                    .await;
+            } else if let Some(reply) = me
+                .unary(request, Some(&running.cancel), Permit::Take, Some(ended))
+                .await
                 && let Err(e) = reply_to
                     .send(ClientMessage {
                         message: Some(client_message::Message::Reply(reply)),
@@ -303,6 +309,8 @@ impl Dispatcher {
                 tracing::warn!(request = %request_id, stream = reply_to.stream(), "reply dropped: {e}");
             }
             drop(running);
+            // A cancelled handler is aborted; it may still be inside a poll that does not yield.
+            let _ = handler_ended.await;
             // The request is finished either way: one permit back to the hub it came from.
             reply_to.grant().await;
         }
@@ -310,7 +318,7 @@ impl Dispatcher {
 
     /// One unary request to its `Reply`, as [`serve`](Self::serve) does it but never cancelled.
     pub async fn handle(&self, req: proto::Request) -> Reply {
-        self.unary(req, None, Permit::Take)
+        self.unary(req, None, Permit::Take, None)
             .await
             .expect("a request without a cancel token always gets a reply")
     }
@@ -327,7 +335,7 @@ impl Dispatcher {
     /// handler sending to another of its instance's handlers), and the permits bound what the
     /// hubs push, not what the instance asks itself.
     pub(crate) async fn handle_local(&self, req: proto::Request) -> Reply {
-        self.unary(req, None, Permit::Skip)
+        self.unary(req, None, Permit::Skip, None)
             .await
             .expect("a request without a cancel token always gets a reply")
     }
@@ -368,9 +376,10 @@ impl Dispatcher {
         req: proto::Request,
         cancel: Option<&CancellationToken>,
         permit: Permit,
+        ended: Option<oneshot::Sender<()>>,
     ) -> Option<Reply> {
         let request_id = req.id.clone();
-        let run = self.run(req, permit);
+        let run = self.run(req, permit, ended);
         let outcome = match cancel {
             Some(token) => tokio::select! {
                 _ = token.cancelled() => return None,
@@ -392,7 +401,13 @@ impl Dispatcher {
         })
     }
 
-    async fn run(&self, req: proto::Request, permit: Permit) -> Result<Vec<u8>, MessagingError> {
+    /// `ended` is dropped with the handler's task (or with this future, before the task exists).
+    async fn run(
+        &self,
+        req: proto::Request,
+        permit: Permit,
+        ended: Option<oneshot::Sender<()>>,
+    ) -> Result<Vec<u8>, MessagingError> {
         let identity = self.identity(&req).await?;
         let handler = match kind(&req)? {
             RequestKind::Command => self.registry.command_handler(&req.r#type).cloned(),
@@ -439,9 +454,10 @@ impl Dispatcher {
         };
         // Spawned so that a panic is this request's error, not the dispatcher's; aborted when the
         // caller drops the run (the hub cancelled the request).
-        let mut task = AbortOnDrop(tokio::spawn(
-            CURRENT.scope(ctx.clone(), async move { handler(payload, ctx).await }),
-        ));
+        let mut task = AbortOnDrop(tokio::spawn(CURRENT.scope(ctx.clone(), async move {
+            let _ended = ended;
+            handler(payload, ctx).await
+        })));
         let handler_error = |message: String| MessagingError::RemoteHandler {
             type_name: type_name.clone(),
             message,
@@ -626,15 +642,16 @@ impl Dispatcher {
         req: proto::Request,
         credits: mpsc::UnboundedReceiver<u32>,
         reply_to: &ReplyTo,
+        ended: oneshot::Sender<()>,
     ) {
         let request_id = req.id.clone();
         let type_name = req.r#type.clone();
         // Spawned so that a panic in the handler or its stream is this stream's error.
-        let mut pump = AbortOnDrop(tokio::spawn(Arc::clone(self).pump(
-            req,
-            credits,
-            reply_to.clone(),
-        )));
+        let pump = Arc::clone(self).pump(req, credits, reply_to.clone());
+        let mut pump = AbortOnDrop(tokio::spawn(async move {
+            let _ended = ended;
+            pump.await
+        }));
         tokio::select! {
             _ = running.cancel.cancelled() => {}
             joined = &mut pump.0 => match joined {

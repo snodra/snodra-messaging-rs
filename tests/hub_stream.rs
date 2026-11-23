@@ -631,6 +631,62 @@ async fn a_hub_cancel_aborts_a_unary_handler() {
     h.shutdown().await;
 }
 
+#[derive(Serialize, Deserialize)]
+struct Busy {}
+message_type!(Busy, "t.Busy");
+impl Query for Busy {
+    type Reply = ();
+}
+
+/// The permit of a request the hub cancelled goes back once its handler has ended, not when the
+/// cancel arrives: a handler busy in a blocking call keeps its slot until it returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_requests_permit_goes_back_once_its_handler_ended() {
+    let hub = FakeHub::start().await;
+    let started = Arc::new(AtomicBool::new(false));
+    let mut r = HandlerRegistry::new();
+    let flag = Arc::clone(&started);
+    r.query::<Busy, _, _>(move |_, _| {
+        let flag = Arc::clone(&flag);
+        async move {
+            flag.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(400)); // not at an await: abort waits for it
+            Ok(())
+        }
+    });
+    let h = node_with(
+        &hub.address(),
+        "svc-h",
+        "h1",
+        r,
+        1,
+        SenderSettings::default(),
+        None,
+    )
+    .await;
+    hub.send_to_clients(forwarded("b#0", "t.Busy", b"{}", 0))
+        .await;
+    eventually("the handler runs", async || started.load(Ordering::SeqCst)).await;
+    let cancelled = Instant::now();
+    hub.send_to_clients(cancel("b#0", "max results")).await;
+    eventually("the permit came back", async || {
+        hub.permits_timed().iter().any(|(_, n, _)| *n > 0)
+    })
+    .await;
+    let (_, _, at) = hub
+        .permits_timed()
+        .into_iter()
+        .find(|(_, n, _)| *n > 0)
+        .unwrap();
+    assert!(
+        at.duration_since(cancelled) >= Duration::from_millis(250),
+        "the permit came back {:?} after the cancel, while the handler still ran",
+        at.duration_since(cancelled)
+    );
+    assert!(hub.replies().await.is_empty(), "nothing after a cancel");
+    h.shutdown().await;
+}
+
 /// The hub stream a streaming request arrived on closes: its handler would wait for credit for
 /// ever, holding its permit, so it is aborted (the hub forgot the stream with the session). A
 /// unary handler keeps running; its reply is dropped.
