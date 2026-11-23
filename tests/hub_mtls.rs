@@ -677,6 +677,42 @@ async fn with_several_hubs_each_is_deregistered_closed_and_back_before_the_next(
     b.stop();
 }
 
+/// A hub being rolled over to the renewed certificate stays counted in the permit split: the
+/// `Register` of its new stream offers `ceil(max / N)` with N all the hubs, itself included, as
+/// its first one did.
+#[tokio::test]
+async fn a_hub_rolled_over_offers_its_share_of_the_permits_again() {
+    let w = world(true).await;
+    let (a, b) = (hub_named(&w, "hub-a").await, hub_named(&w, "hub-b").await);
+    let (tls, first) = w.issue("svc", &ClientSpec::service("svc"));
+    let c = client(HubSettings {
+        max_concurrent_handlers: 10,
+        ..settings(format!("{},{}", a.address(), b.address()), tls.clone())
+    })
+    .await;
+    assert!(c.pool.await_all_registered(Duration::from_secs(5)).await);
+    c.presenting(&first).await;
+    let second = w.renew(&tls, &ClientSpec::service("svc"));
+    c.presenting(&second).await;
+    for (name, hub) in [("hub-a", &a), ("hub-b", &b)] {
+        let offered: Vec<u32> = hub
+            .registers()
+            .await
+            .iter()
+            .filter(|r| !r.command_types.is_empty())
+            .map(|r| r.initial_permits)
+            .collect();
+        assert_eq!(
+            offered,
+            [5, 5],
+            "{name}: ceil(10 / 2) before and after its roll"
+        );
+    }
+    c.shutdown().await;
+    a.stop();
+    b.stop();
+}
+
 #[tokio::test]
 async fn a_trickle_of_requests_sees_no_failure_while_the_hubs_roll_over() {
     let w = world(true).await;

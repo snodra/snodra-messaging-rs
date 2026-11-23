@@ -22,7 +22,8 @@
 //!   that order with the same request id: it was never sent. One already written fails with
 //!   `HubConnectionLost` when its stream drops (the caller's retry policy decides).
 //! - **Permits.** A stream offers `ceil(max_concurrent_handlers / N)` permits
-//!   ([`permit_share`]), N being the hubs live when its `Register` is written, itself included;
+//!   ([`permit_share`]), N being the hubs live when its `Register` is written, itself included
+//!   (also a hub reconnecting for a client certificate rollover);
 //!   until a hub's first connect attempt is over it counts as live, so hubs that come up together
 //!   split from the start. When N shrinks (a hub is lost, closed as a duplicate or leaves DNS),
 //!   every live stream is topped up to `ceil(max / N)` with one `Permits` message whose `grant`
@@ -928,15 +929,16 @@ impl HubPool {
     }
 
     /// N of the split: the active connections whose stream is live or that are still on their
-    /// first connect attempt, plus the one at `including`.
+    /// first connect attempt, plus the one at `including`, also while it is being rolled over to a
+    /// renewed client certificate (its new stream offers the same share as the one it replaces).
     fn hubs(&self, including: Option<&str>) -> usize {
         self.members()
             .iter()
-            .filter(|m| m.role() == Role::Active)
             .filter(|m| {
-                Some(m.address()) == including
-                    || m.conn.handshake().is_some()
-                    || !m.conn.failed_once()
+                if Some(m.address()) == including {
+                    return m.kept();
+                }
+                m.role() == Role::Active && (m.conn.handshake().is_some() || !m.conn.failed_once())
             })
             .count()
     }
