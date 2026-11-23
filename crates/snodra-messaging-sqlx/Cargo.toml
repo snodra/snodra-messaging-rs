@@ -1,6 +1,6 @@
 [package]
 name = "snodra-messaging-sqlx"
-version = "0.6.1"
+version.workspace = true
 edition = "2024"
 rust-version = "1.99"
 description = "Snodra messaging: the SQL message store on PostgreSQL and MySQL (outbox, processed events, dead letters, processor control, external calls, sagas), sharing its tables with snodra-messaging-jdbc"
@@ -17,7 +17,7 @@ postgres = ["sqlx/postgres"]
 mysql = ["sqlx/mysql"]
 
 [dependencies]
-snodra-messaging-rs = { path = "../..", version = "0.6.1" }
+snodra-messaging-rs = { workspace = true }
 # Pure Rust TLS (rustls with ring and the platform roots, as the core's hub client): no OpenSSL.
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "chrono"] }
 # sqlx's transaction manager (not re-exported by sqlx): the store begins and ends its transactions
@@ -33,7 +33,7 @@ tokio-util = { version = "0.7.20", features = ["rt"] }
 tracing = "0.1.44"
 
 [dev-dependencies]
-snodra-messaging-rs = { path = "../..", version = "0.6.1", features = ["testing"] }
+snodra-messaging-rs = { workspace = true, features = ["testing"] }
 tokio = { version = "1.54.1", features = ["full"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15.0", features = ["postgres", "mysql"] }
