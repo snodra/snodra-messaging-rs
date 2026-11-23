@@ -539,6 +539,16 @@ impl Gathering<'_> {
             };
             match event {
                 GatherEvent::Part(part) => return Some(Ok(part)),
+                // A gather's end carries no error from a conforming hub; one that does ends the
+                // gather with it, mapped as a unary error.
+                GatherEvent::End(proto::ReplyEnd { error: Some(e), .. }) => {
+                    return self.fail(MessagingError::from_hub(
+                        self.call.type_name,
+                        e.code,
+                        &e.message,
+                        &e.details,
+                    ));
+                }
                 GatherEvent::End(end) => {
                     self.done = true;
                     self.end = Some(end);

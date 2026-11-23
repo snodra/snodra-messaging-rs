@@ -371,6 +371,55 @@ async fn a_target_that_does_not_answer_in_time_is_counted_timed_out() {
     c.shutdown().await;
 }
 
+/// A `ReplyEnd` carrying an error ends the gather with that error, mapped as a unary error (a
+/// conforming hub never sends one for a gather; it is not taken for a result).
+#[tokio::test]
+async fn an_error_on_the_gathers_end_is_the_callers_error() {
+    let hub = FakeHub::start().await;
+    let a = hub.address();
+    let mute = target(&a, "svc-b", "b1", Behaviour::Silent).await;
+    let c = caller(&a).await;
+    let sender = Arc::clone(&c.sender);
+    let call = tokio::spawn(async move {
+        sender
+            .scatter_gather(
+                &find(),
+                ScatterOptions {
+                    timeout: Some(Duration::from_secs(5)),
+                    ..ScatterOptions::default()
+                },
+            )
+            .await
+    });
+    eventually("the gather is sent", async || {
+        !gathers(&hub).await.is_empty()
+    })
+    .await;
+    let id = gathers(&hub).await[0].id.clone();
+    hub.send_to_clients(proto::ServerMessage {
+        message: Some(proto::server_message::Message::End(proto::ReplyEnd {
+            request_id: id,
+            error: Some(proto::Error {
+                code: ErrorCode::InvalidRequest as i32,
+                message: "not for a gather".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })),
+    })
+    .await;
+    let result = tokio::time::timeout(Duration::from_secs(2), call)
+        .await
+        .expect("ended by the error end")
+        .unwrap();
+    assert!(
+        matches!(result, Err(MessagingError::InvalidMessage(ref m)) if m == "not for a gather"),
+        "{result:?}"
+    );
+    mute.shutdown().await;
+    c.shutdown().await;
+}
+
 #[tokio::test]
 async fn max_results_ends_the_gather_early() {
     let hub = FakeHub::start().await;
