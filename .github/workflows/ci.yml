@@ -184,6 +184,7 @@ jobs:
       # The manifests and the lock agree (--locked) and every published crate has the version.
       # Then every published crate is packaged and built as crates.io would get it: cargo puts the
       # core in a local registry first, so the add-ons build against the new core version.
+      # --allow-dirty: the bump is not committed in this job (the push job commits it).
       - name: the crates package at the new version
         env:
           VERSION: ${{ needs.version.outputs.version }}
@@ -193,7 +194,7 @@ jobs:
             '[.packages[] | select(.source == null and .publish == null) | .version]
              | length >= 5 and all(. == $v)' \
             "$RUNNER_TEMP/metadata.json"
-          cargo publish --workspace --dry-run --locked
+          cargo publish --workspace --dry-run --locked --allow-dirty
 
   push:
     needs: [version, package]
