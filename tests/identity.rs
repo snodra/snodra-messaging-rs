@@ -160,6 +160,10 @@ async fn without_a_jwks_a_malformed_token_is_unauthenticated() {
             format!("{}.{claims}.sig", b64(r#"{"alg":"none"}"#)),
         ),
         ("no signature", format!("{header}.{claims}.")),
+        (
+            "alg not a string",
+            format!("{}.{claims}.sig", b64(r#"{"alg":5}"#)),
+        ),
     ];
     for (what, token) in cases {
         let resolved = resolver().resolve(Some(&format!("Bearer {token}"))).await;
@@ -226,4 +230,51 @@ async fn a_guarded_handler_without_a_jwks_is_a_startup_error() {
         .unwrap()
         .shutdown()
         .await;
+}
+
+/// The authorization header as the reference reads it: the scheme `Bearer ` in any letter case
+/// at the very start of the value, the token what follows it, trimmed. A blank header is an
+/// anonymous caller; leading whitespace, another scheme or no token is a malformed header.
+#[tokio::test]
+async fn the_bearer_scheme_is_read_at_the_start_in_any_case() {
+    let token = support::sign(
+        support::OTHER_KEY_PEM,
+        None,
+        "u-1",
+        &[],
+        "https://other.test",
+        support::now() + 60,
+    );
+    for header in [
+        format!("Bearer {token}"),
+        format!("bearer {token}"),
+        format!("BEARER {token}"),
+        format!("bEaReR   {token}  "),
+    ] {
+        assert_eq!(
+            resolver().resolve(Some(&header)).await.unwrap(),
+            None,
+            "accepted (anonymous without a JWKS): {header:?}"
+        );
+    }
+    for header in ["", "   ", "\t"] {
+        assert_eq!(
+            resolver().resolve(Some(header)).await.unwrap(),
+            None,
+            "blank is anonymous: {header:?}"
+        );
+    }
+    for header in [
+        format!(" Bearer {token}"),
+        format!("Bearer\t{token}"),
+        format!("Token {token}"),
+        "Bearer".to_string(),
+        "Bearer    ".to_string(),
+    ] {
+        let resolved = resolver().resolve(Some(&header)).await;
+        assert!(
+            matches!(&resolved, Err(MessagingError::Unauthenticated(m)) if m == "malformed authorization header"),
+            "{header:?}: {resolved:?}"
+        );
+    }
 }

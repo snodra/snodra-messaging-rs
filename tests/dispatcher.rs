@@ -497,3 +497,23 @@ fn shared_query_registered_twice_panics() {
     r.shared_query::<Search, _, _>(|_, _| async move { Ok(Total { n: 0 }) });
     r.shared_query::<Search, _, _>(|_, _| async move { Ok(Total { n: 0 }) });
 }
+
+/// A malformed token is UNAUTHENTICATED before the handler lookup: also for a type this instance
+/// does not handle (not NO_HANDLER), with or without a JWKS.
+#[tokio::test]
+async fn a_malformed_token_to_an_unhandled_type_is_unauthenticated() {
+    let (verifying, _jwks) = verifying_dispatcher().await;
+    for dispatcher in [dispatcher(), verifying] {
+        for auth in ["Bearer not-a-jwt", " Bearer x.y.z", "Basic abc"] {
+            let reply = dispatcher
+                .handle(request(
+                    RequestKind::Command,
+                    "t.Nobody",
+                    "{}",
+                    &[("authorization", auth)],
+                ))
+                .await;
+            assert_eq!(error_code(&reply).0, ErrorCode::Unauthenticated, "{auth}");
+        }
+    }
+}

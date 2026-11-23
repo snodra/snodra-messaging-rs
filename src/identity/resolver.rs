@@ -49,17 +49,12 @@ impl IdentityResolver {
         &self,
         authorization: Option<&str>,
     ) -> Result<Option<Identity>, MessagingError> {
-        let Some(raw) = authorization.map(str::trim).filter(|s| !s.is_empty()) else {
+        let Some(raw) = authorization.filter(|s| !s.trim().is_empty()) else {
             return Ok(None);
         };
-        let token = raw
-            .strip_prefix("Bearer ")
-            .or_else(|| raw.strip_prefix("bearer "))
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .ok_or_else(|| {
-                MessagingError::Unauthenticated("malformed authorization header".into())
-            })?;
+        let token = bearer_token(raw).ok_or_else(|| {
+            MessagingError::Unauthenticated("malformed authorization header".into())
+        })?;
         match &self.verifier {
             Some(verifier) => Ok(Some(Identity::from_claims(
                 &verifier.verify(token).await?,
@@ -93,7 +88,12 @@ fn check_shape(token: &str) -> Result<(), MessagingError> {
         return Err(refused("unreadable token"));
     }
     let header = json_object(parts[0]).ok_or_else(|| refused("unreadable token"))?;
-    let alg = header.get("alg").and_then(Value::as_str).unwrap_or("");
+    // A header whose `alg` is there but not a string is unreadable.
+    let alg = match header.get("alg") {
+        None => "",
+        Some(Value::String(alg)) => alg.as_str(),
+        Some(_) => return Err(refused("unreadable token")),
+    };
     if alg.eq_ignore_ascii_case("none") || parts[2].is_empty() {
         return Err(refused("unsigned token"));
     }
@@ -108,4 +108,18 @@ fn json_object(segment: &str) -> Option<serde_json::Map<String, Value>> {
         Value::Object(map) => Some(map),
         _ => None,
     }
+}
+
+/// The scheme of a bearer header, matched in any letter case at the very start of the value.
+const BEARER: &str = "Bearer ";
+
+/// The token of a `Bearer <token>` header: the scheme in any letter case at the very start of
+/// the (untrimmed) value, the token what follows it, trimmed; `None` for any other shape
+/// (leading whitespace, another scheme, no token).
+fn bearer_token(header: &str) -> Option<&str> {
+    let scheme = header.get(..BEARER.len())?;
+    if !scheme.eq_ignore_ascii_case(BEARER) {
+        return None;
+    }
+    Some(header[BEARER.len()..].trim()).filter(|t| !t.is_empty())
 }
