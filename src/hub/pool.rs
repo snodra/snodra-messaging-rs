@@ -862,8 +862,15 @@ impl HubPool {
     }
 
     fn add(self: &Arc<Self>, address: String) -> Arc<Member> {
-        let member = self.member(address);
-        self.members.lock().unwrap().push(Arc::clone(&member));
+        let member = {
+            // Built (its types read) under the members lock: `deregister` empties the types before
+            // it takes its snapshot of the members, so a member added meanwhile either reads the
+            // empty types or is in that snapshot and gets the empty Register.
+            let mut members = self.members.lock().unwrap();
+            let member = self.member(address);
+            members.push(Arc::clone(&member));
+            member
+        };
         if self.started.load(Ordering::SeqCst) {
             member.conn.start();
         }
