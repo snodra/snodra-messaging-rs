@@ -1,7 +1,9 @@
 //! Who is calling: the identity read from the forwarded JWT, verification, and handler guards.
 //!
-//! Trusted-by-default model: an absent token is an anonymous caller and the request proceeds;
-//! whether anonymity is acceptable is the handler's decision through a [`Guard`].
+//! An absent token is an anonymous caller and the request proceeds; whether anonymity is
+//! acceptable is the handler's decision through a [`Guard`]. A forwarded token is an identity only
+//! once verified against the service's JWKS (`Config::jwks_url`): without one every caller is
+//! anonymous ([`IdentityResolver`]), and a handler with a guard is a startup error.
 
 mod guard;
 mod jwks;
@@ -20,7 +22,8 @@ pub struct Identity {
     pub user_id: Option<String>,
     /// The roles read from the configured claim ([RolesClaim]), without any prefix.
     pub roles: Vec<String>,
-    /// True when the token's signature was verified by this process.
+    /// True when the token's signature was verified by this process: always, for an identity a
+    /// handler sees (without a JWKS there is none).
     pub verified: bool,
 }
 

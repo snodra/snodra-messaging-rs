@@ -133,6 +133,27 @@ fn dispatcher() -> Dispatcher {
     )
 }
 
+/// A dispatcher that verifies forwarded tokens against the fixture key's JWKS (served by the
+/// returned mock server, kept alive by the caller).
+async fn verifying_dispatcher() -> (Dispatcher, wiremock::MockServer) {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/jwks"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(support::JWKS_JSON))
+        .mount(&server)
+        .await;
+    let verifier = snodra_messaging::identity::JwksVerifier::new(
+        format!("{}/jwks", server.uri()),
+        support::ISSUER.to_string(),
+    );
+    let dispatcher = Dispatcher::new(
+        Arc::new(registry()),
+        Arc::new(IdentityResolver::new(Some(verifier))),
+        4,
+    );
+    (dispatcher, server)
+}
+
 fn request(kind: RequestKind, type_name: &str, payload: &str, headers: &[(&str, &str)]) -> Request {
     Request {
         id: "req-1".into(),
@@ -260,16 +281,15 @@ async fn guarded_handler_rejects_anonymous_before_decoding() {
 
 #[tokio::test]
 async fn guarded_handler_denies_missing_role() {
-    let token = support::sign(
-        support::OTHER_KEY_PEM,
-        None,
+    let (dispatcher, _jwks) = verifying_dispatcher().await;
+    let token = support::token(
         "u-1",
         &["snodra-user"],
         support::ISSUER,
         support::now() + 60,
     );
     let auth = format!("Bearer {token}");
-    let reply = dispatcher()
+    let reply = dispatcher
         .handle(request(
             RequestKind::Command,
             "t.Secret",
@@ -279,16 +299,14 @@ async fn guarded_handler_denies_missing_role() {
         .await;
     assert_eq!(error_code(&reply).0, ErrorCode::PermissionDenied);
 
-    let admin = support::sign(
-        support::OTHER_KEY_PEM,
-        None,
+    let admin = support::token(
         "u-1",
         &["snodra-admin"],
         support::ISSUER,
         support::now() + 60,
     );
     let auth = format!("Bearer {admin}");
-    let reply = dispatcher()
+    let reply = dispatcher
         .handle(request(
             RequestKind::Command,
             "t.Secret",
@@ -343,27 +361,22 @@ async fn panicking_handler_is_handler_error() {
 
 #[tokio::test]
 async fn handler_sees_context_and_current_task_local() {
-    let token = support::sign(
-        support::OTHER_KEY_PEM,
-        None,
-        "u-7",
-        &[],
-        support::ISSUER,
-        support::now() + 60,
-    );
+    let (verifying, _jwks) = verifying_dispatcher().await;
+    let token = support::token("u-7", &[], support::ISSUER, support::now() + 60);
     let auth = format!("Bearer {token}");
-    let reply = dispatcher()
-        .handle(request(
-            RequestKind::Command,
-            "t.Introspect",
-            "{}",
-            &[("correlationId", "c-1"), ("authorization", &auth)],
-        ))
-        .await;
-    let seen = payload(&reply);
+    let introspect = request(
+        RequestKind::Command,
+        "t.Introspect",
+        "{}",
+        &[("correlationId", "c-1"), ("authorization", &auth)],
+    );
+    let seen = payload(&verifying.handle(introspect.clone()).await);
     assert_eq!(seen["correlation_id"], "c-1");
     assert_eq!(seen["current_message_id"], "req-1");
     assert_eq!(seen["user_id"], "u-7");
+    // Without a JWKS the same token is never read: an anonymous caller.
+    let seen = payload(&dispatcher().handle(introspect).await);
+    assert_eq!(seen["user_id"], serde_json::Value::Null);
 }
 
 #[tokio::test]

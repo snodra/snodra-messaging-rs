@@ -746,7 +746,9 @@ impl SnodraMessagingBuilder {
         self
     }
 
-    /// Opt-in authorization for a command or query registered before this call.
+    /// Opt-in authorization for a command or query registered before this call. A guard needs a
+    /// JWKS (`Config::jwks_url`, `SNODRA_JWKS_URL`): without one [`start`](Self::start) fails,
+    /// naming the guarded types (a forwarded token is an identity only once verified).
     pub fn requires<M: MessageType>(mut self, guard: Guard) -> Self {
         self.registry.requires::<M>(guard);
         self
@@ -823,6 +825,15 @@ impl SnodraMessagingBuilder {
             return Err(e);
         }
         let saga_types = validate_registrations(sagas)?;
+        // A guard judges the caller's identity, and only a verified token is one.
+        let guarded = registry.guarded_types();
+        if !guarded.is_empty() && config.jwks_url.is_none() {
+            return Err(MessagingError::InvalidMessage(format!(
+                "{} {} a guard (requires) but no JWKS is configured to verify forwarded tokens: set SNODRA_JWKS_URL and SNODRA_ISSUER (Config::jwks_url, Config::issuer); without one, forwarded tokens are not verified and every caller is anonymous",
+                guarded.join(", "),
+                if guarded.len() == 1 { "has" } else { "have" }
+            )));
+        }
         for source in &sources {
             validate_source(&source.name)?;
         }

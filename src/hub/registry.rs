@@ -462,6 +462,11 @@ impl HandlerRegistry {
         }
     }
 
+    /// The types registered with a guard ([`requires`](Self::requires)), sorted.
+    pub fn guarded_types(&self) -> Vec<String> {
+        sorted(self.guards.keys())
+    }
+
     pub(crate) fn guard(&self, type_name: &str) -> Option<&Guard> {
         self.guards.get(type_name)
     }

@@ -176,7 +176,9 @@ pub struct Config {
     /// reads `dead_letter_retention` (a letter's expiry).
     pub outbox_retention: Duration,
     pub idempotency_retention: Duration,
-    /// When set (with `issuer`), forwarded tokens are verified; otherwise read unverified.
+    /// When set (with `issuer`), forwarded tokens are verified and their callers are identities.
+    /// Without it a forwarded token is never read: every caller is anonymous (the token is still
+    /// forwarded on), and a handler with a guard is a startup error.
     pub jwks_url: Option<String>,
     pub issuer: Option<String>,
     /// Forward the current handler's bearer token on outgoing requests.

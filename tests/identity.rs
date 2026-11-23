@@ -93,21 +93,23 @@ async fn absent_header_is_anonymous() {
 }
 
 #[tokio::test]
-async fn malformed_header_is_unauthenticated() {
+async fn a_header_that_is_not_a_bearer_token_is_unauthenticated() {
     assert!(matches!(
         resolver().resolve(Some("Basic abc")).await,
         Err(MessagingError::Unauthenticated(_))
     ));
     assert!(matches!(
-        resolver().resolve(Some("Bearer not-a-jwt")).await,
+        resolver().resolve(Some("Bearer ")).await,
         Err(MessagingError::Unauthenticated(_))
     ));
 }
 
+/// Without a JWKS a forwarded token is never read: whatever it claims (signed by any key,
+/// unsigned, not even a JWT), the caller is anonymous. The token itself is still forwarded by
+/// the handler's own sends (`MessageContext.authorization`).
 #[tokio::test]
-async fn unverified_mode_reads_signed_token_without_checking_signature() {
-    // Signed by a key this process does not know: accepted, but marked unverified.
-    let token = support::sign(
+async fn without_a_jwks_a_token_is_never_an_identity() {
+    let signed = support::sign(
         support::OTHER_KEY_PEM,
         None,
         "u-9",
@@ -115,29 +117,79 @@ async fn unverified_mode_reads_signed_token_without_checking_signature() {
         "https://other.test",
         support::now() + 60,
     );
-    let id = resolver()
-        .resolve(Some(&format!("Bearer {token}")))
+    let fixture = support::token("u-1", &["admin"], support::ISSUER, support::now() + 60);
+    for token in [
+        signed,
+        fixture,
+        support::unsigned_token("u-1"),
+        "not-a-jwt".to_string(),
+        "a.b.c.d.e".to_string(),
+    ] {
+        assert_eq!(
+            resolver()
+                .resolve(Some(&format!("Bearer {token}")))
+                .await
+                .unwrap(),
+            None,
+            "{token}"
+        );
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Guarded {}
+snodra_messaging::message_type!(Guarded, "t.Guarded");
+impl snodra_messaging::Command for Guarded {
+    type Reply = ();
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Open {}
+snodra_messaging::message_type!(Open, "t.Open");
+impl snodra_messaging::Command for Open {
+    type Reply = ();
+}
+
+fn app_config() -> snodra_messaging::Config {
+    let mut c = snodra_messaging::Config::new("svc-guard", "static://127.0.0.1:1");
+    c.hub_enabled = false;
+    c
+}
+
+async fn guarded(
+    config: snodra_messaging::Config,
+) -> Result<snodra_messaging::SnodraMessaging, MessagingError> {
+    snodra_messaging::SnodraMessaging::builder(config)
         .await
         .unwrap()
-        .unwrap();
-    assert_eq!(id.user_id.as_deref(), Some("u-9"));
-    assert_eq!(id.roles, vec!["snodra-admin"]);
-    assert!(!id.verified);
+        .command::<Open, _, _>(|_, _| async { Ok(()) })
+        .command::<Guarded, _, _>(|_, _| async { Ok(()) })
+        .requires::<Guarded>(Guard::authenticated())
+        .start()
+        .await
 }
 
+/// A handler with a guard needs a JWKS to verify the callers it judges: without one the service
+/// does not start, and the error names the handler and the settings.
 #[tokio::test]
-async fn unverified_mode_rejects_alg_none() {
-    let token = support::unsigned_token("u-1");
-    assert!(matches!(
-        resolver().resolve(Some(&format!("Bearer {token}"))).await,
-        Err(MessagingError::Unauthenticated(_))
-    ));
-}
-
-#[tokio::test]
-async fn unverified_mode_rejects_five_segment_token() {
-    assert!(matches!(
-        resolver().resolve(Some("Bearer a.b.c.d.e")).await,
-        Err(MessagingError::Unauthenticated(_))
-    ));
+async fn a_guarded_handler_without_a_jwks_is_a_startup_error() {
+    let refused = guarded(app_config()).await.err().expect("refused");
+    assert!(
+        matches!(&refused, MessagingError::InvalidMessage(m) if m.contains("t.Guarded") && m.contains("SNODRA_JWKS_URL") && !m.contains("t.Open")),
+        "{refused:?}"
+    );
+    let mut with_jwks = app_config();
+    with_jwks.jwks_url = Some("http://127.0.0.1:1/jwks".into());
+    with_jwks.issuer = Some(support::ISSUER.into());
+    guarded(with_jwks).await.unwrap().shutdown().await;
+    // Without a guard, no JWKS is needed.
+    snodra_messaging::SnodraMessaging::builder(app_config())
+        .await
+        .unwrap()
+        .command::<Open, _, _>(|_, _| async { Ok(()) })
+        .start()
+        .await
+        .unwrap()
+        .shutdown()
+        .await;
 }

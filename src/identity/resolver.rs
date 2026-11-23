@@ -2,21 +2,21 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde_json::{Map, Value};
-
 use super::{Identity, JwksVerifier, RolesClaim};
 use crate::error::MessagingError;
 
-/// With a verifier: verified identities (`verified = true`), invalid tokens rejected. Without one:
-/// the claims of a *signed* token are read without checking the signature (`verified = false`),
-/// warned once per process; unsigned (`alg: none`) and encrypted (five-segment) tokens are rejected.
-/// Absence is never rejected: the caller is anonymous.
+/// With a verifier (the service's JWKS): verified identities, invalid tokens rejected
+/// (`UNAUTHENTICATED`). Without one a token is never read, so it is never an identity: the caller
+/// is anonymous, whatever the token claims, and the token is only forwarded on by the requests the
+/// handler sends (`MessageContext::authorization`); noted once per process at `info`. A handler
+/// with a guard cannot be registered without a JWKS
+/// ([`SnodraMessagingBuilder::start`](crate::SnodraMessagingBuilder::start) refuses it), so no
+/// handler acts on claims nobody checked. Either way an absent header is an anonymous caller, and
+/// a header that is not `Bearer <token>` is `UNAUTHENTICATED`.
 #[derive(Debug)]
 pub struct IdentityResolver {
     verifier: Option<JwksVerifier>,
-    warned: AtomicBool,
+    noted: AtomicBool,
     roles_claim: RolesClaim,
 }
 
@@ -24,7 +24,7 @@ impl IdentityResolver {
     pub fn new(verifier: Option<JwksVerifier>) -> Self {
         IdentityResolver {
             verifier,
-            warned: AtomicBool::new(false),
+            noted: AtomicBool::new(false),
             roles_claim: RolesClaim::default(),
         }
     }
@@ -33,6 +33,11 @@ impl IdentityResolver {
     pub fn with_roles_claim(mut self, value: &str) -> Self {
         self.roles_claim = RolesClaim::parse(value);
         self
+    }
+
+    /// Whether forwarded tokens are verified (a JWKS is configured).
+    pub fn verifies(&self) -> bool {
+        self.verifier.is_some()
     }
 
     pub async fn resolve(
@@ -57,44 +62,13 @@ impl IdentityResolver {
                 &self.roles_claim,
             ))),
             None => {
-                if !self.warned.swap(true, Ordering::Relaxed) {
-                    tracing::warn!(
-                        "forwarded identities are trusted without verification: no SNODRA_JWKS_URL configured"
+                if !self.noted.swap(true, Ordering::Relaxed) {
+                    tracing::info!(
+                        "no SNODRA_JWKS_URL: forwarded tokens are not verified, so their callers are anonymous (the tokens are forwarded on unread)"
                     );
                 }
-                Ok(Some(Identity::from_claims(
-                    &unverified_claims(token)?,
-                    false,
-                    &self.roles_claim,
-                )))
+                Ok(None)
             }
         }
     }
-}
-
-/// Claims of a signed JWS without signature verification. Rejects `alg: none` and non-JWS shapes.
-fn unverified_claims(token: &str) -> Result<Map<String, Value>, MessagingError> {
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() == 5 {
-        return Err(MessagingError::Unauthenticated("unsupported token".into()));
-    }
-    if parts.len() != 3 {
-        return Err(MessagingError::Unauthenticated("unreadable token".into()));
-    }
-    let header: Map<String, Value> = decode_segment(parts[0])?;
-    let alg = header.get("alg").and_then(Value::as_str).unwrap_or("");
-    if alg.eq_ignore_ascii_case("none") || parts[2].is_empty() {
-        return Err(MessagingError::Unauthenticated("unsigned token".into()));
-    }
-    decode_segment(parts[1])
-}
-
-fn decode_segment(segment: &str) -> Result<Map<String, Value>, MessagingError> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(segment.trim_end_matches('='))
-        .map_err(|_| MessagingError::Unauthenticated("unreadable token".into()))?;
-    serde_json::from_slice::<Value>(&bytes)
-        .ok()
-        .and_then(|v| v.as_object().cloned())
-        .ok_or_else(|| MessagingError::Unauthenticated("unreadable token".into()))
 }

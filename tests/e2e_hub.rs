@@ -119,12 +119,17 @@ async fn two_participants_round_trip() {
         .start()
         .await
         .expect("service a starts");
-    let b = start_b(
-        config("svc-b", &hub.address),
-        &mongo.uri_for("b"),
-        &kafka.bootstrap,
-    )
-    .await;
+    // Service B's guard needs a JWKS to start.
+    let jwks = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/certs"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(support::JWKS_JSON))
+        .mount(&jwks)
+        .await;
+    let mut cfg_b = config("svc-b", &hub.address);
+    cfg_b.jwks_url = Some(format!("{}/certs", jwks.uri()));
+    cfg_b.issuer = Some(support::ISSUER.to_string());
+    let b = start_b(cfg_b, &mongo.uri_for("b"), &kafka.bootstrap).await;
     assert!(
         a.await_hub(Duration::from_secs(15)).await && b.await_hub(Duration::from_secs(15)).await
     );
