@@ -104,11 +104,11 @@ async fn a_header_that_is_not_a_bearer_token_is_unauthenticated() {
     ));
 }
 
-/// Without a JWKS a forwarded token is never read: whatever it claims (signed by any key,
-/// unsigned, not even a JWT), the caller is anonymous. The token itself is still forwarded by
-/// the handler's own sends (`MessageContext.authorization`).
+/// Without a JWKS a well-formed signed token is never an identity: whatever it claims (signed by
+/// any key), the caller is anonymous. The token itself is still forwarded by the handler's own
+/// sends (`MessageContext.authorization`).
 #[tokio::test]
-async fn without_a_jwks_a_token_is_never_an_identity() {
+async fn without_a_jwks_a_signed_token_is_never_an_identity() {
     let signed = support::sign(
         support::OTHER_KEY_PEM,
         None,
@@ -118,13 +118,7 @@ async fn without_a_jwks_a_token_is_never_an_identity() {
         support::now() + 60,
     );
     let fixture = support::token("u-1", &["admin"], support::ISSUER, support::now() + 60);
-    for token in [
-        signed,
-        fixture,
-        support::unsigned_token("u-1"),
-        "not-a-jwt".to_string(),
-        "a.b.c.d.e".to_string(),
-    ] {
+    for token in [signed, fixture] {
         assert_eq!(
             resolver()
                 .resolve(Some(&format!("Bearer {token}")))
@@ -132,6 +126,46 @@ async fn without_a_jwks_a_token_is_never_an_identity() {
                 .unwrap(),
             None,
             "{token}"
+        );
+    }
+}
+
+/// Without a JWKS a token that is not a well-formed signed JWS is still refused
+/// (`UNAUTHENTICATED`), by its shape alone: not three segments, encrypted (five), a header or
+/// claims segment that is not a base64url JSON object, `alg: none`, no signature.
+#[tokio::test]
+async fn without_a_jwks_a_malformed_token_is_unauthenticated() {
+    use base64::Engine;
+    let b64 = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s);
+    let header = b64(r#"{"alg":"RS256","kid":"k1"}"#);
+    let claims = b64(r#"{"sub":"u-1"}"#);
+    let cases = [
+        ("one segment", "not-a-jwt".to_string()),
+        ("two segments", format!("{header}.{claims}")),
+        ("four segments", format!("{header}.{claims}.sig.x")),
+        ("encrypted", "a.b.c.d.e".to_string()),
+        ("unreadable header", format!("!!.{claims}.sig")),
+        (
+            "header not an object",
+            format!("{}.{claims}.sig", b64("[1]")),
+        ),
+        (
+            "claims not an object",
+            format!("{header}.{}.sig", b64("42")),
+        ),
+        ("unreadable claims", format!("{header}.%%.sig")),
+        ("alg none", support::unsigned_token("u-1")),
+        (
+            "alg none, signed",
+            format!("{}.{claims}.sig", b64(r#"{"alg":"none"}"#)),
+        ),
+        ("no signature", format!("{header}.{claims}.")),
+    ];
+    for (what, token) in cases {
+        let resolved = resolver().resolve(Some(&format!("Bearer {token}"))).await;
+        assert!(
+            matches!(resolved, Err(MessagingError::Unauthenticated(_))),
+            "{what}: {resolved:?}"
         );
     }
 }

@@ -85,6 +85,7 @@ struct Seen {
     correlation_id: String,
     current_message_id: String,
     user_id: Option<String>,
+    authorization: Option<String>,
 }
 message_type!(Introspect, "t.Introspect");
 impl Command for Introspect {
@@ -120,6 +121,7 @@ fn registry() -> HandlerRegistry {
             correlation_id: ctx.correlation_id,
             current_message_id: current.message_id,
             user_id,
+            authorization: ctx.authorization,
         })
     });
     r
@@ -374,9 +376,11 @@ async fn handler_sees_context_and_current_task_local() {
     assert_eq!(seen["correlation_id"], "c-1");
     assert_eq!(seen["current_message_id"], "req-1");
     assert_eq!(seen["user_id"], "u-7");
-    // Without a JWKS the same token is never read: an anonymous caller.
+    // Without a JWKS the same token is never an identity: an anonymous caller, the token still
+    // there to be forwarded by the handler's own sends.
     let seen = payload(&dispatcher().handle(introspect).await);
     assert_eq!(seen["user_id"], serde_json::Value::Null);
+    assert_eq!(seen["authorization"], auth.as_str());
 }
 
 #[tokio::test]

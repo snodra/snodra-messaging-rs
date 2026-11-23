@@ -2,6 +2,10 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde_json::Value;
+
 use super::{Identity, JwksVerifier, RolesClaim};
 use crate::error::MessagingError;
 
@@ -12,7 +16,8 @@ use crate::error::MessagingError;
 /// with a guard cannot be registered without a JWKS
 /// ([`SnodraMessagingBuilder::start`](crate::SnodraMessagingBuilder::start) refuses it), so no
 /// handler acts on claims nobody checked. Either way an absent header is an anonymous caller, and
-/// a header that is not `Bearer <token>` is `UNAUTHENTICATED`.
+/// a header that is not `Bearer <token>` is `UNAUTHENTICATED`; without a JWKS so is a token that is
+/// not a well-formed signed JWS ([`check_shape`]), judged by its shape alone.
 #[derive(Debug)]
 pub struct IdentityResolver {
     verifier: Option<JwksVerifier>,
@@ -62,6 +67,7 @@ impl IdentityResolver {
                 &self.roles_claim,
             ))),
             None => {
+                check_shape(token)?;
                 if !self.noted.swap(true, Ordering::Relaxed) {
                     tracing::info!(
                         "no SNODRA_JWKS_URL: forwarded tokens are not verified, so their callers are anonymous (the tokens are forwarded on unread)"
@@ -70,5 +76,36 @@ impl IdentityResolver {
                 Ok(None)
             }
         }
+    }
+}
+
+/// What a service without a JWKS can judge of a token: its shape. A well-formed signed JWS has
+/// three segments, a header and a claims segment that are base64url JSON objects, an `alg` other
+/// than `none` and a signature; anything else (an encrypted, five-segment token included) is
+/// `UNAUTHENTICATED`. The claims are parsed for their shape only, never used.
+fn check_shape(token: &str) -> Result<(), MessagingError> {
+    let refused = |why: &str| MessagingError::Unauthenticated(why.to_string());
+    let parts: Vec<&str> = token.splitn(6, '.').collect();
+    if parts.len() == 5 {
+        return Err(refused("unsupported token"));
+    }
+    if parts.len() != 3 {
+        return Err(refused("unreadable token"));
+    }
+    let header = json_object(parts[0]).ok_or_else(|| refused("unreadable token"))?;
+    let alg = header.get("alg").and_then(Value::as_str).unwrap_or("");
+    if alg.eq_ignore_ascii_case("none") || parts[2].is_empty() {
+        return Err(refused("unsigned token"));
+    }
+    json_object(parts[1]).ok_or_else(|| refused("unreadable token"))?;
+    Ok(())
+}
+
+/// A base64url segment (padding tolerated) holding a JSON object.
+fn json_object(segment: &str) -> Option<serde_json::Map<String, Value>> {
+    let bytes = URL_SAFE_NO_PAD.decode(segment.trim_end_matches('=')).ok()?;
+    match serde_json::from_slice::<Value>(&bytes).ok()? {
+        Value::Object(map) => Some(map),
+        _ => None,
     }
 }
