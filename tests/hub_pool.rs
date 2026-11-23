@@ -1266,3 +1266,45 @@ async fn after_the_deregistration_a_new_address_registers_no_types() {
     );
     c.shutdown().await;
 }
+
+/// Besides every `status_interval`, an `InstanceStatus` goes to every live hub at once when the
+/// set of live hubs changes: a hub coming up, and an address leaving DNS.
+#[tokio::test]
+async fn instance_status_goes_out_at_once_when_the_live_hubs_change() {
+    let (a, b) = (answering("hub-a").await, answering("hub-b").await);
+    let resolved: Resolved = Arc::new(Mutex::new(vec![a.addr]));
+    let c = client_with(
+        HubSettings {
+            dns_refresh: Duration::from_millis(50),
+            status_interval: Duration::from_secs(600),
+            ..settings("dns:///hubs.test:7000".into())
+        },
+        |pool| {
+            let resolved = Arc::clone(&resolved);
+            pool.set_resolver(Arc::new(move |_, _| {
+                let addrs = resolved.lock().unwrap().clone();
+                Box::pin(async move { Ok(addrs) })
+            }));
+        },
+    )
+    .await;
+    let reported = |hub: &FakeHub, ids: &[&str]| {
+        hub.statuses()
+            .iter()
+            .any(|(_, s)| s.connected_hub_ids == ids)
+    };
+    eventually("hub-a told it is live", async || reported(&a, &["hub-a"])).await;
+    resolved.lock().unwrap().push(b.addr);
+    eventually("both told both are live", async || {
+        reported(&a, &["hub-a", "hub-b"]) && reported(&b, &["hub-a", "hub-b"])
+    })
+    .await;
+    *resolved.lock().unwrap() = vec![a.addr];
+    eventually("hub-a told hub-b left", async || {
+        a.statuses()
+            .last()
+            .is_some_and(|(_, s)| s.connected_hub_ids == ["hub-a"])
+    })
+    .await;
+    c.shutdown().await;
+}

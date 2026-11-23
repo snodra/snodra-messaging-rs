@@ -31,8 +31,9 @@
 //!   share of the hub that left; a stream that already offered that many
 //!   gets nothing. Permits are never revoked when N grows. The local concurrency guard stays the
 //!   total.
-//! - **Status.** Every `status_interval` an `InstanceStatus` (acknowledged hub ids, handlers in
-//!   flight, the event processors' status) goes to every live hub.
+//! - **Status.** Every `status_interval`, and at once whenever the set of live hubs changes (a
+//!   stream acknowledged or lost, an address leaving DNS), an `InstanceStatus` (acknowledged hub
+//!   ids, handlers in flight, the event processors' status) goes to every live hub.
 //! - **DNS.** A `dns:///name:port` target is resolved at start and every `dns_refresh` into
 //!   `ip:port` targets of one family (IPv4 when any, else IPv6, [`resolved_targets`]): a new
 //!   address gets a connection; a vanished one leaves the routing at once, gets an empty
@@ -913,6 +914,7 @@ impl HubPool {
                 if let Some(pool) = weak.upgrade() {
                     pool.changes.send_modify(|n| *n += 1);
                     pool.top_up();
+                    pool.report_soon();
                 }
             }),
             in_flight: Arc::clone(&self.in_flight),
@@ -1046,6 +1048,16 @@ impl HubPool {
         }
     }
 
+    /// An `InstanceStatus` to every live hub now, off the caller's thread: the set of live hubs
+    /// changed (besides the `status_interval` reports).
+    fn report_soon(self: &Arc<Self>) {
+        if self.external || self.cancel.is_cancelled() {
+            return;
+        }
+        let me = Arc::clone(self);
+        tokio::spawn(async move { me.report_status().await });
+    }
+
     /// One `InstanceStatus` to every live hub.
     pub(crate) async fn report_status(&self) {
         let live = self.live();
@@ -1135,11 +1147,17 @@ impl HubPool {
                 }
             }
         }
+        let mut left = false;
         for address in removed {
             if let Some(m) = members.iter().find(|m| m.address() == address) {
                 tracing::info!(service = %self.service_name, address, "hub address left DNS; closing once idle");
+                left |= m.role() == Role::Active && m.conn.handshake().is_some();
                 self.drain(Arc::clone(m));
             }
+        }
+        if left {
+            // Out of the live hubs at once: the others hear of it now.
+            self.report_soon();
         }
         // An owner that drains frees its hub id for the addresses parked behind it.
         self.revive();
