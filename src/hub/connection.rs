@@ -8,6 +8,12 @@
 //! ([`HubConnection::send_with`]). A request that cannot be written to a handshaken stream fails
 //! with `HubUnavailable`.
 //!
+//! A silent hub: from the ack on, each heartbeat tick looks before sending its heartbeat, and the
+//! stream is dropped (`UNAVAILABLE`, an ordinary reconnect) when more than three heartbeat
+//! intervals have passed since the last echo (or the ack) and the three heartbeats sent since then
+//! are all unanswered: between three and four intervals after the last echo. Before the ack the
+//! handshake timeout applies, not this check.
+//!
 //! Any failure closes the stream, notifies the owner with [`Inbound::Disconnected`] (carrying the
 //! stream id and the requests still in its outbound buffer, never written) and reconnects with exponential backoff (`backoff_min` doubling up to `backoff_max`,
 //! each wait jittered by ±20 % and clamped to `backoff_max`; at the cap 80-100 % of it), reset to `backoff_min` once an attempt
@@ -1401,7 +1407,10 @@ impl HubConnection {
         let mut roll = self.roll.subscribe();
         let mut interval = HEARTBEAT_INTERVAL_BEFORE_ACK;
         let mut ticker = ticker(interval);
+        // The silent-hub check, armed by the ack (before it the handshake timeout applies): the
+        // last sign of life (the ack, then each echo) and the heartbeats sent since it.
         let mut last_echo = tokio::time::Instant::now();
+        let mut unanswered: u32 = 0;
         let handshake_deadline = tokio::time::Instant::now() + self.settings.handshake_timeout;
         let mut handshake: Option<RegisterAck> = None;
         loop {
@@ -1430,9 +1439,12 @@ impl HubConnection {
                     return Err(Status::deadline_exceeded("registration not confirmed in time").into());
                 }
                 _ = ticker.tick() => {
-                    let echo_timeout = interval * 3;
-                    if last_echo.elapsed() > echo_timeout {
-                        return Err(Status::unavailable(format!("no heartbeat echo for {echo_timeout:?}")).into());
+                    if handshake.is_some() {
+                        let since = last_echo.elapsed();
+                        if hub_silent(since, unanswered, interval) {
+                            return Err(Status::unavailable(format!("no heartbeat echo for {since:?} ({unanswered} heartbeats unanswered)")).into());
+                        }
+                        unanswered += 1;
                     }
                     tx.send(heartbeat()).await.map_err(|_| Status::unavailable("stream closed"))?;
                     self.follow_token_file(&tx, handshake.is_some()).await?;
@@ -1463,6 +1475,8 @@ impl HubConnection {
                                     return Ok(());
                                 }
                                 tracing::info!(service = %self.service_name, instance = %self.instance_id, hub = %ack.hub_id, address = %self.settings.address, heartbeat = ?interval, "registered with the hub");
+                                last_echo = tokio::time::Instant::now();
+                                unanswered = 0;
                                 self.go_live(stream_id, &tx, &ack, &grants, identity.as_ref());
                                 handshake = Some(ack);
                                 // A token published since the Register went out.
@@ -1473,7 +1487,11 @@ impl HubConnection {
                                 handshake = Some(ack);
                             }
                         }
-                        server_message::Message::Heartbeat(_) => last_echo = tokio::time::Instant::now(),
+                        // Before the ack an echo confirms nothing; after it, it shows the hub alive.
+                        server_message::Message::Heartbeat(_) => if handshake.is_some() {
+                            last_echo = tokio::time::Instant::now();
+                            unanswered = 0;
+                        },
                         server_message::Message::Request(request) => {
                             // A subscription is passive: the hub spent no permit on it and no
                             // handler runs for it, so it is neither a permit to give back nor a
@@ -1884,6 +1902,20 @@ impl HubConnection {
     }
 }
 
+/// How many heartbeat intervals without an echo make a hub silent.
+pub(crate) const SILENT_INTERVALS: u32 = 3;
+
+/// On a heartbeat tick of a handshaken stream, before that tick's heartbeat: true when the hub is
+/// silent, so the stream is dropped. Silent is more than [`SILENT_INTERVALS`] intervals since the
+/// last echo (or the ack, before any echo) *and* the [`SILENT_INTERVALS`] heartbeats sent since
+/// then all unanswered: the drop comes on the tick after the third unanswered heartbeat, between
+/// three and four intervals after the last echo, never before three full intervals (a tick that
+/// fires a little late does not cut it short). Before the ack nothing is silent: the handshake
+/// timeout covers a hub that never answers.
+pub(crate) fn hub_silent(since_echo: Duration, unanswered: u32, interval: Duration) -> bool {
+    unanswered >= SILENT_INTERVALS && since_echo > interval * SILENT_INTERVALS
+}
+
 /// A ticker whose first tick is one `period` from now (the first heartbeat is sent with the
 /// `Register`).
 fn ticker(period: Duration) -> tokio::time::Interval {
@@ -1993,6 +2025,19 @@ mod tests {
         // An older one arriving late (a lower sequence) does not replace it.
         keep_newer(&slot, &(1, refusal("a", now + Duration::from_secs(3600))));
         assert_eq!(slot.lock().unwrap().as_ref().unwrap().1.hub, "b");
+    }
+
+    #[test]
+    fn a_hub_is_silent_only_after_three_full_intervals_and_three_unanswered_heartbeats() {
+        let i = Duration::from_millis(100);
+        // Three intervals passed, but the tick came a little late: only two heartbeats unanswered.
+        assert!(!hub_silent(i * 3 + Duration::from_millis(1), 2, i));
+        // Three unanswered, but not more than three intervals yet.
+        assert!(!hub_silent(i * 3, 3, i));
+        assert!(!hub_silent(i * 2, 3, i));
+        // Both: silent.
+        assert!(hub_silent(i * 3 + Duration::from_millis(1), 3, i));
+        assert!(hub_silent(i * 4, 4, i));
     }
 
     #[test]

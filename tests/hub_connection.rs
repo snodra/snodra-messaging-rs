@@ -246,7 +246,7 @@ async fn a_registered_stream_whose_echoes_stop_reconnects() {
     .await;
     assert!(lost.is_ok(), "a stream without echoes must be abandoned");
     assert!(
-        stopped.elapsed() >= Duration::from_millis(200),
+        stopped.elapsed() >= Duration::from_millis(290),
         "abandoned after {:?}, before three intervals without an echo",
         stopped.elapsed()
     );
@@ -264,6 +264,73 @@ async fn a_registered_stream_whose_echoes_stop_reconnects() {
     .await
     .expect("a new stream registers");
     assert!(conn.await_registered(Duration::from_secs(3)).await);
+    conn.shutdown().await;
+    hub.stop();
+}
+
+/// A hub that acknowledges the `Register` but never echoes a heartbeat: the silence is counted
+/// from the ack, and the stream is dropped on the tick after the third unanswered heartbeat,
+/// between three and four intervals after the ack, never at three.
+#[tokio::test]
+async fn a_hub_that_never_echoes_is_dropped_after_three_unanswered_heartbeats() {
+    let hub = FakeHub::start().await;
+    hub.set_ack(Some(proto::RegisterAck {
+        heartbeat_interval_ms: 100,
+        ..default_ack()
+    }));
+    hub.set_echo_heartbeats(false);
+    let (conn, mut rx) = connection(settings(hub.address(), 50, 100));
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    let registered = Instant::now();
+    let before = hub.heartbeats();
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(Inbound::Disconnected { .. }) = rx.recv().await {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("a stream without echoes must be abandoned");
+    let after = registered.elapsed();
+    assert!(
+        after >= Duration::from_millis(370) && after < Duration::from_millis(900),
+        "dropped {after:?} after the ack: not between three and four intervals"
+    );
+    assert!(
+        hub.heartbeats() - before >= 3,
+        "{} heartbeats sent after the ack before the drop",
+        hub.heartbeats() - before
+    );
+    conn.shutdown().await;
+    hub.stop();
+}
+
+/// Before the `RegisterAck` nothing counts as silence: a hub that takes longer than three
+/// heartbeat intervals (3 s each before the ack) to acknowledge, and echoes nothing meanwhile,
+/// is waited for until the handshake timeout.
+#[tokio::test]
+async fn a_slow_ack_is_waited_for_until_the_handshake_timeout_not_dropped_as_silent() {
+    let hub = FakeHub::start().await;
+    // The fake hub handles a stream's messages in order: the heartbeats sent before the ack are
+    // only echoed after it.
+    hub.set_ack_delay(Duration::from_millis(9_600));
+    let mut s = settings(hub.address(), 50, 100);
+    s.handshake_timeout = Duration::from_secs(10);
+    let (conn, mut rx) = connection(s);
+    conn.start();
+    let registered = conn.await_registered(Duration::from_secs(11)).await;
+    assert!(
+        registered,
+        "the stream was dropped before its ack: {:?}",
+        rx.try_recv().ok()
+    );
+    assert_eq!(
+        hub.registers().await.len(),
+        1,
+        "the first stream registered"
+    );
     conn.shutdown().await;
     hub.stop();
 }
