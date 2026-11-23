@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures::Stream;
@@ -54,6 +54,7 @@ use crate::saga::{RawOutcome, classify_failure};
 use crate::types::{Command, Query, StreamingQuery, SubscriptionQuery};
 
 use super::connection::{HubConnection, Inbound, StreamId};
+use super::dispatcher::Dispatcher;
 use super::pool::{Consumers, HubPool, weak_probe};
 
 /// The budget of a call that chose no timeout while no hub has acknowledged this instance yet (the
@@ -860,8 +861,27 @@ struct Entry {
 }
 
 /// The `CommandBus`/`QueryBus` of the Rust side. Replies arrive through [`Sender::on_inbound`].
+///
+/// Local dispatch: once the application started ([`crate::SnodraMessagingBuilder::start`]), a
+/// command, or a unary query of a type not registered as shared, that this instance handles itself
+/// is answered in-process by its handler, without the hub, unless
+/// [`Config::hub_always_route_through_hub`](crate::Config::hub_always_route_through_hub) is set.
+/// The handler answers it exactly as it would answer the request through the hub: the payload and
+/// the reply go through the codec, the request carries the same headers (the correlation id, the
+/// trace parent, the bearer token the hub path would send, [`SendOptions::headers`]), the identity
+/// is that token's (verified as for a forwarded request), the guard applies, and a failure is the
+/// error the hub path would give (`RemoteHandler` for the handler's own error or panic,
+/// `Unauthenticated`, `AccessDenied`, `InvalidMessage`). The routing key and the priority are
+/// ignored; the timeout does not bound the handler, there is no retry, the call is not timed in
+/// `snodra.hub.client.request.duration`, and it takes no handler permit. It also works while the
+/// hub is turned off or unreachable. Scatter-gather, streaming and subscription queries always go
+/// through the hub. Before the start, and on a sender made without the application, everything
+/// goes through the hub.
 pub struct Sender {
     hubs: Arc<HubPool>,
+    /// This instance's own handlers, set by the application's start unless every request is to go
+    /// through the hub.
+    local: OnceLock<Arc<Dispatcher>>,
     pending: Mutex<HashMap<String, Entry>>,
     default_timeout: Option<Duration>,
     forward_jwt: bool,
@@ -895,6 +915,7 @@ impl Sender {
     pub fn with_pool(hubs: Arc<HubPool>, settings: SenderSettings) -> Arc<Sender> {
         let sender = Arc::new(Sender {
             hubs: Arc::clone(&hubs),
+            local: OnceLock::new(),
             pending: Mutex::new(HashMap::new()),
             default_timeout: settings.default_timeout,
             forward_jwt: settings.forward_jwt,
@@ -916,11 +937,64 @@ impl Sender {
         })
     }
 
+    /// Answers the requests this instance handles itself with `dispatcher` from now on (see the
+    /// type's docs); the first call wins.
+    pub(crate) fn answer_locally(&self, dispatcher: Arc<Dispatcher>) {
+        let _ = self.local.set(dispatcher);
+    }
+
+    /// The dispatcher that answers a unary request of `kind` for `type_name` in-process, if any.
+    fn local_for(&self, kind: RequestKind, type_name: &str) -> Option<&Arc<Dispatcher>> {
+        self.local
+            .get()
+            .filter(|local| local.answers_locally(kind, type_name))
+    }
+
+    /// One unary request to this instance's own handler, in-process (see the type's docs): the
+    /// reply's payload, or the error the hub path would give.
+    async fn local_request(
+        &self,
+        local: &Dispatcher,
+        kind: RequestKind,
+        type_name: &str,
+        payload: Vec<u8>,
+        opts: SendOptions,
+    ) -> Result<Vec<u8>, MessagingError> {
+        reject_reserved_headers(&opts.headers)?;
+        let mut headers = self.headers(opts.authorization);
+        headers.extend(opts.headers);
+        let request = proto::Request {
+            id: uuid::Uuid::new_v4().to_string(),
+            kind: kind as i32,
+            r#type: type_name.to_string(),
+            payload,
+            headers,
+            mode: RequestMode::Unary as i32,
+            ..Default::default()
+        };
+        match local.handle_local(request).await.result {
+            Some(reply::Result::Payload(p)) => Ok(p),
+            Some(reply::Result::Error(e)) => Err(MessagingError::from_hub(
+                type_name, e.code, &e.message, &e.details,
+            )),
+            None => Ok(b"{}".to_vec()),
+        }
+    }
+
+    /// Sends a command: answered in-process when this instance handles its type (see the type's
+    /// docs), else through the hub.
     pub async fn send_command<C: Command>(
         &self,
         command: &C,
         opts: SendOptions,
     ) -> Result<C::Reply, MessagingError> {
+        if let Some(local) = self.local_for(RequestKind::Command, C::TYPE) {
+            let payload = codec::encode(command)?;
+            let reply = self
+                .local_request(local, RequestKind::Command, C::TYPE, payload, opts)
+                .await?;
+            return codec::decode_reply(&reply);
+        }
         let started = Instant::now();
         let reply = match codec::encode(command) {
             Ok(payload) => {
@@ -932,11 +1006,20 @@ impl Sender {
         self.decoded(RequestKind::Command, C::TYPE, started, reply)
     }
 
+    /// Sends a unary query: answered in-process when this instance handles its type and did not
+    /// register it as shared (see the type's docs), else through the hub.
     pub async fn send_query<Q: Query>(
         &self,
         query: &Q,
         opts: SendOptions,
     ) -> Result<Q::Reply, MessagingError> {
+        if let Some(local) = self.local_for(RequestKind::Query, Q::TYPE) {
+            let payload = codec::encode(query)?;
+            let reply = self
+                .local_request(local, RequestKind::Query, Q::TYPE, payload, opts)
+                .await?;
+            return codec::decode_reply(&reply);
+        }
         let started = Instant::now();
         let reply = match codec::encode(query) {
             Ok(payload) => {

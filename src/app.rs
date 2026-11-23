@@ -738,6 +738,14 @@ impl SnodraMessagingBuilder {
         self
     }
 
+    /// Sends every command and query through the hub, also one of a type this instance handles
+    /// itself ([`Config::hub_always_route_through_hub`], `SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB`;
+    /// off by default: such a request is answered in-process).
+    pub fn always_route_through_hub(mut self, on: bool) -> Self {
+        self.config.hub_always_route_through_hub = on;
+        self
+    }
+
     /// Opt-in authorization for a command or query registered before this call.
     pub fn requires<M: MessageType>(mut self, guard: Guard) -> Self {
         self.registry.requires::<M>(guard);
@@ -1007,6 +1015,10 @@ impl SnodraMessagingBuilder {
         }));
 
         hubs.set_registered_types(registry.registered_types());
+        // The requests this instance sends to its own types are answered in-process from now on.
+        if !config.hub_always_route_through_hub {
+            sender.answer_locally(Arc::clone(&dispatcher));
+        }
         if !config.hub_enabled {
             hubs.turn_off();
             tracing::info!("the hub is turned off (SNODRA_SERVER_ENABLED=false): not connecting");
@@ -1082,10 +1094,10 @@ impl SnodraMessagingBuilder {
         let mut saga_tasks = Vec::new();
         if let (Some(runtime), Some(store)) = (&runtime, &store) {
             let sagas = store.sagas();
-            let commands: Arc<dyn RawCommandSender> = Arc::new(LocalFirstSender::new(
-                Arc::clone(&registry),
-                Arc::clone(&sender),
-            ));
+            let commands: Arc<dyn RawCommandSender> = Arc::new(
+                LocalFirstSender::new(Arc::clone(&registry), Arc::clone(&sender))
+                    .always_through_hub(config.hub_always_route_through_hub),
+            );
             let relay = SagaDispatchRelay::new(
                 store.tx(),
                 Arc::clone(&sagas.dispatch),

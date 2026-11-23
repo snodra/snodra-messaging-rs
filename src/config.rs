@@ -71,13 +71,22 @@ pub struct Config {
     pub hub_address: String,
     /// Whether the service connects to the hubs (`SNODRA_SERVER_ENABLED`, default true). Off, it
     /// never connects (`hub_address` must still parse, nothing dials it): events, processors,
-    /// dead letters, sagas and idempotent handlers work, and every command, query and
-    /// subscription sent fails at once with `HubUnavailable` naming the setting, those to the
-    /// service's own handlers included (a sender always goes through the hub). The saga relay
-    /// still delivers a command type this instance handles to its own handler; any other saga
-    /// command goes into the relay's retries. For tests and local runs
+    /// dead letters, sagas and idempotent handlers work, a command or unary query of a type the
+    /// service handles itself is still answered in-process (unless
+    /// [`hub_always_route_through_hub`](Self::hub_always_route_through_hub)), and every other
+    /// command, query and subscription sent fails at once with `HubUnavailable` naming the
+    /// setting. The saga relay still delivers a command type this instance handles to its own
+    /// handler; any other saga command goes into the relay's retries. For tests and local runs
     /// (`testing::InMemoryStores` turns it off).
     pub hub_enabled: bool,
+    /// Send every command and query through the hub, also one of a type this instance handles
+    /// itself (`SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB`, default false). Off: such a request (a
+    /// command, or a unary query of a type not registered as shared) is answered in-process by
+    /// this instance's handler, without the hub, and its routing key is ignored. On: the hub
+    /// routes it like any other request, so a routing key keeps its instance affinity across the
+    /// instances of this service, and the request gets the hub's flow control, priorities,
+    /// deadline and metrics. Covers the saga relay's commands too.
+    pub hub_always_route_through_hub: bool,
     /// How often an `InstanceStatus` goes to every hub (default 5 s, at least 1 ms).
     pub hub_status_interval: Duration,
     /// Request timeout sent as `timeout_ms` when a call sets none (`SendOptions.timeout` wins).
@@ -224,6 +233,7 @@ impl Config {
             instance_id: uuid::Uuid::new_v4().to_string(),
             hub_address: hub_address.to_string(),
             hub_enabled: true,
+            hub_always_route_through_hub: false,
             hub_status_interval: Duration::from_secs(5),
             hub_request_timeout: None,
             reconnect_backoff_min: Duration::from_millis(500),
@@ -313,7 +323,7 @@ impl Config {
 
     /// `SNODRA_SERVICE_NAME` is required; `SNODRA_SERVER_ADDRESS` defaults to
     /// `static://snodra-server:7000`. Optional:
-    /// `SNODRA_INSTANCE_ID`, `SNODRA_SERVER_ENABLED`, `SNODRA_EVENTS_SOURCE`, `SNODRA_JWKS_URL`, `SNODRA_ISSUER`, `SNODRA_SERVER_REQUEST_TIMEOUT_MS`,
+    /// `SNODRA_INSTANCE_ID`, `SNODRA_SERVER_ENABLED`, `SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB`, `SNODRA_EVENTS_SOURCE`, `SNODRA_JWKS_URL`, `SNODRA_ISSUER`, `SNODRA_SERVER_REQUEST_TIMEOUT_MS`,
     /// `SNODRA_SERVER_STATUS_INTERVAL_MS`, `SNODRA_RECONNECT_BACKOFF_MIN_MS`,
     /// `SNODRA_RECONNECT_BACKOFF_MAX_MS`,
     /// `SNODRA_MAX_CONCURRENT_HANDLERS`, `SNODRA_CONSUMER_ENABLED`, `SNODRA_CONSUMER_MAX_ATTEMPTS`,
@@ -372,6 +382,9 @@ impl Config {
         }
         if let Some(v) = optional("SNODRA_SERVER_ENABLED") {
             c.hub_enabled = flag("SNODRA_SERVER_ENABLED", &v)?;
+        }
+        if let Some(v) = optional("SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB") {
+            c.hub_always_route_through_hub = flag("SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB", &v)?;
         }
         if let Some(t) = optional("SNODRA_EVENTS_SOURCE") {
             c.events_source = t;

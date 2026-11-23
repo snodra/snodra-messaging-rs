@@ -293,7 +293,7 @@ impl Dispatcher {
             };
             if streaming {
                 me.stream(&running, request, credits, &reply_to).await;
-            } else if let Some(reply) = me.unary(request, Some(&running.cancel)).await
+            } else if let Some(reply) = me.unary(request, Some(&running.cancel), Permit::Take).await
                 && let Err(e) = reply_to
                     .send(ClientMessage {
                         message: Some(client_message::Message::Reply(reply)),
@@ -310,7 +310,24 @@ impl Dispatcher {
 
     /// One unary request to its `Reply`, as [`serve`](Self::serve) does it but never cancelled.
     pub async fn handle(&self, req: proto::Request) -> Reply {
-        self.unary(req, None)
+        self.unary(req, None, Permit::Take)
+            .await
+            .expect("a request without a cancel token always gets a reply")
+    }
+
+    /// Whether a unary request this instance sends is answered here in-process (see
+    /// [`HandlerRegistry`]'s local dispatch rule).
+    pub(crate) fn answers_locally(&self, kind: RequestKind, type_name: &str) -> bool {
+        self.registry.answers_locally(kind, type_name)
+    }
+
+    /// A unary request this instance sends to its own handler, answered in-process as
+    /// [`handle`](Self::handle) answers one from the hub (identity, lookup, guard, decode,
+    /// handler, the reply's error), but without a handler permit: the caller may hold one (a
+    /// handler sending to another of its instance's handlers), and the permits bound what the
+    /// hubs push, not what the instance asks itself.
+    pub(crate) async fn handle_local(&self, req: proto::Request) -> Reply {
+        self.unary(req, None, Permit::Skip)
             .await
             .expect("a request without a cancel token always gets a reply")
     }
@@ -350,9 +367,10 @@ impl Dispatcher {
         &self,
         req: proto::Request,
         cancel: Option<&CancellationToken>,
+        permit: Permit,
     ) -> Option<Reply> {
         let request_id = req.id.clone();
-        let run = self.run(req);
+        let run = self.run(req, permit);
         let outcome = match cancel {
             Some(token) => tokio::select! {
                 _ = token.cancelled() => return None,
@@ -374,7 +392,7 @@ impl Dispatcher {
         })
     }
 
-    async fn run(&self, req: proto::Request) -> Result<Vec<u8>, MessagingError> {
+    async fn run(&self, req: proto::Request, permit: Permit) -> Result<Vec<u8>, MessagingError> {
         let identity = self.identity(&req).await?;
         let handler = match kind(&req)? {
             RequestKind::Command => self.registry.command_handler(&req.r#type).cloned(),
@@ -409,7 +427,16 @@ impl Dispatcher {
         }
         .ok_or_else(|| MessagingError::NoHandler(req.r#type.clone()))?;
         let type_name = req.r#type.clone();
-        let (ctx, _permit, payload) = self.admit(req, identity).await?;
+        let (ctx, _permit, payload) = match permit {
+            Permit::Take => {
+                let (ctx, permit, payload) = self.admit(req, identity).await?;
+                (ctx, Some(permit), payload)
+            }
+            Permit::Skip => {
+                let (ctx, payload) = self.context(req, identity)?;
+                (ctx, None, payload)
+            }
+        };
         // Spawned so that a panic is this request's error, not the dispatcher's; aborted when the
         // caller drops the run (the hub cancelled the request).
         let mut task = AbortOnDrop(tokio::spawn(
@@ -735,6 +762,15 @@ impl Dispatcher {
             .map_err(|e| invocation_error(&type_name, e))?;
         Ok((permit, ctx, items))
     }
+}
+
+/// Whether a unary request takes one of the handler permits.
+#[derive(Clone, Copy)]
+enum Permit {
+    /// A request from a hub.
+    Take,
+    /// A request this instance sends to its own handler.
+    Skip,
 }
 
 /// The request's kind; `InvalidMessage` when it names none.

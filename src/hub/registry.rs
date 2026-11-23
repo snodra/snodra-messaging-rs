@@ -444,6 +444,24 @@ impl HandlerRegistry {
             .collect()
     }
 
+    /// Whether a unary request of `kind` for `type_name` sent by this instance is answered by its
+    /// own handler in-process ([`super::Sender`]'s local dispatch): a command it handles, or a
+    /// query with an exclusive handler here (unary, streaming or subscription: the handler answers
+    /// a unary request in the wrong mode as it would through the hub). A shared query is not: the
+    /// hub spreads it over every owner.
+    pub(crate) fn answers_locally(&self, kind: crate::proto::RequestKind, type_name: &str) -> bool {
+        match kind {
+            crate::proto::RequestKind::Command => self.commands.contains_key(type_name),
+            crate::proto::RequestKind::Query => {
+                (self.queries.contains_key(type_name)
+                    || self.streams.contains_key(type_name)
+                    || self.subscriptions.contains_key(type_name))
+                    && !self.shared.contains(type_name)
+            }
+            crate::proto::RequestKind::Unspecified => false,
+        }
+    }
+
     pub(crate) fn guard(&self, type_name: &str) -> Option<&Guard> {
         self.guards.get(type_name)
     }

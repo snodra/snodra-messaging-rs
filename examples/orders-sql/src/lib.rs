@@ -1,7 +1,8 @@
 //! A small orders service on PostgreSQL with the SQL message store (snodra-messaging-sqlx), the
 //! Rust twin of snodra-messaging's `examples/orders-sql`:
 //!
-//! - `PlaceOrder` (a command, through the hub) writes the order row and appends `OrderPlaced` to
+//! - `PlaceOrder` (a command; answered in-process when this service sends it itself, unless
+//!   `SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB=true`) writes the order row and appends `OrderPlaced` to
 //!   the outbox **in one transaction** of the store: both commit, or neither (a command that fails
 //!   after its writes leaves nothing behind);
 //! - the outbox relay publishes `OrderPlaced` to the event store;

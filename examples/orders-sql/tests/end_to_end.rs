@@ -74,7 +74,9 @@ async fn an_order_is_placed_published_and_confirmed_once() {
         .unwrap();
 
     let events = MemoryEventStore::default();
-    let config = Config::new("orders-sql", &format!("static://127.0.0.1:{hub_port}"));
+    let mut config = Config::new("orders-sql", &format!("static://127.0.0.1:{hub_port}"));
+    // The service handles PlaceOrder itself: through the hub, as this test is about, not in-process.
+    config.hub_always_route_through_hub = true;
     let builder = SnodraMessaging::builder(config.clone())
         .await
         .unwrap()

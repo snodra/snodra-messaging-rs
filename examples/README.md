@@ -5,7 +5,9 @@
   a reset to `earliest`, the dead letters), in every sandbox mode (`snodra-messaging/examples/README.md`, "Event processors and dead
   letters").
 - `orders-sql/`: a small orders service on PostgreSQL with the SQL message store (`snodra-messaging-sqlx`), the twin of
-  snodra-messaging's `examples/orders-sql`. `PlaceOrder` (a command through the hub) writes the order row and appends
+  snodra-messaging's `examples/orders-sql`. `PlaceOrder` (a command; the service handles it itself, so it is answered
+  in-process unless `SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB=true`, which its end-to-end test sets to send it through the
+  hub) writes the order row and appends
   `OrderPlaced` to the outbox in one transaction; the relay publishes it to the event store (the in-memory one, to keep the
   example to one database); its handler confirms the order in the transaction of the event, with its processed-event marker.
   Run it with `DATABASE_URL` and the library's `SNODRA_*` settings (`cargo run -p orders-sql`); its end-to-end test

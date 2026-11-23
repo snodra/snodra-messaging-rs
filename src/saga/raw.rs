@@ -178,12 +178,15 @@ impl RawCommandSender for LocalRawCommandSender {
 }
 
 /// What the saga relay sends with: a command type this instance handles is delivered to
-/// its own handler directly, with no hub (spec decision 5: the adapter lives in the service that
-/// owns the saga); every other type goes through the hub ([`Sender::send_raw`]), where `NO_HANDLER`
-/// is transient. The crate's ordinary senders never short-circuit; only the relay does.
+/// its own handler directly, with no hub (the adapter lives in the service that owns the saga);
+/// every other type goes through the hub ([`Sender::send_raw`]), where `NO_HANDLER` is transient.
+/// With [`always_through_hub`](Self::always_through_hub)
+/// ([`Config::hub_always_route_through_hub`](crate::Config::hub_always_route_through_hub)) every
+/// command goes through the hub.
 pub struct LocalFirstSender {
     local: LocalRawCommandSender,
     hub: Arc<Sender>,
+    through_hub: bool,
 }
 
 impl LocalFirstSender {
@@ -191,7 +194,14 @@ impl LocalFirstSender {
         LocalFirstSender {
             local: LocalRawCommandSender::new(registry),
             hub,
+            through_hub: false,
         }
+    }
+
+    /// `true`: every command goes through the hub, also one this instance handles.
+    pub fn always_through_hub(mut self, on: bool) -> LocalFirstSender {
+        self.through_hub = on;
+        self
     }
 }
 
@@ -202,7 +212,7 @@ impl RawCommandSender for LocalFirstSender {
         payload: Vec<u8>,
         options: SendOptions,
     ) -> BoxFuture<'a, RawOutcome> {
-        if self.local.handles(type_name) {
+        if !self.through_hub && self.local.handles(type_name) {
             Box::pin(self.local.deliver(type_name, payload, options))
         } else {
             Box::pin(self.hub.send_raw(type_name, payload, options))

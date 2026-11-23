@@ -34,8 +34,8 @@
 //! ```
 //!
 //! Events, processors, dead letters, sagas and idempotent handlers run as on any store; commands
-//! and queries need a hub, which [`InMemoryStores::config`] turns off (a test of those uses a hub
-//! as before). The application's clock is [`Clock::tokio`], so paused time moves it. The stores
+//! and unary queries of the service's own types are answered in-process; those of other services
+//! need a hub, which [`InMemoryStores::config`] turns off (a test of those uses a hub as before). The application's clock is [`Clock::tokio`], so paused time moves it. The stores
 //! warn at startup that they are not durable.
 
 use std::time::Duration;

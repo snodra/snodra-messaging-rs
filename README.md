@@ -25,7 +25,11 @@ One builder that gives a Rust service everything it needs to take part in a Snod
 same wire protocol and the same stored records as the Kotlin library — a Kotlin and a Rust service are
 indistinguishable in front of the server and on the event store.
 
-- **Commands and queries** through Snodra Server, with deadlines, retries and streaming queries.
+- **Commands and queries** through Snodra Server, with deadlines, retries and streaming queries. A command or unary
+  query of a type the service handles itself (a query not registered as shared) is answered in-process by its own
+  handler, without the hub, as the Kotlin library does; `SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB=true`
+  (`Config::hub_always_route_through_hub`, or the builder's `always_route_through_hub(true)`) sends it through the hub
+  like any other request.
 - **Events** published through the outbox of a message store, never by a second write.
 - **Event processors** that are idempotent by construction: processed-event markers in the same store.
 - **Sagas** with associations, deadlines and a relay that retries commands.

@@ -261,6 +261,24 @@ async fn a_command_this_instance_handles_is_delivered_locally_without_the_hub() 
     );
 }
 
+/// Always through the hub: a command this instance handles goes to the hub like any other.
+#[tokio::test]
+async fn always_through_the_hub_a_command_this_instance_handles_goes_to_the_hub() {
+    let hub = FakeHub::start().await;
+    hub.set_responder(|req| Some(reply_ok(&req))).await;
+    let sender = sender(&hub, quick()).await;
+    let seen = seen();
+    let first = LocalFirstSender::new(Arc::new(registry(&seen)), sender).always_through_hub(true);
+    let outcome = first
+        .send_raw("t.Ping", PAYLOAD.to_vec(), with_headers())
+        .await;
+    assert_eq!(outcome, RawOutcome::Success);
+    assert!(seen.lock().unwrap().is_empty(), "not delivered locally");
+    let requests = hub.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].r#type, "t.Ping");
+}
+
 #[tokio::test]
 async fn through_the_hub_no_handler_is_transient_locally_it_is_permanent() {
     let hub = FakeHub::start().await;
