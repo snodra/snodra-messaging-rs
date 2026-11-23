@@ -444,7 +444,7 @@ impl Dispatcher {
         }
         .ok_or_else(|| MessagingError::NoHandler(req.r#type.clone()))?;
         let type_name = req.r#type.clone();
-        let (ctx, _permit, payload) = match permit {
+        let (ctx, permit, payload) = match permit {
             Permit::Take => {
                 let (ctx, permit, payload) = self.admit(req, identity).await?;
                 (ctx, Some(permit), payload)
@@ -455,9 +455,10 @@ impl Dispatcher {
             }
         };
         // Spawned so that a panic is this request's error, not the dispatcher's; aborted when the
-        // caller drops the run (the hub cancelled the request).
+        // caller drops the run (the hub cancelled the request). The handler permit lives in the
+        // task: an aborted handler still inside a poll keeps it until it has ended.
         let mut task = AbortOnDrop(tokio::spawn(CURRENT.scope(ctx.clone(), async move {
-            let _ended = ended;
+            let (_ended, _permit) = (ended, permit);
             handler(payload, ctx).await
         })));
         let handler_error = |message: String| MessagingError::RemoteHandler {

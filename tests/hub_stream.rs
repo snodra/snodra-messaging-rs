@@ -687,6 +687,70 @@ async fn a_cancelled_requests_permit_goes_back_once_its_handler_ended() {
     h.shutdown().await;
 }
 
+#[derive(Serialize, Deserialize)]
+struct Quick {}
+message_type!(Quick, "t.Quick");
+impl Query for Quick {
+    type Reply = ();
+}
+
+/// With one handler permit, a request waiting for it starts only once a cancelled handler has
+/// ended, not when the cancel arrives: the permit is held by the handler's task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_waiting_request_starts_only_once_the_cancelled_handler_ended() {
+    let hub = FakeHub::start().await;
+    let started = Arc::new(AtomicBool::new(false));
+    let finished: Arc<std::sync::Mutex<Option<Instant>>> = Arc::default();
+    let quick_at: Arc<std::sync::Mutex<Option<Instant>>> = Arc::default();
+    let mut r = HandlerRegistry::new();
+    let (flag, done) = (Arc::clone(&started), Arc::clone(&finished));
+    r.query::<Busy, _, _>(move |_, _| {
+        let (flag, done) = (Arc::clone(&flag), Arc::clone(&done));
+        async move {
+            flag.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(400)); // not at an await: abort waits for it
+            *done.lock().unwrap() = Some(Instant::now());
+            Ok(())
+        }
+    });
+    let at = Arc::clone(&quick_at);
+    r.query::<Quick, _, _>(move |_, _| {
+        let at = Arc::clone(&at);
+        async move {
+            *at.lock().unwrap() = Some(Instant::now());
+            Ok(())
+        }
+    });
+    let h = node_with(
+        &hub.address(),
+        "svc-h",
+        "h1",
+        r,
+        1,
+        SenderSettings::default(),
+        None,
+    )
+    .await;
+    hub.send_to_clients(forwarded("b#0", "t.Busy", b"{}", 0))
+        .await;
+    eventually("the handler runs", async || started.load(Ordering::SeqCst)).await;
+    hub.send_to_clients(cancel("b#0", "max results")).await;
+    hub.send_to_clients(forwarded("q#0", "t.Quick", b"{}", 0))
+        .await;
+    eventually("the waiting request ran", async || {
+        quick_at.lock().unwrap().is_some()
+    })
+    .await;
+    let quick = quick_at.lock().unwrap().unwrap();
+    let busy_ended = finished.lock().unwrap().expect("the blocked call returned");
+    assert!(
+        quick >= busy_ended,
+        "the waiting request started {:?} before the cancelled handler ended",
+        busy_ended - quick
+    );
+    h.shutdown().await;
+}
+
 /// The hub stream a streaming request arrived on closes: its handler would wait for credit for
 /// ever, holding its permit, so it is aborted (the hub forgot the stream with the session). A
 /// unary handler keeps running; its reply is dropped.
