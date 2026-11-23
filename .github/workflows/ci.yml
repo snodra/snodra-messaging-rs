@@ -9,9 +9,10 @@ permissions:
   contents: read
 
 # A branch keeps only its newest run. On main the runs queue instead: a run that is releasing must
-# finish, and the next one then starts from the tag it pushed.
+# finish, and the next one then starts from the tag it pushed. The event is in the group, so a run
+# started by hand (which never releases) cannot replace a push run waiting in the queue.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # bash -eo pipefail: a failing command inside a pipe fails the step.
@@ -147,6 +148,17 @@ jobs:
           echo "last tag: ${last:-none}; next version: ${version:-none, no release}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      # The release publishes with this secret: without it, stop before anything is tagged.
+      - name: the crates.io token is set
+        if: steps.next.outputs.version != ''
+        env:
+          HAS_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+        run: |
+          if [ "$HAS_TOKEN" != true ]; then
+            echo "::error::the secret CARGO_REGISTRY_TOKEN is not set, so nothing is tagged"
+            exit 1
+          fi
+
   # The packaging check: the bumped tree must package before anything is pushed. crates.io is
   # irreversible, and the release commit gets no CI run of its own.
   package:
@@ -194,6 +206,8 @@ jobs:
             '[.packages[] | select(.source == null and .publish == null) | .version]
              | length >= 5 and all(. == $v)' \
             "$RUNNER_TEMP/metadata.json"
+          # The order the release publishes them in (it fails on a dependency cycle).
+          cargo metadata --no-deps --format-version 1 | scripts/publish-order.sh
           cargo publish --workspace --dry-run --locked --allow-dirty
 
   push:
