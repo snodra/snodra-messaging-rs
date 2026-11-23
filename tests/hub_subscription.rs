@@ -401,6 +401,7 @@ fn subscription_handlers_are_query_types_exclusive_or_shared() {
             shared_queries: vec!["t.SharedPrices".into()],
             streaming_queries: vec![],
             subscription_queries: vec!["t.Prices".into()],
+            shared_subscription_queries: vec!["t.SharedPrices".into()],
         }
     );
     assert_eq!(r.query_types(), ["t.Lookup", "t.Prices", "t.SharedPrices"]);

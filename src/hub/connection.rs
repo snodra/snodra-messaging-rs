@@ -402,7 +402,11 @@ impl ReplyTo {
 /// `streaming_queries` are the
 /// exclusive ones, announced in `Register.query_types` next to `queries`; a shared streaming
 /// query is listed in `shared_queries` like any shared query. A subscription query is the
-/// same: `subscription_queries` are the exclusive ones, a shared one is in `shared_queries`.
+/// same: `subscription_queries` are the exclusive ones, a shared one is in `shared_queries` and
+/// also in `shared_subscription_queries`. Every subscription type, exclusive or shared, is
+/// declared in `Register.subscription_query_types`
+/// ([`subscription_query_types`](Self::subscription_query_types)): the hub serves such a type in
+/// mode `SUBSCRIPTION` only, and mode `SUBSCRIPTION` for declared types only.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RegisteredTypes {
     pub commands: Vec<String>,
@@ -414,6 +418,8 @@ pub struct RegisteredTypes {
     pub streaming_queries: Vec<String>,
     /// Exclusive subscription queries.
     pub subscription_queries: Vec<String>,
+    /// Shared subscription queries (also in `shared_queries`).
+    pub shared_subscription_queries: Vec<String>,
 }
 
 impl RegisteredTypes {
@@ -423,7 +429,18 @@ impl RegisteredTypes {
         self.shared_queries.sort();
         self.streaming_queries.sort();
         self.subscription_queries.sort();
+        self.shared_subscription_queries.sort();
         self
+    }
+
+    /// `Register.subscription_query_types`: every subscription query type, exclusive and shared,
+    /// sorted.
+    pub fn subscription_query_types(&self) -> Vec<String> {
+        let mut all = self.subscription_queries.clone();
+        all.extend(self.shared_subscription_queries.iter().cloned());
+        all.sort();
+        all.dedup();
+        all
     }
 
     /// `Register.query_types`: the exclusive queries, unary, streaming and subscription, sorted.
@@ -1746,6 +1763,7 @@ impl HubConnection {
             load_factor: self.settings.load_factor,
             tags: self.settings.tags.clone(),
             shared_query_types: types.shared_queries.clone(),
+            subscription_query_types: types.subscription_query_types(),
         };
         ClientMessage {
             message: Some(client_message::Message::Register(register)),

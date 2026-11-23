@@ -823,6 +823,7 @@ fn streaming_handlers_are_query_types_exclusive_or_shared() {
             shared_queries: vec!["t.SharedExport".into(), "t.SharedLookup".into()],
             streaming_queries: vec!["t.Export".into()],
             subscription_queries: vec![],
+            shared_subscription_queries: vec![],
         }
     );
     assert_eq!(

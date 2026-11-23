@@ -70,6 +70,7 @@ async fn registers_shared_query_types_apart() {
         // Exclusive streaming queries are query types to the hub: announced with `t.Q`.
         streaming_queries: vec!["t.A".into()],
         subscription_queries: vec![],
+        shared_subscription_queries: vec![],
     });
     conn.start();
     assert!(conn.await_registered(Duration::from_secs(5)).await);
@@ -77,6 +78,65 @@ async fn registers_shared_query_types_apart() {
     assert_eq!(r.command_types, vec!["t.Cmd"]);
     assert_eq!(r.query_types, vec!["t.A", "t.Q"]);
     assert_eq!(r.shared_query_types, vec!["t.S1", "t.S2"]);
+    conn.shutdown().await;
+    hub.stop();
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Watch {}
+snodra_messaging::message_type!(Watch, "t.Watch");
+impl snodra_messaging::SubscriptionQuery for Watch {
+    type Initial = ();
+    type Update = ();
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SharedWatch {}
+snodra_messaging::message_type!(SharedWatch, "t.SharedWatch");
+impl snodra_messaging::SubscriptionQuery for SharedWatch {
+    type Initial = ();
+    type Update = ();
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Lookup {}
+snodra_messaging::message_type!(Lookup, "t.Lookup");
+impl snodra_messaging::Query for Lookup {
+    type Reply = ();
+}
+
+/// The types served by subscription handlers, exclusive or shared, are declared in
+/// `Register.subscription_query_types` (each also in `query_types` or `shared_query_types`), on
+/// the first `Register` and on every later one; plain queries and commands are not; the empty
+/// `Register` of a shutdown declares none.
+#[tokio::test]
+async fn the_register_declares_the_subscription_types() {
+    let hub = FakeHub::start().await;
+    let (conn, _rx) = connection(settings(hub.address(), 50, 500));
+    let mut registry = snodra_messaging::hub::HandlerRegistry::new();
+    registry.subscription_query::<Watch, _, _>(|_, _| async { Ok(()) });
+    registry.shared_subscription_query::<SharedWatch, _, _>(|_, _| async { Ok(()) });
+    registry.query::<Lookup, _, _>(|_, _| async { Ok(()) });
+    conn.set_registered_types(registry.registered_types());
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    let first = hub.registers().await[0].clone();
+    assert_eq!(first.subscription_query_types, ["t.SharedWatch", "t.Watch"]);
+    assert_eq!(first.query_types, ["t.Lookup", "t.Watch"]);
+    assert_eq!(first.shared_query_types, ["t.SharedWatch"]);
+    // A reconnect registers again with the same declaration.
+    hub.drop_streams();
+    timeout(Duration::from_secs(5), async {
+        while hub.registers().await.len() < 2 {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("registered again");
+    assert_eq!(
+        hub.registers().await[1].subscription_query_types,
+        ["t.SharedWatch", "t.Watch"]
+    );
     conn.shutdown().await;
     hub.stop();
 }

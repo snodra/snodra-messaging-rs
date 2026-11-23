@@ -404,6 +404,11 @@ impl HandlerRegistry {
                     .keys()
                     .filter(|t| !self.shared.contains(*t)),
             ),
+            shared_subscription_queries: sorted(
+                self.subscriptions
+                    .keys()
+                    .filter(|t| self.shared.contains(*t)),
+            ),
         }
     }
 
