@@ -1180,3 +1180,36 @@ async fn with_no_owner_anywhere_every_hub_is_tried_once_and_no_handler_comes_bac
     }
     c.shutdown().await;
 }
+
+/// Once the pool deregistered (the first step of a shutdown), a connection it opens later (a new
+/// DNS address during the drain) registers no types either: the hub must not route to a
+/// closing instance.
+#[tokio::test]
+async fn after_the_deregistration_a_new_address_registers_no_types() {
+    let (a, b) = (answering("hub-a").await, answering("hub-b").await);
+    let resolved: Resolved = Arc::new(Mutex::new(vec![a.addr]));
+    let c = client_with(
+        HubSettings {
+            dns_refresh: Duration::from_millis(50),
+            ..settings("dns:///hubs.test:7000".into())
+        },
+        |pool| {
+            let resolved = Arc::clone(&resolved);
+            pool.set_resolver(Arc::new(move |_, _| {
+                let addrs = resolved.lock().unwrap().clone();
+                Box::pin(async move { Ok(addrs) })
+            }));
+        },
+    )
+    .await;
+    all_registered(&c, &["hub-a"]).await;
+    assert!(c.pool.deregister(Duration::from_secs(1)).await);
+    resolved.lock().unwrap().push(b.addr);
+    eventually("hub-b registered", async || !b.registers().await.is_empty()).await;
+    let register = b.registers().await.remove(0);
+    assert!(
+        register.command_types.is_empty() && register.query_types.is_empty(),
+        "{register:?}"
+    );
+    c.shutdown().await;
+}

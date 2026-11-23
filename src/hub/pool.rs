@@ -756,6 +756,9 @@ impl HubPool {
         if self.off.load(Ordering::SeqCst) {
             return true;
         }
+        // A connection opened from now on (a new DNS address, a revived parked one) registers no
+        // types either.
+        *self.types.lock().unwrap() = RegisteredTypes::default();
         let members = self.members();
         futures::future::join_all(
             members
@@ -993,10 +996,12 @@ impl HubPool {
     /// them to start. Ownerships of connections no longer kept (draining) are dropped first.
     /// Caller holds `owners` (taken before `members`).
     fn revive_locked(self: &Arc<Self>, owners: &mut HashMap<String, String>) -> Vec<Arc<Member>> {
+        let mut members = self.members.lock().unwrap();
+        // Looked at under the lock: `shutdown` cancels before it takes its snapshot of the members,
+        // so either this sees the cancel, or the snapshot holds what is put in place here.
         if self.cancel.is_cancelled() || !self.started.load(Ordering::SeqCst) {
             return vec![];
         }
-        let mut members = self.members.lock().unwrap();
         owners.retain(|_, owner| members.iter().any(|m| m.address() == owner && m.kept()));
         let mut revived = Vec::new();
         for slot in members.iter_mut() {
@@ -1561,6 +1566,28 @@ mod tests {
 
     fn strings(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Once the pool is shut down nothing is revived: a parked member stays as it is.
+    #[tokio::test]
+    async fn nothing_is_revived_after_the_shutdown() {
+        let (tx, _rx) = mpsc::channel(8);
+        let pool = HubPool::new(
+            HubSettings {
+                address: "static://127.0.0.1:1,static://127.0.0.1:2".into(),
+                ..HubSettings::default()
+            },
+            "svc".into(),
+            "i".into(),
+            tx,
+        )
+        .unwrap();
+        pool.started.store(true, Ordering::SeqCst);
+        let parked = Arc::clone(&pool.members()[1]);
+        parked.park("hub-x".into());
+        pool.cancel.cancel();
+        pool.revive();
+        assert!(Arc::ptr_eq(&pool.members()[1], &parked), "not replaced");
     }
 
     #[test]
