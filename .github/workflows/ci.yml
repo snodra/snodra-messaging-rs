@@ -76,6 +76,6 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: the server image the end-to-end tests need
         run: |
-          docker pull "snodra/snodra-server:${{ vars.SNODRA_SERVER_VERSION || '0.5.0' }}"
-          docker tag "snodra/snodra-server:${{ vars.SNODRA_SERVER_VERSION || '0.5.0' }}" snodra-server:dev
+          docker pull "snodra/snodra-server:${{ vars.SNODRA_SERVER_VERSION || '0.6.0' }}"
+          docker tag "snodra/snodra-server:${{ vars.SNODRA_SERVER_VERSION || '0.6.0' }}" snodra-server:dev
       - run: cargo test --workspace --all-features -- --test-threads=1
