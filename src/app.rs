@@ -67,6 +67,8 @@ const SUBSCRIPTION_END_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a graceful shutdown waits for the hubs to ack its empty registration (as
 /// snodra-messaging's `HubLifecycle.stop`).
 pub const DEREGISTER_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a shutdown waits for the handlers in flight, after the subscriptions ended.
+pub const HANDLER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a shutdown waits for the saga relay, the deadline scheduler and the sampler.
 const SAGA_STOP_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -348,30 +350,35 @@ impl SnodraMessaging {
 
     /// First registers no types with every hub and waits for their acks (at most
     /// [`DEREGISTER_TIMEOUT`]): each hub stops routing to this instance and hands the requests
-    /// it queued for it to the other instances at once (snodra-messaging's `HubLifecycle.stop`).
-    /// Then stops the saga relay (its sends in flight finish, bounded), the deadline scheduler
-    /// and the gauge sampler, drains in-flight handlers (bounded; their replies still go
-    /// through), completes the subscriptions served here with a `ReplyEnd` (best effort,
-    /// bounded), closes every hub stream (each hub drops this instance at once), stops the
-    /// outbox publisher and the consumer. Pending outgoing requests fail with
-    /// `HubConnectionLost`.
+    /// it queued for it to the other instances at once. Then completes the subscriptions served
+    /// here with a `ReplyEnd` at once (their subscribers are told without waiting for a slow
+    /// handler), stops the saga relay (its sends in flight finish, bounded), the deadline
+    /// scheduler and the gauge sampler, drains in-flight handlers (at most
+    /// [`HANDLER_DRAIN_TIMEOUT`]; their replies still go through), waits for the subscription ends
+    /// to be written (bounded), closes every hub stream (each hub drops this instance, after at
+    /// most 2 s for it to finish its side), stops the outbox publisher and the consumer. Pending
+    /// outgoing requests fail with `HubConnectionLost`.
     pub async fn shutdown(self) {
         if !self.hubs.deregister(DEREGISTER_TIMEOUT).await {
             tracing::debug!("not every hub confirmed the empty registration before shutdown");
         }
+        // Every subscription served here ends now; its end is written before the half-close.
+        let ends = futures::future::join_all(self.dispatcher.end_subscriptions());
         // The saga relay and the deadline scheduler first, while the hub and the consumer still
         // run: the relay's sends in flight finish (or are abandoned after 15 s, their leases
         // expire and another instance takes the sagas over).
         self.saga_cancel.cancel();
         stop_saga_tasks(self.saga_tasks, SAGA_STOP_TIMEOUT).await;
         self.handlers.close();
-        if tokio::time::timeout(Duration::from_secs(10), self.handlers.wait())
+        if tokio::time::timeout(HANDLER_DRAIN_TIMEOUT, self.handlers.wait())
             .await
             .is_err()
         {
-            tracing::warn!("handlers still running after 10 s, closing the hub stream anyway");
+            tracing::warn!(
+                "handlers still running after {} s, closing the hub stream anyway",
+                HANDLER_DRAIN_TIMEOUT.as_secs()
+            );
         }
-        let ends = futures::future::join_all(self.dispatcher.end_subscriptions());
         if tokio::time::timeout(SUBSCRIPTION_END_TIMEOUT, ends)
             .await
             .is_err()
