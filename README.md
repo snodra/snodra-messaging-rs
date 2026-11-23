@@ -79,8 +79,9 @@ or `perf` is the next patch. Anything else (`docs`, `test`, `chore`, `ci`, `refa
 
 All five crates share one version: `workspace.package.version` in `Cargo.toml`. CI checks that every
 crate packages at the new version. Then it commits `release: X.Y.Z` (`Cargo.toml`, `Cargo.lock` and
-the install lines of this README), tags `vX.Y.Z` and publishes the crates to crates.io, core first,
-and the GitHub release. Pull before you push: `main` then carries that commit.
+the install lines of this README) and tags `vX.Y.Z`. The release workflow builds the tagged crates
+once more, publishes them to crates.io in dependency order (core first), and then creates the GitHub
+release. Pull before you push: `main` then carries that commit.
 
 - Below 1.0.0, any `type!:` subject and any line starting `BREAKING CHANGE:` in a message count as a
   minor, never a major. 1.0.0 is declared by hand.
