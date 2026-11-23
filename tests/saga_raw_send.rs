@@ -435,7 +435,7 @@ async fn the_retry_policy_of_a_raw_send_is_none() {
         .send_command(&Ping { text: "x".into() }, SendOptions::default())
         .await
         .unwrap_err();
-    assert!(matches!(err, MessagingError::HandlerBusy(_)), "{err:?}");
+    assert!(matches!(err, MessagingError::HandlerBusy { .. }), "{err:?}");
     assert_eq!(hub.requests().await.len(), 3);
 
     // The relay owns the backoff and the attempt limit: one request per raw send.
@@ -495,7 +495,10 @@ fn the_retry_taxonomy_names_every_failure() {
         MessagingError::Timeout("t.Ping".into()),
         MessagingError::HandlerDisconnected("t.Ping".into()),
         MessagingError::HubConnectionLost("broken".into()),
-        MessagingError::HandlerBusy("t.Ping".into()),
+        MessagingError::HandlerBusy {
+            type_name: "t.Ping".into(),
+            reason: None,
+        },
         // Not a handler's answer: something unexpected in the sender or the store.
         MessagingError::Transport("tcp".into()),
         MessagingError::Storage("mongo".into()),

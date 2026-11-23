@@ -568,7 +568,7 @@ async fn resource_exhausted_maps_to_handler_busy() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, MessagingError::HandlerBusy(ref t) if t == "t.Ping"),
+        matches!(err, MessagingError::HandlerBusy { ref type_name, .. } if type_name == "t.Ping"),
         "{err:?}"
     );
     assert_eq!(

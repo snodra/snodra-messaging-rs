@@ -399,7 +399,7 @@ async fn an_owner_at_its_subscription_limit_fails_a_new_subscription_and_a_shutd
         }
     };
     assert!(
-        matches!(error, MessagingError::HandlerBusy(ref t) if t == "e2e.Prices"),
+        matches!(error, MessagingError::HandlerBusy { ref type_name, .. } if type_name == "e2e.Prices"),
         "{error:?}"
     );
     eventually("o1 holds only the first one again", async || {

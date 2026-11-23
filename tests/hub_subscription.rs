@@ -1773,7 +1773,16 @@ async fn a_consumer_further_behind_than_the_hubs_buffer_loses_the_subscription_a
         "the buffered updates are dropped with it: {got:?}"
     );
     assert!(
-        matches!(error, Some(MessagingError::HandlerBusy(ref t)) if t == "t.Prices"),
+        matches!(error, Some(MessagingError::HandlerBusy { ref type_name, .. }) if type_name == "t.Prices"),
+        "{error:?}"
+    );
+    // A subscription's RESOURCE_EXHAUSTED keeps the hub's reason.
+    assert!(
+        error
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .starts_with("Handler for 't.Prices' is busy: subscriber buffer ("),
         "{error:?}"
     );
     eventually("every target cancelled", async || {

@@ -155,7 +155,10 @@ async fn app(config: Config, ran: &Arc<Ran>, meter: Option<&TestMeter>) -> Snodr
             async move {
                 match fail.how.as_str() {
                     "panic" => panic!("boom"),
-                    "busy" => Err(MessagingError::HandlerBusy("full".into())),
+                    "busy" => Err(MessagingError::HandlerBusy {
+                        type_name: "full".into(),
+                        reason: None,
+                    }),
                     _ => Err(MessagingError::Storage("disk gone".into())),
                 }
             }

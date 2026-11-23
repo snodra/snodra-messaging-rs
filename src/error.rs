@@ -12,8 +12,13 @@ pub enum MessagingError {
     HandlerDisconnected(String),
     /// Hub code RESOURCE_EXHAUSTED: the hub's queue or session buffer for the target instance is
     /// full (flow control). The handler never saw the request; a retry after a backoff is safe.
-    #[error("Handler for '{0}' is busy")]
-    HandlerBusy(String),
+    /// `reason` is the hub's own for a subscription (a subscriber buffer overflow, an instance's
+    /// subscription limit); `None` reads "its hub queue or session buffer is full".
+    #[error("Handler for '{type_name}' is busy: {}", reason.as_deref().unwrap_or("its hub queue or session buffer is full"))]
+    HandlerBusy {
+        type_name: String,
+        reason: Option<String>,
+    },
     #[error("{message}")]
     RemoteHandler {
         type_name: String,
@@ -64,8 +69,30 @@ pub enum MessagingError {
 }
 
 impl MessagingError {
-    /// Maps a hub `Error` to the exception a caller gets, exactly as `HubErrors.kt`.
+    /// Maps a hub `Error` to the exception a caller gets, as the reference library does.
     pub fn from_hub(type_name: &str, code: i32, message: &str, details: &[u8]) -> Self {
+        Self::from_wire(type_name, code, message, details, false)
+    }
+
+    /// [`from_hub`](Self::from_hub) for the answers of a subscription, whose
+    /// `RESOURCE_EXHAUSTED` says why (a subscriber buffer overflow, an instance's subscription
+    /// limit): that reason is kept.
+    pub fn from_hub_subscription(
+        type_name: &str,
+        code: i32,
+        message: &str,
+        details: &[u8],
+    ) -> Self {
+        Self::from_wire(type_name, code, message, details, true)
+    }
+
+    fn from_wire(
+        type_name: &str,
+        code: i32,
+        message: &str,
+        details: &[u8],
+        subscription: bool,
+    ) -> Self {
         match ErrorCode::try_from(code).unwrap_or(ErrorCode::Unspecified) {
             ErrorCode::NoHandler => Self::NoHandler(type_name.to_string()),
             ErrorCode::Timeout => Self::Timeout(type_name.to_string()),
@@ -73,9 +100,16 @@ impl MessagingError {
             ErrorCode::Unauthenticated => Self::Unauthenticated(message.to_string()),
             ErrorCode::InvalidRequest => Self::InvalidMessage(message.to_string()),
             ErrorCode::PermissionDenied => Self::AccessDenied(message.to_string()),
-            ErrorCode::ResourceExhausted => Self::HandlerBusy(type_name.to_string()),
-            // The hub ended a streaming query.
-            ErrorCode::Cancelled => Self::Cancelled(format!("'{type_name}': {message}")),
+            ErrorCode::ResourceExhausted => Self::HandlerBusy {
+                type_name: type_name.to_string(),
+                reason: Some(message.to_string()).filter(|m| subscription && !m.is_empty()),
+            },
+            // The hub ended a streaming query: its message as it is.
+            ErrorCode::Cancelled => Self::Cancelled(if message.is_empty() {
+                "cancelled by the hub".to_string()
+            } else {
+                message.to_string()
+            }),
             ErrorCode::HandlerError | ErrorCode::Unspecified => Self::RemoteHandler {
                 type_name: type_name.to_string(),
                 message: message.to_string(),
@@ -102,7 +136,7 @@ impl MessagingError {
             Self::NoHandler(_) => "NoHandler",
             Self::Timeout(_) => "Timeout",
             Self::HandlerDisconnected(_) => "HandlerDisconnected",
-            Self::HandlerBusy(_) => "HandlerBusy",
+            Self::HandlerBusy { .. } => "HandlerBusy",
             Self::RemoteHandler { .. } => "RemoteHandler",
             Self::Unauthenticated(_) => "Unauthenticated",
             Self::AccessDenied(_) => "AccessDenied",
@@ -183,12 +217,39 @@ mod tests {
             b"",
         );
         assert!(
-            matches!(e, MessagingError::HandlerBusy(ref t) if t == "t.X"),
+            matches!(e, MessagingError::HandlerBusy { ref type_name, reason: None } if type_name == "t.X"),
             "{e:?}"
         );
-        assert_eq!(e.to_string(), "Handler for 't.X' is busy");
+        assert_eq!(
+            e.to_string(),
+            "Handler for 't.X' is busy: its hub queue or session buffer is full"
+        );
         // A handler that returns it itself answers HANDLER_ERROR like any other failure.
         assert_eq!(e.to_reply_code(), ErrorCode::HandlerError);
+    }
+
+    #[test]
+    fn a_subscriptions_resource_exhausted_keeps_the_hubs_reason() {
+        let e = MessagingError::from_hub_subscription(
+            "t.X",
+            ErrorCode::ResourceExhausted as i32,
+            "subscription limit (2) reached",
+            b"",
+        );
+        assert_eq!(
+            e.to_string(),
+            "Handler for 't.X' is busy: subscription limit (2) reached"
+        );
+        let bare = MessagingError::from_hub_subscription(
+            "t.X",
+            ErrorCode::ResourceExhausted as i32,
+            "",
+            b"",
+        );
+        assert_eq!(
+            bare.to_string(),
+            "Handler for 't.X' is busy: its hub queue or session buffer is full"
+        );
     }
 
     #[test]
@@ -200,7 +261,12 @@ mod tests {
             b"",
         );
         assert!(matches!(e, MessagingError::Cancelled(_)), "{e:?}");
-        assert!(e.to_string().contains("max stream duration"), "{e}");
+        // The hub's message as it is, with no type prefix; a bare cancel says who cancelled.
+        assert_eq!(e.to_string(), "max stream duration (10m) exceeded");
+        assert_eq!(
+            MessagingError::from_hub("t.X", ErrorCode::Cancelled as i32, "", b"").to_string(),
+            "cancelled by the hub"
+        );
         assert!(!crate::retry::is_retryable(
             crate::proto::RequestKind::Query,
             &e

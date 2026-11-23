@@ -101,7 +101,7 @@ pub fn is_retryable(kind: RequestKind, error: &MessagingError) -> bool {
     match error {
         MessagingError::HubUnavailable(_)
         | MessagingError::NoHandler(_)
-        | MessagingError::HandlerBusy(_) => true,
+        | MessagingError::HandlerBusy { .. } => true,
         MessagingError::HandlerDisconnected(_)
         | MessagingError::Timeout(_)
         | MessagingError::HubConnectionLost(_) => kind == RequestKind::Query,
@@ -163,7 +163,14 @@ mod tests {
         vec![
             (MessagingError::HubUnavailable("x".into()), true, true),
             (MessagingError::NoHandler("t".into()), true, true),
-            (MessagingError::HandlerBusy("t".into()), true, true),
+            (
+                MessagingError::HandlerBusy {
+                    type_name: "t".into(),
+                    reason: None,
+                },
+                true,
+                true,
+            ),
             (MessagingError::HandlerDisconnected("t".into()), false, true),
             (MessagingError::Timeout("t".into()), false, true),
             (MessagingError::HubConnectionLost("x".into()), false, true),

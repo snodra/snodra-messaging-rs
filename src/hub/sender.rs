@@ -756,7 +756,12 @@ impl Streaming<'_> {
                     return match end.error {
                         Some(e) => {
                             tracing::debug!(request = %self.id, code = e.code, "{} ended by the hub: {}", self.call.mode().1, e.message);
-                            Some(Err(MessagingError::from_hub(
+                            let map = if self.call.subscription {
+                                MessagingError::from_hub_subscription
+                            } else {
+                                MessagingError::from_hub
+                            };
+                            Some(Err(map(
                                 self.call.type_name,
                                 e.code,
                                 &e.message,
@@ -896,6 +901,8 @@ struct Entry {
     /// The stream the request was written to.
     stream: StreamId,
     waiter: Waiter,
+    /// A subscription: its `RESOURCE_EXHAUSTED` keeps the hub's reason.
+    subscription: bool,
 }
 
 /// The `CommandBus`/`QueryBus` of the Rust side. Replies arrive through [`Sender::on_inbound`].
@@ -1117,10 +1124,18 @@ impl Sender {
             }
             Inbound::Error(e) => {
                 if let Some(Entry {
-                    type_name, waiter, ..
+                    type_name,
+                    waiter,
+                    subscription,
+                    ..
                 }) = self.take(&e.request_id)
                 {
-                    waiter.finish(Outcome::Done(Err(MessagingError::from_hub(
+                    let map = if subscription {
+                        MessagingError::from_hub_subscription
+                    } else {
+                        MessagingError::from_hub
+                    };
+                    waiter.finish(Outcome::Done(Err(map(
                         &type_name, e.code, &e.message, &e.details,
                     ))));
                 }
@@ -1696,6 +1711,7 @@ impl Sender {
                         type_name: call.type_name.to_string(),
                         stream,
                         waiter: Waiter::Stream(tx),
+                        subscription: call.subscription,
                     },
                 );
                 let request = proto::Request {
@@ -1814,6 +1830,7 @@ impl Sender {
                         type_name: call.type_name.to_string(),
                         stream,
                         waiter: Waiter::Scatter(tx),
+                        subscription: false,
                     },
                 );
                 let request = proto::Request {
@@ -1931,6 +1948,7 @@ impl Sender {
                             type_name: type_name.to_string(),
                             stream,
                             waiter: Waiter::Unary(tx),
+                            subscription: false,
                         },
                     );
                     let request = proto::Request {
@@ -2196,6 +2214,7 @@ mod tests {
                 type_name: "t.X".into(),
                 stream: 7,
                 waiter,
+                subscription: false,
             },
         );
     }

@@ -120,7 +120,7 @@ pub fn request_outcome(result: Result<(), &MessagingError>) -> &'static str {
         MessagingError::NoHandler(_) => "no_handler",
         MessagingError::Timeout(_) => "timeout",
         MessagingError::HandlerDisconnected(_) => "handler_disconnected",
-        MessagingError::HandlerBusy(_) => "resource_exhausted",
+        MessagingError::HandlerBusy { .. } => "resource_exhausted",
         MessagingError::RemoteHandler { .. }
         | MessagingError::RetryableExternal(_)
         | MessagingError::UnknownOutcome(_) => "handler_error",
@@ -387,7 +387,10 @@ mod tests {
     fn every_error_has_a_bounded_outcome() {
         assert_eq!(request_outcome(Ok(())), "ok");
         assert_eq!(
-            request_outcome(Err(&MessagingError::HandlerBusy("t".into()))),
+            request_outcome(Err(&MessagingError::HandlerBusy {
+                type_name: "t".into(),
+                reason: None
+            })),
             "resource_exhausted"
         );
         assert_eq!(

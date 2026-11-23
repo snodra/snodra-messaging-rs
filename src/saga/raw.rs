@@ -48,7 +48,7 @@ pub fn classify_failure(error: &MessagingError) -> RawOutcome {
         | MessagingError::Timeout(_)
         | MessagingError::HandlerDisconnected(_)
         | MessagingError::HubConnectionLost(_)
-        | MessagingError::HandlerBusy(_)
+        | MessagingError::HandlerBusy { .. }
         | MessagingError::Transport(_)
         | MessagingError::Storage(_) => RawOutcome::Transient(message),
         MessagingError::NoHandler(_) => RawOutcome::Permanent(FailureReason::NoHandler, message),

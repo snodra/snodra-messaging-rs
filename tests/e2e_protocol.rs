@@ -776,7 +776,7 @@ async fn a_full_queue_is_handler_busy_and_a_retried_command_gets_through() {
         )
         .await;
     assert!(
-        matches!(busy, Err(MessagingError::HandlerBusy(ref t)) if t == "flow.Rec"),
+        matches!(busy, Err(MessagingError::HandlerBusy { ref type_name, .. }) if type_name == "flow.Rec"),
         "{busy:?}"
     );
 
