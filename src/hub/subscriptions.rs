@@ -92,6 +92,15 @@ pub(crate) struct Subscriptions {
     open: Mutex<HashMap<String, Open>>,
 }
 
+/// Why a subscription was not registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refused {
+    /// A subscription with that id is open here already.
+    AlreadyOpen,
+    /// The instance serves this many subscriptions already.
+    Limit(usize),
+}
+
 impl Subscriptions {
     pub(crate) fn new(max: usize) -> Subscriptions {
         Subscriptions {
@@ -121,9 +130,9 @@ impl Subscriptions {
     }
 
     /// Registers subscription `id` of `type_name` with its decoded `query`, its parts and end to
-    /// go to `reply_to`, pending its admission. `Err(max)` when the instance already serves
-    /// `max` subscriptions (nothing registered). A second registration of the same id replaces
-    /// (and stops) the first.
+    /// go to `reply_to`, pending its admission. Nothing is registered when `id` is already open
+    /// here ([`Refused::AlreadyOpen`]: the open one is kept) or the instance already serves its
+    /// limit ([`Refused::Limit`]).
     ///
     /// The pump is started at once but writes nothing until the [`Admission`] is decided: what
     /// matching emits send meanwhile is queued, in order, and goes out first once it is
@@ -137,11 +146,14 @@ impl Subscriptions {
         query: Box<dyn Any + Send + Sync>,
         payload: Vec<u8>,
         reply_to: ReplyTo,
-    ) -> Result<Admission, usize> {
+    ) -> Result<Admission, Refused> {
         let mut open = self.lock();
+        if open.contains_key(id) {
+            return Err(Refused::AlreadyOpen);
+        }
         let max = self.max();
-        if open.len() >= max && !open.contains_key(id) {
-            return Err(max);
+        if open.len() >= max {
+            return Err(Refused::Limit(max));
         }
         let serial = self.serials.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
@@ -158,7 +170,7 @@ impl Subscriptions {
             rx,
             verdict,
         ));
-        let replaced = open.insert(
+        open.insert(
             id.to_string(),
             Open {
                 serial,
@@ -172,13 +184,6 @@ impl Subscriptions {
                 pump,
             },
         );
-        if let Some(old) = replaced {
-            tracing::debug!(
-                request = id,
-                "subscription registered again: the first one is dropped"
-            );
-            old.cancel.cancel();
-        }
         Ok(Admission {
             subscriptions: Arc::clone(self),
             id: id.to_string(),

@@ -27,7 +27,7 @@ use super::connection::{ReplyTo, StreamId};
 use super::registry::SubscriptionHandler;
 use super::registry::{HandlerRegistry, Invocation, ItemStream};
 use super::subscriptions::{
-    Admission, DEFAULT_MAX_SUBSCRIPTIONS, QueryUpdateEmitter, Subscriptions,
+    Admission, DEFAULT_MAX_SUBSCRIPTIONS, QueryUpdateEmitter, Refused, Subscriptions,
 };
 
 /// How the hub reaches a running request: its cancel token and, for a stream, its credits.
@@ -114,6 +114,8 @@ enum Flaw {
     Decode(MessagingError),
     /// The instance serves its limit already.
     Limit(usize),
+    /// A subscription with this id is open here already.
+    AlreadyOpen,
 }
 
 impl Dispatcher {
@@ -548,7 +550,8 @@ impl Dispatcher {
                 admission: Some(admission),
                 flaw: Flaw::None,
             },
-            Err(max) => flawed(Flaw::Limit(max)),
+            Err(Refused::Limit(max)) => flawed(Flaw::Limit(max)),
+            Err(Refused::AlreadyOpen) => flawed(Flaw::AlreadyOpen),
         }
     }
 
@@ -623,10 +626,14 @@ impl Dispatcher {
         if let Flaw::Lookup(e) = flaw {
             return Err(e.into());
         }
+        let request_id = req.id.clone();
         let (_ctx, _payload) = self.context(req, identity)?;
         match flaw {
             Flaw::Decode(e) => Err(e.into()),
             Flaw::Limit(max) => Err(Rejected::Limit(max)),
+            Flaw::AlreadyOpen => Err(Rejected::Error(MessagingError::InvalidMessage(format!(
+                "subscription {request_id} is already open"
+            )))),
             Flaw::Lookup(_) | Flaw::None => Ok(()),
         }
     }

@@ -1142,6 +1142,47 @@ async fn the_per_instance_limit_refuses_new_subscriptions_with_resource_exhauste
     a.shutdown().await;
 }
 
+/// A subscription request whose id is already open here is refused with `INVALID_REQUEST`; the
+/// open one is kept and still served.
+#[tokio::test]
+async fn a_subscription_id_already_open_is_refused_and_the_open_one_kept() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let a = node_with(
+        &hub.address(),
+        "svc-a",
+        "a1",
+        registry("a1", &probe),
+        4,
+        SenderSettings::default(),
+        None,
+    )
+    .await;
+    hub.send_to_clients(subscribed("d#1", &prices("acme")))
+        .await;
+    eventually("registered", async || a.emitter.open_subscriptions() == 1).await;
+    hub.send_to_clients(subscribed("d#1", &prices("other")))
+        .await;
+    eventually("the second refused", async || hub.ends().len() == 1).await;
+    let (_, end) = &hub.ends()[0];
+    assert_eq!(end.request_id, "d#1");
+    assert_eq!(end_code(end), Some(ErrorCode::InvalidRequest));
+    assert_eq!(end_message(end), "subscription d#1 is already open");
+    assert_eq!(a.emitter.open_subscriptions(), 1);
+    // The open one still matches its own query, not the refused one's.
+    a.emitter
+        .emit::<Prices>(|q| q.symbol == "other", &tick("other", 1));
+    a.emitter
+        .emit::<Prices>(|q| q.symbol == "acme", &tick("acme", 2));
+    eventually("the open one's update", async || !hub.parts().is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let parts = hub.parts();
+    assert_eq!(parts.len(), 1, "{parts:?}");
+    let update: Tick = serde_json::from_slice(&parts[0].1.payload).unwrap();
+    assert_eq!(update, tick("acme", 2));
+    a.shutdown().await;
+}
+
 /// A node whose subscription requests wait at `gate` before their identity check.
 async fn gated_owner(hub: &FakeHub, gate: &Gate, max_subscriptions: Option<usize>) -> Node {
     node_wired(
