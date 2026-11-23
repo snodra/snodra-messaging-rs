@@ -70,6 +70,30 @@ The Kotlin counterpart is [`snodra-messaging`](https://github.com/snodra/snodra-
 
 Branches off `main`, conventional commits, a pull request with a green workflow.
 
+## Releases
+
+Versions are cut by CI from the commit types. Never push a tag. When the checks pass on a push to
+`main`, the subjects since the last `v*` tag decide. Any `feat` is the next minor. Otherwise any `fix`
+or `perf` is the next patch. Anything else (`docs`, `test`, `chore`, `ci`, `refactor`, `build`,
+`style`) releases nothing.
+
+All five crates share one version: `workspace.package.version` in `Cargo.toml`. CI checks that every
+crate packages at the new version. Then it commits `release: X.Y.Z` (`Cargo.toml`, `Cargo.lock` and
+the install lines of this README), tags `vX.Y.Z` and publishes the crates to crates.io, core first,
+and the GitHub release. Pull before you push: `main` then carries that commit.
+
+- Below 1.0.0, any `type!:` subject and any line starting `BREAKING CHANGE:` in a message count as a
+  minor, never a major. 1.0.0 is declared by hand.
+- A revert (`Revert "feat: ..."`, `revert:`) is not a release reason. The reverted change stays in the
+  last published version until the next `feat`, `fix` or `perf`.
+- Only tags shaped `vN.N.N` count. The highest one reachable from `main` is the last release.
+- `scripts/next-version.sh` holds the rule. `for t in scripts/*.test.sh; do sh "$t"; done` tests it.
+
+If a release fails halfway (the tag exists, some crates are not published), use **Re-run failed jobs**
+on that run. Every step is safe to repeat: a crate already on crates.io is skipped. Or run the
+`release` workflow by hand with the existing tag. **Re-run all jobs** on a run that released does
+nothing, because `main` has moved to its release commit.
+
 ## License
 
 [Apache-2.0](LICENSE) © 2026 Guilherme D'Amoreira.
