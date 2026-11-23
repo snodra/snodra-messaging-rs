@@ -1311,3 +1311,143 @@ async fn instance_status_goes_out_at_once_when_the_live_hubs_change() {
     .await;
     c.shutdown().await;
 }
+
+#[derive(Serialize, Deserialize)]
+struct BlobFind {
+    data: String,
+}
+message_type!(BlobFind, "t.BlobFind");
+impl Query for BlobFind {
+    type Reply = ();
+}
+
+#[derive(Serialize, Deserialize)]
+struct BlobRows {
+    data: String,
+}
+message_type!(BlobRows, "t.BlobRows");
+impl snodra_messaging::StreamingQuery for BlobRows {
+    type Item = ();
+}
+
+#[derive(Serialize, Deserialize)]
+struct BlobWatch {
+    data: String,
+}
+message_type!(BlobWatch, "t.BlobWatch");
+impl snodra_messaging::SubscriptionQuery for BlobWatch {
+    type Initial = ();
+    type Update = ();
+}
+
+/// What kind of call [`no_move_after_the_timeout`] makes.
+#[derive(Clone, Copy, Debug)]
+enum Call {
+    Gather,
+    Stream,
+    Subscribe,
+}
+
+/// Scatter-gather, streaming and subscription requests follow the unary rule: once the caller's
+/// timeout has passed no new hop starts, so a request still buffered for a hub whose stream is
+/// lost fails as never sent instead of moving to the other hub. These calls are unkeyed (round
+/// robin): the ones the other hub got at once are counted first, and that count must not grow.
+async fn no_move_after_the_timeout(kind: Call) {
+    let a = FakeHub::start_with_id("hub-a").await;
+    let b = answering("hub-b").await;
+    let c = client(settings(addresses(&[&a, &b]))).await;
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    a.set_stall_reads(true);
+    let timeout = Some(Duration::from_millis(300));
+    let calls: Vec<_> = (0..40)
+        .map(|_| {
+            let sender = Arc::clone(&c.sender);
+            let data = "x".repeat(256 * 1024);
+            tokio::spawn(async move {
+                match kind {
+                    Call::Gather => sender
+                        .scatter_gather(
+                            &BlobFind { data },
+                            snodra_messaging::hub::ScatterOptions {
+                                timeout,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                    Call::Stream => {
+                        let options = snodra_messaging::StreamOptions {
+                            timeout,
+                            ..Default::default()
+                        };
+                        match sender.stream_owned(&BlobRows { data }, options).await {
+                            Ok(mut rows) => {
+                                use futures::StreamExt;
+                                match rows.next().await {
+                                    Some(Err(e)) => Err(e),
+                                    _ => Ok(()),
+                                }
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Call::Subscribe => sender
+                        .subscribe(
+                            &BlobWatch { data },
+                            snodra_messaging::SubscriptionOptions {
+                                timeout,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                }
+            })
+        })
+        .collect();
+    // Hub-b reads its share (it takes a while in a debug build); then every call's 300 ms is
+    // long past.
+    let mut on_b = 0;
+    let settle = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let now = b.requests().await.len();
+        if now > 0 && now == on_b || tokio::time::Instant::now() > settle {
+            break;
+        }
+        on_b = now;
+    }
+    a.drop_streams();
+    let mut never_sent = 0;
+    for call in calls {
+        let ended = tokio::time::timeout(Duration::from_secs(10), call)
+            .await
+            .expect("every call ends")
+            .unwrap();
+        if let Err(MessagingError::HubUnavailable(_)) = ended {
+            never_sent += 1;
+        }
+    }
+    assert_eq!(
+        b.requests().await.len(),
+        on_b,
+        "{kind:?}: a request moved to hub-b after its timeout"
+    );
+    assert!(never_sent > 0, "{kind:?}: none was left buffered");
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn no_gather_moves_after_the_callers_timeout() {
+    no_move_after_the_timeout(Call::Gather).await;
+}
+
+#[tokio::test]
+async fn no_stream_moves_after_the_callers_timeout() {
+    no_move_after_the_timeout(Call::Stream).await;
+}
+
+#[tokio::test]
+async fn no_subscription_moves_after_the_callers_timeout() {
+    no_move_after_the_timeout(Call::Subscribe).await;
+}
