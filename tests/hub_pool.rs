@@ -14,7 +14,7 @@ use snodra_messaging::hub::{
 };
 use snodra_messaging::proto::{self, ServerMessage, reply, server_message};
 use snodra_messaging::{Command, MessagingError, Query, RetryPolicy, message_type};
-use support::fake_hub::{Event, FakeHub};
+use support::fake_hub::{Event, FakeHub, default_ack};
 use tokio::sync::mpsc;
 
 #[derive(Serialize, Deserialize)]
@@ -596,6 +596,123 @@ async fn two_addresses_of_one_hub_keep_one_connection() {
     }
     let (na, nb) = (a.requests().await.len(), b.requests().await.len());
     assert!(na == 4 && nb == 0 || na == 0 && nb == 4, "{na} / {nb}");
+    c.shutdown().await;
+}
+
+/// Of two hubs answering one id, the one whose address owns it (the other is parked).
+async fn owner_of<'h>(c: &Client, a: &'h FakeHub, b: &'h FakeHub) -> (&'h FakeHub, &'h FakeHub) {
+    eventually("one connection left to the shared id", async || {
+        a.connected_clients().await + b.connected_clients().await == 1
+            && c.pool.hub_ids() == ["hub-x"]
+    })
+    .await;
+    if a.connected_clients().await == 1 {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Makes `hub` answer `id` from its next stream on, and ends its streams (a restarted hub).
+fn renamed(hub: &FakeHub, id: &str) {
+    hub.set_ack(Some(proto::RegisterAck {
+        hub_id: id.into(),
+        ..default_ack()
+    }));
+    hub.drop_streams();
+}
+
+/// A parked address is connected again once the address that owns its hub id answers another id
+/// (its hub was replaced): the id is free, and the parked address reaches it.
+#[tokio::test]
+async fn a_parked_address_is_connected_again_once_its_owner_answers_another_hub_id() {
+    let (a, b) = (answering("hub-x").await, answering("hub-x").await);
+    let c = client(settings(addresses(&[&a, &b]))).await;
+    let (owner, parked) = owner_of(&c, &a, &b).await;
+    let parked_streams = parked.streams();
+    renamed(owner, "hub-y");
+    eventually("both ids live, each on one address", async || {
+        let mut ids = c.pool.hub_ids();
+        ids.sort();
+        ids == ["hub-x", "hub-y"]
+            && owner.connected_clients().await == 1
+            && parked.connected_clients().await == 1
+    })
+    .await;
+    assert_eq!(
+        parked.streams(),
+        parked_streams + 1,
+        "the parked address reconnected once"
+    );
+    c.shutdown().await;
+}
+
+/// With `dns:///`, a parked address is connected again once its owner's address is no longer
+/// resolved: the owner drains, the parked address takes the hub over.
+#[tokio::test]
+async fn a_parked_address_is_connected_again_once_its_owner_leaves_dns() {
+    let (a, b) = (answering("hub-x").await, answering("hub-x").await);
+    let resolved: Resolved = Arc::new(Mutex::new(vec![a.addr, b.addr]));
+    let c = client_with(
+        HubSettings {
+            dns_refresh: Duration::from_millis(50),
+            ..settings("dns:///hubs.test:7000".into())
+        },
+        |pool| {
+            let resolved = Arc::clone(&resolved);
+            pool.set_resolver(Arc::new(move |_, _| {
+                let addrs = resolved.lock().unwrap().clone();
+                Box::pin(async move { Ok(addrs) })
+            }));
+        },
+    )
+    .await;
+    let (owner, parked) = owner_of(&c, &a, &b).await;
+    *resolved.lock().unwrap() = vec![parked.addr];
+    eventually("the parked address took the hub over", async || {
+        c.pool.hub_ids() == ["hub-x"]
+            && parked.connected_clients().await == 1
+            && owner.connected_clients().await == 0
+    })
+    .await;
+    c.sender
+        .send_command(&Ping {}, SendOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(parked.requests().await.len(), 1);
+    c.shutdown().await;
+}
+
+/// The owner of an id can itself become a duplicate (its hub now answers an id another address
+/// owns): it is parked, and the id it gave up goes to the address parked behind it.
+#[tokio::test]
+async fn an_id_given_up_by_an_owner_that_became_a_duplicate_goes_to_the_address_parked_behind_it() {
+    let (a, b, y) = (
+        answering("hub-x").await,
+        answering("hub-x").await,
+        answering("hub-y").await,
+    );
+    let c = client(settings(addresses(&[&a, &b, &y]))).await;
+    eventually("hub-x and hub-y live", async || {
+        a.connected_clients().await + b.connected_clients().await == 1
+            && c.pool.hub_ids().len() == 2
+    })
+    .await;
+    let (owner, parked) = if a.connected_clients().await == 1 {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    renamed(owner, "hub-y");
+    eventually("hub-x through the other address, hub-y once", async || {
+        let mut ids = c.pool.hub_ids();
+        ids.sort();
+        ids == ["hub-x", "hub-y"]
+            && parked.connected_clients().await == 1
+            && owner.connected_clients().await == 0
+            && y.connected_clients().await == 1
+    })
+    .await;
     c.shutdown().await;
 }
 

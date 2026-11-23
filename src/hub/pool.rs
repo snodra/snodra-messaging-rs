@@ -6,10 +6,15 @@
 //! `Register`, and all feeding one inbound channel (replies go on the arrival stream).
 //!
 //! - **Dedupe.** Two targets whose acks carry the same `hub_id` are one hub: the connection
-//!   acknowledged first keeps it, the other is closed for good (logged once). A hub has no say in
-//!   this: its second `Register` already replaced the first stream's session, so that stream is
-//!   ended by the hub and reconnects, once. An empty `RegisterAck.hub_id` (a real hub always
-//!   names itself) stands for the target as `host:port` (prefix stripped).
+//!   acknowledged first owns the id for as long as it is kept (live or reconnecting), the other is
+//!   closed and parked (logged once): no stream, out of the routing, the status reports and the
+//!   permit split. A hub has no say in this: its second `Register` already replaced the first
+//!   stream's session, so that stream is ended by the hub and reconnects, once. A parked target is
+//!   connected again once its owner is gone: its address is no longer resolved (it drains), or it
+//!   answers another hub id (also when that makes the owner itself a parked duplicate of another
+//!   id). With `dns:///` a parked target that is no longer resolved is dropped. An empty
+//!   `RegisterAck.hub_id` (a real hub always names itself) stands for the target as `host:port`
+//!   (prefix stripped).
 //! - **Routing.** An unkeyed request goes round-robin over the hubs whose stream is handshaken
 //!   (reconnecting ones are skipped); a keyed one to the live hub with the highest
 //!   [`rendezvous_score`](super::rendezvous_score) for `(hub_id, routing key)`. A request that
@@ -133,7 +138,8 @@ pub(crate) enum Consumers {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
     Active,
-    /// Its hub is reached by another connection; closed for good.
+    /// Its hub is reached by another connection: closed and parked ([`Member::parked`]), connected
+    /// again (a new member at its address) once that connection is gone.
     Duplicate,
     /// Its address vanished from DNS; out of the routing, closed once idle.
     Draining,
@@ -145,9 +151,38 @@ enum Role {
 struct Member {
     conn: Arc<HubConnection>,
     role: Mutex<Role>,
+    /// A [`Role::Duplicate`]: the hub id it answered, owned by another connection.
+    parked: Mutex<Option<String>>,
 }
 
 impl Member {
+    fn new(conn: Arc<HubConnection>) -> Member {
+        Member {
+            conn,
+            role: Mutex::new(Role::Active),
+            parked: Mutex::new(None),
+        }
+    }
+
+    /// Closed and parked behind `hub_id`, which another connection owns.
+    fn park(&self, hub_id: String) {
+        *self.parked.lock().unwrap() = Some(hub_id);
+        self.set_role(Role::Duplicate);
+    }
+
+    /// The hub id a parked member waits for; `None` unless it is parked.
+    fn parked_behind(&self) -> Option<String> {
+        if self.role() != Role::Duplicate {
+            return None;
+        }
+        self.parked.lock().unwrap().clone()
+    }
+
+    /// Kept by the pool: routed to (or about to be again), owning the hub id it answered.
+    fn kept(&self) -> bool {
+        matches!(self.role(), Role::Active | Role::Rolling)
+    }
+
     fn role(&self) -> Role {
         *self.role.lock().unwrap()
     }
@@ -276,10 +311,10 @@ impl HubPool {
             tx,
             true,
         );
-        pool.members.lock().unwrap().push(Arc::new(Member {
-            conn,
-            role: Mutex::new(Role::Active),
-        }));
+        pool.members
+            .lock()
+            .unwrap()
+            .push(Arc::new(Member::new(conn)));
         Arc::new(pool)
     }
 
@@ -822,6 +857,16 @@ impl HubPool {
     }
 
     fn add(self: &Arc<Self>, address: String) -> Arc<Member> {
+        let member = self.member(address);
+        self.members.lock().unwrap().push(Arc::clone(&member));
+        if self.started.load(Ordering::SeqCst) {
+            member.conn.start();
+        }
+        member
+    }
+
+    /// A new member for `address`, not started and not in [`members`](Self::members) yet.
+    fn member(self: &Arc<Self>, address: String) -> Arc<Member> {
         let mut settings = HubSettings {
             address: address.clone(),
             ..self.settings.clone()
@@ -870,15 +915,7 @@ impl HubPool {
             refreshes_sent: Arc::clone(&self.refreshes_sent),
             latest_rejection: Arc::clone(&self.latest_rejection),
         });
-        let member = Arc::new(Member {
-            conn,
-            role: Mutex::new(Role::Active),
-        });
-        self.members.lock().unwrap().push(Arc::clone(&member));
-        if self.started.load(Ordering::SeqCst) {
-            member.conn.start();
-        }
-        member
+        Arc::new(Member::new(conn))
     }
 
     /// `ceil(max / N)`, N = the hubs live now or still on their first connect attempt, the one at
@@ -919,31 +956,75 @@ impl HubPool {
     }
 
     /// The connection at `address` completed its handshake: it keeps its hub unless another
-    /// active connection reached the same hub id first.
-    fn accept(&self, address: &str, ack: &RegisterAck) -> bool {
+    /// kept connection reached the same hub id first; then it is parked (and its connection
+    /// closed by the caller). Either way an id this address gave up (it reaches another hub
+    /// than before) frees the addresses parked behind it.
+    fn accept(self: &Arc<Self>, address: &str, ack: &RegisterAck) -> bool {
         let hub_id = hub_id(ack, address);
-        let mut owners = self.owners.lock().unwrap();
-        // This connection may reach another hub than before (a restarted hub gets a new id).
-        owners.retain(|_, owner| owner != address);
-        let members = self.members();
-        let active = |a: &str| {
-            members
-                .iter()
-                .any(|m| m.address() == a && m.role() == Role::Active)
-        };
-        match owners.get(&hub_id) {
-            Some(owner) if active(owner) => {
-                tracing::warn!(service = %self.service_name, hub = %hub_id, address, kept = %owner, "two hub addresses reach the same hub; closing the second");
-                if let Some(m) = members.iter().find(|m| m.address() == address) {
-                    m.set_role(Role::Duplicate);
+        let (accepted, revived) = {
+            let mut owners = self.owners.lock().unwrap();
+            // This connection may reach another hub than before (a restarted hub gets a new id).
+            owners.retain(|_, owner| owner != address);
+            let members = self.members();
+            let kept = |a: &str| members.iter().any(|m| m.address() == a && m.kept());
+            let accepted = match owners.get(&hub_id) {
+                Some(owner) if kept(owner) => {
+                    tracing::warn!(service = %self.service_name, hub = %hub_id, address, kept = %owner, "two hub addresses reach the same hub; closing and parking the second");
+                    if let Some(m) = members.iter().find(|m| m.address() == address) {
+                        m.park(hub_id);
+                    }
+                    false
                 }
-                false
-            }
-            _ => {
-                owners.insert(hub_id, address.to_string());
-                true
-            }
+                _ => {
+                    owners.insert(hub_id, address.to_string());
+                    true
+                }
+            };
+            (accepted, self.revive_locked(&mut owners))
+        };
+        self.start_revived(revived);
+        accepted
+    }
+
+    /// Replaces every parked member whose hub id no kept connection owns any more (its owner left
+    /// DNS, or answers another id) with a new member at its address, in its place, and returns
+    /// them to start. Ownerships of connections no longer kept (draining) are dropped first.
+    /// Caller holds `owners` (taken before `members`).
+    fn revive_locked(self: &Arc<Self>, owners: &mut HashMap<String, String>) -> Vec<Arc<Member>> {
+        if self.cancel.is_cancelled() || !self.started.load(Ordering::SeqCst) {
+            return vec![];
         }
+        let mut members = self.members.lock().unwrap();
+        owners.retain(|_, owner| members.iter().any(|m| m.address() == owner && m.kept()));
+        let mut revived = Vec::new();
+        for slot in members.iter_mut() {
+            let Some(id) = slot.parked_behind() else {
+                continue;
+            };
+            if owners.contains_key(&id) {
+                continue;
+            }
+            let fresh = self.member(slot.address().to_string());
+            let parked = std::mem::replace(slot, Arc::clone(&fresh));
+            // Its connection was cancelled when it was parked; let it finish.
+            tokio::spawn(async move { parked.conn.shutdown().await });
+            revived.push(fresh);
+        }
+        revived
+    }
+
+    /// Starts the members [`revive_locked`](Self::revive_locked) put in place of parked ones.
+    fn start_revived(&self, revived: Vec<Arc<Member>>) {
+        for m in revived {
+            tracing::info!(service = %self.service_name, address = %m.address(), "the hub this address was parked behind has no other address any more; connecting again");
+            m.conn.start();
+        }
+    }
+
+    /// [`revive_locked`](Self::revive_locked) with the lock taken, then the start.
+    fn revive(self: &Arc<Self>) {
+        let revived = self.revive_locked(&mut self.owners.lock().unwrap());
+        self.start_revived(revived);
     }
 
     async fn status_loop(self: Arc<Self>) {
@@ -1022,6 +1103,15 @@ impl HubPool {
                 Some(m) => {
                     tracing::info!(service = %self.service_name, address, "hub address is back in DNS; kept");
                     m.set_role(Role::Active);
+                    // Its hub may be reached through another address meanwhile (a parked one
+                    // revived when this one drained): deduplicated as at a handshake.
+                    if let Some(ack) = m.conn.handshake()
+                        && !self.accept(&address, &ack)
+                    {
+                        let conn = Arc::clone(&m.conn);
+                        tokio::spawn(async move { conn.shutdown().await });
+                        continue;
+                    }
                     // Announce the types again (the drain had withdrawn them).
                     m.conn
                         .set_registered_types(self.types.lock().unwrap().clone());
@@ -1044,6 +1134,8 @@ impl HubPool {
                 self.drain(Arc::clone(m));
             }
         }
+        // An owner that drains frees its hub id for the addresses parked behind it.
+        self.revive();
         self.top_up();
     }
 
