@@ -877,8 +877,11 @@ async fn instance_status_goes_to_every_hub() {
     all_registered(&c, &["hub-a", "hub-b"]).await;
     a.send_to_clients(push_request("in-1")).await;
     eventually("a handler runs", async || c.held.lock().unwrap().len() == 1).await;
-    eventually("both hubs got reports", async || {
-        a.statuses().len() >= 2 && b.statuses().len() >= 2
+    // A report made while the handler runs (the ones sent at once when the hubs came up may
+    // precede it).
+    let (from_a, from_b) = (a.statuses().len(), b.statuses().len());
+    eventually("both hubs got a report since", async || {
+        a.statuses().len() > from_a && b.statuses().len() > from_b
     })
     .await;
     for hub in [&a, &b] {
