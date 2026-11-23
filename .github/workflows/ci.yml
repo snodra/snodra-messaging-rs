@@ -8,9 +8,16 @@ on:
 permissions:
   contents: read
 
+# A branch keeps only its newest run. On main the runs queue instead: a run that is releasing must
+# finish, and the next one then starts from the tag it pushed.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# bash -eo pipefail: a failing command inside a pipe fails the step.
+defaults:
+  run:
+    shell: bash
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,8 +26,10 @@ jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, 2026-11-23
         with:
           toolchain: "1.99.1"
           components: rustfmt
@@ -29,47 +38,54 @@ jobs:
   proto-sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: snodra/snodra-server
           ref: ${{ vars.SNODRA_SERVER_REF || 'main' }}
           path: server
+          persist-credentials: false
       - name: hub.proto must equal the server's
         run: SNODRA_PROTO_SYNC_REQUIRED=true SNODRA_PROTO_SOURCE="$GITHUB_WORKSPACE/server/proto/hub.proto" bash scripts/check-proto-sync.sh
 
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, 2026-11-23
         with:
           toolchain: "1.99.1"
           components: clippy
-      - uses: arduino/setup-protoc@v3
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           version: "29.3"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: librdkafka build dependencies
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev libsasl2-dev zlib1g-dev libzstd-dev
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, 2026-11-23
         with:
           toolchain: "1.99.1"
-      - uses: arduino/setup-protoc@v3
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           version: "29.3"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: librdkafka build dependencies
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev libsasl2-dev zlib1g-dev libzstd-dev
-      - uses: Swatinem/rust-cache@v2
-      - uses: docker/login-action@v3
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: docker.io
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -79,3 +95,168 @@ jobs:
           docker pull "snodra/snodra-server:${{ vars.SNODRA_SERVER_VERSION || '0.6.0' }}"
           docker tag "snodra/snodra-server:${{ vars.SNODRA_SERVER_VERSION || '0.6.0' }}" snodra-server:dev
       - run: cargo test --workspace --all-features -- --test-threads=1
+
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: for t in scripts/*.test.sh; do sh "$t" || exit 1; done
+
+  # Versions are cut here, from the Conventional Commit subjects since the last tag
+  # (scripts/next-version.sh): feat -> minor, fix/perf -> patch, anything else -> no release.
+  # Below 1.0.0 nothing computes a major; 1.0.0 is declared by hand.
+  #
+  # Three jobs: `version` computes the version, `package` checks that the bumped tree packages
+  # (it builds third-party code, so it gets no write token), and `push` writes the same bump,
+  # commits, tags and pushes. One version for every published crate.
+  version:
+    needs: [fmt, proto-sync, clippy, test, scripts]
+    # Pushes to main of this repository only: never a fork or a pull request, and never the
+    # release commit itself (a GITHUB_TOKEN push starts no workflow anyway).
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && github.repository_owner == 'snodra'
+      && !startsWith(github.event.head_commit.message, 'release:')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: next version
+        id: next
+        run: |
+          main=$(git ls-remote --exit-code origin refs/heads/main | cut -f1)
+          if [ "$main" != "$GITHUB_SHA" ]; then
+            echo "::notice::main is at $main, not $GITHUB_SHA: a newer push releases it, or this is a re-run of a run that released. Nothing to do. To finish a failed release, re-run its failed jobs or run the release workflow with the tag."
+            exit 0
+          fi
+          last=$(git tag --merged HEAD --list 'v*' | scripts/last-tag.sh)
+          range=${last:+$last..}HEAD
+          version=$(
+            { git log --format=%s "$range"
+              git log -E --grep='^BREAKING[ -]CHANGE:' --format='BREAKING CHANGE: %h' "$range"
+            } | scripts/next-version.sh "$last"
+          )
+          echo "last tag: ${last:-none}; next version: ${version:-none, no release}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  # The packaging check: the bumped tree must package before anything is pushed. crates.io is
+  # irreversible, and the release commit gets no CI run of its own.
+  package:
+    needs: version
+    if: needs.version.outputs.version != ''
+    runs-on: ubuntu-latest
+    outputs:
+      tree: ${{ steps.bump.outputs.tree }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, 2026-11-23
+        with:
+          toolchain: "1.99.1"
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "29.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: librdkafka build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev libsasl2-dev zlib1g-dev libzstd-dev
+
+      # The push job writes the same bump and checks that it gets this tree.
+      - name: bump
+        id: bump
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          scripts/bump-version.sh "$VERSION"
+          git add -u
+          echo "tree=$(git write-tree)" >> "$GITHUB_OUTPUT"
+          git diff --cached --stat
+
+      # The manifests and the lock agree (--locked) and every published crate has the version.
+      # Then every published crate is packaged and built as crates.io would get it: cargo puts the
+      # core in a local registry first, so the add-ons build against the new core version.
+      - name: the crates package at the new version
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          cargo metadata --locked --format-version 1 > "$RUNNER_TEMP/metadata.json"
+          jq -e --arg v "$VERSION" \
+            '[.packages[] | select(.source == null and .publish == null) | .version]
+             | length >= 5 and all(. == $v)' \
+            "$RUNNER_TEMP/metadata.json"
+          cargo publish --workspace --dry-run --locked
+
+  push:
+    needs: [version, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.push.outputs.tag }}
+    steps:
+      # Keeps its credentials: this job pushes. It runs no third-party action after this one and
+      # builds nothing.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: commit and tag
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TREE: ${{ needs.package.outputs.tree }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          scripts/bump-version.sh "$VERSION"
+          git add -u
+          if [ "$(git write-tree)" != "$TREE" ]; then
+            echo "::error::the bump differs from the tree the package job checked"
+            exit 1
+          fi
+          git commit -m "release: $VERSION"
+          git tag -a "v$VERSION" -m "${GITHUB_REPOSITORY#*/} v$VERSION"
+
+      - name: push
+        id: push
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          # Both or neither, and only as a fast-forward of the commit this run tested.
+          if ! git push --atomic origin HEAD:refs/heads/main "refs/tags/v$VERSION"; then
+            main=$(git ls-remote --exit-code origin refs/heads/main | cut -f1)
+            if [ "$main" = "$(git rev-parse HEAD)" ]; then
+              # The push landed and only the client saw an error: release it.
+              git ls-remote --exit-code origin "refs/tags/v$VERSION" >/dev/null \
+                || { echo "::error::main has the release commit but not v$VERSION"; exit 1; }
+              echo "::warning::git reported an error, but the release commit and v$VERSION are on the remote"
+            elif [ "$main" != "$GITHUB_SHA" ]; then
+              echo "::notice::main moved during the release; the run for the newer commit releases"
+              exit 0
+            else
+              echo "::error::the push to main was refused: check that github-actions may push to main"
+              exit 1
+            fi
+          fi
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+  # A tag pushed with GITHUB_TOKEN starts no workflow, so the release runs here.
+  release:
+    needs: push
+    if: needs.push.outputs.tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.push.outputs.tag }}
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

@@ -1,87 +1,167 @@
 name: release
 
+# CI calls this after it pushes a release tag (ci.yml, job `release`): a tag pushed with
+# GITHUB_TOKEN starts no workflow by itself. Run it by hand only to publish an existing tag again,
+# for example to finish a release that failed halfway; nobody pushes tags.
 on:
-  push:
-    tags: ["v*"]
+  workflow_call:
+    inputs:
+      tag:
+        description: The tag to release, for example v0.7.0
+        required: true
+        type: string
+    secrets:
+      CARGO_REGISTRY_TOKEN:
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: An existing tag to release again, for example v0.7.0
+        required: true
+        type: string
 
 permissions:
-  contents: write
+  contents: read
 
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
-
+# The input reaches the shells only through this variable, never written into a script.
 env:
   CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag }}
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
+  # Every other job needs this one: the tag must be a release version that already exists and the
+  # crates in its tree must carry that version, so a mistyped tag publishes nothing and creates no
+  # tag, and an old tag cannot publish crates under another version.
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      latest: ${{ steps.tag.outputs.latest }}
+    steps:
+      - name: the tag is vN.N.N
+        run: |
+          if ! [[ $TAG =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::the tag input is not a release tag of the form vN.N.N"
+            exit 1
+          fi
+      # The current scripts and every tag (the tag's own tree may predate scripts/).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: the tag exists, and whether it is the highest
+        id: tag
+        run: |
+          if ! git rev-parse -q --verify "refs/tags/$TAG^{commit}" >/dev/null; then
+            echo "::error::the tag $TAG does not exist"
+            exit 1
+          fi
+          highest=$(git tag --list 'v*' | scripts/last-tag.sh)
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "latest=$([ "$TAG" = "$highest" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "$TAG; highest release tag: $highest"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          path: tagged
+          persist-credentials: false
+      # Read from the tagged tree with cargo itself, so the workspace inheritance is resolved.
+      - name: every published crate of the tag has its version
+        working-directory: tagged
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          rustup toolchain install --profile minimal --no-self-update
+          cargo metadata --no-deps --format-version 1 > "$RUNNER_TEMP/metadata.json"
+          jq -r '.packages[] | select(.publish == null) | "\(.name) \(.version)"' "$RUNNER_TEMP/metadata.json"
+          if ! jq -e --arg v "$VERSION" \
+            '[.packages[] | select(.publish == null) | .version] | length > 0 and all(. == $v)' \
+            "$RUNNER_TEMP/metadata.json" >/dev/null; then
+            echo "::error::the crates at $TAG do not all have the version $VERSION"
+            exit 1
+          fi
+
   # The package uploads attach to an existing release, so it is created first.
   prepare:
+    needs: check
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: create the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ github.ref_name }}
+          LATEST: ${{ needs.check.outputs.latest }}
         run: |
-          NOTES="crates.io: \`snodra-messaging-rs\`, \`-kafka\`, \`-mongo\`, \`-sqlx\`, \`-rabbitmq\` at \`$VERSION\`
+          NOTES="crates.io: \`snodra-messaging-rs\`, \`-kafka\`, \`-mongo\`, \`-sqlx\`, \`-rabbitmq\` at \`$TAG\`
           Packages: the published \`.crate\` files below."
-          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$VERSION" --repo "$GITHUB_REPOSITORY" \
-              --title "${GITHUB_REPOSITORY#*/} $VERSION" --notes "$NOTES"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "${GITHUB_REPOSITORY#*/} $TAG" --notes "$NOTES"
           else
-            gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" \
-              --title "${GITHUB_REPOSITORY#*/} $VERSION" --generate-notes --notes "$NOTES"
+            # --verify-tag: never create a tag here.
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --latest="$LATEST" \
+              --title "${GITHUB_REPOSITORY#*/} $TAG" --generate-notes --notes "$NOTES"
           fi
 
   publish:
-    needs: prepare
+    needs: [check, prepare]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, 2026-11-23
         with:
           toolchain: "1.99.1"
-      - uses: arduino/setup-protoc@v3
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           version: "29.3"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: librdkafka build dependencies
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev libsasl2-dev zlib1g-dev libzstd-dev
 
-      - name: the tag must be the crate version
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          MANIFEST=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-          if [ "$VERSION" != "$MANIFEST" ]; then
-            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $MANIFEST" >&2
-            exit 1
-          fi
-
-      # crates.io needs the core in the index before the add-ons can be published, so the add-ons
-      # retry for a few minutes while it propagates.
-      # Publishing is idempotent: a re-run skips what is already on the index, so a failure halfway
-      # through never strands the remaining crates.
+      # In dependency order: the core first, then the add-ons. crates.io needs the core in the
+      # index before an add-on can be published, so each crate retries for a few minutes while it
+      # propagates.
+      # Publishing is idempotent: a crate version already on crates.io is skipped, so a re-run of a
+      # release that failed halfway publishes only what is missing.
       - name: publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.check.outputs.version }}
         run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
+          log=$RUNNER_TEMP/publish.log
           publish_crate() {
-            crate="$1"
+            crate=$1
             if curl -fsS -A "snodra-release" "https://crates.io/api/v1/crates/$crate/$VERSION" >/dev/null 2>&1; then
-              echo "$crate $VERSION is already on crates.io"
+              echo "$crate $VERSION is already on crates.io: skipped"
               return 0
             fi
             for attempt in $(seq 1 20); do
-              if cargo publish -p "$crate" --locked; then
+              if cargo publish -p "$crate" --locked 2>&1 | tee "$log"; then
                 return 0
               fi
+              # The index knew the version before the API did.
+              if grep -Eq 'already (exists|uploaded)' "$log"; then
+                echo "$crate $VERSION is already on crates.io: skipped"
+                return 0
+              fi
+              echo "attempt $attempt to publish $crate failed; retrying in 15 s"
               sleep 15
             done
-            echo "gave up publishing $crate" >&2
+            echo "::error::gave up publishing $crate $VERSION"
             return 1
           }
           for crate in snodra-messaging-rs snodra-messaging-kafka snodra-messaging-mongo snodra-messaging-sqlx snodra-messaging-rabbitmq; do
@@ -95,6 +175,6 @@ jobs:
           # A re-run skips the crates already on crates.io, so the directory may not exist.
           if [ -d target/package ]; then
             find target/package -maxdepth 1 -name '*.crate' -print0 \
-              | xargs -0 -r gh release upload "$GITHUB_REF_NAME" \
+              | xargs -0 -r gh release upload "$TAG" \
                   --repo "$GITHUB_REPOSITORY" --clobber
           fi
