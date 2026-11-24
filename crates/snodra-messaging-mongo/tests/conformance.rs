@@ -107,7 +107,7 @@ async fn markers_without_position_behave_as_before() {
     let at = DateTime::now();
     markers
         .insert_many([
-            // Written by an older version of either library, for the record at offset 4 of
+            // Written by an older version of a library, for the record at offset 4 of
             // partition 1.
             doc! { "_id": "processor:default:old-4", "type": "t.E", "processedAt": at,
             "processor": "default", "topic": "snodra.events", "partition": 1_i32,

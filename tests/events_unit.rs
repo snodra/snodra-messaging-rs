@@ -25,7 +25,7 @@ fn event() -> Happened {
 }
 
 #[test]
-fn entry_matches_kotlin_shape() {
+fn entry_matches_the_outbox_shape() {
     let before = snodra_messaging::time::now_ms();
     let entry = new_outbox_entry(&event(), Some("k1"), None, 42).unwrap();
     assert_eq!(entry.type_name, "t.Happened");
@@ -41,7 +41,7 @@ fn entry_matches_kotlin_shape() {
     assert_eq!(
         entry.headers.get("userId").map(String::as_str),
         Some(""),
-        "anonymous publisher writes an empty userId like Kotlin"
+        "anonymous publisher writes an empty userId"
     );
     assert!(!entry.headers["correlationId"].is_empty());
     assert!(uuid::Uuid::parse_str(&entry.id).is_ok());
@@ -153,7 +153,7 @@ fn classify_skips_missing_type() {
     assert!(matches!(d, RecordDisposition::Skip(reason) if reason.contains("type")));
 }
 
-/// A blank (empty or whitespace-only) `type` header is no type: INVALID, as in Kotlin.
+/// A blank (empty or whitespace-only) `type` header is no type: INVALID.
 #[test]
 fn classify_skips_a_blank_type() {
     for blank in ["", "  ", "\t"] {
@@ -213,7 +213,7 @@ fn classify_uses_source_segment_position_when_id_missing() {
     );
 }
 
-/// A blank `id` header is no id: the fallback, as in Kotlin (and as the letter's absent `eventId`
+/// A blank `id` header is no id: the fallback (as the letter's absent `eventId`
 /// makes the retry use).
 #[test]
 fn classify_uses_source_segment_position_when_id_blank() {

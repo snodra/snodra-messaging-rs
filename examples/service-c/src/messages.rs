@@ -1,4 +1,4 @@
-//! Wire types shared with the Kotlin `examples-api` (same names, same fields, same `@MessageType`s).
+//! Wire types shared with the other example services (same names, same fields).
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,7 @@ impl Query for Reverse {
     type Reply = Reversed;
 }
 
-/// A shared query type: service-b (Kotlin) owns it too, so a point query goes to one of
+/// A shared query type: service-b owns it too, so a point query goes to one of
 /// them and a scatter-gather asks both.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Inventory {
@@ -51,8 +51,8 @@ impl Query for Inventory {
     type Reply = InventoryLevel;
 }
 
-/// service-b's query (Kotlin `examples-api`): how often a name was greeted. service-c sends it
-/// through the hub from `GET /greetings/{name}/count`, the sandbox's one call from Rust to Kotlin.
+/// service-b's query: how often a name was greeted. service-c sends it through the hub from
+/// `GET /greetings/{name}/count`.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct CountGreetings {
     pub name: String,
@@ -83,7 +83,7 @@ pub struct TextReversed {
 message_type!(TextReversed, "examples.TextReversed");
 impl Event for TextReversed {}
 
-/// Published by service-b (Kotlin); C only listens.
+/// Published by service-b; C only listens.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct GreetingDelivered {
     pub id: String,
@@ -93,7 +93,7 @@ pub struct GreetingDelivered {
 message_type!(GreetingDelivered, "examples.GreetingDelivered");
 impl Event for GreetingDelivered {}
 
-/// A shared streaming query type: service-b (Kotlin) owns it too, so a stream goes
+/// A shared streaming query type: service-b owns it too, so a stream goes
 /// to one instance of either. `fail_at > 0` makes the handler fail on reaching that row.
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -115,7 +115,7 @@ impl StreamingQuery for Rows {
     type Item = Row;
 }
 
-/// A shared subscription query type: service-b (Kotlin) serves it too, so a
+/// A shared subscription query type: service-b serves it too, so a
 /// subscription gets the current value of one of them as its initial result and then the changes
 /// of both.
 #[derive(Serialize, Deserialize, Debug)]
@@ -243,7 +243,7 @@ mod tests {
     use snodra_messaging::MessageType;
 
     #[test]
-    fn the_counter_types_use_the_wire_names_and_fields_of_the_kotlin_examples_api() {
+    fn the_counter_types_use_the_shared_wire_names_and_fields() {
         assert_eq!(WatchCounter::TYPE, "examples.WatchCounter");
         assert_eq!(IncrementCounter::TYPE, "examples.IncrementCounter");
         assert_eq!(OpenSubscriptions::TYPE, "examples.OpenSubscriptions");

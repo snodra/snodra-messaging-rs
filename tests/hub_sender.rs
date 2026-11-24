@@ -121,7 +121,7 @@ async fn sender_with(
 }
 
 /// Every command or query call through the hub is timed once, with its final outcome: a reply
-/// that does not decode is `invalid_request`, as Kotlin's.
+/// that does not decode is `invalid_request`.
 #[tokio::test]
 async fn every_call_is_timed_by_kind_type_and_final_outcome() {
     use snodra_messaging::metrics::{HUB_CLIENT_REQUEST_DURATION, Metrics};

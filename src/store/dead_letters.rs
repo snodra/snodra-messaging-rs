@@ -46,8 +46,8 @@ impl DeadLetterReason {
     }
 }
 
-/// A letter's `error`: `type_name` is the error variant ([`MessagingError::variant_name`]),
-/// Kotlin's exception simple name; `message` at most [`MAX_ERROR_MESSAGE_CHARS`] characters.
+/// A letter's `error`: `type_name` is the error variant ([`MessagingError::variant_name`]);
+/// `message` at most [`MAX_ERROR_MESSAGE_CHARS`] characters.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeadLetterError {
     pub type_name: String,

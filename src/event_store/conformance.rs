@@ -35,33 +35,31 @@
 //!   [`SubscriptionAdmin`] call (each runs on a thread of its own, so a blocked one is left
 //!   behind rather than holding the runtime).
 //!
-//! # The checks and their names in snodra-messaging
+//! # The checks
 //!
-//! The Kotlin kit (`EventStoreConformanceTest` in `snodra-messaging-test`) checks the same
-//! contract under the same names in camelCase; the browser checks are this kit's alone (the event
-//! browser is a Rust crate, so the Kotlin event stores have none):
+//! Each check, with the capability it needs. The specification lists them with what each
+//! asserts and the conformance ids that require them:
+//! <https://snodra.damoreira.com/docs/library-authors/event-store-add-ons/#the-conformance-kit>.
 //!
-//! | Rust check | Kotlin check |
-//! |---|---|
-//! | [`headers_round_trip`] | `headersRoundTrip` |
-//! | [`same_key_arrives_in_publish_order`] | `sameKeyArrivesInPublishOrder` |
-//! | [`every_processor_gets_every_event`] | `everyProcessorGetsEveryEvent` |
-//! | [`instances_share_a_processor`] | `instancesShareAProcessor` |
-//! | [`a_joining_instance_announces_its_first_assignment`] | `aJoiningInstanceAnnouncesItsFirstAssignment` |
-//! | [`an_instance_left_without_segments_closes_its_change`] | `anInstanceLeftWithoutSegmentsClosesItsChange` |
-//! | [`unacked_delivery_is_redelivered`] | `unackedDeliveryIsRedelivered` |
-//! | [`redelivered_after_commit_is_skipped`] | `redeliveredAfterCommitIsSkipped` |
-//! | [`paused_subscription_receives_nothing_and_resumes_in_place`] | `pausedSubscriptionReceivesNothingAndResumesInPlace` |
-//! | [`replay_from_earliest_redelivers_history`] (with `replay`) | `replayFromEarliestRedeliversHistory` |
-//! | [`admin_without_replay_is_unsupported`] (without `replay`) | `adminWithoutReplayIsUnsupported` |
-//! | [`lag_counts_unacked`] (with `lag`) | `lagCountsUnacked` |
-//! | [`lag_unknown_without_capability`] (without `lag`) | `lagUnknownWithoutCapability` |
-//! | [`dead_letter_source_receives`] (with `native-dead-letter`) | `deadLetterSourceReceives` |
-//! | [`search_finds_by_type_key_and_correlation`] (with `browse`) | **none** (Rust only) |
-//! | [`search_stops_at_bounds`] (with `browse`) | **none** (Rust only) |
-//! | [`tail_streams_new_events`] (with `browse`) | **none** (Rust only) |
-//! | [`browser_never_commits_a_position`] (with `browse`) | **none** (Rust only) |
-//! | [`no_browser_without_capability`] (without `browse`) | **none** (Rust only) |
+//! - [`headers_round_trip`]
+//! - [`same_key_arrives_in_publish_order`]
+//! - [`every_processor_gets_every_event`]
+//! - [`instances_share_a_processor`]
+//! - [`a_joining_instance_announces_its_first_assignment`]
+//! - [`an_instance_left_without_segments_closes_its_change`]
+//! - [`unacked_delivery_is_redelivered`]
+//! - [`redelivered_after_commit_is_skipped`]
+//! - [`paused_subscription_receives_nothing_and_resumes_in_place`]
+//! - [`replay_from_earliest_redelivers_history`] (with `replay`)
+//! - [`admin_without_replay_is_unsupported`] (without `replay`)
+//! - [`lag_counts_unacked`] (with `lag`)
+//! - [`lag_unknown_without_capability`] (without `lag`)
+//! - [`dead_letter_source_receives`] (with `native-dead-letter`)
+//! - [`search_finds_by_type_key_and_correlation`] (with `browse`)
+//! - [`search_stops_at_bounds`] (with `browse`)
+//! - [`tail_streams_new_events`] (with `browse`)
+//! - [`browser_never_commits_a_position`] (with `browse`)
+//! - [`no_browser_without_capability`] (without `browse`)
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;

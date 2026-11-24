@@ -20,8 +20,7 @@ struct Cache {
     keys: JwkSet,
 }
 
-/// Verifies forwarded tokens the way the Kotlin `JwtDecoder` does: signature against the JWKS,
-/// `exp`, and `iss`.
+/// Verifies forwarded tokens: signature against the JWKS, `exp`, and `iss`.
 #[derive(Clone, Debug)]
 pub struct JwksVerifier {
     jwks_url: String,
@@ -69,7 +68,7 @@ impl JwksVerifier {
         validation.set_issuer(&[&self.issuer]);
         validation.validate_exp = true;
         validation.validate_nbf = true;
-        // Some providers' tokens carry `aud` ("account", client ids); like Spring's JwtDecoder we do not validate it.
+        // Some providers' tokens carry `aud` ("account", client ids); it is not validated.
         validation.validate_aud = false;
         validation.set_required_spec_claims(&["exp", "iss"]);
         let data = decode::<Map<String, Value>>(token, &key, &validation).map_err(|e| {

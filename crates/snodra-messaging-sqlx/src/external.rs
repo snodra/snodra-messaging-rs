@@ -1,5 +1,5 @@
 //! `snodra_external_calls`, keyed by the SHA-256 of the idempotency key (`id_hash`; the key itself
-//! in `id`): `reply` and `error` as the JSON text written, `status` by its Kotlin name. Every write
+//! in `id`): `reply` and `error` as the JSON text written, `status` by its stored name. Every write
 //! is a short transaction of its own, and every write after the insert is conditional on the
 //! record the caller read or owns.
 

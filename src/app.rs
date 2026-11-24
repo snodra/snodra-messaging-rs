@@ -64,8 +64,7 @@ use crate::types::{Command, Event, MessageType, Query, StreamingQuery, Subscript
 
 /// How long a shutdown waits for the subscriptions' `ReplyEnd`s to be written.
 const SUBSCRIPTION_END_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long a graceful shutdown waits for the hubs to ack its empty registration (as
-/// snodra-messaging's `HubLifecycle.stop`).
+/// How long a graceful shutdown waits for the hubs to ack its empty registration.
 pub const DEREGISTER_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long a shutdown waits for the handlers in flight, after the subscriptions ended.
 pub const HANDLER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -342,8 +341,8 @@ impl SnodraMessaging {
     }
 
     /// True once a hub (with several: at least one, so requests can be sent) confirmed this
-    /// instance's registration. snodra-messaging's `HubConnections.awaitRegistered` waits for
-    /// every hub; that is [`await_all_hubs`](Self::await_all_hubs) here. False at once when the
+    /// instance's registration. To wait for every hub, use
+    /// [`await_all_hubs`](Self::await_all_hubs). False at once when the
     /// hub is turned off ([`Config::hub_enabled`](crate::Config::hub_enabled)).
     pub async fn await_hub(&self, timeout: Duration) -> bool {
         self.hubs.await_registered(timeout).await
@@ -523,8 +522,7 @@ impl SnodraMessagingBuilder {
 
     /// An event handler registered with `options`: its processor (`default` unless
     /// [`EventOptions::processor`], as [`event_in`](Self::event_in)) and whether it runs again for
-    /// a record its processor replays after a reset ([`EventOptions::disallow_replay`],
-    /// Kotlin's `@DisallowReplay`).
+    /// a record its processor replays after a reset ([`EventOptions::disallow_replay`]).
     ///
     /// ```ignore
     /// builder.event_with::<OrderPlaced, _, _>(EventOptions::new().disallow_replay(), |e, ctx| async move { ... })
@@ -556,8 +554,8 @@ impl SnodraMessagingBuilder {
         self
     }
 
-    /// A reset handler of processor `processor` (`default`, or a name given to `event_in`;
-    /// Kotlin's `@ResetHandler`): runs once per reset that replays a range, on the instance
+    /// A reset handler of processor `processor` (`default`, or a name given to `event_in`):
+    /// runs once per reset that replays a range, on the instance
     /// executing it, before the markers and the positions change, with the target and the ranges.
     /// The handlers of a processor run in registration order; an error (or a panic) refuses the
     /// reset (`RESET_HANDLER_FAILED`) with nothing changed. A processor without event handlers
@@ -664,8 +662,7 @@ impl SnodraMessagingBuilder {
         self
     }
 
-    /// An idempotent command handler, an adapter to an external system (the
-    /// `@IdempotentHandler @CommandHandler` of Rust): each call is recorded in `external_calls`
+    /// An idempotent command handler, an adapter to an external system: each call is recorded in `external_calls`
     /// under `key` (`IdempotencyKey::default()` is the `idempotency-key` header the saga relay
     /// sets), so a repeat of the key never runs `handler` twice. Return
     /// [`MessagingError::RetryableExternal`] for a failure a later attempt may cure and

@@ -8,9 +8,9 @@
 //!   failure (the printer retries).
 //! - `GET /banners/{jobId}`: how the banner ended (`PRINTED`, or `FAILED` with its reason), 404
 //!   while it is in flight (or unknown).
-//! - `GET /greetings/{name}/count`: service-b's `examples.CountGreetings` through the hub, the
-//!   sandbox's call from Rust to Kotlin (`{"name","count"}`; 502 with the error when it fails). The
-//!   examples smoke uses it for the Rust side of `snodra_hub_client_request_duration_seconds`.
+//! - `GET /greetings/{name}/count`: service-b's `examples.CountGreetings` through the hub
+//!   (`{"name","count"}`; 502 with the error when it fails). The
+//!   examples smoke uses it for service-c's side of `snodra_hub_client_request_duration_seconds`.
 
 use axum::Router;
 use axum::body::Bytes;

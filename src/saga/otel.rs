@@ -3,8 +3,8 @@
 //! Each hook moves the [`SagaStats`] (so `SnodraMessaging::saga_stats()` keeps its values) and
 //! the counter of the same name and labels on the meter; the gauges are observed from the
 //! statistics (the deadline scheduler's last poll and the sampler's last count), never from the
-//! database. The series are Kotlin's (`snodra.sagas.started{type}` is
-//! `snodra_sagas_started_total{type}`; see [`crate::saga::stats`]).
+//! database. `snodra.sagas.started{type}` is exported as
+//! `snodra_sagas_started_total{type}`; see [`crate::saga::stats`].
 
 use std::collections::HashMap;
 
@@ -156,7 +156,7 @@ mod tests {
     use crate::metrics::test_meter::{Kind, TestMeter};
 
     #[test]
-    fn every_hook_reaches_the_meter_and_the_statistics_with_kotlins_names_and_labels() {
+    fn every_hook_reaches_the_meter_and_the_statistics_with_their_names_and_labels() {
         let t = TestMeter::new();
         let stats = SagaStats::new();
         let metrics = OtelSagaMetrics::new(&Metrics::new(t.meter()), stats.clone());

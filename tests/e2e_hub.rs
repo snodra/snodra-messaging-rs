@@ -532,7 +532,7 @@ async fn drain_instance(
         .unwrap()
 }
 
-/// Kotlin parity (`HubLifecycle.stop`): a graceful shutdown first registers no types with the hub,
+/// A graceful shutdown first registers no types with the hub,
 /// so the requests the hub queued for this instance go to another instance at once, not after
 /// the handler drain (up to 10 s) and the stream's close.
 #[tokio::test]

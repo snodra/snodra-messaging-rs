@@ -45,8 +45,7 @@
 //!   of ours written to it unanswered, no handler of its requests running), at most
 //!   [`DRAIN_LIMIT`] later. A failed or empty resolution keeps the current hubs.
 //! - **Client certificate rotation** (mutual TLS). With `hub_tls.client_cert_file` the pool
-//!   reads the files every `HubSettings::certificate_check_interval` (3 s, as the Kotlin client
-//!   does). When they hold a valid pair (not expired, and past its notBefore) that a live
+//!   reads the files every `HubSettings::certificate_check_interval` (3 s). When they hold a valid pair (not expired, and past its notBefore) that a live
 //!   connection is not presenting (the content changed), it waits a random delay (uniform in
 //!   `[0, min(certificate_roll_delay_max (30 s), 10 % of the presented certificate's remaining
 //!   validity)]`, once per pair, so replicas that see the renewal together do not all leave the
@@ -485,8 +484,7 @@ impl HubPool {
         }
     }
 
-    /// True once every hub of the pool confirmed the registration (snodra-messaging's
-    /// `HubConnections.awaitRegistered`): there is at least one connection, and every connection still in use
+    /// True once every hub of the pool confirmed the registration: there is at least one connection, and every connection still in use
     /// (not a closed duplicate, not draining) has a handshaken stream. With `dns:///`, the hubs of
     /// the latest resolution. False at once when the pool is turned off.
     pub async fn await_all_registered(&self, timeout: Duration) -> bool {
@@ -973,7 +971,7 @@ impl HubPool {
     }
 
     /// Fewer hubs now than when some live stream offered its permits: that stream is topped up to
-    /// `ceil(max / N)` (shared with snodra-messaging). More hubs: nothing (permits are never
+    /// `ceil(max / N)`. More hubs: nothing (permits are never
     /// revoked; the local concurrency guard stays the total).
     fn top_up(&self) {
         let share = permit_share(self.settings.max_concurrent_handlers, self.hubs(None));

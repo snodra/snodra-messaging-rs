@@ -1,5 +1,5 @@
 //! The banner saga: every shouted text is printed as a banner by the sandbox's fake
-//! printer, whatever way the printer answers. The Rust counterpart of service-b's postcard saga,
+//! printer, whatever way the printer answers. A saga like service-b's postcard saga,
 //! with service-c's own message types (a command type has one owner).
 //!
 //! It starts on [`TextShouted`] (the job id is `banner-<text in lower case>`), sends
@@ -55,7 +55,7 @@ fn job_of(e: &TextShouted) -> Option<String> {
     Some(job_id_of(&e.text))
 }
 
-/// The wire name of a failure reason (`UNKNOWN_OUTCOME`), as Kotlin's `reason.name`.
+/// The wire name of a failure reason (`UNKNOWN_OUTCOME`).
 fn reason_name(reason: FailureReason) -> String {
     serde_json::to_value(reason)
         .ok()

@@ -1,8 +1,7 @@
 //! Testing a saga without an event store or a database (feature `testing`):
 //! [`SagaTestFixture`](crate::saga::testing::SagaTestFixture) drives one saga definition with
 //! events and time over the crate's own [`SagaRuntime`] and the in-memory ports of
-//! [`InMemorySagaStore`](crate::saga::testing::InMemorySagaStore). The Rust form of the Kotlin
-//! `snodra-messaging-test` `SagaTestFixture`.
+//! [`InMemorySagaStore`](crate::saga::testing::InMemorySagaStore).
 //!
 //! ```ignore
 //! SagaTestFixture::new("examples.Payment", payment_saga) // the closure given to builder.saga(..)

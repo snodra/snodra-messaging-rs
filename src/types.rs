@@ -3,8 +3,8 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-/// Stable wire type name, for example `examples.SendGreeting`. Shared with the Kotlin side through
-/// the `@MessageType` annotation there.
+/// Stable wire type name, for example `examples.SendGreeting`: the name every service that sends
+/// or handles the type uses for it.
 pub trait MessageType {
     const TYPE: &'static str;
 }

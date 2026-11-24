@@ -1,11 +1,12 @@
 //! The saga records: what the saga ports store, field for field the storage contract
-//! both libraries keep.
+//! every Snodra library keeps.
 //!
-//! Times are epoch milliseconds (`_ms`), enums their Kotlin names, ids strings, and the saga
+//! Times are epoch milliseconds (`_ms`), enums their stored names, ids strings, and the saga
 //! `state`, the dispatch and failure `payload` and a deadline `payload` are JSON **text** (the
 //! codec's exact output). How a store keeps them is the store's own: the MongoDB
-//! add-on writes the documents both libraries have always written (dates as BSON datetimes, an
-//! absent field for `None`), so Kotlin and Rust read each other's records.
+//! add-on writes the documents of the specification's MongoDB layout (dates as BSON datetimes, an
+//! absent field for `None`), so services written with any Snodra library read each other's
+//! records.
 
 use std::collections::HashMap;
 

@@ -473,7 +473,7 @@ fn markers_in_error_details_classify_retryable_and_unknown_outcome() {
     assert_eq!(
         classify_failure(&remote(b"  {\"snodra\":\"retryable\"}\n")),
         RawOutcome::Transient("adapter said so".into()),
-        "surrounding whitespace is ignored, as Kotlin does"
+        "surrounding whitespace is ignored"
     );
     assert_eq!(
         classify_failure(&remote(UNKNOWN_OUTCOME_MARKER)),

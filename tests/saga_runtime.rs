@@ -1,7 +1,7 @@
 //! The saga runtime: one transaction
 //! per (event, saga type) with an exactly-once marker, association routing, start keys,
-//! version-checked writes, dispatch entries, deadlines and parking. The Rust form of the Kotlin
-//! `SagaRuntimeTest`, on the in-memory message store and its transactions (no container).
+//! version-checked writes, dispatch entries, deadlines and parking, on the in-memory message
+//! store and its transactions (no container).
 #![cfg(feature = "testing")]
 
 mod support;

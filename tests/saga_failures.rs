@@ -1,6 +1,5 @@
 //! The failure admin: parked saga events are listed,
-//! retried and discarded, on the in-memory message store. The Rust form of the Kotlin
-//! `SagaFailuresTest`.
+//! retried and discarded, on the in-memory message store.
 #![cfg(feature = "testing")]
 
 mod support;
@@ -297,7 +296,7 @@ async fn retry_of_an_unknown_id_is_false() {
     assert_eq!(
         fx.failures.retry_all("rt.Gone").await.unwrap(),
         0,
-        "nothing parked: nothing to refuse, as in Kotlin"
+        "nothing parked: nothing to refuse"
     );
     assert!(fx.failures.list(None).await.unwrap().is_empty());
 }

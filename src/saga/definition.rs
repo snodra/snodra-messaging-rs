@@ -120,7 +120,7 @@ enum Last {
 /// Every handler is a synchronous closure `Fn(&mut S, &E, &mut SagaContext) -> Result<(),
 /// MessagingError>`: it changes the state and records what it wants done on the context; the
 /// runtime does the I/O after the saga's transaction committed. Handlers of one event type run in
-/// registration order (Kotlin runs them in method-name order, a reflection limit).
+/// registration order.
 ///
 /// The association of a handler is `key = value`: the handler runs on the live instances of this
 /// saga type that are associated with it. `start_on` handlers may create an instance when no live

@@ -1,5 +1,4 @@
-//! The webhook ingress and the signature verifier: the Rust
-//! form of the Kotlin `WebhookIngressTest`. The ingress runs on the in-memory message store;
+//! The webhook ingress and the signature verifier. The ingress runs on the in-memory message store;
 //! the verifier needs nothing.
 #![cfg(feature = "testing")]
 

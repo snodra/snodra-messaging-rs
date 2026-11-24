@@ -1,4 +1,4 @@
-//! Partner sources as local snodra events: the Rust form of the Kotlin external sources.
+//! Partner sources as local snodra events.
 //!
 //! Each source registered with
 //! [`SnodraMessagingBuilder::external_source`](crate::SnodraMessagingBuilder::external_source)
@@ -116,7 +116,7 @@ impl TranslatedEvent {
 }
 
 /// Turns a partner record into a Snodra event: `Ok(None)` ignores the record, an error retries it
-/// (as the processors do) and then skips it. Kotlin's `ExternalRecordTranslator` bean.
+/// (as the processors do) and then skips it.
 pub type Translator =
     Arc<dyn Fn(&ExternalRecord) -> Result<Option<TranslatedEvent>, MessagingError> + Send + Sync>;
 

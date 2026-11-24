@@ -1,10 +1,10 @@
-//! The shared layout (snodra-messaging-jdbc's tables, values and meanings), on both databases:
+//! The shared SQL layout (the specification's tables, values and meanings), on both databases:
 //!
 //! - **golden values**: fixed inputs written through the store are read back by plain SQL as the
-//!   exact stored values the Kotlin store writes (hashes computed independently with `shasum -a
+//!   exact stored values the layout fixes (hashes computed independently with `shasum -a
 //!   256`, timestamps as the UTC instant at millisecond precision, JSON columns, enum names);
-//! - **cross-reading**: rows written by plain SQL in the Kotlin layout (as `JdbcMessageStore`
-//!   writes them, hash literals included) are read by the store, found by their hashes, and keep
+//! - **cross-reading**: rows written by plain SQL in the shared layout (as another
+//!   service's store writes them, hash literals included) are read by the store, found by their hashes, and keep
 //!   the uniqueness the hashes carry (a second live saga with that start key is refused).
 
 #![cfg(all(feature = "postgres", feature = "mysql"))]
@@ -492,8 +492,8 @@ async fn golden_values(kind: Kind) {
     );
 }
 
-/// Rows written by plain SQL as `JdbcMessageStore` writes them, read through the store.
-async fn rows_in_the_kotlin_layout_are_read(kind: Kind) {
+/// Rows written by plain SQL as another service's store writes them, read through the store.
+async fn rows_in_the_shared_layout_are_read(kind: Kind) {
     let server = Server::of(kind).await;
     let (store, raw) = server.store().await;
     let at = |s: &str| raw.at(s);
@@ -587,7 +587,7 @@ async fn rows_in_the_kotlin_layout_are_read(kind: Kind) {
             .exists("processor:default:k-9")
             .await
             .unwrap(),
-        "a Kotlin marker, found by its hash"
+        "a marker written by plain SQL, found by its hash"
     );
     let txs = store.tx();
     let sagas = store.sagas();
@@ -600,7 +600,7 @@ async fn rows_in_the_kotlin_layout_are_read(kind: Kind) {
     assert_eq!(
         live.len(),
         1,
-        "a Kotlin saga, found by its association's hash"
+        "a saga written by plain SQL, found by its association's hash"
     );
     assert_eq!(live[0].version, 3);
     assert_eq!(live[0].state, "{\"step\":1}");
@@ -623,7 +623,7 @@ async fn rows_in_the_kotlin_layout_are_read(kind: Kind) {
     txs.abort(&mut tx).await;
     assert!(
         second.as_ref().is_err_and(|e| e.is_conflict()),
-        "the Kotlin saga holds the start key for Rust too: {second:?}"
+        "the saga written by plain SQL holds the start key for this store too: {second:?}"
     );
 
     let call = store
@@ -631,7 +631,7 @@ async fn rows_in_the_kotlin_layout_are_read(kind: Kind) {
         .find("ingress:partner:k-9")
         .await
         .unwrap()
-        .expect("a Kotlin external call");
+        .expect("an external call written by plain SQL");
     assert_eq!(call.status, ExternalCallStatus::Succeeded);
     assert_eq!(call.reply.as_deref(), Some("{\"ok\":true}"));
     let mut tx = Tx::none();
@@ -640,7 +640,7 @@ async fn rows_in_the_kotlin_layout_are_read(kind: Kind) {
         .find(&mut tx, "k.Order:e-9")
         .await
         .unwrap()
-        .expect("a Kotlin saga failure");
+        .expect("a saga failure written by plain SQL");
     assert_eq!(
         failure.headers,
         HashMap::from([("userId".into(), "u-1".into())])
@@ -651,7 +651,7 @@ async fn rows_in_the_kotlin_layout_are_read(kind: Kind) {
     assert_eq!(
         letters.head("default", "key-9").await.unwrap().as_deref(),
         Some("default:snodra.events:1:9"),
-        "a Kotlin letter, found by its key's hash"
+        "a letter written by plain SQL, found by its key's hash"
     );
     let letter = letters
         .get("default:snodra.events:1:9")
@@ -685,13 +685,13 @@ async fn rows_in_the_kotlin_layout_are_read(kind: Kind) {
         .claim_due("scheduler-r", now, now + 30_000)
         .await
         .unwrap()
-        .expect("the Kotlin deadline");
+        .expect("the deadline written by plain SQL");
     assert_eq!(
         (due.id.as_str(), due.correlation_id.as_deref()),
         ("k-d-9", Some("c-9"))
     );
 
-    // The saga-side outbox as Kotlin writes it: a pending command (no notice: NULLs) carrying the
+    // The saga-side outbox as the layout stores it: a pending command (no notice: NULLs) carrying the
     // trace of its cause, and a command given up on with its failure notice pending.
     let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
     raw.exec(&format!(
@@ -710,7 +710,7 @@ async fn rows_in_the_kotlin_layout_are_read(kind: Kind) {
         .next_pending("k-saga-9")
         .await
         .unwrap()
-        .expect("the Kotlin dispatch entry");
+        .expect("the dispatch entry written by plain SQL");
     assert_eq!(
         (
             pending.kind,
@@ -743,7 +743,7 @@ async fn rows_in_the_kotlin_layout_are_read(kind: Kind) {
         .claim_due_notice(now, now + 30_000)
         .await
         .unwrap()
-        .expect("the Kotlin failure notice");
+        .expect("the failure notice written by plain SQL");
     assert_eq!(notice.id, "k-saga-8:3000");
     assert_eq!(
         notice.failure_reason,
@@ -768,10 +768,10 @@ async fn rows_in_the_kotlin_layout_are_read(kind: Kind) {
         "the given-up entry is not pending"
     );
 
-    // Dispatch leases as Kotlin writes them: a running one holds, an expired one is taken over.
+    // Dispatch leases as the layout stores them: a running one holds, an expired one is taken over.
     raw.exec(&format!(
         "INSERT INTO snodra_saga_dispatch_leases (saga_id, owner, lease_until) VALUES \
-         ('k-saga-9', 'kotlin-relay', {later}), ('k-saga-8', 'kotlin-relay', {t0})"
+         ('k-saga-9', 'other-relay', {later}), ('k-saga-8', 'other-relay', {t0})"
     ))
     .await;
     assert!(
@@ -780,7 +780,7 @@ async fn rows_in_the_kotlin_layout_are_read(kind: Kind) {
             .claim_lease("k-saga-9", "rust-relay", now, now + 30_000)
             .await
             .unwrap(),
-        "held by the Kotlin relay"
+        "held by the other relay"
     );
     assert!(
         sagas
@@ -788,7 +788,7 @@ async fn rows_in_the_kotlin_layout_are_read(kind: Kind) {
             .claim_lease("k-saga-8", "rust-relay", now, now + 30_000)
             .await
             .unwrap(),
-        "the Kotlin relay's lease passed"
+        "the other relay's lease passed"
     );
     assert_eq!(
         raw.row("SELECT owner FROM snodra_saga_dispatch_leases WHERE saga_id = 'k-saga-8'")
@@ -798,21 +798,21 @@ async fn rows_in_the_kotlin_layout_are_read(kind: Kind) {
 }
 
 #[tokio::test]
-async fn postgres_stores_the_kotlin_values() {
+async fn postgres_stores_the_golden_values() {
     golden_values(Kind::Postgres).await;
 }
 
 #[tokio::test]
-async fn mysql_stores_the_kotlin_values() {
+async fn mysql_stores_the_golden_values() {
     golden_values(Kind::MySql).await;
 }
 
 #[tokio::test]
-async fn postgres_reads_rows_in_the_kotlin_layout() {
-    rows_in_the_kotlin_layout_are_read(Kind::Postgres).await;
+async fn postgres_reads_rows_in_the_shared_layout() {
+    rows_in_the_shared_layout_are_read(Kind::Postgres).await;
 }
 
 #[tokio::test]
-async fn mysql_reads_rows_in_the_kotlin_layout() {
-    rows_in_the_kotlin_layout_are_read(Kind::MySql).await;
+async fn mysql_reads_rows_in_the_shared_layout() {
+    rows_in_the_shared_layout_are_read(Kind::MySql).await;
 }

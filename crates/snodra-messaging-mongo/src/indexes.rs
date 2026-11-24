@@ -1,5 +1,5 @@
 //! The indexes of every collection of the store (idempotent). The names are the ones the library
-//! has always given them, so a database indexed by either library is accepted by the other.
+//! has always given them, so a database indexed by any Snodra library is accepted.
 
 use std::time::Duration;
 

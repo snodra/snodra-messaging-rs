@@ -277,7 +277,7 @@ fn shown(text: &str) -> String {
 }
 
 /// FNV-1a 64 of the key's UTF-8 bytes: the key's segment (this mod the number of segments) is the
-/// same in every run, and the same as the Kotlin library's in-memory event store.
+/// same in every run, and the same as the specification's reference in-memory event store.
 fn hash(key: &str) -> u64 {
     key.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
@@ -495,9 +495,9 @@ mod tests {
         }
     }
 
-    /// The reference values both libraries pin.
+    /// The reference values of the FNV-1a 64 segment rule.
     #[test]
-    fn a_key_goes_to_the_segment_both_libraries_give_it() {
+    fn a_key_goes_to_the_segment_the_reference_gives_it() {
         let segment = |key: &str, n: u64| hash(key) % n;
         let keys = ["k", "order-1", "order-2", "é", ""];
         assert_eq!(keys.map(|k| segment(k, 4)), [2, 1, 0, 1, 1]);

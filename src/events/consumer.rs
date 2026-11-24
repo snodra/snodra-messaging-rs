@@ -983,7 +983,7 @@ fn dead_letter_event(
     let header = |name: &str| record.headers.get(name).cloned().unwrap_or_default();
     OutgoingEvent {
         source: dlt.to_string(),
-        // No id (or a blank one): the record's position names it, as the Kotlin consumer does.
+        // No id (or a blank one): the record's position names it.
         id: record
             .headers
             .get(headers::ID)
@@ -1066,7 +1066,7 @@ mod tests {
     }
 
     /// A record without an `id` header (or a blank one) gets `<source>-<segment>-<position>` as
-    /// its dead-letter event's id, as the Kotlin consumer does; its headers stay as they were.
+    /// its dead-letter event's id; its headers stay as they were.
     #[test]
     fn a_dead_letter_event_of_a_record_without_an_id_is_named_by_its_position() {
         for id in [None, Some(" ")] {

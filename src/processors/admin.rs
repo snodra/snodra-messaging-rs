@@ -13,7 +13,7 @@ use crate::store::{
     DeadLetter, DeadLetterError, DeadLetterReason, DeadLetterStore, DeadLetterSummary,
 };
 
-/// The default `limit` of [`DeadLetters::list`] (Kotlin's `limit: Int = 100`).
+/// The default `limit` of [`DeadLetters::list`].
 pub const DEFAULT_LIST_LIMIT: usize = 100;
 
 /// What one [`DeadLetters::retry`] did.
@@ -88,7 +88,7 @@ impl DeadLetters {
 
     /// Up to `limit` letters ([`DEFAULT_LIST_LIMIT`] is the usual), sorted by `parkedAt`, then
     /// `_id`: of `processor`, or of every processor of the service with `None`. A `limit` of 0 is
-    /// an error (as Kotlin's `require(limit >= 1)`), never "no limit".
+    /// an error, never "no limit".
     pub async fn list(
         &self,
         processor: Option<&str>,
@@ -217,7 +217,7 @@ impl DeadLetters {
     }
 
     /// Records a failed retry on the letter: `Failed(message)`, or `NotFound` when the letter was
-    /// removed meanwhile (the update matched nothing), as Kotlin answers.
+    /// removed meanwhile (the update matched nothing).
     async fn failed(
         &self,
         id: &str,

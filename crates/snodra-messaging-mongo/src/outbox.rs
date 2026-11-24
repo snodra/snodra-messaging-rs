@@ -20,7 +20,7 @@ use crate::{OrStoreError, date, session};
 
 pub(crate) const OUTBOX_COLLECTION: &str = "outbox";
 
-/// One outbox document. Field names are the Kotlin ones.
+/// One outbox document. Field names are the MongoDB layout's (camelCase).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OutboxDocument {
@@ -359,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_is_written_in_the_kotlin_shape() {
+    fn an_entry_is_written_in_the_layouts_shape() {
         let entry = OutboxEntry {
             id: "e-1".into(),
             type_name: "t.Happened".into(),

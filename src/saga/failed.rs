@@ -11,7 +11,7 @@ use crate::types::Event;
 /// handles it with [`SagaDefinition::on_command_failed`](super::SagaDefinition::on_command_failed),
 /// which the runtime routes by `saga_id`; unhandled, it is logged at error and
 /// counted. `idempotency_key` is the failed command's `<sagaId>:<seq>`, `command_type` its wire
-/// type name. The JSON field names are the Kotlin class's.
+/// type name. The JSON field names are the fields' names in camelCase.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SagaCommandFailed {
@@ -25,8 +25,8 @@ message_type!(SagaCommandFailed, "snodra.SagaCommandFailed");
 impl Event for SagaCommandFailed {}
 
 /// Why a command failed (the retry taxonomy): the permanent kinds at
-/// once, [`Exhausted`](Self::Exhausted) after the transient retries. Serialised by name, as the
-/// Kotlin enum.
+/// once, [`Exhausted`](Self::Exhausted) after the transient retries. Serialised by name
+/// (`NO_HANDLER`, `EXHAUSTED`, ...).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum FailureReason {

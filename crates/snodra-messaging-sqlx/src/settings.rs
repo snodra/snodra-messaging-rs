@@ -1,13 +1,13 @@
-//! The store's own settings (snodra-messaging-jdbc's `snodra.messaging.store.jdbc.*`); the
+//! The store's own settings; the
 //! retentions and `SNODRA_STORE_INIT_SCHEMA` are the core `Config`'s.
 
 use std::time::Duration;
 
 use snodra_messaging::error::MessagingError;
 
-/// `SNODRA_STORE_SQL_NOTIFY` (`snodra.messaging.store.jdbc.notify`).
+/// `SNODRA_STORE_SQL_NOTIFY`.
 pub const NOTIFY_VAR: &str = "SNODRA_STORE_SQL_NOTIFY";
-/// `SNODRA_STORE_SQL_PURGE_INTERVAL_MS` (`snodra.messaging.store.jdbc.purge-interval`).
+/// `SNODRA_STORE_SQL_PURGE_INTERVAL_MS`.
 pub const PURGE_INTERVAL_VAR: &str = "SNODRA_STORE_SQL_PURGE_INTERVAL_MS";
 
 /// How the SQL store runs beside its tables.

@@ -1,5 +1,4 @@
-//! The SQL store's behaviour beyond the kit, on both databases, as snodra-messaging-jdbc's tests
-//! pin it: the service's transaction, the bounds, the schema, the purge, and the concurrency the
+//! The SQL store's behaviour beyond the kit, on both databases: the service's transaction, the bounds, the schema, the purge, and the concurrency the
 //! MySQL lock rules are there for.
 
 #![cfg(all(feature = "postgres", feature = "mysql"))]

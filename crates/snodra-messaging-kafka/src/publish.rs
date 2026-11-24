@@ -10,13 +10,12 @@ use snodra_messaging::event_store::{EventStoreError, OutgoingEvent, headers};
 
 use crate::{KafkaConfig, failed};
 
-/// The most one send takes: the producer's delivery budget (as Kotlin's `max.block.ms` 10 s +
-/// `delivery.timeout.ms` 30 s). A relay's lease must be longer.
+/// The most one send takes. A relay's lease must be longer.
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// The partitioner the producer uses unless a `partitioner` property names another: the Java
 /// client's default (murmur2 of the key, positive, modulo the partitions; a record without a key
-/// on a random partition), so a key lands on the partition a Kotlin publisher writes it to.
+/// on a random partition), so a key lands on the same partition whatever library publishes it.
 /// librdkafka's own default (`consistent_random`) would put it elsewhere.
 pub const DEFAULT_PARTITIONER: &str = "murmur2_random";
 
@@ -90,8 +89,8 @@ pub(crate) async fn send(
         .map_err(|(e, _)| publish_error(e))
 }
 
-/// A failure no retry can fix (oversized or invalid records, unknown or unauthorized topics: the
-/// Kotlin starter's NON_RETRIABLE set) is [`EventStoreError::Rejected`]; anything else `Failed`.
+/// A failure no retry can fix (oversized or invalid records, unknown or unauthorized topics) is
+/// [`EventStoreError::Rejected`]; anything else `Failed`.
 fn publish_error(e: KafkaError) -> EventStoreError {
     use rdkafka::types::RDKafkaErrorCode as Code;
     match e.rdkafka_error_code() {

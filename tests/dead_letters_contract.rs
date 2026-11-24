@@ -1,9 +1,9 @@
 //! The storage contract for dead letters: the `dead_letters` document and its indexes.
 //! The fixtures in `tests/fixtures/dead_letters_contract` are written by hand from the contract's
-//! table and are byte for byte the Kotlin library's (`src/test/resources/dead_letters_contract`):
-//! this library writes each of them from its record and reads each of them back through its store
-//! and admin API, so a letter one library parks is one the other can list, retry and discard.
-//! Neither library writes `_class` or a null, an absent field stays absent, and a blank `id` or
+//! table (the specification's MongoDB layout): this library writes each of them from its record
+//! and reads each of them back through its store and admin API, so a letter parked by any Snodra
+//! library is one this library can list, retry and discard. No `_class` or null is written, an
+//! absent field stays absent, and a blank `id` or
 //! `type` header is an absent `eventId` or `eventType`. `replay` (parked while its processor
 //! replayed the record) is written only when true.
 
@@ -510,7 +510,7 @@ fn the_error_message_is_cut_at_2000_characters_and_a_repeated_header_keeps_its_l
     assert_eq!(letter.expire_at_ms - letter.parked_at_ms, 1000);
 }
 
-/// A document the other library wrote (each shared fixture, inserted as is) reads back through
+/// A document another service wrote (each shared fixture, inserted as is) reads back through
 /// this library's store and admin API with every field the admin API returns.
 #[tokio::test]
 async fn every_shared_fixture_reads_back_through_the_store_and_the_admin_api() {

@@ -1,8 +1,7 @@
 //! Idempotent adapter handlers: a command or event
 //! handler that calls an external system, recorded in the message store's external calls
 //! ([`ExternalCallStore`]) under its idempotency key
-//! so a repeat of the key never reaches the external system twice. The Rust form of the Kotlin
-//! `@IdempotentHandler` and its `IdempotencyInterceptor`.
+//! so a repeat of the key never reaches the external system twice.
 //!
 //! 1. The record is inserted `IN_PROGRESS` with `leaseUntil = now + lease`; a duplicate key means
 //!    an earlier call of the key exists.
@@ -88,7 +87,7 @@ impl ExternalCallSettings {
     }
 }
 
-/// Where an idempotent handler's key comes from (Kotlin's SpEL `key`): a message header, by
+/// Where an idempotent handler's key comes from: a message header, by
 /// default `idempotency-key` (what the saga relay sets), or a function of the message and its
 /// context, e.g. a polling adapter's `poll:<jobId>:<attempt>`. A key that comes out empty (the
 /// header is missing) fails the call naming the handler; the body does not run.
@@ -531,7 +530,7 @@ fn stored_message(doc: &ExternalCall) -> String {
 /// hold the handle, and [`SnodraMessagingBuilder::start`](crate::SnodraMessagingBuilder::start)
 /// binds it (with the configured lease, the clock and the statistics), so a handler registered
 /// before the clock was set still uses it. A call through a handle that was never bound fails
-/// naming the handler (Kotlin's missing interceptor: with the builder it cannot happen).
+/// naming the handler (with the builder it cannot happen).
 #[derive(Clone, Default)]
 pub struct ExternalCallsHandle(Arc<OnceLock<Arc<ExternalCalls>>>);
 

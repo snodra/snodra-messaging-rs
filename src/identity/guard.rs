@@ -9,7 +9,7 @@ use crate::error::MessagingError;
 
 type Predicate = dyn Fn(&Identity, &MessageContext) -> bool + Send + Sync;
 
-/// The Rust counterpart of `@RequiresAuthentication(expression)`: an anonymous caller is rejected
+/// Opt-in authorization of a command or query: an anonymous caller is rejected
 /// with `UNAUTHENTICATED` before the payload is decoded (so it cannot probe payload shapes), a
 /// caller the predicate refuses with `PERMISSION_DENIED` once the payload is decoded (a payload
 /// that does not decode is `INVALID_REQUEST` for any authenticated caller).

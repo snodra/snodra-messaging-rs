@@ -300,7 +300,7 @@ async fn outside_mode_collection_every_call_is_an_error_naming_the_mode() {
     }
 }
 
-/// Kotlin's `require(limit >= 1)`: a limit of 0 is an error, never "no limit".
+/// A limit of 0 is an error, never "no limit".
 #[tokio::test]
 async fn a_list_limit_below_one_is_an_error() {
     // No store is reached.
@@ -638,8 +638,8 @@ async fn a_letter_removed_before_its_turn_in_retry_all_is_skipped_not_failed() {
     assert!(f.letter(&gone).await.is_none());
 }
 
-/// `retry_all` lists only what orders the run and reads each letter just before retrying it (as
-/// Kotlin does): a letter changed meanwhile is retried as it is then, not as it was listed.
+/// `retry_all` lists only what orders the run and reads each letter just before retrying it:
+/// a letter changed meanwhile is retried as it is then, not as it was listed.
 #[tokio::test]
 async fn retry_all_reads_each_letter_just_before_retrying_it() {
     require_docker!();

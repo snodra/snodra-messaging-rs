@@ -1,8 +1,8 @@
 //! The SQL message store: every store of `snodra_messaging::store` over the service's
 //! own PostgreSQL (13 or later, feature `postgres`) or MySQL (8.0.17 or later, InnoDB, feature
-//! `mysql`) database through [`sqlx`], in the tables snodra-messaging-jdbc (the Kotlin twin)
-//! writes: same tables, same values, same meanings, so a Kotlin service and a Rust service can
-//! share one database.
+//! `mysql`) database through [`sqlx`], in the specification's SQL layout: same
+//! tables, same values, same meanings as every Snodra library's SQL store, so services written
+//! with any of them can share one database.
 //!
 //! ```ignore
 //! let pool = sqlx::postgres::PgPoolOptions::new().max_connections(10).connect(&url).await?;
@@ -11,7 +11,7 @@
 //!     /* ... */;
 //! ```
 //!
-//! - **Schema**: `db/snodra/<dialect>/V1__snodra.sql`, the files snodra-messaging-jdbc ships, byte
+//! - **Schema**: `db/snodra/<dialect>/V1__snodra.sql`, the specification's reference files, byte
 //!   for byte ([`schema::POSTGRESQL_V1`], [`schema::MYSQL_V1`]). `start()` applies it
 //!   ([`MessageStore::init_schema`]: the server checked, then V1 under a database lock unless
 //!   `snodra_schema` holds version 1 or later) unless `SNODRA_STORE_INIT_SCHEMA=false`; then it

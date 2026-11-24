@@ -148,7 +148,7 @@ pub struct HubSettings {
     /// within one tick do not all deregister at once. Zero: no delay.
     pub certificate_roll_delay_max: Duration,
     /// [`super::HubPool`] with a client certificate only: how often the certificate files are
-    /// looked at for a renewal (3 s, as in the Kotlin client, whatever the heartbeat period).
+    /// looked at for a renewal (3 s, whatever the heartbeat period).
     pub certificate_check_interval: Duration,
 }
 
@@ -1111,7 +1111,7 @@ impl HubConnection {
         later_heartbeat(&tx, &unanswered).await
     }
 
-    /// The first step of a graceful shutdown (snodra-messaging's `HubLifecycle.stop`): registers
+    /// The first step of a graceful shutdown: registers
     /// no types from now on (a stream opened later registers none either) and writes that
     /// `Register` to the current handshaken stream, then waits at most `within` for the hub's
     /// ack. The hub stops routing to this instance and hands its queue to other instances at

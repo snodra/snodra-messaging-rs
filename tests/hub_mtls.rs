@@ -1457,7 +1457,7 @@ async fn the_pair_is_checked_again_after_the_delay() {
 }
 
 #[test]
-fn the_files_are_looked_at_every_three_seconds_by_default_like_kotlin() {
+fn the_files_are_looked_at_every_three_seconds_by_default() {
     assert_eq!(
         HubSettings::default().certificate_check_interval,
         Duration::from_secs(3)

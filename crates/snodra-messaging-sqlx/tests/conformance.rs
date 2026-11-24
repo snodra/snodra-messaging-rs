@@ -1,5 +1,5 @@
 //! The SQL store passes the store conformance kit, every check, on PostgreSQL and on MySQL, at
-//! the image versions snodra-messaging-jdbc's kit runs on.
+//! `postgres:17.7` and `mysql:8.4.7`.
 
 #![cfg(all(feature = "postgres", feature = "mysql"))]
 

@@ -18,7 +18,7 @@ use snodra_messaging::external::ExternalSourceProvider;
 use crate::subscription::KafkaSubscription;
 
 /// The consumer properties the library sets itself; a source's `properties` cannot hold them
-/// (Kotlin's list: Rust has no deserializers to configure, the keys are refused all the same).
+/// (the deserializer keys too: this crate configures none, and refuses them all the same).
 pub const FIXED_KEYS: [&str; 5] = [
     "bootstrap.servers",
     "group.id",
@@ -27,7 +27,7 @@ pub const FIXED_KEYS: [&str; 5] = [
     "enable.auto.commit",
 ];
 
-/// A partner's Kafka topic (Kotlin's `snodra.messaging.external.kafka.sources.<name>`):
+/// A partner's Kafka topic:
 /// `bootstrap_servers` defaults to the service's own Kafka, `group_id` to
 /// `<service-name>.external.<name>`; `properties` are extra consumer properties (librdkafka
 /// names), never one of [`FIXED_KEYS`].

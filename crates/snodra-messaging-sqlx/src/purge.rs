@@ -3,8 +3,7 @@
 //! sagas (and, by cascade, their associations), the dispatched and the failed saga-dispatch
 //! entries, the fired or cancelled deadlines and the parked saga failures older than their
 //! retention, the expired dead letters and the saga-dispatch leases that passed. Unsent outbox
-//! entries, live sagas and scheduled deadlines are never deleted. The same statements as
-//! snodra-messaging-jdbc's `JdbcPurge`.
+//! entries, live sagas and scheduled deadlines are never deleted.
 
 use std::time::Duration;
 

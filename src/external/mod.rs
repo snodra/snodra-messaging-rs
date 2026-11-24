@@ -1,7 +1,7 @@
 //! The integration toolkit: idempotent adapter handlers over `external_calls`
 //! ([`calls`]), partner sources as local events ([`sources`], read through an event-store
 //! add-on's [`ExternalSourceProvider`]), and the webhook ingress with its signature verifier
-//! ([`ingress`], [`webhook`]). The Rust form of the Kotlin `external` package.
+//! ([`ingress`], [`webhook`]).
 
 pub mod calls;
 pub mod ingress;

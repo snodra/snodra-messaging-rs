@@ -7,7 +7,7 @@
 //! virtual call. [`SnodraMessaging::builder_with_meter`](crate::SnodraMessaging::builder_with_meter)
 //! takes the meter instead (tests read it back from an in-memory exporter).
 //!
-//! Instruments are named with dots, as Kotlin's Micrometer meters; the OTLP→Prometheus translation
+//! Instruments are named with dots; the OTLP→Prometheus translation
 //! turns the dots into underscores, adds the unit suffix (`s` → `_seconds`) and `_total` to a
 //! counter, which gives the series of the README's Metrics section (`snodra.outbox.published` is
 //! `snodra_outbox_published_total`). Every label value comes from a bounded set: a type this
@@ -110,8 +110,8 @@ impl Consumed {
 }
 
 /// The `outcome` of a hub request: `ok`, or what its error is: the hub's outcome names, plus
-/// `unavailable` (no live hub, or the hub connection broke) and `error` (anything else), as
-/// Kotlin's. A reply that does not decode is `invalid_request` (see [`DECODE_FAILED`]).
+/// `unavailable` (no live hub, or the hub connection broke) and `error` (anything else).
+/// A reply that does not decode is `invalid_request` (see [`DECODE_FAILED`]).
 pub fn request_outcome(result: Result<(), &MessagingError>) -> &'static str {
     let Err(e) = result else {
         return "ok";
@@ -400,7 +400,7 @@ mod tests {
         assert_eq!(
             request_outcome(Err(&MessagingError::HubConnectionLost("x".into()))),
             "unavailable",
-            "the hub connection broke: as Kotlin's"
+            "the hub connection broke"
         );
         assert_eq!(
             request_outcome(Err(&MessagingError::HubUnavailable("x".into()))),

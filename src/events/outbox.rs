@@ -55,7 +55,7 @@ pub fn new_outbox_entry<E: Event>(
 /// The deepest outbox payload, as MySQL's `JSON_DEPTH` counts: a scalar or an empty object or
 /// array is 1, a non-empty one 1 + its deepest member (`{}` 1, `{"a":1}` 2, `{"a":[1]}` 3). MySQL
 /// keeps no document nesting more than 100 objects and arrays, so the shared bound is depth 100
-/// (both libraries: one under MySQL's own limit for a document ending in a scalar).
+/// (every library: one under MySQL's own limit for a document ending in a scalar).
 pub const MAX_PAYLOAD_DEPTH: usize = 100;
 
 /// An outbox payload must be a JSON object whose integers fit in a signed 64-bit integer, at most

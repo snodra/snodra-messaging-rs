@@ -27,42 +27,40 @@
 //! Its time bounds leave the store a second or more: a store stamps times with the application
 //! clock, and the kit never compares the host clock with a stamped time at a finer margin.
 //!
-//! # The checks and their names in snodra-messaging
+//! # The checks
 //!
-//! The Kotlin kit (`MessageStoreConformanceTest` in `snodra-messaging-test`) checks the same
-//! contract; each check here, in the order it runs, with the name of its Kotlin twin (the same
-//! name in camelCase unless the row says otherwise):
+//! Each check, in the order it runs. The specification lists them with what each asserts and
+//! the conformance ids that require them:
+//! <https://snodra.damoreira.com/docs/library-authors/message-store-add-ons/#the-conformance-kit>.
 //!
-//! | Rust check | Kotlin check |
-//! |---|---|
-//! | [`appended_entry_is_claimed_in_created_seq_order`] | `appendedEntryIsClaimedInCreatedSeqOrder` |
-//! | [`outbox_rejects_a_payload_that_is_not_a_json_object`] | **`outboxPayloadMustBeAJsonObject`** |
-//! | [`pending_counts_entries_neither_sent_nor_failed`] | **`oldestPendingIsTheOldestEntryNeitherSentNorFailed`** |
-//! | [`rolled_back_transaction_leaves_no_outbox_entry`] | `rolledBackTransactionLeavesNoOutboxEntry` |
-//! | [`rolled_back_handler_leaves_no_processed_marker`] | `rolledBackHandlerLeavesNoProcessedMarker` |
-//! | [`processed_marker_records_once`] | `processedMarkerRecordsOnce` |
-//! | [`delete_markers_removes_only_the_range`] | `deleteMarkersRemovesOnlyTheRange` |
-//! | [`concurrent_relays_publish_each_entry_once`] | `concurrentRelaysPublishEachEntryOnce` |
-//! | [`expired_lease_is_reclaimed`] | `expiredLeaseIsReclaimed` |
-//! | [`purge_removes_only_sent_before`] | `purgeRemovesOnlySentBefore` |
-//! | [`dead_letters_sequence_per_key`] | `deadLettersSequencePerKey` |
-//! | [`dead_letter_parked_inside_rolled_back_transaction_is_kept`] | `deadLetterParkedInsideRolledBackTransactionIsKept` |
-//! | [`dead_letter_deleted_in_a_transaction_goes_with_it`] | **none** (Rust only) |
-//! | [`control_lock_is_exclusive_until_lease_expires`] | `controlLockIsExclusiveUntilLeaseExpires` |
-//! | [`pause_state_round_trips`] | `pauseStateRoundTrips` |
-//! | [`replay_ranges_round_trip`] | `replayRangesRoundTrip` |
-//! | [`processor_control_write_inside_rolled_back_transaction_is_kept`] | `processorControlWriteInsideRolledBackTransactionIsKept` |
-//! | [`external_call_idempotency_returns_first_result`] | `externalCallIdempotencyReturnsFirstResult` |
-//! | [`saga_ports_round_trip`] | `sagaPortsRoundTrip` |
-//! | [`two_transactions_starting_one_saga_key_leave_one_live_saga`] | **`concurrentStartsOfOneSagaKeyLetOneWin`** |
-//! | [`two_transactions_updating_one_saga_version_commit_once`] | **`concurrentUpdatesOfOneSagaLetOneWin`** |
-//! | [`saga_dispatch_store_refuses_an_event_the_outbox_would_refuse`] | **`sagaEventTheOutboxWouldRefuseIsNotRecorded`** |
-//! | [`due_deadline_is_claimed_once_until_its_lease_passes`] | **`dueDeadlinesAreClaimedOnceUntilTheirLeaseExpires`** |
-//! | [`an_empty_deadline_correlation_id_reads_as_absent`] | **none yet** |
-//! | [`two_schedulers_claim_each_due_deadline_once`] | **`concurrentDeadlineClaimsReturnEachDeadlineOnce`** |
-//! | [`dispatch_hands_out_each_saga_in_seq_order`] | **`sagaDispatchEntriesAreRelayedInOrderPerSaga`** and **`sagaDispatchLeaseIsExclusiveUntilItExpires`** (one check here) |
-//! | [`two_relays_never_hold_one_saga_lease`] | **`concurrentLeaseClaimsGrantOneOwner`** |
-//! | [`concurrent_notice_claims_return_each_notice_once`] | `concurrentNoticeClaimsReturnEachNoticeOnce` |
+//! - [`appended_entry_is_claimed_in_created_seq_order`]
+//! - [`outbox_rejects_a_payload_that_is_not_a_json_object`]
+//! - [`pending_counts_entries_neither_sent_nor_failed`]
+//! - [`rolled_back_transaction_leaves_no_outbox_entry`]
+//! - [`rolled_back_handler_leaves_no_processed_marker`]
+//! - [`processed_marker_records_once`]
+//! - [`delete_markers_removes_only_the_range`]
+//! - [`concurrent_relays_publish_each_entry_once`]
+//! - [`expired_lease_is_reclaimed`]
+//! - [`purge_removes_only_sent_before`]
+//! - [`dead_letters_sequence_per_key`]
+//! - [`dead_letter_parked_inside_rolled_back_transaction_is_kept`]
+//! - [`dead_letter_deleted_in_a_transaction_goes_with_it`]
+//! - [`control_lock_is_exclusive_until_lease_expires`]
+//! - [`pause_state_round_trips`]
+//! - [`replay_ranges_round_trip`]
+//! - [`processor_control_write_inside_rolled_back_transaction_is_kept`]
+//! - [`external_call_idempotency_returns_first_result`]
+//! - [`saga_ports_round_trip`]
+//! - [`two_transactions_starting_one_saga_key_leave_one_live_saga`]
+//! - [`two_transactions_updating_one_saga_version_commit_once`]
+//! - [`saga_dispatch_store_refuses_an_event_the_outbox_would_refuse`]
+//! - [`due_deadline_is_claimed_once_until_its_lease_passes`]
+//! - [`an_empty_deadline_correlation_id_reads_as_absent`]
+//! - [`two_schedulers_claim_each_due_deadline_once`]
+//! - [`dispatch_hands_out_each_saga_in_seq_order`]
+//! - [`two_relays_never_hold_one_saga_lease`]
+//! - [`concurrent_notice_claims_return_each_notice_once`]
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;

@@ -1,6 +1,5 @@
 //! The deadline scheduler: due deadlines fire at least
-//! once from a leased poller, on the in-memory message store. The Rust form of the Kotlin
-//! `DeadlineSchedulerTest`.
+//! once from a leased poller, on the in-memory message store.
 #![cfg(feature = "testing")]
 
 mod support;

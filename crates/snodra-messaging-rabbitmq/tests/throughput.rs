@@ -1,4 +1,4 @@
-//! Throughput on a real broker, as the Kotlin Kafka add-on measures it: 10 000 events published
+//! Throughput on a real broker: 10 000 events published
 //! the relay's way (one at a time, each awaiting its confirm), then read by one subscription that
 //! acknowledges each and does nothing else. Consuming must reach 3 000 events/s, publishing
 //! 500/s (a regression guard only); both rates are printed.

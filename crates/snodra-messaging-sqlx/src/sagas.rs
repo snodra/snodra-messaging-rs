@@ -35,7 +35,7 @@ use crate::limits;
 use crate::outbox::marker_exists;
 
 /// The first key of the transaction-scoped advisory lock that serialises the start of sagas per
-/// start key on PostgreSQL (0x534E_4452 = 1397638226, ASCII "SNDR"; shared with the Kotlin
+/// start key on PostgreSQL (0x534E_4452 = 1397638226, ASCII "SNDR"; the same in every
 /// library).
 #[cfg(feature = "postgres")]
 const SAGA_START_LOCK: i32 = 0x534E_4452;
@@ -73,7 +73,7 @@ impl SqlSagaStore {
     }
 }
 
-/// An enum's stored name: its Kotlin name, as serde writes it.
+/// An enum's stored name, as serde writes it.
 fn enum_name<T: serde::Serialize>(value: &T) -> Result<String, StoreError> {
     Ok(serde_json::to_value(value)?
         .as_str()
@@ -127,8 +127,8 @@ fn read_dispatch(row: &Row) -> Result<SagaDispatchDocument, StoreError> {
     })
 }
 
-/// A deadline's `correlation_id` is NOT NULL in the shared layout (Kotlin's is never absent): a
-/// Rust deadline without one is stored as the empty text, read back as none.
+/// A deadline's `correlation_id` is NOT NULL in the shared layout: a deadline
+/// without one is stored as the empty text, read back as none.
 fn read_deadline(row: &Row) -> Result<DeadlineDocument, StoreError> {
     Ok(DeadlineDocument {
         id: row.text("id")?,

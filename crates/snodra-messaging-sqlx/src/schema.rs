@@ -1,7 +1,7 @@
-//! The schema of the SQL message store: the server check and the versioned schema files, the same
-//! files snodra-messaging-jdbc ships (`db/snodra/<dialect>/V1__snodra.sql`, byte for byte).
+//! The schema of the SQL message store: the server check and the versioned schema files, the
+//! specification's reference files (`db/snodra/<dialect>/V1__snodra.sql`, byte for byte).
 //!
-//! **The version rule** (a contract of both libraries): schema versions are additive.
+//! **The version rule** (a contract of every library): schema versions are additive.
 //! `V1__snodra.sql` is frozen once released; a later change is `V2__snodra.sql`, `V3__...`, each
 //! applied over the one before. Code that knows version n works on a database at version n **or
 //! later** (a newer library may have added tables or columns it does not read), and refuses one
@@ -19,15 +19,15 @@ use crate::db::{Dialect, Pool, storage};
 /// The schema version this library reads and writes.
 pub const SCHEMA_VERSION: i64 = 1;
 
-/// Schema version 1 for PostgreSQL, as snodra-messaging-jdbc ships it.
+/// Schema version 1 for PostgreSQL: the specification's reference file, byte for byte.
 pub const POSTGRESQL_V1: &str = include_str!("db/snodra/postgresql/V1__snodra.sql");
 
-/// Schema version 1 for MySQL, as snodra-messaging-jdbc ships it.
+/// Schema version 1 for MySQL: the specification's reference file, byte for byte.
 pub const MYSQL_V1: &str = include_str!("db/snodra/mysql/V1__snodra.sql");
 
 /// The session-level advisory lock that serialises the schema's application on PostgreSQL (one
-/// bigint key, 0x534E_4452_5343_484D = 6002810473706375245, ASCII "SNDRSCHM"; shared with the
-/// Kotlin library).
+/// bigint key, 0x534E_4452_5343_484D = 6002810473706375245, ASCII "SNDRSCHM"; the same in
+/// every library).
 #[cfg(feature = "postgres")]
 const PG_LOCK: i64 = 0x534E_4452_5343_484D;
 /// The named lock that serialises it on MySQL.
@@ -40,7 +40,7 @@ const PG_LOCK_POLL: Duration = Duration::from_millis(200);
 
 const SUPPORTED: &str = "PostgreSQL 13 or later, MySQL 8.0.17 or later";
 
-/// The file of schema version 1 of `dialect`, by its path in both libraries.
+/// The file of schema version 1 of `dialect`, by its path (`db/snodra/<dialect>/V1__snodra.sql`).
 pub(crate) fn v1(dialect: Dialect) -> (&'static str, &'static str) {
     match dialect {
         #[cfg(feature = "postgres")]
@@ -329,8 +329,9 @@ mod tests {
             .collect()
     }
 
-    /// The schema files are snodra-messaging-jdbc's, byte for byte: a Kotlin service and a Rust
-    /// service share one database. A change to either file costs both libraries.
+    /// The schema files are the specification's reference files, byte for byte: services written
+    /// with any Snodra library share one database. A change to either file is a change to the
+    /// specification.
     #[test]
     fn the_schema_files_are_the_shared_ones_byte_for_byte() {
         assert_eq!(
@@ -345,7 +346,7 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    fn the_schema_lock_key_is_the_kotlin_one() {
+    fn the_schema_lock_key_is_the_shared_one() {
         assert_eq!(PG_LOCK, 6_002_810_473_706_375_245);
     }
 

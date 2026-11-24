@@ -196,8 +196,8 @@ async fn a_stream_opened_while_the_other_hub_is_down_offers_all_permits() {
     c.shutdown().await;
 }
 
-/// `await_registered` is "any hub" (the client can send), `await_all_registered` "every hub"
-/// (snodra-messaging's `awaitRegistered`): a hub that is down holds back only the latter.
+/// `await_registered` is "any hub" (the client can send), `await_all_registered` "every hub":
+/// a hub that is down holds back only the latter.
 #[tokio::test]
 async fn await_registered_waits_for_any_hub_and_await_all_registered_for_every_hub() {
     let (a, b) = (answering("hub-a").await, answering("hub-b").await);
@@ -215,7 +215,7 @@ async fn await_registered_waits_for_any_hub_and_await_all_registered_for_every_h
     c.shutdown().await;
 }
 
-/// While a hub is out, the survivors may run its share too (shared with snodra-messaging): when
+/// While a hub is out, the survivors may run its share too: when
 /// the live hubs go from N_old to N_new < N_old, every live hub gets a `Permits` top-up up to
 /// `ceil(max / N_new)` (here 8 / 1 − 8 / 2 = 4) with `grant = ceil(max / N_new)`, which raises the
 /// hub's permit cap (the fake hub caps like snodra-server) so the hub keeps the top-up. A returning hub
@@ -847,7 +847,7 @@ async fn two_targets_of_one_replacing_hub_settle_without_ping_pong() {
 }
 
 /// A hub whose ack carries an empty `RegisterAck.hub_id` is known by its target as `host:port`
-/// (shared with snodra-messaging): two such hubs are two hubs, not duplicates.
+/// two such hubs are two hubs, not duplicates.
 #[tokio::test]
 async fn a_hub_without_an_id_is_known_by_its_bare_target() {
     let (a, b) = (answering("").await, answering("").await);

@@ -7,7 +7,7 @@
 //! banner on the sandbox's fake printer through a saga (`banner.rs`), with its own
 //! idempotent printer adapters, the printer's topic as an external source and a small HTTP side for
 //! the printer's webhook and the banner outcomes (`http.rs`), which also sends service-b's
-//! `examples.CountGreetings` through the hub (the sandbox's call from Rust to Kotlin). Runs a
+//! `examples.CountGreetings` through the hub. Runs a
 //! named event processor, `audit` (`audit.rs`), whose failures become dead letters the
 //! example's admin endpoints retry and discard.
 

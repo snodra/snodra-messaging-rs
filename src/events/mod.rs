@@ -1,8 +1,8 @@
 //! Events through the event store with the message store's outbox:
 //! [`EventBus`] appends to the outbox, [`OutboxPublisher`] relays it with
 //! [`EventStore::publish`](crate::event_store::EventStore::publish), and each event processor's
-//! [`EventConsumer`] reads its subscription, idempotently. The records are byte-compatible with
-//! the Kotlin starter's (`OutboxEventBus`, `OutboxPublisher`, `EventConsumer`).
+//! [`EventConsumer`] reads its subscription, idempotently. The records are byte for byte the
+//! ones every Snodra library writes and reads.
 
 mod consumer;
 pub mod dispatch;

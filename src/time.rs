@@ -22,7 +22,7 @@ pub fn after(at_ms: i64, by: Duration) -> i64 {
     at_ms.saturating_add(i64::try_from(by.as_millis()).unwrap_or(i64::MAX))
 }
 
-/// `at_ms` as Kotlin's `Instant.toString()` prints it (millisecond precision, `Z`).
+/// `at_ms` as an RFC 3339 UTC instant at millisecond precision (`2026-01-01T00:00:00.000Z`).
 pub fn rfc3339(at_ms: i64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at_ms)
         .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))

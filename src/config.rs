@@ -170,7 +170,7 @@ pub struct Config {
     /// under a send, and its next claim renews what it still holds.
     pub outbox_lease: Duration,
     /// Whether `start()` prepares the message store's schema (`SNODRA_STORE_INIT_SCHEMA`, default
-    /// true; Kotlin's `snodra.messaging.store.init-schema`): the MongoDB store's indexes, an SQL
+    /// true): the MongoDB store's indexes, an SQL
     /// store's tables. `false` when the schema is managed elsewhere (migrations).
     pub store_init_schema: bool,
     /// The retentions (`outbox_retention`, `idempotency_retention`, `sagas_*_retention`,
@@ -1531,10 +1531,7 @@ mod tests {
             o.token_uri,
             "https://idp.example/realms/snodra/protocol/openid-connect/token"
         );
-        assert_eq!(
-            o.client_id, "svc",
-            "the service name, like the Kotlin starter"
-        );
+        assert_eq!(o.client_id, "svc", "the service name");
         assert_eq!(
             o.client_secret.as_ref().map(SecretString::expose),
             Some("s3cr3t-client-secret")
@@ -1846,7 +1843,7 @@ mod tests {
         mentions(vars(&c, &k), &["expired"]);
     }
     #[test]
-    fn saga_settings_default_as_kotlin() {
+    fn saga_settings_have_their_defaults() {
         let c = code_config();
         assert!(c.sagas_enabled);
         assert_eq!(c.sagas_max_attempts, 5);

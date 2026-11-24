@@ -52,15 +52,15 @@ pub enum MessagingError {
     #[error("transport error: {0}")]
     Transport(String),
     /// An adapter's external call failed in a way a later attempt may cure (a timeout, a 503, a
-    /// rate limit): Kotlin's `RetryableExternalException`. Adapters never retry internally; the
+    /// rate limit). Adapters never retry internally; the
     /// saga relay owns the backoff. It crosses the hub as `HANDLER_ERROR` with the
     /// [`RETRYABLE_MARKER`](crate::saga::RETRYABLE_MARKER) in `details`, and an
     /// idempotent handler resets its call record for it, so the next attempt runs the body.
     #[error("{0}")]
     RetryableExternal(String),
     /// Whether the external system acted is unknown (a connection broke after the request went
-    /// out, or an earlier call of the key crashed mid-way): Kotlin's
-    /// `ExternalCallUnknownOutcomeException`. It crosses the hub as `HANDLER_ERROR` with the
+    /// out, or an earlier call of the key crashed mid-way). It crosses the hub as
+    /// `HANDLER_ERROR` with the
     /// [`UNKNOWN_OUTCOME_MARKER`](crate::saga::UNKNOWN_OUTCOME_MARKER) in `details`; the relay
     /// reports it as `SagaCommandFailed(UNKNOWN_OUTCOME)`, and an idempotent handler never calls
     /// the key's body again.
@@ -129,8 +129,7 @@ impl MessagingError {
         }
     }
 
-    /// The variant's name (`"Storage"`, `"RemoteHandler"`, ...): a dead letter's `error.type`
-    ///, the Rust form of Kotlin's exception simple name.
+    /// The variant's name (`"Storage"`, `"RemoteHandler"`, ...): a dead letter's `error.type`.
     pub fn variant_name(&self) -> &'static str {
         match self {
             Self::NoHandler(_) => "NoHandler",

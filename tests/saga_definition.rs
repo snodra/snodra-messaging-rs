@@ -131,7 +131,7 @@ async fn two_deadline_handlers_of_one_name_are_refused() {
 }
 
 #[test]
-fn saga_command_failed_serialises_with_the_kotlin_field_names() {
+fn saga_command_failed_serialises_with_camel_case_field_names() {
     let failed = SagaCommandFailed {
         saga_id: "s-1".into(),
         command_type: "examples.PrintBanner".into(),
@@ -153,7 +153,7 @@ fn saga_command_failed_serialises_with_the_kotlin_field_names() {
 }
 
 #[test]
-fn saga_command_failed_reads_what_kotlin_writes_and_every_reason_has_its_kotlin_name() {
+fn saga_command_failed_reads_its_json_and_every_reason_has_its_wire_name() {
     for (name, reason) in [
         ("NO_HANDLER", FailureReason::NoHandler),
         ("DENIED", FailureReason::Denied),

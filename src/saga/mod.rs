@@ -1,5 +1,4 @@
-//! Sagas, deadlines and the integration toolkit: the Rust form of the Kotlin
-//! `saga`, `deadline` and `external` packages, over the message store's saga ports.
+//! Sagas, deadlines and the integration toolkit, over the message store's saga ports.
 //!
 //! A saga is registered on the builder with a closure-based definition
 //! ([`SnodraMessagingBuilder::saga`](crate::SnodraMessagingBuilder::saga)); its handlers are

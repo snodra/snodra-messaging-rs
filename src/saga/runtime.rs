@@ -19,7 +19,7 @@
 //! redelivers the record instead of losing it.
 //!
 //! Handlers run on the calling task inside a `tracing` span with the fields `saga_type`,
-//! `saga_id` and `correlation_id` (the Rust form of the Kotlin library's MDC keys). They are
+//! `saga_id` and `correlation_id`. They are
 //! synchronous and must stay short: a slow one holds the consumer's partition. A handler that
 //! panics is a handler error.
 
@@ -1100,7 +1100,7 @@ fn describe(e: &StoreError) -> String {
 
 /// The start key of a saga started by `key = value`: `<type>|<key>=<value>` with `%`, `|` and `=`
 /// percent-escaped in each part (`%25`, `%7C`, `%3D`), so two different pairs never build the same
-/// key; the same bytes as Kotlin's `SagaRuntime.startKey`.
+/// key; byte for byte the specification's `startKey`.
 pub(crate) fn start_key_of(type_name: &str, key: &str, value: &str) -> String {
     fn escape(part: &str) -> String {
         part.replace('%', "%25")
@@ -1114,8 +1114,7 @@ pub(crate) fn start_key_of(type_name: &str, key: &str, value: &str) -> String {
 mod tests {
     use super::start_key_of;
 
-    /// The same inputs and expected strings as Kotlin's `SagaRuntimeTest` (start keys whose parts
-    /// contain the separators stay apart): both libraries build the same key.
+    /// Start keys whose parts contain the separators stay apart.
     #[test]
     fn start_keys_whose_parts_contain_the_separators_stay_apart() {
         assert_eq!(start_key_of("rt.Escape", "k=x", "1"), "rt.Escape|k%3Dx=1");

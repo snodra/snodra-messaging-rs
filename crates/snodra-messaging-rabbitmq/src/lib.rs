@@ -4,8 +4,9 @@
 //!
 //! # The layout on the wire
 //!
-//! The Kotlin add-on (`com.rabbitmq:stream-client`) reads and writes the same streams the same
-//! way. These are rules, not descriptions: both libraries must follow them.
+//! These are rules, not descriptions: every RabbitMQ Streams add-on of a Snodra library follows
+//! them, so services written with any of them read and write the same streams the same way
+//! (<https://snodra.damoreira.com/docs/library-authors/event-store-add-ons/#rabbitmq-streams-wire-rules>).
 //!
 //! - **A source is a super stream** (`snodra.events`, partition streams `snodra.events-0` to
 //!   `-N`), created by the infrastructure, never by the library
@@ -44,16 +45,14 @@
 //!   partition stream, with `single-active-consumer=true`, `name=<service>.<processor>` and
 //!   `super-stream=<source>` (absent on a plain stream): the broker makes one consumer of the name
 //!   active per partition and spreads the partitions over the instances. Every consumer also
-//!   carries the property **`snodra-member`**, a random id per subscription instance (the Kotlin
-//!   add-on sets it too): the management API tells the instances apart by it.
+//!   carries the property **`snodra-member`**, a random id per subscription instance: the
+//!   management API tells the instances apart by it.
 //! - **Offset tracking**: the tracking reference is the consumer name, per partition stream;
 //!   **the stored value is the next offset to read** (the offset after the last acknowledged
 //!   event, as Kafka commits: the "last processed" convention cannot say "resume at offset 0"
 //!   after a reset, the protocol's offset being unsigned); a consumer with no stored value starts
 //!   at `first`. A consumer that becomes active answers the broker `offset(stored)` (or `first`).
-//!   The Kotlin add-on uses the Java client's manual tracking and a consumer update listener that
-//!   returns the offset specification itself, never the client's automatic tracking (which would
-//!   resume at stored + 1 and skip one event), and stores `offset + 1` of what it acknowledged.
+//!   Never a client's automatic tracking, which would resume at stored + 1 and skip one event.
 //!   Stored offsets are entries in the stream itself, so a subscription stores every
 //!   [`StorePolicy::messages`] acknowledgements or [`StorePolicy::interval`] (10 000 / 5 s by
 //!   default, the Java client's), and always on deactivation and at close.

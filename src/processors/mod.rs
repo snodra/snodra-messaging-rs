@@ -31,7 +31,7 @@ pub use runner::ProcessorRunner;
 /// How an event handler is registered
 /// ([`event_with`](crate::SnodraMessagingBuilder::event_with)): the processor it belongs to
 /// (`default` unless named) and whether it runs again when that processor replays a
-/// range after a reset (Kotlin's `@DisallowReplay`).
+/// range after a reset.
 ///
 /// ```ignore
 /// builder.event_with::<OrderPlaced, _, _>(

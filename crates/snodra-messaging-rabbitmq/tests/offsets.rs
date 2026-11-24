@@ -1,4 +1,5 @@
-//! The offset-tracking wire rules on a real broker, which the Kotlin add-on shares:
+//! The offset-tracking wire rules on a real broker, which every RabbitMQ Streams add-on follows
+//! (<https://snodra.damoreira.com/docs/library-authors/event-store-add-ons/#rabbitmq-streams-wire-rules>):
 //!
 //! - the value stored under a subscription's name, per partition stream, is the **next offset to
 //!   read**: stored N, a new consumer's first delivery is offset N; a reset to 0 replays from 0;
@@ -73,7 +74,7 @@ async fn the_stored_value_is_the_next_offset_to_read() {
         store.publish(&event(source, "k")).await.unwrap();
     }
     let spec = spec(source);
-    // Stored 3 (by a reset of the subscription, as the Kotlin add-on would read it): the first
+    // Stored 3 (by a reset of the subscription, as any add-on reads it): the first
     // delivery is offset 3.
     let apply = |from: &'static str| {
         let admin = store.admin(&spec).unwrap();

@@ -1,5 +1,5 @@
 //! Metadata of the message currently being handled, and the task-local that carries it so nested
-//! sends re-forward the caller's identity and correlation id (the Kotlin coroutine context does this).
+//! sends re-forward the caller's identity and correlation id.
 
 use std::collections::HashMap;
 
@@ -28,7 +28,7 @@ pub struct MessageContext {
 
 impl MessageContext {
     /// The acting user: from the resolved identity on the hub path, from the `userId` header on
-    /// the event path (events carry no token), as Kotlin's `MessageContext.userId` does.
+    /// the event path (events carry no token).
     pub fn user_id(&self) -> Option<&str> {
         self.identity
             .as_ref()
@@ -64,7 +64,7 @@ impl MessageContext {
 
 /// `value` when it is a valid W3C `traceparent` of version `00`: `00-<32 hex>-<16 hex>-<2 hex>`,
 /// lower case, neither the trace id nor the parent id all zeros. The trace floor forwards no
-/// other value (snodra-messaging's `Traceparents.valid`).
+/// other value.
 pub fn valid_traceparent(value: &str) -> Option<&str> {
     let hex = |part: &str, len: usize| {
         part.len() == len && part.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))

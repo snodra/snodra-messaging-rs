@@ -234,7 +234,7 @@ impl HandlerRegistry {
     }
 
     /// [`event`](Self::event) for a handler that does not run again when its processor replays a
-    /// range after a reset (Kotlin's `@DisallowReplay`): a handler with effects outside
+    /// range after a reset: a handler with effects outside
     /// the service (an e-mail, a payment) that must happen once per record.
     pub fn event_disallowing_replay<E, F, Fut>(&mut self, handler: F)
     where
@@ -255,8 +255,8 @@ impl HandlerRegistry {
         let erased: EventHandler = Arc::new(move |payload: Vec<u8>, ctx: EventContext| {
             let handler = Arc::clone(&handler);
             Box::pin(async move {
-                // A payload that does not fit the event's type cannot get better by retrying
-                // (Kotlin's InvalidMessageException): the consumer parks it after one attempt.
+                // A payload that does not fit the event's type cannot get better by retrying:
+                // the consumer parks it after one attempt.
                 let event: E = codec::decode(&payload).map_err(|e| {
                     MessagingError::InvalidMessage(format!("cannot read {}: {e}", E::TYPE))
                 })?;
@@ -269,8 +269,7 @@ impl HandlerRegistry {
             .push((erased, replayed));
     }
 
-    /// An idempotent command handler: an adapter to an external system (the
-    /// `@IdempotentHandler @CommandHandler` of Rust). Each call is recorded in `external_calls`
+    /// An idempotent command handler: an adapter to an external system. Each call is recorded in `external_calls`
     /// under `key` (by default the `idempotency-key` header the saga relay sets), so a repeat of
     /// the key never runs `handler` twice: a success replays the stored reply, a failure returns
     /// the stored error, a [`MessagingError::RetryableExternal`] lets the next call run again, and
@@ -373,7 +372,7 @@ impl HandlerRegistry {
         labels
     }
 
-    /// Opt-in authorization for a registered command or query (the `@RequiresAuthentication` of Rust).
+    /// Opt-in authorization for a registered command or query.
     pub fn requires<M: MessageType>(&mut self, guard: Guard) {
         assert!(
             self.commands.contains_key(M::TYPE)
@@ -390,8 +389,7 @@ impl HandlerRegistry {
         sorted(self.commands.keys())
     }
 
-    /// Every query type served here, unary, streaming and subscription, exclusive and shared
-    /// (as snodra-messaging's `queryTypes()`).
+    /// Every query type served here, unary, streaming and subscription, exclusive and shared.
     pub fn query_types(&self) -> Vec<String> {
         sorted(
             self.queries

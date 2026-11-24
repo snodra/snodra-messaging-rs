@@ -1,6 +1,6 @@
 //! Partner Kafka topics become local snodra events:
-//! the core's external sources over the Kafka add-on's `KafkaExternalSource`, the Rust form of the
-//! Kotlin `ExternalKafkaSourcesTest`, against a real Kafka (the in-memory message store keeps the rest). One broker serves every
+//! the core's external sources over the Kafka add-on's `KafkaExternalSource`,
+//! against a real Kafka (the in-memory message store keeps the rest). One broker serves every
 //! scenario (each on a topic and source of its own).
 #![cfg(feature = "testing")]
 

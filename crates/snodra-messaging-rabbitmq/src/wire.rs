@@ -1,4 +1,4 @@
-//! The layout on the wire, shared with the Kotlin add-on (`com.rabbitmq:stream-client`): how an
+//! The layout on the wire, shared by every RabbitMQ Streams add-on of a Snodra library: how an
 //! event becomes an AMQP 1.0 message, which partition stream it goes to, and how a delivered
 //! chunk is read back. See the crate docs for the whole layout.
 
@@ -252,7 +252,7 @@ mod tests {
         }
     }
 
-    /// The partition table the Kotlin twin pins too (murmur3 x86_32, seed 104729, the hash as an
+    /// The partition table (murmur3 x86_32, seed 104729, the hash as an
     /// unsigned number modulo 6 partitions; a signed modulo is wrong for `order-7`, whose hash
     /// has its top bit set).
     #[test]
@@ -379,7 +379,7 @@ mod tests {
 }
 
 /// The encoded message, section by section, with the AMQP type codes of what Snodra's layout
-/// fixes (the Kotlin add-on writes the same bytes' types).
+/// fixes.
 #[cfg(test)]
 mod golden {
     use super::*;

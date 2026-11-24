@@ -1,5 +1,5 @@
 //! The `dead_letters` collection (mode `collection`): the document, field for field the
-//! contract both libraries write. A letter's `_id` is `<processor>:<source>:<segment>:<position>`
+//! contract every library writes. A letter's `_id` is `<processor>:<source>:<segment>:<position>`
 //! (`<processor>:<topic>:<partition>:<offset>` on Kafka), so parking the same record twice finds
 //! the first letter (a duplicate key means "already parked"). Dates are BSON datetimes; `topic` is
 //! the source, `partition` the segment and `offset` the position, as
@@ -23,7 +23,7 @@ use crate::{OrStoreError, date, is_duplicate_key, positions, session, store_erro
 
 pub(crate) const DEAD_LETTERS_COLLECTION: &str = "dead_letters";
 
-/// A letter's `reason`, by its Kotlin name.
+/// A letter's `reason`, by its stored name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum ReasonDocument {

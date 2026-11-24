@@ -1,5 +1,5 @@
-//! Test databases: a PostgreSQL or MySQL container at the image versions snodra-messaging-jdbc's
-//! tests use (`postgres:17.7`, `mysql:8.4.7`), a fresh database per check, and raw SQL (literal
+//! Test databases: a PostgreSQL or MySQL container at the image versions the tests
+//! pin (`postgres:17.7`, `mysql:8.4.7`), a fresh database per check, and raw SQL (literal
 //! test values, every column read back as text) to look at the stored rows apart from the store.
 #![allow(dead_code)]
 

@@ -919,7 +919,7 @@ struct Entry {
     subscription: bool,
 }
 
-/// The `CommandBus`/`QueryBus` of the Rust side. Replies arrive through [`Sender::on_inbound`].
+/// Sends commands and queries through the hub. Replies arrive through [`Sender::on_inbound`].
 ///
 /// Local dispatch: a command, or a unary query of a type not registered as shared, that this
 /// instance handles itself is answered in-process by its handler, without the hub, unless

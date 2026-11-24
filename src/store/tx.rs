@@ -37,7 +37,7 @@ impl Tx {
     }
 }
 
-/// Starts, commits and aborts a [`Tx`] (Spring's `TransactionOperations`).
+/// Starts, commits and aborts a [`Tx`].
 pub trait TxProvider: Send + Sync {
     /// A transaction.
     fn begin(&self) -> BoxFuture<'_, Result<Tx, StoreError>>;

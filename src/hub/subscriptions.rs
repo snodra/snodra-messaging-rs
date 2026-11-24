@@ -466,8 +466,7 @@ async fn pump(
 /// message}` and removes it. With no matching subscription a call is a no-op. The messages are
 /// written by a task per subscription, so a call never waits for the hub stream.
 ///
-/// There is no transaction to defer to here (the Kotlin library emits after the commit of the
-/// surrounding Spring transaction automatically): a handler that writes in a Mongo transaction
+/// There is no transaction to defer to here: a handler that writes in a Mongo transaction
 /// emits after its commit, or the subscribers see an update of a write that may roll back.
 #[derive(Clone)]
 pub struct QueryUpdateEmitter {

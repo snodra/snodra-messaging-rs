@@ -1,7 +1,6 @@
 # service-c
 
-The Rust participant of the examples sandbox (see `snodra-messaging/examples/README.md` for the whole
-picture and the curl walkthrough). Handles `examples.Shout` and `examples.Reverse`, publishes
+The Rust participant of the examples sandbox. Handles `examples.Shout` and `examples.Reverse`, publishes
 `examples.TextShouted` / `examples.TextReversed` through its outbox, logs `examples.GreetingDelivered`.
 Shares the query `examples.Inventory` with service-b (`shared_query`): it answers with its
 service name, its host name (the container id under Docker), a fixed count of 3 and how many
@@ -20,8 +19,8 @@ right away). It also answers the shared query `examples.OpenSubscriptions` with
 
 ## The banner saga
 
-Every shouted text is printed as a banner by the sandbox's fake printer (`snodra-messaging/examples/fake-printer`),
-through the Rust form of service-b's postcard saga with service-c's own types (`src/banner.rs`):
+Every shouted text is printed as a banner by the sandbox's fake printer,
+through a saga like service-b's postcard saga, with service-c's own types (`src/banner.rs`):
 
 - `examples.Banner` starts on `examples.TextShouted` (the job id is `banner-<text in lower case>`, the association
   `jobId`), sends `examples.PrintBanner` to service-c's own idempotent adapter (`idempotent_command`, delivered locally
@@ -86,8 +85,7 @@ curl -s "$HUB/dead-letters"                      # the letters without payloads;
 
 The pure parts (the switch, the views of a letter, of a retry result and of a reset, the query parsing) are unit-tested in
 `src/audit.rs`; smoke steps 26 to 26h drive the HTTP side against the real hub, Kafka and MongoDB, and steps 27 to 27e pause, resume
-and reset `audit` and retry and discard its letters through the hub's HTTP API (`snodra-messaging/examples/README.md`, "Event
-processors and dead letters").
+and reset `audit` and retry and discard its letters through the hub's HTTP API.
 
 Configuration is the crate's `Config::from_env`: `SNODRA_SERVICE_NAME` (`service-c`), `SNODRA_SERVER_ADDRESS`,
 `SNODRA_KAFKA_BOOTSTRAP`, `SNODRA_INSTANCE_ID` (default a fresh UUID), `RUST_LOG` (default `info`), and the service's own
@@ -102,7 +100,7 @@ Prometheus with `job="service-c"` and `instance="<instance id>"`. Unset (the def
 the library records nothing. The examples sandbox sets both (`compose.local.yaml`: 5 s).
 
 `GET /greetings/{name}/count` sends service-b's query `examples.CountGreetings` through the hub and answers
-`{"name","count"}` (502 with the error when the call fails): the sandbox's one call from Rust to Kotlin, which gives
+`{"name","count"}` (502 with the error when the call fails): the sandbox's one call from service-c to service-b, which gives
 `snodra_hub_client_request_duration_seconds` a Rust sender (the examples smoke's step 29c compares it with
 service-a's).
 

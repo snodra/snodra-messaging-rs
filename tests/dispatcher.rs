@@ -477,7 +477,7 @@ async fn shared_query_is_listed_apart_and_dispatched_like_any_query() {
         })
     });
     r.requires::<Search>(Guard::authenticated());
-    // `query_types` is every query served here (as in snodra-messaging); the `Register` lists
+    // `query_types` is every query served here; the `Register` lists
     // the exclusive and the shared ones apart.
     assert_eq!(r.query_types(), vec!["t.Count", "t.Search"]);
     assert_eq!(r.exclusive_query_types(), vec!["t.Count"]);

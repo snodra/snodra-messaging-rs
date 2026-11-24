@@ -2,9 +2,9 @@
 
 The SQL message store of snodra-messaging: the outbox, the processed events, the dead letters, the processor
 control, the external calls and the sagas in the service's own **PostgreSQL** (feature `postgres`) or **MySQL** (feature
-`mysql`) database, through [`sqlx`](https://docs.rs/sqlx) 0.9. It writes the tables of the Kotlin module
-`snodra-messaging-jdbc` with the same values and the same meanings, so a Kotlin service and a Rust service can share one
-database.
+`mysql`) database, through [`sqlx`](https://docs.rs/sqlx) 0.9. It writes the specification's
+[SQL layout](https://snodra.damoreira.com/docs/library-authors/message-store-add-ons/#the-sql-layout) with its values and meanings, so
+services written with any Snodra library can share one database.
 
 ```toml
 snodra-messaging-sqlx = { git = "...", default-features = false, features = ["postgres"] }
@@ -53,7 +53,8 @@ and, past the pool's `acquire_timeout` (30 s by default), fails with a storage e
 relay's LISTEN connection (PostgreSQL) is its own, outside the pool.
 
 **One database, one service.** A database (or schema) with these tables belongs to one logical service: its instances,
-in Kotlin, in Rust or both (two implementations of the same service share it, which is what the shared layout is for).
+whatever library they are written with (two implementations of the same service share it, which is what the shared
+layout is for).
 Two different services keep separate databases or schemas: the processed-event markers, the processor control, the
 dead letters' key blocking and the deadline and failure-notice claims carry no service name.
 
@@ -70,18 +71,17 @@ or the URL (`sslmode=verify-full`, `ssl-mode=VERIFY_IDENTITY`). The store never 
 | `Config::store_init_schema` | `SNODRA_STORE_INIT_SCHEMA` | `true` | apply the schema at startup; `false`: check it is there |
 | retentions | `Config::outbox_retention`, `idempotency_retention` (by code); `SNODRA_EXTERNAL_CALLS_RETENTION_MS`, `SNODRA_SAGAS_ENDED_RETENTION_MS`, `SNODRA_SAGAS_DISPATCH_RETENTION_MS`, `SNODRA_SAGAS_FAILED_RETENTION_MS`, `SNODRA_DEADLINES_RETENTION_MS` | outbox 7 d, markers 30 d, external calls 30 d, ended sagas 30 d, dispatched 7 d, failed 30 d, deadlines 7 d | what the purge keeps |
 
-They mirror the Kotlin module's `snodra.messaging.store.jdbc.notify`, `snodra.messaging.store.jdbc.purge-interval`,
-`snodra.messaging.store.init-schema` and `snodra.messaging.*.retention`. `SqlxSettings::from_env()` reads the two variables;
+`SqlxSettings::from_env()` reads the two variables;
 the retentions and `SNODRA_STORE_INIT_SCHEMA` are the core `Config`'s.
 
 ## Schema
 
-The schema files are `snodra-messaging-jdbc`'s, byte for byte (a test pins their SHA-256), embedded in the crate:
+The schema files are the specification's reference files, byte for byte (a test pins their SHA-256), embedded in the crate:
 `schema::POSTGRESQL_V1` (`db/snodra/postgresql/V1__snodra.sql`) and `schema::MYSQL_V1` (`db/snodra/mysql/V1__snodra.sql`).
 The tables: `snodra_schema`, `snodra_outbox`, `snodra_processed_events`, `snodra_dead_letters`, `snodra_processor_control`,
 `snodra_external_calls`, `snodra_sagas`, `snodra_saga_associations`, `snodra_saga_dispatch`, `snodra_saga_dispatch_leases`,
-`snodra_deadlines`, `snodra_saga_failures`; every column, index and constraint is in the files and in the Kotlin module's
-README (the shared reference).
+`snodra_deadlines`, `snodra_saga_failures`; every column, index and constraint is in the files, which are
+the [specification's reference schema](https://snodra.damoreira.com/docs/library-authors/message-store-add-ons/#the-sql-layout) byte for byte.
 
 - **Applying it.** `start()` checks the server, then applies V1 unless `snodra_schema` holds version 1 or later, under a
   database lock so instances starting together apply it once: PostgreSQL `pg_try_advisory_lock(6002810473706375245)`
@@ -91,13 +91,13 @@ README (the shared reference).
   `SNODRA_STORE_INIT_SCHEMA=false`. `SqlxStore::apply_schema()` does the same by hand.
 - **Applying it yourself** (Flyway, Liquibase, a DBA): run the file, set `SNODRA_STORE_INIT_SCHEMA=false`; `start()` then
   fails unless the database is at version 1 or later (`SqlxStore::require_schema()`).
-- **The version rule** (both libraries): versions are additive. `V1__snodra.sql` is frozen once released; a change is
+- **The version rule** (every library): versions are additive. `V1__snodra.sql` is frozen once released; a change is
   `V2__snodra.sql`, applied over V1. Code that knows version n works on a database at version n or later, and refuses one
   below n.
 
 ## Values
 
-The same as `snodra-messaging-jdbc`'s, so either library reads the other's rows:
+The values the shared layout fixes, so every library reads the others' rows:
 
 - **Times**: the application's clock (`Config`'s, never the database's `now()`), at millisecond precision, UTC: PostgreSQL
   `TIMESTAMPTZ(3)`, MySQL `DATETIME(3)` holding the UTC wall clock.
@@ -112,7 +112,7 @@ The same as `snodra-messaging-jdbc`'s, so either library reads the other's rows:
   each part percent-escaped (`%` → `%25`, `|` → `%7C`, `=` → `%3D`).
 - **Positions**: `position_num` is the position as a number when it is a canonical decimal (`41`, not `041`), else NULL;
   decimal positions are ordered by value, the others by their bytes.
-- **Enums** by their Kotlin names (`IN_PROGRESS`, `SCHEDULED`, `COMMAND`, `HANDLER_FAILED`, `NO_HANDLER`, `reset`, ...).
+- **Enums** by their stored names (`IN_PROGRESS`, `SCHEDULED`, `COMMAND`, `HANDLER_FAILED`, `NO_HANDLER`, `reset`, ...).
 
 ## Limits
 
@@ -205,6 +205,6 @@ every read. `SqlxStore::purge_expired(&config)` runs it by hand.
 ## Tests
 
 `tests/conformance.rs` runs the whole store conformance kit on `postgres:17.7` and `mysql:8.4.7`; `tests/layout.rs` pins the
-stored values (golden values, hashes computed independently) and reads rows written in the Kotlin layout by plain SQL;
+stored values (golden values, hashes computed independently) and reads rows written in the shared layout by plain SQL;
 `tests/behaviour.rs` the transactions with the service, the bounds, the schema, the purge and the concurrency rules on both;
 `tests/notify.rs` the PostgreSQL wake-up. They need Docker (`DOCKER_HOST=unix://$HOME/.rd/docker.sock` on Rancher Desktop).

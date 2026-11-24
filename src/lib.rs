@@ -1,6 +1,6 @@
-//! Snodra messaging client for Rust: the counterpart of the Kotlin `snodra-messaging` starter.
+//! Snodra messaging client for Rust.
 //!
-//! Wire- and storage-compatible with it: same hub protocol (`proto/hub.proto`), same events on the
+//! Wire- and storage-compatible with every Snodra library: same hub protocol (`proto/hub.proto`), same events on the
 //! event store (an add-on: `snodra-messaging-kafka` or `snodra-messaging-rabbitmq`; the
 //! in-memory [`event_store::memory`] for tests), same records in the message store (an add-on:
 //! `snodra-messaging-mongo` or `snodra-messaging-sqlx` for PostgreSQL and MySQL; the

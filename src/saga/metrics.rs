@@ -33,7 +33,7 @@ pub enum ExternalOutcome {
 }
 
 impl ExternalOutcome {
-    /// The tag value, as Kotlin's (`succeeded`, `replayed`, `failed`, `retryable`, `unknown`).
+    /// The tag value (`succeeded`, `replayed`, `failed`, `retryable`, `unknown`).
     pub fn as_str(self) -> &'static str {
         match self {
             ExternalOutcome::Succeeded => "succeeded",

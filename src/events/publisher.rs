@@ -33,8 +33,8 @@ use crate::saga::Clock;
 use crate::store::{OutboxEntry, OutboxStore};
 use crate::time::{after, now_ms, rfc3339};
 
-/// The most one publish takes (as Kotlin's `max.block.ms` 10 s + `delivery.timeout.ms` 30 s): one
-/// still unanswered then counts as failed. The outbox lease must be longer.
+/// The most one publish takes: one still unanswered then counts as failed. The outbox lease
+/// must be longer.
 pub const OUTBOX_SEND_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// What an [`OutboxPublisher`] relays, where to and how (`Config`'s `outbox_*` and events

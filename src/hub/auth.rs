@@ -41,7 +41,7 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 /// The lifetime assumed when the endpoint sends no `expires_in`.
 pub const DEFAULT_LIFETIME: Duration = Duration::from_secs(60);
-/// A token is refreshed at least this long before it expires (the Kotlin starter agrees)...
+/// A token is refreshed at least this long before it expires...
 pub const MIN_REFRESH_MARGIN: Duration = Duration::from_secs(5);
 /// The wait after the first failed proactive refresh; it doubles up to [`RETRY_MAX`].
 pub const RETRY_MIN: Duration = Duration::from_secs(1);

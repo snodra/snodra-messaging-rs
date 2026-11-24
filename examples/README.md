@@ -2,10 +2,9 @@
 
 - `service-c/`: the Rust example service of the sandbox; see its README. Besides the messaging, saga and query examples it runs the
   named event processor `audit` with example admin endpoints over `dead_letters()`, a reset handler and a no-replay handler; the sandbox's smoke steps 26 to 26h drive it and its dead letters locally, steps 27 to 27e through the hub (pause, resume,
-  a reset to `earliest`, the dead letters), in every sandbox mode (`snodra-messaging/examples/README.md`, "Event processors and dead
-  letters").
-- `orders-sql/`: a small orders service on PostgreSQL with the SQL message store (`snodra-messaging-sqlx`), the twin of
-  snodra-messaging's `examples/orders-sql`. `PlaceOrder` (a command; the service handles it itself, so it is answered
+  a reset to `earliest`, the dead letters), in every sandbox mode.
+- `orders-sql/`: a small orders service on PostgreSQL with the SQL message store (`snodra-messaging-sqlx`).
+  `PlaceOrder` (a command; the service handles it itself, so it is answered
   in-process unless `SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB=true`, which its end-to-end test sets to send it through the
   hub) writes the order row and appends
   `OrderPlaced` to the outbox in one transaction; the relay publishes it to the event store (the in-memory one, to keep the

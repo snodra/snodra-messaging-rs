@@ -1,5 +1,5 @@
 //! Verifies a webhook request against a shared secret, by
-//! the rules of an identity provider webhook, as the Kotlin `WebhookSignatureVerifier`:
+//! the rules of an identity provider webhook:
 //!
 //! - **shared secret**: the header `X-Snodra-Webhook-Secret` holds the secret itself;
 //! - **HMAC**: the header `X-Snodra-Signature` holds `sha256=<hex>`, the HMAC-SHA256 of the raw

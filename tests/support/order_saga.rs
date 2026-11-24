@@ -1,5 +1,4 @@
-//! The messages and sagas of the saga runtime and failure-admin tests ("rt.*", the Rust form of
-//! the Kotlin `SagaRuntimeFixtures`).
+//! The messages and sagas of the saga runtime and failure-admin tests ("rt.*").
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap};

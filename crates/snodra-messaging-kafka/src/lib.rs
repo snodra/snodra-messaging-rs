@@ -3,8 +3,9 @@
 //!
 //! On Kafka a source is a topic, a segment a partition and a position an offset (both in
 //! decimal); a subscription's name is its consumer group (`<service>.<processor>`). The layout
-//! on the wire is the one the Kotlin starter writes: the event's headers are the record's
-//! headers, its key the record's key, its payload the record's value, a dead letter goes to
+//! on the wire is the one every Snodra library writes
+//! (<https://snodra.damoreira.com/docs/library-authors/event-store-add-ons/#kafka-wire-rules>):
+//! the event's headers are the record's headers, its key the record's key, its payload the record's value, a dead letter goes to
 //! `<topic>.dlt`.
 //!
 //! Capabilities: all four. `replay` (reset a group's offsets, [`KafkaAdmin`]), `lag` (committed
@@ -35,8 +36,8 @@
 //! store itself.
 //!
 //! **Partitions**: the producer partitions keys as the Java client's default partitioner does
-//! (librdkafka `partitioner=murmur2_random`, [`DEFAULT_PARTITIONER`]), so one key from a Kotlin and
-//! a Rust publisher lands on one partition and keeps its order; a `partitioner` producer property
+//! (librdkafka `partitioner=murmur2_random`, [`DEFAULT_PARTITIONER`]), so one key from any
+//! publisher lands on one partition and keeps its order; a `partitioner` producer property
 //! (`SNODRA_KAFKA_PROPERTY_PARTITIONER`, which reaches the producer only, or
 //! [`KafkaConfig::producer_property`]) chooses another.
 //!

@@ -1,5 +1,5 @@
-//! Saga, deadline, dispatch and external-call statistics: the Kotlin
-//! meters as counters and gauges behind accessors, with the same names and labels, which
+//! Saga, deadline, dispatch and external-call statistics: counters and gauges behind accessors,
+//! with the names and labels below, which
 //! [`OtelSagaMetrics`](super::OtelSagaMetrics) also records on the meter
 //! (`snodra.sagas.started{type}` is what Prometheus shows as `snodra_sagas_started_total{type}`).
 //! Every label value is a saga type, a deadline name, a handler label, an outcome or a reason,
@@ -16,7 +16,7 @@
 //!   saga event the outbox refuses (`type` the event's wire type, `reason` `INVALID`);
 //! - the gauges `snodra.sagas.active{type}` and `snodra.saga.dispatch.pending`, which no hook
 //!   moves: [`SagaStats::sample_once`] counts them in the message store, and
-//!   [`SagaStats::start_sampler`] does so every [`SAMPLE_INTERVAL`] (15 s, as Kotlin). A failed
+//!   [`SagaStats::start_sampler`] does so every [`SAMPLE_INTERVAL`] (15 s). A failed
 //!   sample is logged and keeps the last values.
 //!
 //! [`SagaStats`] implements [`SagaMetrics`]; the application's runtime, relay, scheduler and
@@ -153,7 +153,7 @@ impl SagaStats {
     }
 
     /// Makes the `snodra.sagas.active` gauge of each of `saga_types` exist (at 0) before its
-    /// first sample, as Kotlin's.
+    /// first sample.
     pub fn register_saga_types<'a>(&self, saga_types: impl IntoIterator<Item = &'a str>) {
         let mut inner = self.inner();
         for t in saga_types {

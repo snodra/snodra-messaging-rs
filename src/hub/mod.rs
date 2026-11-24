@@ -1,7 +1,7 @@
 //! The hub side: one bidirectional stream per hub ([`HubConnection`]; every hub of
 //! `hub_address` through a [`HubPool`]), typed handler registration, inbound dispatch and outbound
-//! sends. Protocol in `proto/hub.proto`, behaviour mirrors the Kotlin
-//! `HubConnection`/`HubBus`.
+//! sends. Protocol in `proto/hub.proto`; the specification:
+//! <https://snodra.damoreira.com/docs/library-authors/protocol/>.
 
 mod auth;
 mod connection;

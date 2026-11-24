@@ -16,8 +16,8 @@ use crate::identity::Guard;
 
 /// What an adapter's error carries in `details` when the external call failed for a reason a
 /// later attempt may cure: the relay reads it to tell a transient failure from an ordinary
-/// handler failure, whether the adapter ran in this service or in another (the Kotlin
-/// marker, byte for byte).
+/// handler failure, whether the adapter ran in this service or in another (the marker
+/// the specification fixes, byte for byte).
 pub const RETRYABLE_MARKER: &[u8] = br#"{"snodra":"retryable"}"#;
 /// What an adapter's error carries in `details` when the call's outcome is unknown.
 pub const UNKNOWN_OUTCOME_MARKER: &[u8] = br#"{"snodra":"unknown-outcome"}"#;

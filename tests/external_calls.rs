@@ -1,5 +1,4 @@
-//! Idempotent adapter handlers over `external_calls`: the Rust form of the Kotlin
-//! `IdempotentHandlerTest`, on the in-memory message store.
+//! Idempotent adapter handlers over `external_calls`, on the in-memory message store.
 #![cfg(feature = "testing")]
 
 mod support;
@@ -583,7 +582,7 @@ async fn the_key_can_be_computed_from_the_message() {
     assert_eq!(
         ex.record("poll:j1:1").await.unwrap().reply.as_deref(),
         Some("{}"),
-        "a unit reply is stored as the empty object, as Kotlin writes it"
+        "a unit reply is stored as the empty object"
     );
     assert!(ex.record("poll:j1:2").await.is_some());
 }

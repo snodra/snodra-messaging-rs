@@ -19,7 +19,7 @@ pub struct OutboxEntry {
     pub key: Option<String>,
     pub headers: HashMap<String, String>,
     /// The event as JSON: always a JSON object whose integers fit in a signed 64-bit integer
-    /// (what both libraries and every store hold). A store refuses any other payload (not JSON,
+    /// (what every library and every store hold). A store refuses any other payload (not JSON,
     /// JSON that is not an object, an integer above `i64::MAX`) with
     /// [`MessagingError::InvalidMessage`].
     ///

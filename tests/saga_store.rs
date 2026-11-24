@@ -3,7 +3,8 @@
 //! `external_calls` (`snodra_messaging_mongo::documents`, read back into the core's records), and
 //! their indexes.
 //! The fixtures in `tests/fixtures/saga_contract` are written by hand from the contract's table, in
-//! the shape Spring Data writes them (`_class` included); Rust writes no `_class` and no nulls.
+//! the shape another writer may store them in (`_class` included); this library writes no `_class`
+//! and no nulls.
 
 mod support;
 
@@ -34,7 +35,7 @@ macro_rules! require_docker {
     };
 }
 
-/// A fixture as the BSON document Spring Data would have stored (extended JSON for dates and longs).
+/// A fixture as the BSON document another writer may have stored (extended JSON for dates and longs).
 fn fixture(name: &str) -> Document {
     let path = format!(
         "{}/tests/fixtures/saga_contract/{name}.json",
@@ -65,7 +66,7 @@ fn record<D: DeserializeOwned, T: From<D>>(name: &str) -> T {
 }
 
 #[test]
-fn a_kotlin_shaped_document_of_each_collection_deserialises() {
+fn a_fixture_document_of_each_collection_deserialises() {
     let saga: SagaDocument = record::<SagaDoc, _>("sagas");
     assert_eq!(saga.id, "7f6c1f0e-5a53-4f3e-9a0a-1d2f6f0c9b11");
     assert_eq!(saga.type_name, "PaymentSaga");
@@ -206,7 +207,7 @@ fn to_doc<T: Serialize>(value: &T) -> Document {
 
 #[test]
 fn a_document_rust_writes_has_exactly_the_contracts_field_names_and_bson_types_and_no_nulls() {
-    // Full: every optional field set, from the Kotlin fixtures (which also proves the round trip).
+    // Full: every optional field set, from the fixtures (which also proves the round trip).
     let saga: SagaDocument = record::<SagaDoc, _>("sagas");
     let ended: SagaDocument = record::<SagaDoc, _>("sagas_ended");
     let written = to_doc(&SagaDoc::from(&saga));
@@ -614,7 +615,7 @@ async fn two_live_instances_with_one_start_key_are_refused() {
 }
 
 #[tokio::test]
-async fn kotlin_shaped_documents_are_read_back_through_the_driver_and_rewritten_without_class() {
+async fn fixture_documents_are_read_back_through_the_driver_and_rewritten_without_class() {
     require_docker!();
     let mongo = support::containers::mongo().await;
     let db = db(&mongo.uri).await;
@@ -628,12 +629,12 @@ async fn kotlin_shaped_documents_are_read_back_through_the_driver_and_rewritten_
             .find_one(doc! { "_id": "7f6c1f0e-5a53-4f3e-9a0a-1d2f6f0c9b11" })
             .await
             .unwrap()
-            .expect("the Kotlin document"),
+            .expect("the fixture document"),
     );
     assert_eq!(saga.version, 3);
     assert_eq!(saga.associations.len(), 2);
 
-    // Rust replaces it: its own shape, no `_class`, state text untouched.
+    // This library replaces it: its own shape, no `_class`, state text untouched.
     saga.version += 1;
     typed
         .replace_one(doc! { "_id": &saga.id }, SagaDoc::from(&saga))

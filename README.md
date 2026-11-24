@@ -22,12 +22,12 @@
 ## What it is
 
 One builder that gives a Rust service everything it needs to take part in a Snodra system, with the
-same wire protocol and the same stored records as the Kotlin library — a Kotlin and a Rust service are
-indistinguishable in front of the server and on the event store.
+same wire protocol and the same stored records as every Snodra library: services written with any of
+them are indistinguishable in front of the server and on the event store.
 
 - **Commands and queries** through Snodra Server, with deadlines, retries and streaming queries. A command or unary
   query of a type the service handles itself (a query not registered as shared) is answered in-process by its own
-  handler, without the hub, as the Kotlin library does; `SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB=true`
+  handler, without the hub; `SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB=true`
   (`Config::hub_always_route_through_hub`, or the builder's `always_route_through_hub(true)`) sends it through the hub
   like any other request. Before `start()`, an idempotent command type of this service is not answered in-process: it
   goes through the hub like another service's command (its call records are bound by `start()`), so with no hub yet it
@@ -66,7 +66,7 @@ Settings come from the environment (`SNODRA_*`, and `SNODRA_SERVER_*` for the hu
 ## Documentation
 
 Quick start, the settings map, the add-ons and the conformance kits: **<https://snodra.damoreira.com/docs/messaging/rust/>**.
-The Kotlin counterpart is [`snodra-messaging`](https://github.com/snodra/snodra-messaging).
+Other languages: <https://snodra.damoreira.com/>.
 
 ## Contributing
 

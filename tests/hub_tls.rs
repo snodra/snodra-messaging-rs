@@ -184,7 +184,7 @@ async fn dns_pool(address: String, tls: HubTls) -> Arc<HubPool> {
 async fn a_dns_target_is_verified_against_its_name_not_the_resolved_ip() {
     // The certificate names `localhost` and nothing else (no IP SAN), as one issued for a service
     // name does. `dns:///` resolves to `127.0.0.1:port`; the certificate must be checked against
-    // the DNS name, like snodra-messaging (Kotlin) does, without `server_name`.
+    // the DNS name, without `server_name`.
     let (dir, pki) = (TempDir::new(), Pki::new("test CA"));
     let (cert, key) = pki.server_names_only(&["localhost"]);
     let hub = FakeHub::start_tls(&cert, &key).await;

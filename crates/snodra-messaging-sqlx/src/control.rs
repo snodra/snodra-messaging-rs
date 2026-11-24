@@ -50,7 +50,7 @@ fn ranges(text: Option<&str>) -> Result<Vec<ReplayRange>, StoreError> {
     let Some(text) = text else {
         return Ok(Vec::new());
     };
-    // A range missing a field is skipped (Kotlin's reader does the same).
+    // A range missing a field is skipped.
     let values: Vec<serde_json::Value> = serde_json::from_str(text)?;
     Ok(values
         .into_iter()
@@ -394,7 +394,7 @@ impl ProcessorControlStore for SqlProcessorControlStore {
 mod tests {
     use super::*;
 
-    /// The column holds `[{"source","segment","from","until"}]` strings, in order (the Kotlin
+    /// The column holds `[{"source","segment","from","until"}]` strings, in order (the shared
     /// layout), and reads it back.
     #[test]
     fn replay_ranges_are_a_json_array_of_string_objects_in_order() {

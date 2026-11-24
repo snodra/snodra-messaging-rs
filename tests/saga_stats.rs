@@ -1,6 +1,5 @@
-//! Saga statistics: every counter and gauge of the Kotlin
-//! meters moves on the matching action of a real runtime, scheduler, relay and idempotent adapter
-//! on the in-memory message store. The Rust form of the Kotlin `SagaMetricsTest`.
+//! Saga statistics: every counter and gauge moves on the matching action of a real runtime,
+//! scheduler, relay and idempotent adapter on the in-memory message store.
 #![cfg(feature = "testing")]
 
 mod support;

@@ -100,7 +100,7 @@ fn consumer(
 }
 
 #[tokio::test]
-async fn outbox_relays_to_kafka_with_kotlin_headers() {
+async fn outbox_relays_to_kafka_with_the_event_headers() {
     require_docker!();
     let kafka = support::containers::kafka().await;
     let mongo = support::containers::mongo().await;
@@ -263,7 +263,7 @@ async fn consumer_handles_once_and_dedupes() {
     assert_eq!(
         seen_user.lock().unwrap().as_deref(),
         Some("u-1"),
-        "userId header reaches the event context like Kotlin's MessageContext.userId"
+        "userId header reaches the event context's user_id"
     );
     let markers = db
         .collection::<mongodb::bson::Document>("processed_events")

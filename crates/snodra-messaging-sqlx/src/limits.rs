@@ -1,5 +1,5 @@
-//! The bounds of the store's columns (schema version 1), the same on both databases and in both
-//! libraries (snodra-messaging-jdbc's `Limits`): a value over its bound is refused before anything
+//! The bounds of the store's columns (schema version 1), the same on both databases and in every
+//! library: a value over its bound is refused before anything
 //! is written, with an `InvalidMessage` naming the field and its length (never the value: it may
 //! be personal data); the database never truncates. Lengths are in characters (Unicode code
 //! points), as `VARCHAR(n)` counts them on both databases.
@@ -165,8 +165,7 @@ fn has_nul(json: &serde_json::Value) -> bool {
 mod tests {
     use super::*;
 
-    /// The golden values both libraries compute (snodra-messaging-jdbc's `Limits.sha256` and
-    /// `Limits.associationHash`), taken from an independent SHA-256 (`printf '...' | shasum -a
+    /// The golden values, taken from an independent SHA-256 (`printf '...' | shasum -a
     /// 256`): a marker id, an association (key, a zero byte, value), a start key with the
     /// runtime's escaping, and multi-byte text.
     #[test]

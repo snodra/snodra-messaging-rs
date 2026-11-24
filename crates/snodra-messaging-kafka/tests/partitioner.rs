@@ -1,6 +1,6 @@
-//! A key lands on the partition the Java client's default partitioner gives it, so a Kotlin and a
-//! Rust publisher of one key write to one partition (and its events keep their order across
-//! languages). Against a real Kafka.
+//! A key lands on the partition the Java client's default partitioner gives it, so every publisher
+//! of one key writes to one partition, whatever library it uses (and its events keep their
+//! order). Against a real Kafka.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};

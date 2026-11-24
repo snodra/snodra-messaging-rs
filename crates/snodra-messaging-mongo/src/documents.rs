@@ -1,13 +1,13 @@
-//! The documents the store writes, field for field the storage contract both libraries keep, and
+//! The documents the store writes, field for field the storage contract every library keeps, and
 //! their mapping to the core's records: public for tools and tests that read the collections
 //! (`collection::<SagaDoc>("sagas")`, then `SagaDocument::from`). The saga collections' are here
 //!; `dead_letters`' and `external_calls`' are re-exported.
 //!
-//! Dates are BSON datetimes, enums their Kotlin names, `_id`s strings, and the saga `state`, the
+//! Dates are BSON datetimes, enums their stored names, `_id`s strings, and the saga `state`, the
 //! dispatch and failure `payload` and a deadline `payload` JSON **text**. A field
 //! that is absent reads as `None`; `None` is never written (no nulls), and no `_class` is written
-//! or required (readers ignore the one Spring Data writes). Kotlin and Rust therefore read each
-//! other's documents.
+//! or required (a reader ignores one). Services written with any Snodra library therefore read
+//! each other's documents (the specification's MongoDB layout).
 
 use std::collections::HashMap;
 

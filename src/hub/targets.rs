@@ -86,7 +86,7 @@ impl HubTargets {
 }
 
 /// The id of a hub whose `RegisterAck.hub_id` is empty (a real hub always names itself;
-/// defensive): its target as `host:port`, the `static://` or `http(s)://` prefix stripped (shared with snodra-messaging).
+/// defensive): its target as `host:port`, the `static://` or `http(s)://` prefix stripped.
 pub fn target_id(address: &str) -> String {
     let address = address.strip_prefix("static://").unwrap_or(address);
     ["http://", "https://"]
@@ -96,7 +96,7 @@ pub fn target_id(address: &str) -> String {
         .to_string()
 }
 
-/// The targets of one `dns:///` resolution (shared with snodra-messaging): the IPv4 addresses
+/// The targets of one `dns:///` resolution: the IPv4 addresses
 /// when there is any, else the IPv6 ones, each as `ip:port` (`[ip]:port` for IPv6, no zone), no
 /// prefix, repeats dropped, order kept. A dual-stack name lists every hub under both families;
 /// connecting to both would register twice on one hub, and the second `Register` takes the session
@@ -222,7 +222,7 @@ mod tests {
         );
     }
 
-    /// Shared with snodra-messaging (Kotlin): the id of a hub with an empty `RegisterAck.hub_id`
+    /// The id of a hub with an empty `RegisterAck.hub_id`
     /// is its target as `host:port`, prefix stripped.
     #[test]
     fn a_target_id_is_the_bare_host_and_port() {
@@ -238,7 +238,7 @@ mod tests {
         }
     }
 
-    /// Shared with snodra-messaging (Kotlin): a `dns:///` name yields one target per address of
+    /// A `dns:///` name yields one target per address of
     /// one family (IPv4 when there is any, else IPv6), `ip:port` without prefix, repeats dropped,
     /// order kept. A dual-stack name would otherwise reach each hub twice.
     #[test]
@@ -289,7 +289,7 @@ mod tests {
         }
     }
 
-    /// Test vectors for snodra-messaging (Kotlin): FNV-1a 64 over `hub_id + "\0" + key`, then fmix64.
+    /// Test vectors: FNV-1a 64 over `hub_id + "\0" + key`, then fmix64.
     #[test]
     fn rendezvous_score_is_fnv1a_64_over_hub_id_zero_key_then_fmix64() {
         assert_eq!(fnv(b"\0"), 0xaf63_bd4c_8601_b7df, "the reference FNV-1a 64");
