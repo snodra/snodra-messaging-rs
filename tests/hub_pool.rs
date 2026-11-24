@@ -573,7 +573,12 @@ async fn requests_still_buffered_when_a_stream_is_lost_go_to_another_hub() {
 
 /// A request still buffered when its stream is lost moves to another hub only while the caller's
 /// timeout has not passed: once it has, no new hop starts and the call fails as never sent.
-#[tokio::test]
+///
+/// The stream is dropped as soon as every call's timeout has passed: each call's timeout runs
+/// from before its request is recorded as pending, so once all 40 are pending it has passed 300
+/// ms later. Dropping later would race the local guard of the calls written first (300 ms + 1 s
+/// from their write); the encodings run in parallel so the 40 become pending close together.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_move_starts_after_the_callers_timeout() {
     let a = FakeHub::start_with_id("hub-a").await;
     let b = answering("hub-b").await;
@@ -605,7 +610,8 @@ async fn no_move_starts_after_the_callers_timeout() {
         c.sender.in_flight() == 40
     })
     .await;
-    tokio::time::sleep(Duration::from_millis(600)).await; // past every call's 300 ms
+    // Every call's 300 ms (it started before its entry was recorded) has passed.
+    tokio::time::sleep(Duration::from_millis(350)).await;
     a.drop_streams();
     let (mut never_sent, mut lost) = (0, 0);
     for call in calls {
