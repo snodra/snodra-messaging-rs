@@ -1,6 +1,8 @@
 //! The stream to the hub and its lifecycle: register, handshake, heartbeat, reconnect.
 //!
-//! Every stream starts with `Register` (with `client_version`) followed by a `Heartbeat`. The hub
+//! Every stream starts with `Register` (with `client_version`) followed by a `Heartbeat`, and
+//! every later `Register` on it (a re-registration, the empty one of a deregistration) is
+//! followed by a `Heartbeat` too, which counts toward the silent-hub rule like any other. The hub
 //! answers the `Register` with a `RegisterAck` (before it echoes the heartbeat): the ack completes
 //! the handshake (the registration is confirmed), and its heartbeat interval and timeout limits
 //! apply to this stream. A stream without an ack within `handshake_timeout` is abandoned and opened
@@ -10,8 +12,8 @@
 //!
 //! A silent hub: from the ack on, each heartbeat tick looks before sending its heartbeat, and the
 //! stream is dropped (`UNAVAILABLE`, an ordinary reconnect) when more than three heartbeat
-//! intervals have passed since the last echo (or the ack) and the three heartbeats sent since then
-//! are all unanswered: between three and four intervals after the last echo. Before the ack the
+//! intervals have passed since the last echo (or the ack) and the three heartbeats written since
+//! then (on a tick or after a later `Register`) are all unanswered: between three and four intervals after the last echo. Before the ack the
 //! handshake timeout applies, not this check.
 //!
 //! Any failure closes the stream, notifies the owner with [`Inbound::Disconnected`] (carrying the
@@ -56,7 +58,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -578,6 +580,9 @@ struct Live {
     tx: mpsc::Sender<ClientMessage>,
     ack: RegisterAck,
     grants: Arc<Grants>,
+    /// The heartbeats written on the stream since its last echo (or its ack): the silent-hub
+    /// count, shared with the stream's loop.
+    unanswered: Arc<AtomicU32>,
 }
 
 pub struct HubConnection {
@@ -1043,18 +1048,24 @@ impl HubConnection {
     pub(crate) async fn reregister(&self) -> Result<(StreamId, u64), MessagingError> {
         // One at a time: the message built last (with the types set last) is written last.
         let _order = self.reregistering.lock().await;
-        let (tx, initial, stream) = {
+        let (tx, initial, stream, unanswered) = {
             let live = self.live.lock().unwrap();
             let live = live
                 .as_ref()
                 .ok_or_else(|| MessagingError::HubUnavailable("not connected to the hub".into()))?;
-            (live.tx.clone(), live.grants.initial(), live.stream)
+            (
+                live.tx.clone(),
+                live.grants.initial(),
+                live.stream,
+                Arc::clone(&live.unanswered),
+            )
         };
         // Counted before it is written: its ack may be handled before `send` returns.
         let ours = self.count_later_register(stream);
         tx.send(self.register(initial))
             .await
             .map_err(|_| MessagingError::HubUnavailable("hub stream closed".into()))?;
+        later_heartbeat(&tx, &unanswered).await?;
         Ok((stream, ours))
     }
 
@@ -1080,12 +1091,16 @@ impl HubConnection {
     /// no handshaken stream.
     pub(crate) async fn deregister(&self) -> Result<(), MessagingError> {
         let _order = self.reregistering.lock().await;
-        let (tx, initial) = {
+        let (tx, initial, unanswered) = {
             let live = self.live.lock().unwrap();
             let live = live
                 .as_ref()
                 .ok_or_else(|| MessagingError::HubUnavailable("not connected to the hub".into()))?;
-            (live.tx.clone(), live.grants.initial())
+            (
+                live.tx.clone(),
+                live.grants.initial(),
+                Arc::clone(&live.unanswered),
+            )
         };
         if let Some(stream) = self.live.lock().unwrap().as_ref().map(|l| l.stream) {
             self.count_later_register(stream);
@@ -1093,7 +1108,7 @@ impl HubConnection {
         tx.send(self.register_with(RegisteredTypes::default(), initial))
             .await
             .map_err(|_| MessagingError::HubUnavailable("hub stream closed".into()))?;
-        Ok(())
+        later_heartbeat(&tx, &unanswered).await
     }
 
     /// The first step of a graceful shutdown (snodra-messaging's `HubLifecycle.stop`): registers
@@ -1434,7 +1449,7 @@ impl HubConnection {
         // The silent-hub check, armed by the ack (before it the handshake timeout applies): the
         // last sign of life (the ack, then each echo) and the heartbeats sent since it.
         let mut last_echo = tokio::time::Instant::now();
-        let mut unanswered: u32 = 0;
+        let unanswered = Arc::new(AtomicU32::new(0));
         let handshake_deadline = tokio::time::Instant::now() + self.settings.handshake_timeout;
         let mut handshake: Option<RegisterAck> = None;
         loop {
@@ -1465,10 +1480,11 @@ impl HubConnection {
                 _ = ticker.tick() => {
                     if handshake.is_some() {
                         let since = last_echo.elapsed();
-                        if hub_silent(since, unanswered, interval) {
-                            return Err(Status::unavailable(format!("no heartbeat echo for {since:?} ({unanswered} heartbeats unanswered)")).into());
+                        let count = unanswered.load(Ordering::SeqCst);
+                        if hub_silent(since, count, interval) {
+                            return Err(Status::unavailable(format!("no heartbeat echo for {since:?} ({count} heartbeats unanswered)")).into());
                         }
-                        unanswered += 1;
+                        unanswered.fetch_add(1, Ordering::SeqCst);
                     }
                     tx.send(heartbeat()).await.map_err(|_| Status::unavailable("stream closed"))?;
                     self.follow_token_file(&tx, handshake.is_some()).await?;
@@ -1500,21 +1516,21 @@ impl HubConnection {
                                 }
                                 tracing::info!(service = %self.service_name, instance = %self.instance_id, hub = %ack.hub_id, address = %self.settings.address, heartbeat = ?interval, "registered with the hub");
                                 last_echo = tokio::time::Instant::now();
-                                unanswered = 0;
-                                self.go_live(stream_id, &tx, &ack, &grants, identity.as_ref());
+                                unanswered.store(0, Ordering::SeqCst);
+                                self.go_live(stream_id, &tx, &ack, &grants, &unanswered, identity.as_ref());
                                 handshake = Some(ack);
                                 // A token published since the Register went out.
                                 self.follow_token(&tx, handshake.is_some(), following.as_mut()).await?;
                             } else {
                                 // Every later Register is acked too; the values do not change.
-                                self.go_live(stream_id, &tx, &ack, &grants, identity.as_ref());
+                                self.go_live(stream_id, &tx, &ack, &grants, &unanswered, identity.as_ref());
                                 handshake = Some(ack);
                             }
                         }
                         // Before the ack an echo confirms nothing; after it, it shows the hub alive.
                         server_message::Message::Heartbeat(_) => if handshake.is_some() {
                             last_echo = tokio::time::Instant::now();
-                            unanswered = 0;
+                            unanswered.store(0, Ordering::SeqCst);
                         },
                         server_message::Message::Request(request) => {
                             // A subscription is passive: the hub spent no permit on it and no
@@ -1880,6 +1896,7 @@ impl HubConnection {
         tx: &mpsc::Sender<ClientMessage>,
         ack: &RegisterAck,
         grants: &Arc<Grants>,
+        unanswered: &Arc<AtomicU32>,
         identity: Option<&ClientIdentity>,
     ) {
         if let Some(identity) = identity {
@@ -1890,6 +1907,7 @@ impl HubConnection {
             tx: tx.clone(),
             ack: ack.clone(),
             grants: Arc::clone(grants),
+            unanswered: Arc::clone(unanswered),
         });
         // A registered stream is the end of any earlier rejection.
         *self.last_rejection.lock().unwrap() = None;
@@ -2008,6 +2026,18 @@ impl Hint {
             status
         }
     }
+}
+
+/// The `Heartbeat` that follows a later `Register` on a handshaken stream, counted (before it is
+/// written, as a tick's is) toward the silent-hub rule.
+async fn later_heartbeat(
+    tx: &mpsc::Sender<ClientMessage>,
+    unanswered: &AtomicU32,
+) -> Result<(), MessagingError> {
+    unanswered.fetch_add(1, Ordering::SeqCst);
+    tx.send(heartbeat())
+        .await
+        .map_err(|_| MessagingError::HubUnavailable("hub stream closed".into()))
 }
 
 fn heartbeat() -> ClientMessage {

@@ -940,3 +940,36 @@ async fn the_application_reads_each_hubs_latest_rejection() {
     app.shutdown().await;
     hub.stop();
 }
+
+/// Every later `Register` (here the empty one of a graceful shutdown) is followed by a
+/// `Heartbeat`, as the first one is; the hub echoes it like any other.
+#[tokio::test]
+async fn a_later_register_is_followed_by_a_heartbeat() {
+    let hub = FakeHub::start().await;
+    hub.set_ack(Some(proto::RegisterAck {
+        heartbeat_interval_ms: 60_000, // no tick heartbeat during the test
+        ..default_ack()
+    }));
+    let (conn, _rx) = connection(settings(hub.address(), 50, 500));
+    conn.start();
+    assert!(conn.await_registered(Duration::from_secs(5)).await);
+    timeout(Duration::from_secs(3), async {
+        while hub.heartbeats() < 1 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first heartbeat");
+    let pool = snodra_messaging::hub::HubPool::of(Arc::clone(&conn));
+    assert!(pool.deregister(Duration::from_secs(3)).await);
+    timeout(Duration::from_secs(3), async {
+        while hub.heartbeats() < 2 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a heartbeat after the later Register");
+    assert_eq!(hub.registers().await.len(), 2);
+    conn.shutdown().await;
+    hub.stop();
+}
