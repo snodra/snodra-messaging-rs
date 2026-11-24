@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use snodra_messaging::hub::{
-    HubPool, HubSettings, Inbound, ReplyTo, SendOptions, Sender, SenderSettings, rendezvous_score,
+    DEFAULT_REQUEST_TIMEOUT, HubPool, HubSettings, Inbound, ReplyTo, SendOptions, Sender,
+    SenderSettings, rendezvous_score,
 };
 use snodra_messaging::proto::{self, ServerMessage, reply, server_message};
 use snodra_messaging::{Command, MessagingError, Query, RetryPolicy, message_type};
@@ -574,10 +575,11 @@ async fn requests_still_buffered_when_a_stream_is_lost_go_to_another_hub() {
 /// A request still buffered when its stream is lost moves to another hub only while the caller's
 /// timeout has not passed: once it has, no new hop starts and the call fails as never sent.
 ///
-/// The stream is dropped as soon as every call's timeout has passed: each call's timeout runs
-/// from before its request is recorded as pending, so once all 40 are pending it has passed 300
-/// ms later. Dropping later would race the local guard of the calls written first (300 ms + 1 s
-/// from their write); the encodings run in parallel so the 40 become pending close together.
+/// The calls choose no timeout, so their deadline is [`DEFAULT_REQUEST_TIMEOUT`] (5 s) while the
+/// local guard of a written request is the hub's bound for it (`max_timeout_ms`, 60 s) plus the
+/// margin: the stream is dropped once every call's deadline has passed (each runs from before
+/// its request is recorded as pending), far before any guard, so a call can only end as never
+/// sent or as lost, never by its guard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_move_starts_after_the_callers_timeout() {
     let a = FakeHub::start_with_id("hub-a").await;
@@ -595,7 +597,6 @@ async fn no_move_starts_after_the_callers_timeout() {
             let opts = SendOptions {
                 routing_key: Some(key_on_a.clone()),
                 retry: Some(RetryPolicy::NONE),
-                timeout: Some(Duration::from_millis(300)),
                 ..Default::default()
             };
             tokio::spawn(async move {
@@ -610,8 +611,8 @@ async fn no_move_starts_after_the_callers_timeout() {
         c.sender.in_flight() == 40
     })
     .await;
-    // Every call's 300 ms (it started before its entry was recorded) has passed.
-    tokio::time::sleep(Duration::from_millis(350)).await;
+    // Every call's deadline (it started before its entry was recorded) has passed.
+    tokio::time::sleep(DEFAULT_REQUEST_TIMEOUT + Duration::from_millis(50)).await;
     a.drop_streams();
     let (mut never_sent, mut lost) = (0, 0);
     for call in calls {
@@ -1684,3 +1685,4 @@ async fn no_handler_and_a_hub_that_does_not_take_the_write_is_no_handler_at_once
     );
     c.shutdown().await;
 }
+
