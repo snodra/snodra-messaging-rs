@@ -5,10 +5,10 @@ resolver = "3"
 # One version for every published crate, written by scripts/bump-version.sh: the crates inherit it,
 # and the add-ons depend on the core through the workspace dependency below.
 [workspace.package]
-version = "0.7.1"
+version = "0.8.0"
 
 [workspace.dependencies]
-snodra-messaging = { path = ".", version = "0.7.1" }
+snodra-messaging = { path = ".", version = "0.8.0" }
 
 [package]
 name = "snodra-messaging"

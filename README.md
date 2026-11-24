@@ -42,9 +42,9 @@ them are indistinguishable in front of the server and on the event store.
 
 ```toml
 [dependencies]
-snodra-messaging       = "0.7"
-snodra-messaging-kafka = "0.7"   # or snodra-messaging-rabbitmq
-snodra-messaging-mongo = "0.7"   # or snodra-messaging-sqlx
+snodra-messaging       = "0.8"
+snodra-messaging-kafka = "0.8"   # or snodra-messaging-rabbitmq
+snodra-messaging-mongo = "0.8"   # or snodra-messaging-sqlx
 ```
 
 All five crates are on crates.io; no git dependency and no extra registry.
