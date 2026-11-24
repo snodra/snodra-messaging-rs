@@ -413,9 +413,11 @@ impl HubPool {
     }
 
     /// Turns the pool off before [`start`](Self::start): it never connects, and a send fails at
-    /// once with `HubUnavailable` naming `SNODRA_SERVER_ENABLED`.
+    /// once with `HubUnavailable` naming `SNODRA_SERVER_ENABLED`, also one already waiting for a
+    /// hub.
     pub fn turn_off(&self) {
         self.off.store(true, Ordering::SeqCst);
+        self.changes.send_modify(|n| *n += 1);
     }
 
     /// What a send fails with when no hub took it.

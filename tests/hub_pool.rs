@@ -1698,3 +1698,40 @@ async fn no_handler_and_a_hub_that_does_not_take_the_write_is_no_handler_at_once
     c.shutdown().await;
 }
 
+/// A call already waiting for a hub when the pool is turned off fails at once, as one sent after.
+#[tokio::test]
+async fn a_call_waiting_for_a_hub_fails_at_once_when_the_pool_is_turned_off() {
+    let (tx, _rx) = mpsc::channel::<Inbound>(8);
+    let pool = HubPool::new(
+        settings("static://127.0.0.1:1".into()),
+        "svc".into(),
+        uuid::Uuid::new_v4().to_string(),
+        tx,
+    )
+    .unwrap();
+    let sender = Sender::with_pool(Arc::clone(&pool), SenderSettings::default());
+    let started = std::time::Instant::now();
+    let call = tokio::spawn(async move {
+        sender
+            .send_command(
+                &Ping {},
+                SendOptions {
+                    timeout: Some(Duration::from_secs(5)),
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    pool.turn_off();
+    let e = call.await.unwrap().unwrap_err();
+    assert!(
+        matches!(&e, MessagingError::HubUnavailable(m) if m.contains("SNODRA_SERVER_ENABLED")),
+        "{e:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+}
