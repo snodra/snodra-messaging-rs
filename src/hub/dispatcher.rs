@@ -334,10 +334,10 @@ impl Dispatcher {
     }
 
     /// A unary request this instance sends to its own handler, answered in-process as
-    /// [`handle`](Self::handle) answers one from the hub (identity, lookup, guard, decode,
-    /// handler, the reply's error), but without a handler permit: the caller may hold one (a
-    /// handler sending to another of its instance's handlers), and the permits bound what the
-    /// hubs push, not what the instance asks itself.
+    /// [`handle`](Self::handle) answers one from the hub (identity, lookup, the guard's anonymous
+    /// check, decode, the guard's rule, handler, the reply's error), but without a handler
+    /// permit: the caller may hold one (a handler sending to another of its instance's handlers),
+    /// and the permits bound what the hubs push, not what the instance asks itself.
     pub(crate) async fn handle_local(&self, req: proto::Request) -> Reply {
         self.unary(req, None, Permit::Skip, None)
             .await
@@ -531,8 +531,8 @@ impl Dispatcher {
     /// Registers a subscription request (`<id>#n`, `mode = SUBSCRIPTION`) as pending, as far
     /// as it can be before its identity is known. The limit and an id already open are decided
     /// first, as the request is read; then its handler is looked up and its query decoded (the
-    /// token and the guard decide later whether either matters). What stops it is kept to be reported by
-    /// [`subscribe`](Self::subscribe) in the order its admission always reported it.
+    /// token and the guard decide later whether either matters). What stops it is kept to be
+    /// reported by [`subscribe`](Self::subscribe) in the order its admission always reports it.
     fn register_subscription(&self, req: &proto::Request, reply_to: &ReplyTo) -> Prepared {
         let flawed = |flaw| Prepared {
             admission: None,

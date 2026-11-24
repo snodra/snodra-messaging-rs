@@ -3,9 +3,10 @@
 //! Failure split: a request that was never accepted by a handshaken stream fails with
 //! `HubUnavailable` (the hub never saw it, a retry is always safe). While no hub can take it, a
 //! call waits for one until its deadline: its timeout (the per-call one, else the configured
-//! default), else [`DEFAULT_REQUEST_TIMEOUT`], from the moment the call began. One whose stream broke while
-//! it still waited in that stream's outbound buffer was never written either: it goes to the next
-//! hub with the same id (and fails with `HubUnavailable` if there is none). One the transport had
+//! default), else [`DEFAULT_REQUEST_TIMEOUT`], from the moment the call began. One whose stream
+//! broke while it still waited in that stream's outbound buffer was never written either: it goes
+//! to the next hub with the same id (waiting for one, within the deadline, when none is live). One
+//! the transport had
 //! taken from the buffer fails with `HubConnectionLost` when its stream breaks (outcome unknown,
 //! the handler may have run).
 //!
@@ -60,7 +61,8 @@ use super::dispatcher::Dispatcher;
 use super::pool::{Consumers, HubPool, weak_probe};
 
 /// The budget of a call that chose no timeout while no hub has acknowledged this instance yet (the
-/// hub's default request timeout, which only its ack announces).
+/// hub's default request timeout, which only its ack announces), and how long a call that chose
+/// none waits for a hub to take it.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Added to the hub's own deadline for the local guard, which only catches a hub that never answers.
 pub const LOCAL_GUARD_MARGIN: Duration = Duration::from_secs(1);

@@ -13,8 +13,8 @@
 //! A silent hub: from the ack on, each heartbeat tick looks before sending its heartbeat, and the
 //! stream is dropped (`UNAVAILABLE`, an ordinary reconnect) when more than three heartbeat
 //! intervals have passed since the last echo (or the ack) and the three heartbeats written since
-//! then (on a tick or after a later `Register`) are all unanswered: between three and four intervals after the last echo. Before the ack the
-//! handshake timeout applies, not this check.
+//! then (on a tick or after a later `Register`) are all unanswered: between three and four
+//! intervals after the last echo. Before the ack the handshake timeout applies, not this check.
 //!
 //! Any failure closes the stream, notifies the owner with [`Inbound::Disconnected`] (carrying the
 //! stream id and the requests still in its outbound buffer, never written) and reconnects with exponential backoff (`backoff_min` doubling up to `backoff_max`,

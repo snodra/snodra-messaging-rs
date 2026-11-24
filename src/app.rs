@@ -1271,10 +1271,6 @@ fn needs_event_store(
     Ok(())
 }
 
-/// The hub connection settings a [`Config`] describes, access control included.
-///
-/// With `hub_oauth2` this is where the one token provider of the process is made; it is shared by
-/// every hub connection through the settings.
 /// The dispatcher of the requests to this instance's own handlers in `registry`, from the hubs and
 /// in-process.
 fn local_dispatcher(
@@ -1292,6 +1288,10 @@ fn local_dispatcher(
     .with_emitter(emitter.clone())
 }
 
+/// The hub connection settings a [`Config`] describes, access control included.
+///
+/// With `hub_oauth2` this is where the one token provider of the process is made; it is shared by
+/// every hub connection through the settings.
 fn hub_settings(config: &Config) -> Result<HubSettings, MessagingError> {
     let token_provider = config
         .hub_oauth2

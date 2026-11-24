@@ -61,14 +61,15 @@
 //!   what it sends meanwhile, late replies included, is still handled), and the connection
 //!   reconnects with the new pair; only when it is registered again (at most
 //!   [`ROLL_RECONNECT_LIMIT`]) is the next hub rolled. While no hub is routable (a single hub
-//!   being rolled), a send waits for one within its own deadline, as it always does. A pair that does not
-//!   load (a rotation caught half way, a key that is not the certificate's, a certificate for
-//!   another service, an expired one) leaves every connection as it is and is logged at `error`
-//!   once per distinct problem (when it persists for a second period); one that is not valid yet
-//!   is waited for. A hub that does not take the new pair back in time stops the rollover
-//!   (logged at `error`, the other hubs keep what they have). Requests already written to a hub
-//!   when its stream is closed fail like on any lost stream. A certificate with less than a tenth
-//!   of its lifetime (at most 24 h) left, and no renewed file, is warned about once.
+//!   being rolled), a send waits for one within its own deadline, as it always does. A pair
+//!   that does not load (a rotation caught half way, a key that is not the certificate's, a
+//!   certificate for another service, an expired one) leaves every connection as it is and is
+//!   logged at `error` once per distinct problem (when it persists for a second period); one
+//!   that is not valid yet is waited for. A hub that does not take the new pair back in time
+//!   stops the rollover (logged at `error`, the other hubs keep what they have). Requests
+//!   already written to a hub when its stream is closed fail like on any lost stream. A
+//!   certificate with less than a tenth of its lifetime (at most 24 h) left, and no renewed file,
+//!   is warned about once.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
