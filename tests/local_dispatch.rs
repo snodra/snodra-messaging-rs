@@ -506,28 +506,72 @@ async fn with_the_hub_turned_off_own_handlers_still_answer() {
     app.shutdown().await;
 }
 
-/// Before `start` the registry is not known yet: the builder's sender goes through the hub (not
-/// connected yet: `HubUnavailable`, nothing was sent).
+/// Before `start` the sender already answers the types registered so far in-process, as after
+/// it (the guard included); a type registered later is answered too, and any other type goes
+/// through the hub (not connected yet: it waits for one until its deadline, `HubUnavailable`).
 #[tokio::test]
-async fn before_start_the_sender_goes_through_the_hub() {
+async fn before_start_the_sender_answers_its_own_types_in_process() {
     let (hub, jwks) = (hub().await, jwks().await);
     let builder = SnodraMessaging::builder(config(&hub, &jwks))
         .await
         .unwrap()
         .query::<Lookup, _, _>(|_, _| async move { Ok(1) });
     let sender = builder.sender();
-    let e = sender
+    let n: u32 = sender
         .send_query(&Lookup {}, SendOptions::default())
+        .await
+        .expect("answered in-process before start");
+    assert_eq!(n, 1);
+    let builder = builder
+        .command::<Admin, _, _>(|_, _| async move { Ok(String::new()) })
+        .requires::<Admin>(Guard::role("admin"));
+    let e = sender
+        .send_command(&Admin {}, SendOptions::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(e, MessagingError::Unauthenticated(_)), "{e:?}");
+    let short = SendOptions {
+        timeout: Some(Duration::from_millis(300)),
+        ..SendOptions::default()
+    };
+    let started = std::time::Instant::now();
+    let e = sender
+        .send_command(&Elsewhere {}, short.clone())
         .await
         .unwrap_err();
     assert!(matches!(e, MessagingError::HubUnavailable(_)), "{e:?}");
+    assert!(started.elapsed() >= Duration::from_millis(250));
     let app = builder.start().await.unwrap();
     let n: u32 = sender
         .send_query(&Lookup {}, SendOptions::default())
         .await
         .unwrap();
     assert_eq!(n, 1, "the same sender answers locally once started");
+    assert!(hub.requests().await.is_empty(), "nothing went to the hub");
     app.shutdown().await;
+}
+
+/// With "always route through the hub" nothing is answered in-process before `start` either.
+#[tokio::test]
+async fn before_start_always_through_the_hub_answers_nothing_in_process() {
+    let (hub, jwks) = (hub().await, jwks().await);
+    let builder = SnodraMessaging::builder(config(&hub, &jwks))
+        .await
+        .unwrap()
+        .query::<Lookup, _, _>(|_, _| async move { Ok(1) })
+        .always_route_through_hub(true);
+    let e = builder
+        .sender()
+        .send_query(
+            &Lookup {},
+            SendOptions {
+                timeout: Some(Duration::from_millis(300)),
+                ..SendOptions::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(e, MessagingError::HubUnavailable(_)), "{e:?}");
 }
 
 #[derive(Serialize, Deserialize)]

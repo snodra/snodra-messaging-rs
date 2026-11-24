@@ -343,6 +343,21 @@ impl HandlerRegistry {
         self.idempotent.push(E::TYPE);
     }
 
+    /// A copy of the command and query handlers registered so far, with their guards (no event
+    /// handlers): what the builder's sender answers in-process before the start.
+    pub(crate) fn requests(&self) -> HandlerRegistry {
+        HandlerRegistry {
+            commands: self.commands.clone(),
+            queries: self.queries.clone(),
+            streams: self.streams.clone(),
+            subscriptions: self.subscriptions.clone(),
+            shared: self.shared.clone(),
+            events: HashMap::new(),
+            guards: self.guards.clone(),
+            idempotent: self.idempotent.clone(),
+        }
+    }
+
     /// The labels (wire type names) of the idempotent handlers registered here, sorted.
     pub fn idempotent_handlers(&self) -> Vec<String> {
         let mut labels: Vec<String> = self.idempotent.iter().map(|l| l.to_string()).collect();

@@ -84,6 +84,8 @@ pub struct SnodraMessagingBuilder {
     inbound: mpsc::Receiver<Inbound>,
     sender: Arc<Sender>,
     emitter: QueryUpdateEmitter,
+    /// Who calls: the forwarded tokens verified against the JWKS, when one is configured.
+    resolver: Arc<IdentityResolver>,
     /// The saga registrations, checked by `start()`.
     sagas: Vec<Result<SagaType, MessagingError>>,
     /// What the idempotent handlers record their calls in, bound by `start()`.
@@ -171,7 +173,15 @@ impl SnodraMessaging {
             },
         );
         HubPool::observe(&hubs, &metrics);
+        let verifier = match (&config.jwks_url, &config.issuer) {
+            (Some(url), Some(issuer)) => Some(JwksVerifier::new(url.clone(), issuer.clone())),
+            _ => None,
+        };
+        let resolver = Arc::new(
+            IdentityResolver::new(verifier).with_roles_claim(&config.security_roles_claim),
+        );
         Ok(SnodraMessagingBuilder {
+            resolver,
             registry: HandlerRegistry::new(),
             store: None,
             event_store: None,
@@ -413,6 +423,22 @@ async fn stop_saga_tasks(tasks: Vec<JoinHandle<()>>, bound: Duration) {
 }
 
 impl SnodraMessagingBuilder {
+    /// The builder's sender answers the command and query types registered so far in-process
+    /// (see [`Sender`]), before the start as after it, unless every request goes through the hub.
+    fn answering_locally(self) -> Self {
+        let through_hub = self.config.hub_always_route_through_hub && self.config.hub_enabled;
+        let local = (!through_hub).then(|| {
+            Arc::new(local_dispatcher(
+                &self.config,
+                Arc::new(self.registry.requests()),
+                &self.resolver,
+                &self.emitter,
+            ))
+        });
+        self.sender.answer_locally(local);
+        self
+    }
+
     pub fn command<C, F, Fut>(mut self, handler: F) -> Self
     where
         C: Command,
@@ -420,7 +446,7 @@ impl SnodraMessagingBuilder {
         Fut: Future<Output = Result<C::Reply, MessagingError>> + Send + 'static,
     {
         self.registry.command::<C, F, Fut>(handler);
-        self
+        self.answering_locally()
     }
 
     pub fn query<Q, F, Fut>(mut self, handler: F) -> Self
@@ -430,7 +456,7 @@ impl SnodraMessagingBuilder {
         Fut: Future<Output = Result<Q::Reply, MessagingError>> + Send + 'static,
     {
         self.registry.query::<Q, F, Fut>(handler);
-        self
+        self.answering_locally()
     }
 
     /// A shared query handler: several services may own `Q`; a point query goes to one
@@ -447,7 +473,7 @@ impl SnodraMessagingBuilder {
         Fut: Future<Output = Result<Q::Reply, MessagingError>> + Send + 'static,
     {
         self.registry.shared_query::<Q, F, Fut>(handler);
-        self
+        self.answering_locally()
     }
 
     /// A streaming query handler: `Q` is served to [`Sender::stream`] callers
@@ -464,7 +490,7 @@ impl SnodraMessagingBuilder {
         S: futures::Stream<Item = Result<Q::Item, MessagingError>> + Send + 'static,
     {
         self.registry.streaming_query::<Q, F, Fut, S>(handler);
-        self
+        self.answering_locally()
     }
 
     /// A shared streaming query handler: several services may own `Q`; a stream goes to one
@@ -481,7 +507,7 @@ impl SnodraMessagingBuilder {
     {
         self.registry
             .shared_streaming_query::<Q, F, Fut, S>(handler);
-        self
+        self.answering_locally()
     }
 
     /// An event handler in the unnamed processor `default` (with the sagas): the subscription
@@ -584,7 +610,7 @@ impl SnodraMessagingBuilder {
         Fut: Future<Output = Result<Q::Initial, MessagingError>> + Send + 'static,
     {
         self.registry.subscription_query::<Q, F, Fut>(handler);
-        self
+        self.answering_locally()
     }
 
     /// A shared subscription query handler: several services may own `Q`; a subscription
@@ -601,7 +627,7 @@ impl SnodraMessagingBuilder {
     {
         self.registry
             .shared_subscription_query::<Q, F, Fut>(handler);
-        self
+        self.answering_locally()
     }
 
     /// Registers a saga: `name` is its wire type name in `sagas.type`, `S` its state
@@ -673,7 +699,7 @@ impl SnodraMessagingBuilder {
             external_idempotent,
             handler,
         );
-        self
+        self.answering_locally()
     }
 
     /// An idempotent event handler (an `@IdempotentHandler @EventHandler`): see
@@ -750,7 +776,7 @@ impl SnodraMessagingBuilder {
     /// off by default: such a request is answered in-process).
     pub fn always_route_through_hub(mut self, on: bool) -> Self {
         self.config.hub_always_route_through_hub = on;
-        self
+        self.answering_locally()
     }
 
     /// Opt-in authorization for a command or query registered before this call. A guard needs a
@@ -758,7 +784,7 @@ impl SnodraMessagingBuilder {
     /// naming the guarded types (a forwarded token is an identity only once verified).
     pub fn requires<M: MessageType>(mut self, guard: Guard) -> Self {
         self.registry.requires::<M>(guard);
-        self
+        self.answering_locally()
     }
 
     /// The event bus, to capture in handlers that publish.
@@ -817,6 +843,7 @@ impl SnodraMessagingBuilder {
             mut inbound,
             sender,
             emitter,
+            resolver,
             sagas,
             external_calls,
             sources,
@@ -938,21 +965,12 @@ impl SnodraMessagingBuilder {
                 .with_fan_out(named.iter().map(|(_, d)| Arc::clone(d)).collect()),
         );
         let ingress = ExternalEventIngress::new(Arc::clone(&local), store.clone(), clock.clone());
-        let verifier = match (&config.jwks_url, &config.issuer) {
-            (Some(url), Some(issuer)) => Some(JwksVerifier::new(url.clone(), issuer.clone())),
-            _ => None,
-        };
-        let dispatcher = Arc::new(
-            Dispatcher::new(
-                Arc::clone(&registry),
-                Arc::new(
-                    IdentityResolver::new(verifier).with_roles_claim(&config.security_roles_claim),
-                ),
-                config.max_concurrent_handlers,
-            )
-            .stream_credit_timeout(config.hub_stream_credit_timeout)
-            .with_emitter(emitter.clone()),
-        );
+        let dispatcher = Arc::new(local_dispatcher(
+            &config,
+            Arc::clone(&registry),
+            &resolver,
+            &emitter,
+        ));
         let cancel = CancellationToken::new();
         let handlers = TaskTracker::new();
         let mut tasks = Vec::new();
@@ -1033,12 +1051,11 @@ impl SnodraMessagingBuilder {
         }));
 
         hubs.set_registered_types(registry.registered_types());
-        // The requests this instance sends to its own types are answered in-process from now on.
-        // Routing everything through the hub means nothing while the hub is turned off.
+        // The requests this instance sends to its own types are answered in-process by the
+        // application's dispatcher from now on. Routing everything through the hub means nothing
+        // while the hub is turned off.
         let through_hub = config.hub_always_route_through_hub && config.hub_enabled;
-        if !through_hub {
-            sender.answer_locally(Arc::clone(&dispatcher));
-        }
+        sender.answer_locally((!through_hub).then(|| Arc::clone(&dispatcher)));
         if !config.hub_enabled {
             hubs.turn_off();
             tracing::info!("the hub is turned off (SNODRA_SERVER_ENABLED=false): not connecting");
@@ -1258,6 +1275,23 @@ fn needs_event_store(
 ///
 /// With `hub_oauth2` this is where the one token provider of the process is made; it is shared by
 /// every hub connection through the settings.
+/// The dispatcher of the requests to this instance's own handlers in `registry`, from the hubs and
+/// in-process.
+fn local_dispatcher(
+    config: &Config,
+    registry: Arc<HandlerRegistry>,
+    resolver: &Arc<IdentityResolver>,
+    emitter: &QueryUpdateEmitter,
+) -> Dispatcher {
+    Dispatcher::new(
+        registry,
+        Arc::clone(resolver),
+        config.max_concurrent_handlers,
+    )
+    .stream_credit_timeout(config.hub_stream_credit_timeout)
+    .with_emitter(emitter.clone())
+}
+
 fn hub_settings(config: &Config) -> Result<HubSettings, MessagingError> {
     let token_provider = config
         .hub_oauth2

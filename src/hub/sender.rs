@@ -36,7 +36,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use futures::Stream;
@@ -920,9 +920,8 @@ struct Entry {
 
 /// The `CommandBus`/`QueryBus` of the Rust side. Replies arrive through [`Sender::on_inbound`].
 ///
-/// Local dispatch: once the application started ([`crate::SnodraMessagingBuilder::start`]), a
-/// command, or a unary query of a type not registered as shared, that this instance handles itself
-/// is answered in-process by its handler, without the hub, unless
+/// Local dispatch: a command, or a unary query of a type not registered as shared, that this
+/// instance handles itself is answered in-process by its handler, without the hub, unless
 /// [`Config::hub_always_route_through_hub`](crate::Config::hub_always_route_through_hub) is set.
 /// The handler answers it exactly as it would answer the request through the hub: the payload and
 /// the reply go through the codec, the request carries the same headers (the correlation id, the
@@ -933,13 +932,15 @@ struct Entry {
 /// ignored; the timeout does not bound the handler, there is no retry, the call is not timed in
 /// `snodra.hub.client.request.duration`, and it takes no handler permit. It also works while the
 /// hub is turned off or unreachable. Scatter-gather, streaming and subscription queries always go
-/// through the hub. Before the start, and on a sender made without the application, everything
-/// goes through the hub.
+/// through the hub. The builder's sender answers so from the first registration on, also before
+/// the application started ([`crate::SnodraMessagingBuilder::start`]): every type registered so
+/// far, with its guard; an idempotent handler's call records are bound only by the start. A
+/// sender made without the application sends everything through the hub.
 pub struct Sender {
     hubs: Arc<HubPool>,
-    /// This instance's own handlers, set by the application's start unless every request is to go
-    /// through the hub.
-    local: OnceLock<Arc<Dispatcher>>,
+    /// This instance's own handlers, set by the application's builder (on every registration,
+    /// then by the start) unless every request is to go through the hub.
+    local: RwLock<Option<Arc<Dispatcher>>>,
     pending: Mutex<HashMap<String, Entry>>,
     default_timeout: Option<Duration>,
     forward_jwt: bool,
@@ -973,7 +974,7 @@ impl Sender {
     pub fn with_pool(hubs: Arc<HubPool>, settings: SenderSettings) -> Arc<Sender> {
         let sender = Arc::new(Sender {
             hubs: Arc::clone(&hubs),
-            local: OnceLock::new(),
+            local: RwLock::new(None),
             pending: Mutex::new(HashMap::new()),
             default_timeout: settings.default_timeout,
             forward_jwt: settings.forward_jwt,
@@ -996,16 +997,19 @@ impl Sender {
     }
 
     /// Answers the requests this instance handles itself with `dispatcher` from now on (see the
-    /// type's docs); the first call wins.
-    pub(crate) fn answer_locally(&self, dispatcher: Arc<Dispatcher>) {
-        let _ = self.local.set(dispatcher);
+    /// type's docs), replacing the one set before; `None` sends everything through the hub.
+    pub(crate) fn answer_locally(&self, dispatcher: Option<Arc<Dispatcher>>) {
+        *self.local.write().unwrap_or_else(|e| e.into_inner()) = dispatcher;
     }
 
     /// The dispatcher that answers a unary request of `kind` for `type_name` in-process, if any.
-    fn local_for(&self, kind: RequestKind, type_name: &str) -> Option<&Arc<Dispatcher>> {
+    fn local_for(&self, kind: RequestKind, type_name: &str) -> Option<Arc<Dispatcher>> {
         self.local
-            .get()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
             .filter(|local| local.answers_locally(kind, type_name))
+            .cloned()
     }
 
     /// One unary request to this instance's own handler, in-process (see the type's docs): the
@@ -1049,7 +1053,7 @@ impl Sender {
         if let Some(local) = self.local_for(RequestKind::Command, C::TYPE) {
             let payload = codec::encode(command)?;
             let reply = self
-                .local_request(local, RequestKind::Command, C::TYPE, payload, opts)
+                .local_request(&local, RequestKind::Command, C::TYPE, payload, opts)
                 .await?;
             return codec::decode_reply(&reply);
         }
@@ -1074,7 +1078,7 @@ impl Sender {
         if let Some(local) = self.local_for(RequestKind::Query, Q::TYPE) {
             let payload = codec::encode(query)?;
             let reply = self
-                .local_request(local, RequestKind::Query, Q::TYPE, payload, opts)
+                .local_request(&local, RequestKind::Query, Q::TYPE, payload, opts)
                 .await?;
             return codec::decode_reply(&reply);
         }
