@@ -783,14 +783,15 @@ async fn two_targets_of_one_replacing_hub_settle_without_ping_pong() {
     .await;
     let instance = c.pool.instance_id().to_string();
     all_registered(&c, &["hub-x"]).await;
+    // Both targets registered once (the fake hub replaces sessions like snodra-server), then one
+    // stream is left holding the session.
     eventually("one stream left, holding the session", async || {
-        hub.connected_clients().await == 1 && hub.holds(&instance) && c.pool.hub_ids() == ["hub-x"]
+        hub.evictions() >= 1
+            && hub.connected_clients().await == 1
+            && hub.holds(&instance)
+            && c.pool.hub_ids() == ["hub-x"]
     })
     .await;
-    assert!(
-        hub.evictions() >= 1,
-        "the fake hub replaces sessions like snodra-server"
-    );
     assert!(
         c.pool.await_all_registered(Duration::from_secs(1)).await,
         "a closed duplicate is not a hub to wait for"
