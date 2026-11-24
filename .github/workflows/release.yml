@@ -52,6 +52,7 @@ jobs:
     outputs:
       version: ${{ steps.tag.outputs.version }}
       latest: ${{ steps.tag.outputs.latest }}
+      commit: ${{ steps.tag.outputs.commit }}
       crates: ${{ steps.crates.outputs.crates }}
     steps:
       - name: the tag is vN.N.N
@@ -65,20 +66,23 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # The commit the tag points at: this job builds it and the publish job uploads it, by commit,
+      # so --no-verify can only upload the tree built here even if the tag moved in between.
       - name: the tag exists, and whether it is the highest
         id: tag
         run: |
-          if ! git rev-parse -q --verify "refs/tags/$TAG^{commit}" >/dev/null; then
+          if ! commit=$(git rev-parse -q --verify "refs/tags/$TAG^{commit}"); then
             echo "::error::the tag $TAG does not exist"
             exit 1
           fi
           highest=$(git tag --list 'v*' | scripts/last-tag.sh)
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
           echo "latest=$([ "$TAG" = "$highest" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-          echo "$TAG; highest release tag: $highest"
+          echo "$TAG at $commit; highest release tag: $highest"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: refs/tags/${{ env.TAG }}
+          ref: ${{ steps.tag.outputs.commit }}
           path: tagged
           persist-credentials: false
       # Read from the tagged tree with cargo itself, so the workspace inheritance is resolved. The
@@ -123,17 +127,21 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     steps:
+      # The commit the check job built, not the tag by name.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: refs/tags/${{ env.TAG }}
+          ref: ${{ needs.check.outputs.commit }}
           persist-credentials: false
+      - name: the toolchain
+        run: rustup toolchain install --profile minimal --no-self-update
       - name: publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          # Plain text: the "already exists" line below is matched exactly, without colour codes.
+          CARGO_TERM_COLOR: never
           VERSION: ${{ needs.check.outputs.version }}
           CRATES: ${{ needs.check.outputs.crates }}
         run: |
-          rustup toolchain install --profile minimal --no-self-update
           log=$RUNNER_TEMP/publish.log
           published() {
             curl -fsS -A "snodra-release" "https://crates.io/api/v1/crates/$1/$VERSION" >/dev/null 2>&1
