@@ -529,14 +529,20 @@ impl Dispatcher {
     }
 
     /// Registers a subscription request (`<id>#n`, `mode = SUBSCRIPTION`) as pending, as far
-    /// as it can be before its identity is known: its handler is looked up and its query decoded
-    /// (the token and the guard decide later whether either matters). What stops it is kept to be reported by
+    /// as it can be before its identity is known. The limit and an id already open are decided
+    /// first, as the request is read; then its handler is looked up and its query decoded (the
+    /// token and the guard decide later whether either matters). What stops it is kept to be reported by
     /// [`subscribe`](Self::subscribe) in the order its admission always reported it.
     fn register_subscription(&self, req: &proto::Request, reply_to: &ReplyTo) -> Prepared {
         let flawed = |flaw| Prepared {
             admission: None,
             flaw,
         };
+        match self.subscriptions.refusal(&req.id) {
+            Some(Refused::Limit(max)) => return flawed(Flaw::Limit(max)),
+            Some(Refused::AlreadyOpen) => return flawed(Flaw::AlreadyOpen),
+            None => {}
+        }
         let handler = match self.subscription_handler(req) {
             Ok(handler) => handler,
             Err(e) => return flawed(Flaw::Lookup(e)),
@@ -622,10 +628,21 @@ impl Dispatcher {
         }
     }
 
-    /// Identity, then what `register_subscription` found wrong with the request, in this order:
+    /// What `register_subscription` found wrong with the request, in this order: the limit and
+    /// an id already open (decided when the request was read, before the token), then the token,
     /// the lookup, an anonymous caller of a guarded handler (before the decode's verdict:
-    /// anonymous callers cannot probe payload shapes), the decode, then the guard's rule.
+    /// anonymous callers cannot probe payload shapes), the decode, and the guard's rule.
     async fn vet_subscription(&self, req: proto::Request, flaw: Flaw) -> Result<(), Rejected> {
+        let request_id = req.id.clone();
+        let flaw = match flaw {
+            Flaw::Limit(max) => return Err(Rejected::Limit(max)),
+            Flaw::AlreadyOpen => {
+                return Err(Rejected::Error(MessagingError::InvalidMessage(format!(
+                    "subscription {request_id} is already open"
+                ))));
+            }
+            flaw => flaw,
+        };
         if let Some(hook) = &self.admission_hook {
             hook(&req.id).await;
         }
@@ -633,22 +650,14 @@ impl Dispatcher {
         if let Flaw::Lookup(e) = flaw {
             return Err(e.into());
         }
-        let request_id = req.id.clone();
         let (ctx, _payload) = self.context(req, identity)?;
-        let flaw = match flaw {
-            Flaw::Decode(e) => return Err(e.into()),
-            flaw => flaw,
-        };
+        if let Flaw::Decode(e) = flaw {
+            return Err(e.into());
+        }
         if let Some(guard) = self.registry.guard(&ctx.type_name) {
             guard.check(ctx.identity.as_ref(), &ctx)?;
         }
-        match flaw {
-            Flaw::Limit(max) => Err(Rejected::Limit(max)),
-            Flaw::AlreadyOpen => Err(Rejected::Error(MessagingError::InvalidMessage(format!(
-                "subscription {request_id} is already open"
-            )))),
-            Flaw::Lookup(_) | Flaw::Decode(_) | Flaw::None => Ok(()),
-        }
+        Ok(())
     }
 
     /// A streaming request: its parts under the credits (`initial_credit` plus every `Flow`;

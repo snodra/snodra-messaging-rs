@@ -1185,6 +1185,68 @@ async fn a_subscription_id_already_open_is_refused_and_the_open_one_kept() {
     a.shutdown().await;
 }
 
+/// A subscription request with a header that is no token.
+fn with_bad_token(mut msg: ServerMessage) -> ServerMessage {
+    if let Some(server_message::Message::Request(r)) = msg.message.as_mut() {
+        r.headers
+            .insert("authorization".into(), "Basic not-a-bearer".into());
+    }
+    msg
+}
+
+/// The limit and an id already open are decided when the request is read, before the token
+/// check and the handler lookup: a request past the limit is `RESOURCE_EXHAUSTED` and a duplicate
+/// id `INVALID_REQUEST` "already open", whatever its token or type.
+#[tokio::test]
+async fn the_limit_and_a_duplicate_id_are_decided_before_the_token_check() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let a = node_with(
+        &hub.address(),
+        "svc-a",
+        "a1",
+        registry("a1", &probe),
+        4,
+        SenderSettings::default(),
+        Some(1),
+    )
+    .await;
+    hub.send_to_clients(subscribed("d#1", &prices("acme")))
+        .await;
+    eventually("registered", async || a.emitter.open_subscriptions() == 1).await;
+    hub.send_to_clients(with_bad_token(subscribed("d#1", &prices("acme"))))
+        .await;
+    hub.send_to_clients(with_bad_token(subscribed("e#1", &prices("acme"))))
+        .await;
+    hub.send_to_clients(forwarded("n#1", "t.Nope", b"{}", true))
+        .await;
+    eventually("three refused", async || hub.ends().len() == 3).await;
+    let end = |id: &str| {
+        hub.ends()
+            .iter()
+            .find(|(_, e)| e.request_id == id)
+            .map(|(_, e)| (end_code(e), end_message(e).to_string()))
+            .unwrap()
+    };
+    assert_eq!(
+        end("d#1"),
+        (
+            Some(ErrorCode::InvalidRequest),
+            "subscription d#1 is already open".into()
+        )
+    );
+    assert_eq!(
+        end("e#1"),
+        (
+            Some(ErrorCode::ResourceExhausted),
+            "subscription limit (1) reached".into()
+        )
+    );
+    assert_eq!(end("n#1").0, Some(ErrorCode::ResourceExhausted));
+    assert_eq!(a.emitter.open_subscriptions(), 1, "the open one kept");
+    a.shutdown().await;
+}
+
 /// The guard's role rule comes after the decode: a query that does not decode is
 /// `INVALID_REQUEST` for an authenticated caller the rule refuses, a decodable one
 /// `PERMISSION_DENIED`.

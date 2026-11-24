@@ -129,6 +129,22 @@ impl Subscriptions {
         self.lock().len()
     }
 
+    /// Why subscription `id` could not be registered now, if it could not: `id` is already open
+    /// here ([`Refused::AlreadyOpen`]), or the instance serves its limit ([`Refused::Limit`]).
+    /// The checks [`register`](Self::register) makes, decided when the request is read, before
+    /// anything else about it.
+    pub(crate) fn refusal(&self, id: &str) -> Option<Refused> {
+        let open = self.lock();
+        let max = self.max();
+        if open.contains_key(id) {
+            Some(Refused::AlreadyOpen)
+        } else if open.len() >= max {
+            Some(Refused::Limit(max))
+        } else {
+            None
+        }
+    }
+
     /// Registers subscription `id` of `type_name` with its decoded `query`, its parts and end to
     /// go to `reply_to`, pending its admission. Nothing is registered when `id` is already open
     /// here ([`Refused::AlreadyOpen`]: the open one is kept) or the instance already serves its
