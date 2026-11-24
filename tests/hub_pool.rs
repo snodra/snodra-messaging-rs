@@ -791,19 +791,31 @@ async fn two_targets_of_one_replacing_hub_settle_without_ping_pong() {
     let instance = c.pool.instance_id().to_string();
     all_registered(&c, &["hub-x"]).await;
     // Settled: both targets registered once (the fake hub replaces sessions like snodra-server),
-    // the duplicate is closed, and the one kept connection is registered again and holds the
-    // session (while the duplicate's stream still holds it, no connection of the pool is live).
+    // the evicted stream and the duplicate's are both closed on the hub, and the kept connection
+    // registered again after both, on the stream that holds the session. Until the kept
+    // connection has seen its evicted stream end it still counts as live in the pool, so the
+    // pool's own view cannot tell this state apart: the hub's events do.
     eventually("one kept stream left, holding the session", async || {
+        let events = hub.events();
+        let closed = events
+            .iter()
+            .filter(|e| matches!(e, Event::Closed { .. }))
+            .count();
+        let registered_after_every_close = events
+            .iter()
+            .rposition(|e| matches!(e, Event::Register { .. }))
+            .is_some_and(|r| {
+                events[r + 1..]
+                    .iter()
+                    .all(|e| !matches!(e, Event::Closed { .. }))
+            });
         hub.evictions() >= 1
+            && closed >= 2
+            && closed + 1 == hub.streams()
+            && registered_after_every_close
             && hub.connected_clients().await == 1
             && hub.holds(&instance)
             && c.pool.hub_ids() == ["hub-x"]
-            && c.pool
-                .connections()
-                .iter()
-                .filter(|conn| conn.handshake().is_some())
-                .count()
-                == 1
     })
     .await;
     assert!(
