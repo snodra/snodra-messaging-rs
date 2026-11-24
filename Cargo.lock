@@ -3821,7 +3821,7 @@ dependencies = [
 
 [[package]]
 name = "snodra-messaging-kafka"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "futures",
  "mongodb",
@@ -3839,7 +3839,7 @@ dependencies = [
 
 [[package]]
 name = "snodra-messaging-mongo"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "futures",
  "mongodb",
@@ -3854,7 +3854,7 @@ dependencies = [
 
 [[package]]
 name = "snodra-messaging-rabbitmq"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "futures",
  "murmur3",
@@ -3875,7 +3875,7 @@ dependencies = [
 
 [[package]]
 name = "snodra-messaging-rs"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -3915,7 +3915,7 @@ dependencies = [
 
 [[package]]
 name = "snodra-messaging-sqlx"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "chrono",
  "futures",
