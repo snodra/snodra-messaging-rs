@@ -1635,3 +1635,39 @@ async fn a_no_handler_after_the_deadline_with_a_hub_untried_is_hub_unavailable()
     assert!(b.requests().await.is_empty(), "no hop after the deadline");
     c.shutdown().await;
 }
+
+/// A hub that declined with `NO_HANDLER` and another that does not take the write: the declines
+/// are the answer at once, the call does not wait for the hubs to change.
+#[tokio::test]
+async fn no_handler_and_a_hub_that_does_not_take_the_write_is_no_handler_at_once() {
+    let (a, b) = (without_owner("hub-a").await, answering("hub-b").await);
+    let c = client(settings(addresses(&[&a, &b]))).await;
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    let hub_b = c
+        .pool
+        .connections()
+        .into_iter()
+        .find(|conn| conn.hub_id().as_deref() == Some("hub-b"))
+        .unwrap();
+    hub_b.sever_writes();
+    let started = std::time::Instant::now();
+    let e = c
+        .sender
+        .send_command(
+            &Ping {},
+            SendOptions {
+                routing_key: Some(key_preferring("hub-a", "hub-b")),
+                timeout: Some(Duration::from_secs(3)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(e, MessagingError::NoHandler(_)), "{e:?}");
+    assert!(
+        started.elapsed() < Duration::from_millis(1_000),
+        "{:?}",
+        started.elapsed()
+    );
+    c.shutdown().await;
+}

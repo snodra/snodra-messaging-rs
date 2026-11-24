@@ -696,8 +696,8 @@ impl HubPool {
     /// Like [`send_where`](Self::send_where) over the live hubs whose address is not in `tried`,
     /// which also returns the address of the hub that took the write. For a request a hub
     /// declined with `NO_HANDLER` (it was never delivered): the next hub in the routing order
-    /// gets it. `None` when every live hub is in a non-empty `tried`: the declines are the answer,
-    /// nothing is waited for.
+    /// gets it. `None` when `tried` is not empty and every other live hub refused the write: the
+    /// declines are the answer, nothing is waited for.
     pub(crate) async fn send_excluding<T>(
         &self,
         routing_key: &str,
@@ -714,10 +714,18 @@ impl HubPool {
             if self.off.load(Ordering::SeqCst) {
                 return Err(self.unavailable());
             }
+            // The live hubs not tried yet: neither declined nor refused the write on their
+            // current stream.
             let untried: Vec<Arc<HubConnection>> = self
                 .ranked(routing_key)
                 .into_iter()
                 .filter(|c| !tried.iter().any(|a| a == c.address()))
+                .filter(|c| {
+                    let current = c.current_stream();
+                    !refused
+                        .iter()
+                        .any(|(a, s)| a == c.address() && *s == current)
+                })
                 .collect();
             if untried.is_empty() && !tried.is_empty() {
                 return Ok(None);
@@ -733,12 +741,6 @@ impl HubPool {
             }
             for conn in untried {
                 let current = conn.current_stream();
-                if refused
-                    .iter()
-                    .any(|(a, s)| a == conn.address() && *s == current)
-                {
-                    continue;
-                }
                 match conn.send_with(|stream, ack| build(stream, ack)).await {
                     Ok((stream, extra)) => {
                         return Ok(Some((stream, extra, conn.address().to_string())));
