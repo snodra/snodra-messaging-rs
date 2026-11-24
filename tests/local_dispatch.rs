@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use snodra_messaging::external::IdempotencyKey;
 use snodra_messaging::proto::{self, ServerMessage, reply, server_message};
 use snodra_messaging::{
     Command, Config, Guard, MessagingError, Query, RetryPolicy, SendOptions, SnodraMessaging,
@@ -549,6 +550,38 @@ async fn before_start_the_sender_answers_its_own_types_in_process() {
     assert_eq!(n, 1, "the same sender answers locally once started");
     assert!(hub.requests().await.is_empty(), "nothing went to the hub");
     app.shutdown().await;
+}
+
+/// An idempotent command type of this service is not answered in-process before `start` (its call
+/// records are bound by the start): it goes through the hub, not connected yet, and fails as never
+/// sent (`HubUnavailable`, retry-safe) at its deadline; its handler does not run.
+#[tokio::test]
+async fn before_start_an_idempotent_command_goes_through_the_hub() {
+    let (hub, jwks) = (hub().await, jwks().await);
+    let ran = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&ran);
+    let builder = SnodraMessaging::builder(config(&hub, &jwks))
+        .await
+        .unwrap()
+        .idempotent_command::<Slow, _, _>(IdempotencyKey::default(), false, move |_, _| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(()) }
+        });
+    let started = std::time::Instant::now();
+    let e = builder
+        .sender()
+        .send_command(
+            &Slow {},
+            SendOptions {
+                timeout: Some(Duration::from_millis(300)),
+                ..SendOptions::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(e, MessagingError::HubUnavailable(_)), "{e:?}");
+    assert!(started.elapsed() >= Duration::from_millis(250));
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "the handler did not run");
 }
 
 /// With "always route through the hub" nothing is answered in-process before `start` either.

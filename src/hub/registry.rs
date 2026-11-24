@@ -344,17 +344,24 @@ impl HandlerRegistry {
     }
 
     /// A copy of the command and query handlers registered so far, with their guards (no event
-    /// handlers): what the builder's sender answers in-process before the start.
+    /// handlers): what the builder's sender answers in-process before the start. The idempotent
+    /// command handlers are left out: their call records are bound by the start, so before it
+    /// their types go through the hub.
     pub(crate) fn requests(&self) -> HandlerRegistry {
         HandlerRegistry {
-            commands: self.commands.clone(),
+            commands: self
+                .commands
+                .iter()
+                .filter(|(t, _)| !self.idempotent.contains(t))
+                .map(|(t, h)| (*t, Arc::clone(h)))
+                .collect(),
             queries: self.queries.clone(),
             streams: self.streams.clone(),
             subscriptions: self.subscriptions.clone(),
             shared: self.shared.clone(),
             events: HashMap::new(),
             guards: self.guards.clone(),
-            idempotent: self.idempotent.clone(),
+            idempotent: Vec::new(),
         }
     }
 

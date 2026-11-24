@@ -934,8 +934,11 @@ struct Entry {
 /// hub is turned off or unreachable. Scatter-gather, streaming and subscription queries always go
 /// through the hub. The builder's sender answers so from the first registration on, also before
 /// the application started ([`crate::SnodraMessagingBuilder::start`]): every type registered so
-/// far, with its guard; an idempotent handler's call records are bound only by the start. A
-/// sender made without the application sends everything through the hub.
+/// far, with its guard. Before `start()`, an idempotent command type of this service is not
+/// answered in-process: it goes through the hub like another service's command (its call records
+/// are bound by `start()`), so with no hub yet it fails as never sent with `HubUnavailable` at its
+/// deadline and its handler does not run. A sender made without the application sends everything
+/// through the hub.
 pub struct Sender {
     hubs: Arc<HubPool>,
     /// This instance's own handlers, set by the application's builder (on every registration,
