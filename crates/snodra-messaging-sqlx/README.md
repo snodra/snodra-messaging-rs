@@ -84,7 +84,7 @@ The tables: `snodra_schema`, `snodra_outbox`, `snodra_processed_events`, `snodra
 README (the shared reference).
 
 - **Applying it.** `start()` checks the server, then applies V1 unless `snodra_schema` holds version 1 or later, under a
-  database lock so instances starting together apply it once: PostgreSQL `pg_try_advisory_lock(5427483300711319629)`
+  database lock so instances starting together apply it once: PostgreSQL `pg_try_advisory_lock(6002810473706375245)`
   (polled every 200 ms for at most 60 s; a session lock, so a direct connection, not PgBouncer in transaction mode), the
   file in one transaction; MySQL `GET_LOCK('snodra_schema', 60)` (MySQL commits each DDL statement; the file is idempotent).
   A database user without the right to create tables gets a message saying to apply the file and set
@@ -174,7 +174,7 @@ dead letter's payload holding one is kept as `payload_binary`. Identifiers are c
   notices), with leases as the MongoDB add-on's.
 - **Two transactions on one saga** never wait for each other: the loser fails at once with a `StoreError::Conflict` the saga
   runtime retries. An update locks the row `FOR UPDATE NOWAIT`; a start takes, on PostgreSQL,
-  `pg_try_advisory_xact_lock(1263684430, hashtext(start_key_hash))`, and on MySQL inserts first with
+  `pg_try_advisory_xact_lock(1397638226, hashtext(start_key_hash))`, and on MySQL inserts first with
   `innodb_lock_wait_timeout` at 1 s for that statement (put back after; with `innodb_rollback_on_timeout=ON` the whole
   transaction rolls back, still a retried conflict). Under READ COMMITTED on MySQL a concurrent start of one key waits for the
   other's commit (at most 1 s), then conflicts.

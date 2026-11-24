@@ -26,9 +26,10 @@ pub const POSTGRESQL_V1: &str = include_str!("db/snodra/postgresql/V1__snodra.sq
 pub const MYSQL_V1: &str = include_str!("db/snodra/mysql/V1__snodra.sql");
 
 /// The session-level advisory lock that serialises the schema's application on PostgreSQL (one
-/// bigint key, 0x4B52_4B4E_5343_484D = 5427483300711319629; shared with the Kotlin library).
+/// bigint key, 0x534E_4452_5343_484D = 6002810473706375245, ASCII "SNDRSCHM"; shared with the
+/// Kotlin library).
 #[cfg(feature = "postgres")]
-const PG_LOCK: i64 = 0x4B52_4B4E_5343_484D;
+const PG_LOCK: i64 = 0x534E_4452_5343_484D;
 /// The named lock that serialises it on MySQL.
 #[cfg(feature = "mysql")]
 const MYSQL_LOCK: &str = "snodra_schema";
@@ -345,7 +346,7 @@ mod tests {
     #[cfg(feature = "postgres")]
     #[test]
     fn the_schema_lock_key_is_the_kotlin_one() {
-        assert_eq!(PG_LOCK, 5_427_483_300_711_319_629);
+        assert_eq!(PG_LOCK, 6_002_810_473_706_375_245);
     }
 
     #[cfg(feature = "postgres")]

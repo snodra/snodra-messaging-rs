@@ -7,7 +7,7 @@
 //! [`StoreError::Conflict`] the saga runtime retries (a database would otherwise make it wait for
 //! the winner's commit). An update locks the saga's row with `FOR UPDATE NOWAIT`. A start (an
 //! insert with a live start key) takes, on PostgreSQL, the transaction-scoped advisory lock
-//! `pg_try_advisory_xact_lock(1263684430, hashtext(start_key_hash))` (another transaction's insert
+//! `pg_try_advisory_xact_lock(1397638226, hashtext(start_key_hash))` (another transaction's insert
 //! is invisible until it commits); on MySQL the insert itself meets the other transaction's
 //! uncommitted row in the unique index on `live_start_key_hash` and waits for it at most
 //! [`MYSQL_START_WAIT_SECONDS`] (`innodb_lock_wait_timeout`, for that statement): no locking read
@@ -35,9 +35,10 @@ use crate::limits;
 use crate::outbox::marker_exists;
 
 /// The first key of the transaction-scoped advisory lock that serialises the start of sagas per
-/// start key on PostgreSQL (0x4B52_4B4E = 1263684430; shared with the Kotlin library).
+/// start key on PostgreSQL (0x534E_4452 = 1397638226, ASCII "SNDR"; shared with the Kotlin
+/// library).
 #[cfg(feature = "postgres")]
-const SAGA_START_LOCK: i32 = 0x4B52_4B4E;
+const SAGA_START_LOCK: i32 = 0x534E_4452;
 
 /// How long a saga start waits on MySQL for another transaction's uncommitted start with the same
 /// key (then a conflict, retried).
