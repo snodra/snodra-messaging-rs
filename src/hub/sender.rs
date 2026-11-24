@@ -1944,20 +1944,10 @@ impl Sender {
         // live hub declined, the last `NO_HANDLER` is the answer; once the deadline has passed with
         // a hub untried, no new hop starts and the call fails as never sent.
         let started = tokio::time::Instant::now();
-        // The caller's timeout for the hop rule ([`next_hop`]); `chosen` below is a hop's.
-        let call_timeout = chosen;
-        let (deadline, wait) = call_deadline(started, call_timeout);
+        // Every hop carries `chosen` whole, never what is left of it; the deadline bounds the walk.
+        let (deadline, wait) = call_deadline(started, chosen);
         let mut declined: Vec<String> = Vec::new();
-        let mut no_handler = false;
         loop {
-            let chosen = match (chosen, no_handler) {
-                (Some(c), true) => Some(
-                    c.checked_sub(started.elapsed())
-                        .unwrap_or_default()
-                        .max(MIN_TIMEOUT),
-                ),
-                (c, _) => c,
-            };
             let mut answer = None;
             let sent = self
                 .hubs
@@ -2015,7 +2005,6 @@ impl Sender {
                 Ok(Ok(Outcome::Done(Err(MessagingError::NoHandler(_))))) => {
                     tracing::debug!(r#type = type_name, hub = %hub, "no handler on this hub; trying the others");
                     declined.push(hub);
-                    no_handler = true;
                 }
                 Ok(Ok(Outcome::Done(result))) => return result,
                 Ok(Ok(Outcome::NotWritten)) => {
@@ -2025,7 +2014,7 @@ impl Sender {
                             "'{type_name}' not written: {moves} hub streams lost before it was"
                         )));
                     }
-                    next_hop(type_name, started, call_timeout)?;
+                    next_hop(type_name, started, chosen)?;
                     tracing::debug!(r#type = type_name, request = %id, "stream lost before the request was written; trying the next hub");
                 }
                 Ok(Err(_)) => return Err(MessagingError::HubUnavailable("sender closed".into())),

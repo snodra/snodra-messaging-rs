@@ -1576,6 +1576,31 @@ fn key_preferring(preferred: &str, other: &str) -> String {
         .unwrap()
 }
 
+/// A request moved to another hub after a `NO_HANDLER` carries the caller's timeout whole, not
+/// what is left of it.
+#[tokio::test]
+async fn a_request_moved_after_no_handler_carries_its_full_timeout() {
+    let (a, b) = (without_owner("hub-a").await, answering("hub-b").await);
+    let c = client(settings(addresses(&[&a, &b]))).await;
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    c.sender
+        .send_command(
+            &Ping {},
+            SendOptions {
+                routing_key: Some(key_preferring("hub-a", "hub-b")),
+                timeout: Some(Duration::from_millis(2_000)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("hub-b delivers it");
+    let (on_a, on_b) = (a.requests().await, b.requests().await);
+    assert_eq!((on_a.len(), on_b.len()), (1, 1));
+    assert_eq!(on_a[0].id, on_b[0].id, "the same request");
+    assert_eq!(on_b[0].timeout_ms, 2_000);
+    c.shutdown().await;
+}
+
 /// A `NO_HANDLER` that comes back after the call's deadline, with a hub still untried, starts
 /// no new hop: the call fails as never sent (`HubUnavailable`), not with the `NO_HANDLER`.
 #[tokio::test]
