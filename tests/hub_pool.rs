@@ -1451,3 +1451,119 @@ async fn no_stream_moves_after_the_callers_timeout() {
 async fn no_subscription_moves_after_the_callers_timeout() {
     no_move_after_the_timeout(Call::Subscribe).await;
 }
+
+/// One call of `kind` with `timeout`, its outcome reduced to `()`.
+async fn call_once(
+    sender: Arc<Sender>,
+    kind: Call,
+    timeout: Option<Duration>,
+) -> Result<(), MessagingError> {
+    let data = String::new();
+    match kind {
+        Call::Gather => sender
+            .scatter_gather(
+                &BlobFind { data },
+                snodra_messaging::hub::ScatterOptions {
+                    timeout,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| ()),
+        Call::Stream => {
+            let options = snodra_messaging::StreamOptions {
+                timeout,
+                ..Default::default()
+            };
+            sender
+                .stream_owned(&BlobRows { data }, options)
+                .await
+                .map(|_| ())
+        }
+        Call::Subscribe => sender
+            .subscribe(
+                &BlobWatch { data },
+                snodra_messaging::SubscriptionOptions {
+                    timeout,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| ()),
+    }
+}
+
+/// While no hub is live a call waits for one until its deadline (its timeout, else the
+/// configured one, else 5 s), and is sent once a hub is back.
+#[tokio::test]
+async fn a_send_waits_for_a_hub_to_come_up_within_its_deadline() {
+    let a = answering("hub-a").await;
+    a.set_down(true);
+    let c = client(settings(a.address())).await;
+    let sender = Arc::clone(&c.sender);
+    let started = std::time::Instant::now();
+    let call = tokio::spawn(async move {
+        sender
+            .send_command(
+                &Ping {},
+                SendOptions {
+                    timeout: Some(Duration::from_secs(5)),
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    a.set_down(false);
+    call.await.unwrap().expect("sent once the hub was up");
+    assert!(started.elapsed() >= Duration::from_millis(400));
+    assert_eq!(a.requests().await.len(), 1);
+    c.shutdown().await;
+}
+
+/// With no hub at all every kind of call fails as never sent at its deadline, not at once.
+#[tokio::test]
+async fn with_no_hub_every_call_fails_as_never_sent_at_its_deadline() {
+    let a = answering("hub-a").await;
+    a.set_down(true);
+    let c = client(settings(a.address())).await;
+    let timeout = Duration::from_millis(500);
+    let started = std::time::Instant::now();
+    let unary = c
+        .sender
+        .send_command(
+            &Ping {},
+            SendOptions {
+                timeout: Some(timeout),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    let took = started.elapsed();
+    assert!(
+        matches!(&unary, MessagingError::HubUnavailable(m) if m.contains("no hub connected within")),
+        "{unary:?}"
+    );
+    assert!(
+        took >= Duration::from_millis(450) && took < Duration::from_millis(1_500),
+        "failed after {took:?}"
+    );
+    for kind in [Call::Gather, Call::Stream, Call::Subscribe] {
+        let started = std::time::Instant::now();
+        let e = call_once(Arc::clone(&c.sender), kind, Some(timeout))
+            .await
+            .unwrap_err();
+        let took = started.elapsed();
+        assert!(
+            matches!(e, MessagingError::HubUnavailable(_)),
+            "{kind:?}: {e:?}"
+        );
+        assert!(
+            took >= Duration::from_millis(450) && took < Duration::from_millis(1_500),
+            "{kind:?} failed after {took:?}"
+        );
+    }
+    assert!(a.requests().await.is_empty());
+    c.shutdown().await;
+}

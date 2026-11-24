@@ -92,7 +92,8 @@ pub struct Config {
     /// How often an `InstanceStatus` goes to every hub (default 5 s, at least 1 ms).
     pub hub_status_interval: Duration,
     /// Request timeout sent as `timeout_ms` when a call sets none (`SendOptions.timeout` wins).
-    /// `None` (default): the hub decides (its per-type override or its default, 5 s).
+    /// `None` (default): the hub decides (its per-type override or its default, 5 s). It is also
+    /// how long a call waits for a hub while none can take it (5 s when `None`).
     pub hub_request_timeout: Option<Duration>,
     /// Reconnect backoff floor; also where the backoff restarts once a connect reached the handshake.
     pub reconnect_backoff_min: Duration,

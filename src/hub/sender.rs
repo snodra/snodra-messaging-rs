@@ -1,7 +1,9 @@
 //! Outgoing commands and queries: one `Request` per call, correlated reply, timeout, error mapping.
 //!
 //! Failure split: a request that was never accepted by a handshaken stream fails with
-//! `HubUnavailable` (the hub never saw it, a retry is always safe). One whose stream broke while
+//! `HubUnavailable` (the hub never saw it, a retry is always safe). While no hub can take it, a
+//! call waits for one until its deadline: its timeout (the per-call one, else the configured
+//! default), else [`DEFAULT_REQUEST_TIMEOUT`], from the moment the call began. One whose stream broke while
 //! it still waited in that stream's outbound buffer was never written either: it goes to the next
 //! hub with the same id (and fails with `HubUnavailable` if there is none). One the transport had
 //! taken from the buffer fails with `HubConnectionLost` when its stream breaks (outcome unknown,
@@ -462,6 +464,17 @@ enum GatherEvent {
 /// written; past that it fails with `HubUnavailable` (nothing was written).
 const MAX_UNWRITTEN_MOVES: usize = 8;
 
+/// The deadline of a call that began at `started` with the timeout `chosen` (else
+/// [`DEFAULT_REQUEST_TIMEOUT`]), and that wait: until then the call waits for a hub to take it,
+/// and no new hop starts after it.
+fn call_deadline(
+    started: tokio::time::Instant,
+    chosen: Option<Duration>,
+) -> (tokio::time::Instant, Duration) {
+    let wait = chosen.unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+    (started + wait, wait)
+}
+
 /// A request not written yet moves to another hub only while the caller's timeout (else
 /// [`DEFAULT_REQUEST_TIMEOUT`]) since the call's first hop has not passed: no new hop starts after
 /// it, so a call ends within about twice its timeout plus [`LOCAL_GUARD_MARGIN`]. Each hop sends
@@ -471,8 +484,8 @@ fn next_hop(
     started: tokio::time::Instant,
     chosen: Option<Duration>,
 ) -> Result<(), MessagingError> {
-    let wait = chosen.unwrap_or(DEFAULT_REQUEST_TIMEOUT);
-    if started.elapsed() >= wait {
+    let (deadline, wait) = call_deadline(started, chosen);
+    if tokio::time::Instant::now() >= deadline {
         return Err(MessagingError::HubUnavailable(format!(
             "'{type_name}' not written: no hub took it within {wait:?}"
         )));
@@ -568,7 +581,7 @@ impl Gathering<'_> {
                     tracing::debug!(r#type = self.call.type_name, request = %self.id, "stream lost before the scatter-gather was written; trying the next hub");
                     match self
                         .sender
-                        .write_gather(&self.id, &self.call, self.chosen)
+                        .write_gather(&self.id, &self.call, self.chosen, self.started)
                         .await
                     {
                         Ok((events, guard)) => {
@@ -798,7 +811,7 @@ impl Streaming<'_> {
                     tracing::debug!(r#type = self.call.type_name, request = %self.id, "stream lost before the streaming query was written; trying the next hub");
                     match self
                         .sender
-                        .write_stream(&self.id, &self.call, self.chosen)
+                        .write_stream(&self.id, &self.call, self.chosen, self.started)
                         .await
                     {
                         Ok((events, guard, stream)) => {
@@ -1680,7 +1693,7 @@ impl Sender {
         };
         let (events, guard, stream) = streaming
             .sender
-            .write_stream(&streaming.id, call, chosen)
+            .write_stream(&streaming.id, call, chosen, streaming.started)
             .await?;
         streaming.events = events;
         streaming.guard = guard;
@@ -1689,19 +1702,21 @@ impl Sender {
         Ok(streaming)
     }
 
-    /// Writes streaming query `id` to a hub, its pending entry
+    /// Writes streaming query `id` of a call that began at `started` to a hub, its pending entry
     /// recorded while the stream is current. Returns its events, the idle guard and the stream.
     async fn write_stream(
         &self,
         id: &str,
         call: &StreamCall,
         chosen: Option<Duration>,
+        started: tokio::time::Instant,
     ) -> Result<(mpsc::UnboundedReceiver<GatherEvent>, Duration, StreamId), MessagingError> {
         let mut events = None;
         let (mode, _) = call.mode();
+        let (deadline, wait) = call_deadline(started, chosen);
         let sent = self
             .hubs
-            .send_where("", chosen, |stream, ack| {
+            .send_where("", deadline, wait, |stream, ack| {
                 let (timeout_ms, guard) = request_timing(ack, call.type_name, chosen);
                 let (tx, rx) = mpsc::unbounded_channel();
                 events = Some(rx);
@@ -1803,24 +1818,28 @@ impl Sender {
             end: None,
             done: false,
         };
-        let (events, guard) = self.write_gather(&gathering.id, call, chosen).await?;
+        let (events, guard) = self
+            .write_gather(&gathering.id, call, chosen, gathering.started)
+            .await?;
         gathering.events = events;
         gathering.deadline = tokio::time::Instant::now() + guard;
         Ok(gathering)
     }
 
-    /// Writes scatter-gather `id` to a hub, its pending entry
+    /// Writes scatter-gather `id` of a call that began at `started` to a hub, its pending entry
     /// recorded while the stream is current. Returns its events and the local guard.
     async fn write_gather(
         &self,
         id: &str,
         call: &ScatterCall,
         chosen: Option<Duration>,
+        started: tokio::time::Instant,
     ) -> Result<(mpsc::UnboundedReceiver<GatherEvent>, Duration), MessagingError> {
         let mut events = None;
+        let (deadline, wait) = call_deadline(started, chosen);
         let sent = self
             .hubs
-            .send_where("", chosen, |stream, ack| {
+            .send_where("", deadline, wait, |stream, ack| {
                 let (timeout_ms, guard) = request_timing(ack, call.type_name, chosen);
                 let (tx, rx) = mpsc::unbounded_channel();
                 events = Some(rx);
@@ -1925,6 +1944,7 @@ impl Sender {
         let started = tokio::time::Instant::now();
         // The caller's timeout for the hop rule ([`next_hop`]); `chosen` below is a hop's.
         let call_timeout = chosen;
+        let (deadline, wait) = call_deadline(started, call_timeout);
         let mut declined: Vec<String> = Vec::new();
         let mut no_handler = false;
         loop {
@@ -1938,38 +1958,49 @@ impl Sender {
             let mut answer = None;
             let sent = self
                 .hubs
-                .send_excluding(call.routing_key, &declined, chosen, |stream, ack| {
-                    let (timeout_ms, guard) = request_timing(ack, type_name, chosen);
-                    let (tx, rx) = oneshot::channel();
-                    answer = Some(rx);
-                    self.pending.lock().unwrap().insert(
-                        id.clone(),
-                        Entry {
-                            type_name: type_name.to_string(),
-                            stream,
-                            waiter: Waiter::Unary(tx),
-                            subscription: false,
-                        },
-                    );
-                    let request = proto::Request {
-                        id: id.clone(),
-                        kind: call.kind as i32,
-                        r#type: type_name.to_string(),
-                        routing_key: call.routing_key.to_string(),
-                        payload: payload.to_vec(),
-                        headers: call.headers.clone(),
-                        timeout_ms,
-                        priority: call.priority,
-                        ..proto::Request::default()
-                    };
-                    let msg = ClientMessage {
-                        message: Some(client_message::Message::Request(request)),
-                    };
-                    Ok((msg, guard))
-                })
+                .send_excluding(
+                    call.routing_key,
+                    &declined,
+                    deadline,
+                    wait,
+                    |stream, ack| {
+                        let (timeout_ms, guard) = request_timing(ack, type_name, chosen);
+                        let (tx, rx) = oneshot::channel();
+                        answer = Some(rx);
+                        self.pending.lock().unwrap().insert(
+                            id.clone(),
+                            Entry {
+                                type_name: type_name.to_string(),
+                                stream,
+                                waiter: Waiter::Unary(tx),
+                                subscription: false,
+                            },
+                        );
+                        let request = proto::Request {
+                            id: id.clone(),
+                            kind: call.kind as i32,
+                            r#type: type_name.to_string(),
+                            routing_key: call.routing_key.to_string(),
+                            payload: payload.to_vec(),
+                            headers: call.headers.clone(),
+                            timeout_ms,
+                            priority: call.priority,
+                            ..proto::Request::default()
+                        };
+                        let msg = ClientMessage {
+                            message: Some(client_message::Message::Request(request)),
+                        };
+                        Ok((msg, guard))
+                    },
+                )
                 .await;
             let (guard, rx, hub) = match (sent, answer) {
-                (Ok((_, guard, hub)), Some(rx)) => (guard, rx, hub),
+                (Ok(Some((_, guard, hub))), Some(rx)) => (guard, rx, hub),
+                (Ok(None), _) => {
+                    self.take(&id);
+                    // Every live hub declined: the last `NO_HANDLER` is the answer.
+                    return Err(MessagingError::NoHandler(type_name.to_string()));
+                }
                 (Err(e), _) => {
                     self.take(&id);
                     // No other hub is left to try: the last `NO_HANDLER` is the answer.
@@ -1979,7 +2010,7 @@ impl Sender {
                         e
                     });
                 }
-                (Ok(_), None) => unreachable!("a written request was built"),
+                (Ok(Some(_)), None) => unreachable!("a written request was built"),
             };
             // The hub emits TIMEOUT itself; the guard covers a hub that never answers at all.
             match tokio::time::timeout(guard, rx).await {

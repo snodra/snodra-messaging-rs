@@ -20,7 +20,11 @@
 //!   [`rendezvous_score`](super::rendezvous_score) for `(hub_id, routing key)`. A request that
 //!   could not be written to the chosen hub's stream (it dropped meanwhile) goes to the next hub in
 //!   that order with the same request id: it was never sent. One already written fails with
-//!   `HubConnectionLost` when its stream drops (the caller's retry policy decides).
+//!   `HubConnectionLost` when its stream drops (the caller's retry policy decides). While no hub
+//!   can take a request (none is live yet, a hub is restarting) the call waits for one until its
+//!   deadline: its timeout (the caller's, else the configured default), else 5 s, from the moment
+//!   the call began; then it fails as never sent (`HubUnavailable`). No new hop starts after the
+//!   deadline. A pool turned off fails at once.
 //! - **Permits.** A stream offers `ceil(max_concurrent_handlers / N)` permits
 //!   ([`permit_share`]), N being the hubs live when its `Register` is written, itself included
 //!   (also a hub reconnecting for a client certificate rollover);
@@ -56,8 +60,8 @@
 //!   gets [`SHUTDOWN_CLOSE_TIMEOUT`](super::connection::SHUTDOWN_CLOSE_TIMEOUT) to finish, and
 //!   what it sends meanwhile, late replies included, is still handled), and the connection
 //!   reconnects with the new pair; only when it is registered again (at most
-//!   [`ROLL_RECONNECT_LIMIT`]) is the next hub rolled. While no hub is routable only because of
-//!   the roll (a single hub), a send waits for one within its own deadline. A pair that does not
+//!   [`ROLL_RECONNECT_LIMIT`]) is the next hub rolled. While no hub is routable (a single hub
+//!   being rolled), a send waits for one within its own deadline, as it always does. A pair that does not
 //!   load (a rotation caught half way, a key that is not the certificate's, a certificate for
 //!   another service, an expired one) leaves every connection as it is and is logged at `error`
 //!   once per distinct problem (when it persists for a second period); one that is not valid yet
@@ -668,53 +672,92 @@ impl HubPool {
     /// Writes a message built for the chosen hub's stream: round-robin without a `routing_key`,
     /// rendezvous with one. When the write fails or `build` refuses the stream (nothing was
     /// written) the next hub in that order is tried, so `build` may run more than once, each time
-    /// for another stream; the last error (`HubUnavailable`, or `build`'s) is returned when no hub
-    /// took it; `HubUnavailable` when none is live. `build` sees the ack of the stream current
-    /// at the write.
+    /// for another stream. While no hub takes it (none is live, or none took the write) it waits
+    /// for the live hubs to change, until `deadline`; then it fails with `HubUnavailable` ("no hub
+    /// connected within `wait`", or "no hub took the request within `wait`" once a hub was tried).
+    /// At once when the pool is turned off. `build` sees the ack of the stream current at the
+    /// write.
     pub(crate) async fn send_where<T>(
         &self,
         routing_key: &str,
-        wait: Option<Duration>,
-        mut build: impl FnMut(StreamId, &RegisterAck) -> Result<(ClientMessage, T), MessagingError>,
+        deadline: tokio::time::Instant,
+        wait: Duration,
+        build: impl FnMut(StreamId, &RegisterAck) -> Result<(ClientMessage, T), MessagingError>,
     ) -> Result<(StreamId, T), MessagingError> {
-        let mut last = None;
-        for conn in self.ranked_waiting(routing_key, wait).await {
-            match conn.send_with(|stream, ack| build(stream, ack)).await {
-                Ok(sent) => return Ok(sent),
-                Err(e) => {
-                    tracing::debug!(hub = %conn.address(), "not written, trying the next hub: {e}");
-                    last = Some(e);
-                }
-            }
+        match self
+            .send_excluding(routing_key, &[], deadline, wait, build)
+            .await?
+        {
+            Some((stream, extra, _)) => Ok((stream, extra)),
+            None => Err(self.unavailable()),
         }
-        Err(last.unwrap_or_else(|| self.unavailable()))
     }
 
-    /// Like [`send_where`](Self::send_where) over the live hubs whose address is not in `tried`, which also
-    /// returns the address of the hub that took the write. For a request a hub declined with
-    /// `NO_HANDLER` (it was never delivered): the next hub in the routing order gets it. An error
-    /// (`HubUnavailable`) when no other live hub takes it.
+    /// Like [`send_where`](Self::send_where) over the live hubs whose address is not in `tried`,
+    /// which also returns the address of the hub that took the write. For a request a hub
+    /// declined with `NO_HANDLER` (it was never delivered): the next hub in the routing order
+    /// gets it. `None` when every live hub is in a non-empty `tried`: the declines are the answer,
+    /// nothing is waited for.
     pub(crate) async fn send_excluding<T>(
         &self,
         routing_key: &str,
         tried: &[String],
-        wait: Option<Duration>,
+        deadline: tokio::time::Instant,
+        wait: Duration,
         mut build: impl FnMut(StreamId, &RegisterAck) -> Result<(ClientMessage, T), MessagingError>,
-    ) -> Result<(StreamId, T, String), MessagingError> {
-        let mut last = None;
-        for conn in self.ranked_waiting(routing_key, wait).await {
-            if tried.iter().any(|a| a == conn.address()) {
-                continue;
+    ) -> Result<Option<(StreamId, T, String)>, MessagingError> {
+        let mut changes = self.changes.subscribe();
+        // The hubs that did not take the write, with the stream each had then: a hub with a new
+        // stream is tried again.
+        let mut refused: Vec<(String, Option<StreamId>)> = Vec::new();
+        loop {
+            if self.off.load(Ordering::SeqCst) {
+                return Err(self.unavailable());
             }
-            match conn.send_with(|stream, ack| build(stream, ack)).await {
-                Ok((stream, extra)) => return Ok((stream, extra, conn.address().to_string())),
-                Err(e) => {
-                    tracing::debug!(hub = %conn.address(), "not written, trying the next hub: {e}");
-                    last = Some(e);
+            let untried: Vec<Arc<HubConnection>> = self
+                .ranked(routing_key)
+                .into_iter()
+                .filter(|c| !tried.iter().any(|a| a == c.address()))
+                .collect();
+            if untried.is_empty() && !tried.is_empty() {
+                return Ok(None);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(MessagingError::HubUnavailable(
+                    if tried.is_empty() && refused.is_empty() {
+                        format!("no hub connected within {wait:?}")
+                    } else {
+                        format!("no hub took the request within {wait:?}")
+                    },
+                ));
+            }
+            for conn in untried {
+                let current = conn.current_stream();
+                if refused
+                    .iter()
+                    .any(|(a, s)| a == conn.address() && *s == current)
+                {
+                    continue;
+                }
+                match conn.send_with(|stream, ack| build(stream, ack)).await {
+                    Ok((stream, extra)) => {
+                        return Ok(Some((stream, extra, conn.address().to_string())));
+                    }
+                    Err(e) => {
+                        tracing::debug!(hub = %conn.address(), "not written, trying the next hub: {e}");
+                        refused.push((conn.address().to_string(), current));
+                    }
                 }
             }
+            // No hub took it: wait for the live hubs to change, within the deadline.
+            tokio::select! {
+                _ = changes.changed() => {}
+                // A pool of one external connection hears of no change: poll.
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                _ = tokio::time::sleep_until(deadline) => {}
+                _ = self.cancel.cancelled() => return Err(self.unavailable()),
+            }
         }
-        Err(last.unwrap_or_else(|| self.unavailable()))
     }
 
     /// Writes `msg` to the hub stream `stream`, if it is still the current stream of its
@@ -804,43 +847,6 @@ impl HubPool {
                 })
             })
             .collect()
-    }
-
-    /// Like [`ranked`](Self::ranked), but when no hub is routable only because a certificate
-    /// rollover has taken the hub(s) out of the routing, waits for one to be back, for at most
-    /// `wait` (the caller's remaining deadline; without one, [`ROLL_RECONNECT_LIMIT`], when the
-    /// rollover gives up anyway). Empty when the wait runs out, or when nothing is rolling.
-    async fn ranked_waiting(
-        &self,
-        routing_key: &str,
-        wait: Option<Duration>,
-    ) -> Vec<Arc<HubConnection>> {
-        let ranked = self.ranked(routing_key);
-        if !ranked.is_empty() || !self.rolling() {
-            return ranked;
-        }
-        let limit = wait
-            .unwrap_or(ROLL_RECONNECT_LIMIT)
-            .min(ROLL_RECONNECT_LIMIT);
-        let deadline = tokio::time::Instant::now() + limit;
-        let mut changes = self.changes.subscribe();
-        loop {
-            tokio::select! {
-                _ = changes.changed() => {}
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
-                _ = tokio::time::sleep_until(deadline) => return self.ranked(routing_key),
-                _ = self.cancel.cancelled() => return vec![],
-            }
-            let ranked = self.ranked(routing_key);
-            if !ranked.is_empty() || !self.rolling() {
-                return ranked;
-            }
-        }
-    }
-
-    /// True while a certificate rollover has a connection out of the routing.
-    fn rolling(&self) -> bool {
-        self.members().iter().any(|m| m.role() == Role::Rolling)
     }
 
     /// The live hubs in the order a request with `routing_key` tries them.

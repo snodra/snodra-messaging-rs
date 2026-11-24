@@ -437,16 +437,25 @@ async fn local_guard_uses_the_acks_per_type_timeout() {
     hub.stop();
 }
 
+/// With no live stream the call waits for one until its deadline, then fails as never sent.
 #[tokio::test]
 async fn send_with_no_stream_is_hub_unavailable() {
     let hub = FakeHub::start().await;
     let (sender, conn) = sender(&hub, None).await;
     conn.shutdown().await; // no live stream any more: nothing can be written
+    let started = std::time::Instant::now();
     let err = sender
-        .send_command(&Nop {}, SendOptions::default())
+        .send_command(
+            &Nop {},
+            SendOptions {
+                timeout: Some(Duration::from_millis(300)),
+                ..SendOptions::default()
+            },
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, MessagingError::HubUnavailable(_)), "{err:?}");
+    assert!(started.elapsed() >= Duration::from_millis(250));
     assert!(hub.requests().await.is_empty());
     hub.stop();
 }

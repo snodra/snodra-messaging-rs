@@ -31,8 +31,8 @@ pub enum MessagingError {
     AccessDenied(String),
     #[error("{0}")]
     InvalidMessage(String),
-    /// The request was never written to a live hub stream (not connected, or the write failed):
-    /// the hub never saw it, a retry is safe.
+    /// The request was never written to a live hub stream (no hub took it within the call's
+    /// deadline, or the hub is turned off): the hub never saw it, a retry is safe.
     #[error("{0}")]
     HubUnavailable(String),
     /// The request was written to a hub stream that broke before the answer arrived: the outcome
