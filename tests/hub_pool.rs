@@ -1567,3 +1567,45 @@ async fn with_no_hub_every_call_fails_as_never_sent_at_its_deadline() {
     assert!(a.requests().await.is_empty());
     c.shutdown().await;
 }
+
+/// A routing key whose preferred hub is `preferred` over `other`.
+fn key_preferring(preferred: &str, other: &str) -> String {
+    (0..)
+        .map(|i| format!("agg-{i}"))
+        .find(|k| rendezvous_score(preferred, k) > rendezvous_score(other, k))
+        .unwrap()
+}
+
+/// A `NO_HANDLER` that comes back after the call's deadline, with a hub still untried, starts
+/// no new hop: the call fails as never sent (`HubUnavailable`), not with the `NO_HANDLER`.
+#[tokio::test]
+async fn a_no_handler_after_the_deadline_with_a_hub_untried_is_hub_unavailable() {
+    let a = FakeHub::start_with_id("hub-a").await; // swallows every request
+    let b = answering("hub-b").await;
+    let c = client(settings(addresses(&[&a, &b]))).await;
+    all_registered(&c, &["hub-a", "hub-b"]).await;
+    let sender = Arc::clone(&c.sender);
+    let call = tokio::spawn(async move {
+        sender
+            .send_command(
+                &Ping {},
+                SendOptions {
+                    routing_key: Some(key_preferring("hub-a", "hub-b")),
+                    timeout: Some(Duration::from_millis(300)),
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+    eventually("hub-a has it", async || a.requests().await.len() == 1).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let request = a.requests().await.remove(0);
+    a.send_to_clients(no_handler(&request)).await;
+    let e = call.await.unwrap().unwrap_err();
+    assert!(
+        matches!(&e, MessagingError::HubUnavailable(m) if m.contains("no hub took the request within")),
+        "{e:?}"
+    );
+    assert!(b.requests().await.is_empty(), "no hop after the deadline");
+    c.shutdown().await;
+}

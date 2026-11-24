@@ -1939,8 +1939,10 @@ impl Sender {
         // replaces it (new stream, new channel: a late Disconnected of the failed stream finds
         // nothing of it); when no hub takes the write it is removed (never written).
         let mut moves = 0;
-        // Hubs that answered `NO_HANDLER` (the request was never delivered there), and the last such
-        // answer: the other live hubs get the request in turn, each at most once, within `chosen`.
+        // Hubs that answered `NO_HANDLER` (the request was never delivered there): the other live
+        // hubs get the request in turn, each at most once, until the call's deadline. When every
+        // live hub declined, the last `NO_HANDLER` is the answer; once the deadline has passed with
+        // a hub untried, no new hop starts and the call fails as never sent.
         let started = tokio::time::Instant::now();
         // The caller's timeout for the hop rule ([`next_hop`]); `chosen` below is a hop's.
         let call_timeout = chosen;
@@ -1949,10 +1951,11 @@ impl Sender {
         let mut no_handler = false;
         loop {
             let chosen = match (chosen, no_handler) {
-                (Some(c), true) => match c.checked_sub(started.elapsed()) {
-                    Some(left) if !left.is_zero() => Some(left.max(MIN_TIMEOUT)),
-                    _ => return Err(MessagingError::NoHandler(type_name.to_string())),
-                },
+                (Some(c), true) => Some(
+                    c.checked_sub(started.elapsed())
+                        .unwrap_or_default()
+                        .max(MIN_TIMEOUT),
+                ),
                 (c, _) => c,
             };
             let mut answer = None;
@@ -2003,12 +2006,7 @@ impl Sender {
                 }
                 (Err(e), _) => {
                     self.take(&id);
-                    // No other hub is left to try: the last `NO_HANDLER` is the answer.
-                    return Err(if no_handler {
-                        MessagingError::NoHandler(type_name.to_string())
-                    } else {
-                        e
-                    });
+                    return Err(e);
                 }
                 (Ok(Some(_)), None) => unreachable!("a written request was built"),
             };
