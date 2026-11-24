@@ -789,13 +789,20 @@ async fn two_targets_of_one_replacing_hub_settle_without_ping_pong() {
     .await;
     let instance = c.pool.instance_id().to_string();
     all_registered(&c, &["hub-x"]).await;
-    // Both targets registered once (the fake hub replaces sessions like snodra-server), then one
-    // stream is left holding the session.
-    eventually("one stream left, holding the session", async || {
+    // Settled: both targets registered once (the fake hub replaces sessions like snodra-server),
+    // the duplicate is closed, and the one kept connection is registered again and holds the
+    // session (while the duplicate's stream still holds it, no connection of the pool is live).
+    eventually("one kept stream left, holding the session", async || {
         hub.evictions() >= 1
             && hub.connected_clients().await == 1
             && hub.holds(&instance)
             && c.pool.hub_ids() == ["hub-x"]
+            && c.pool
+                .connections()
+                .iter()
+                .filter(|conn| conn.handshake().is_some())
+                .count()
+                == 1
     })
     .await;
     assert!(
