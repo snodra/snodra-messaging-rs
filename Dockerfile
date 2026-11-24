@@ -12,7 +12,7 @@ COPY proto ./proto
 COPY src ./src
 COPY crates ./crates
 COPY examples ./examples
-RUN cargo build --release --locked -p snodra-messaging-rs
+RUN cargo build --release --locked -p snodra-messaging
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 WORKDIR /app

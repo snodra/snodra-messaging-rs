@@ -8,7 +8,7 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
-snodra-messaging-rs = { path = "../.." }
+snodra-messaging = { path = "../.." }
 # The message store: the service's own PostgreSQL database, through the SQL add-on.
 snodra-messaging-sqlx = { path = "../../crates/snodra-messaging-sqlx", default-features = false, features = ["postgres"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres"] }

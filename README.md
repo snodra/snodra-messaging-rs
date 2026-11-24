@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/snodra/snodra-messaging-rs/actions/workflows/ci.yml"><img alt="ci" src="https://github.com/snodra/snodra-messaging-rs/actions/workflows/ci.yml/badge.svg"></a>
-  <a href="https://crates.io/crates/snodra-messaging-rs"><img alt="crates.io" src="https://img.shields.io/crates/v/snodra-messaging-rs"></a>
+  <a href="https://crates.io/crates/snodra-messaging"><img alt="crates.io" src="https://img.shields.io/crates/v/snodra-messaging"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-1.99.1-000000?logo=rust&logoColor=white">
   <img alt="tonic" src="https://img.shields.io/badge/tonic-gRPC-244c5a">
   <a href="https://snodra.damoreira.com/docs/"><img alt="docs" src="https://img.shields.io/badge/docs-snodra.damoreira.com-0B5FFF"></a>
@@ -42,7 +42,7 @@ indistinguishable in front of the server and on the event store.
 
 ```toml
 [dependencies]
-snodra-messaging-rs    = "0.7"
+snodra-messaging       = "0.7"
 snodra-messaging-kafka = "0.7"   # or snodra-messaging-rabbitmq
 snodra-messaging-mongo = "0.7"   # or snodra-messaging-sqlx
 ```

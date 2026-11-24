@@ -12,7 +12,7 @@ keywords = ["rabbitmq","event-store","messaging","events"]
 categories = ["database"]
 
 [dependencies]
-snodra-messaging-rs = { workspace = true }
+snodra-messaging = { workspace = true }
 # The stream protocol client (pure Rust, TLS through rustls). Its raw `Client` is used, not its
 # `Environment` consumers and producers: see the crate docs for why.
 rabbitmq-stream-client = "=0.11.0"
@@ -31,7 +31,7 @@ tracing = "0.1.44"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-snodra-messaging-rs = { workspace = true, features = ["testing"] }
+snodra-messaging = { workspace = true, features = ["testing"] }
 tokio = { version = "1.54.1", features = ["full", "test-util"] }
 testcontainers = "0.27"
 # The end-to-end test's messages.

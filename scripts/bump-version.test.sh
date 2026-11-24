@@ -12,7 +12,7 @@ fail() {
 }
 
 # The published crates: the core and every add-on.
-crates=snodra-messaging-rs
+crates=snodra-messaging
 for m in "$root"/crates/*/Cargo.toml; do
   crates="$crates $(awk '/^\[/ { p = ($0 == "[package]") } p && /^name = "/ { gsub(/^name = "|"$/, ""); print; exit }' "$m")"
 done
@@ -33,8 +33,8 @@ if sh scripts/bump-version.sh 9.8.7; then echo "ok   it runs"; else fail "it run
 ws=$(awk '/^\[/ { p = ($0 == "[workspace.package]") } p && /^version = / { print; exit }' Cargo.toml)
 [ "$ws" = 'version = "9.8.7"' ] && echo "ok   the workspace version" || fail "the workspace version: $ws"
 
-dep=$(awk '/^\[/ { p = ($0 == "[workspace.dependencies]") } p && /^snodra-messaging-rs = / { print; exit }' Cargo.toml)
-[ "$dep" = 'snodra-messaging-rs = { path = ".", version = "9.8.7" }' ] && echo "ok   the core dependency" \
+dep=$(awk '/^\[/ { p = ($0 == "[workspace.dependencies]") } p && /^snodra-messaging = / { print; exit }' Cargo.toml)
+[ "$dep" = 'snodra-messaging = { path = ".", version = "9.8.7" }' ] && echo "ok   the core dependency" \
   || fail "the core dependency: $dep"
 
 # Every published crate inherits the workspace version, so no crate manifest carries its own.
@@ -44,7 +44,7 @@ for m in Cargo.toml crates/*/Cargo.toml; do
 done
 # And the add-ons name the core through the workspace, never with a version of their own.
 for m in crates/*/Cargo.toml; do
-  if grep -E '^snodra-messaging-rs = ' "$m" | grep -v 'workspace = true' | grep -q .; then
+  if grep -E '^snodra-messaging = ' "$m" | grep -v 'workspace = true' | grep -q .; then
     fail "$m names the core without the workspace"
   else
     echo "ok   $m names the core through the workspace"
@@ -82,7 +82,7 @@ grep -v '^name = "snodra-messaging-mongo"$' Cargo.lock.good >Cargo.lock
 if sh scripts/bump-version.sh 9.9.0 2>/dev/null; then fail "a crate missing from the lock fails"; else echo "ok   a crate missing from the lock fails"; fi
 cp Cargo.lock.good Cargo.lock
 
-sed 's/^snodra-messaging-rs = { path = "\.", version = "[^"]*" }$/snodra-messaging-rs = { path = "." }/' Cargo.toml >Cargo.toml.new
+sed 's/^snodra-messaging = { path = "\.", version = "[^"]*" }$/snodra-messaging = { path = "." }/' Cargo.toml >Cargo.toml.new
 mv Cargo.toml.new Cargo.toml
 if sh scripts/bump-version.sh 9.9.0 2>/dev/null; then fail "a core dependency without a version fails"; else echo "ok   a core dependency without a version fails"; fi
 

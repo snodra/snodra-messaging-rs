@@ -2583,7 +2583,7 @@ name = "orders-sql"
 version = "0.1.0"
 dependencies = [
  "serde",
- "snodra-messaging-rs",
+ "snodra-messaging",
  "snodra-messaging-sqlx",
  "sqlx",
  "testcontainers",
@@ -3700,9 +3700,9 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "snodra-messaging",
  "snodra-messaging-kafka",
  "snodra-messaging-mongo",
- "snodra-messaging-rs",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3820,61 +3820,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "snodra-messaging-kafka"
-version = "0.7.1"
-dependencies = [
- "futures",
- "mongodb",
- "rdkafka",
- "serde_json",
- "snodra-messaging-mongo",
- "snodra-messaging-rs",
- "testcontainers",
- "testcontainers-modules",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "snodra-messaging-mongo"
-version = "0.7.1"
-dependencies = [
- "futures",
- "mongodb",
- "serde",
- "serde_json",
- "snodra-messaging-rs",
- "testcontainers",
- "testcontainers-modules",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "snodra-messaging-rabbitmq"
-version = "0.7.1"
-dependencies = [
- "futures",
- "murmur3",
- "rabbitmq-stream-client",
- "rabbitmq-stream-protocol",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "snodra-messaging-rs",
- "testcontainers",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "snodra-messaging-rs"
+name = "snodra-messaging"
 version = "0.7.1"
 dependencies = [
  "base64 0.23.1",
@@ -3914,6 +3860,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "snodra-messaging-kafka"
+version = "0.7.1"
+dependencies = [
+ "futures",
+ "mongodb",
+ "rdkafka",
+ "serde_json",
+ "snodra-messaging",
+ "snodra-messaging-mongo",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "snodra-messaging-mongo"
+version = "0.7.1"
+dependencies = [
+ "futures",
+ "mongodb",
+ "serde",
+ "serde_json",
+ "snodra-messaging",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "snodra-messaging-rabbitmq"
+version = "0.7.1"
+dependencies = [
+ "futures",
+ "murmur3",
+ "rabbitmq-stream-client",
+ "rabbitmq-stream-protocol",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "snodra-messaging",
+ "testcontainers",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "snodra-messaging-sqlx"
 version = "0.7.1"
 dependencies = [
@@ -3922,7 +3922,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "snodra-messaging-rs",
+ "snodra-messaging",
  "sqlx",
  "sqlx-core",
  "testcontainers",

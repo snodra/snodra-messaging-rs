@@ -10,7 +10,7 @@
 # version is caught by the tests (scripts/bump-version.test.sh) and not by a release.
 set -eu
 
-core=snodra-messaging-rs
+core=snodra-messaging
 
 version=${1:-}
 # Strictly N.N.N without leading zeros, as next-version.sh computes it.

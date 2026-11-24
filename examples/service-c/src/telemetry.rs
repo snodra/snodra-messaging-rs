@@ -1,4 +1,4 @@
-//! The metrics export: snodra-messaging-rs records its metrics through the
+//! The metrics export: snodra-messaging records its metrics through the
 //! OpenTelemetry API; the application installs the meter provider. With `SNODRA_OTLP_ENDPOINT`
 //! set (OTLP/gRPC, e.g. `http://otel-lgtm:4317`), an OTLP meter provider becomes
 //! the global one before the messaging is built, exporting every 60 s

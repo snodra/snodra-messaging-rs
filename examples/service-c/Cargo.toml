@@ -8,7 +8,7 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
-snodra-messaging-rs = { path = "../.." }
+snodra-messaging = { path = "../.." }
 # The message store: its own MongoDB database, through the MongoDB add-on.
 snodra-messaging-mongo = { path = "../../crates/snodra-messaging-mongo" }
 # The event store: Kafka, through the Kafka add-on (also the printer's partner topic).
@@ -33,4 +33,4 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "r
 
 [dev-dependencies]
 # SagaTestFixture (feature `testing`) for the banner saga's unit tests.
-snodra-messaging-rs = { path = "../..", features = ["testing"] }
+snodra-messaging = { path = "../..", features = ["testing"] }
