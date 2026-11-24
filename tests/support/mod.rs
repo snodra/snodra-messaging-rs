@@ -11,6 +11,33 @@ pub const OTHER_KEY_PEM: &[u8] = include_bytes!("../fixtures/other_key.pem");
 pub const JWKS_JSON: &str = include_str!("../fixtures/jwks.json");
 pub const ISSUER: &str = "https://issuer.test/realms/snodra";
 
+/// An identity resolver that verifies forwarded tokens against the fixture key's JWKS, served by
+/// the returned mock server (kept alive by the caller).
+pub async fn verifying_resolver() -> (
+    snodra_messaging::identity::IdentityResolver,
+    wiremock::MockServer,
+) {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/jwks"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(JWKS_JSON))
+        .mount(&server)
+        .await;
+    let verifier = snodra_messaging::identity::JwksVerifier::new(
+        format!("{}/jwks", server.uri()),
+        ISSUER.to_string(),
+    );
+    (
+        snodra_messaging::identity::IdentityResolver::new(Some(verifier)),
+        server,
+    )
+}
+
+/// `Bearer <token>` of a caller `u-1` with `roles`, valid for a minute.
+pub fn bearer(roles: &[&str]) -> String {
+    format!("Bearer {}", token("u-1", roles, ISSUER, now() + 60))
+}
+
 pub fn now() -> u64 {
     jsonwebtoken::get_current_timestamp()
 }

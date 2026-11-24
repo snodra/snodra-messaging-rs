@@ -19,19 +19,27 @@ use crate::types::{Command, Event, MessageType, Query, StreamingQuery, Subscript
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// Why an erased request handler did not produce a payload: the dispatcher maps each case to its
 /// own reply code (decode → INVALID_REQUEST; the handler's error → HANDLER_ERROR unless it is an
-/// authorization outcome).
+/// authorization outcome, the guard's included).
 pub(crate) enum Invocation {
     Decode(String),
     Handler(MessagingError),
     Encode(String),
 }
 
-pub(crate) type RequestHandler =
-    Arc<dyn Fn(Vec<u8>, MessageContext) -> BoxFut<Result<Vec<u8>, Invocation>> + Send + Sync>;
+/// An erased request handler: decodes the payload, applies the type's guard (if any) to the
+/// decoded request, runs the handler and encodes its reply.
+pub(crate) type RequestHandler = Arc<
+    dyn Fn(Vec<u8>, MessageContext, Option<Guard>) -> BoxFut<Result<Vec<u8>, Invocation>>
+        + Send
+        + Sync,
+>;
 /// The items of an erased streaming handler, each encoded (or why it could not be).
 pub(crate) type ItemStream = BoxStream<'static, Result<Vec<u8>, Invocation>>;
-pub(crate) type StreamHandler =
-    Arc<dyn Fn(Vec<u8>, MessageContext) -> BoxFut<Result<ItemStream, Invocation>> + Send + Sync>;
+pub(crate) type StreamHandler = Arc<
+    dyn Fn(Vec<u8>, MessageContext, Option<Guard>) -> BoxFut<Result<ItemStream, Invocation>>
+        + Send
+        + Sync,
+>;
 pub(crate) type EventHandler =
     Arc<dyn Fn(Vec<u8>, EventContext) -> BoxFut<Result<(), MessagingError>> + Send + Sync>;
 /// Decodes a subscription query's payload to the registered `Q`, erased for the emitter's
@@ -501,6 +509,16 @@ fn sorted<'a>(keys: impl Iterator<Item = &'a &'static str>) -> Vec<String> {
     v
 }
 
+/// The guard's rule, applied once the payload is decoded (an anonymous caller was refused before).
+fn check_decoded(guard: Option<&Guard>, ctx: &MessageContext) -> Result<(), Invocation> {
+    match guard {
+        Some(guard) => guard
+            .check(ctx.identity.as_ref(), ctx)
+            .map_err(Invocation::Handler),
+        None => Ok(()),
+    }
+}
+
 fn erase_request<M, R, F, Fut>(handler: F) -> RequestHandler
 where
     M: serde::de::DeserializeOwned + Send + 'static,
@@ -509,16 +527,19 @@ where
     Fut: Future<Output = Result<R, MessagingError>> + Send + 'static,
 {
     let handler = Arc::new(handler);
-    Arc::new(move |payload: Vec<u8>, ctx: MessageContext| {
-        let handler = Arc::clone(&handler);
-        Box::pin(async move {
-            let message: M = codec::decode(&payload)
-                .map_err(|e| Invocation::Decode(format!("cannot decode payload: {e}")))?;
-            let reply = handler(message, ctx).await.map_err(Invocation::Handler)?;
-            codec::encode_reply(&reply)
-                .map_err(|e| Invocation::Encode(format!("cannot encode reply: {e}")))
-        })
-    })
+    Arc::new(
+        move |payload: Vec<u8>, ctx: MessageContext, guard: Option<Guard>| {
+            let handler = Arc::clone(&handler);
+            Box::pin(async move {
+                let message: M = codec::decode(&payload)
+                    .map_err(|e| Invocation::Decode(format!("cannot decode payload: {e}")))?;
+                check_decoded(guard.as_ref(), &ctx)?;
+                let reply = handler(message, ctx).await.map_err(Invocation::Handler)?;
+                codec::encode_reply(&reply)
+                    .map_err(|e| Invocation::Encode(format!("cannot encode reply: {e}")))
+            })
+        },
+    )
 }
 
 /// Erases a streaming handler: the query decoded, the handler's stream boxed with each item
@@ -531,22 +552,25 @@ where
     S: Stream<Item = Result<Q::Item, MessagingError>> + Send + 'static,
 {
     let handler = Arc::new(handler);
-    Arc::new(move |payload: Vec<u8>, ctx: MessageContext| {
-        let handler = Arc::clone(&handler);
-        Box::pin(async move {
-            let query: Q = codec::decode(&payload)
-                .map_err(|e| Invocation::Decode(format!("cannot decode payload: {e}")))?;
-            let items = handler(query, ctx).await.map_err(Invocation::Handler)?;
-            let items: ItemStream = items
-                .map(|item| match item {
-                    Ok(item) => codec::encode_reply(&item)
-                        .map_err(|e| Invocation::Encode(format!("cannot encode item: {e}"))),
-                    Err(e) => Err(Invocation::Handler(e)),
-                })
-                .boxed();
-            Ok(items)
-        })
-    })
+    Arc::new(
+        move |payload: Vec<u8>, ctx: MessageContext, guard: Option<Guard>| {
+            let handler = Arc::clone(&handler);
+            Box::pin(async move {
+                let query: Q = codec::decode(&payload)
+                    .map_err(|e| Invocation::Decode(format!("cannot decode payload: {e}")))?;
+                check_decoded(guard.as_ref(), &ctx)?;
+                let items = handler(query, ctx).await.map_err(Invocation::Handler)?;
+                let items: ItemStream = items
+                    .map(|item| match item {
+                        Ok(item) => codec::encode_reply(&item)
+                            .map_err(|e| Invocation::Encode(format!("cannot encode item: {e}"))),
+                        Err(e) => Err(Invocation::Handler(e)),
+                    })
+                    .boxed();
+                Ok(items)
+            })
+        },
+    )
 }
 
 /// Erases a subscription handler: the initial result as a unary handler, plus the decoder of

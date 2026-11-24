@@ -325,6 +325,34 @@ async fn guarded_handler_denies_missing_role() {
     assert_eq!(payload(&reply), json!({}));
 }
 
+/// The role rule is applied once the payload is decoded: a payload that does not decode is
+/// `INVALID_REQUEST` for an authenticated caller, also one the rule refuses.
+#[tokio::test]
+async fn guarded_handler_decodes_before_its_role_rule() {
+    let (dispatcher, _jwks) = verifying_dispatcher().await;
+    let user = support::token(
+        "u-1",
+        &["snodra-user"],
+        support::ISSUER,
+        support::now() + 60,
+    );
+    let auth = format!("Bearer {user}");
+    let reply = dispatcher
+        .handle(request(
+            RequestKind::Command,
+            "t.Secret",
+            "garbage",
+            &[("authorization", &auth)],
+        ))
+        .await;
+    assert_eq!(error_code(&reply).0, ErrorCode::InvalidRequest);
+    // Anonymous: refused before the decode, whatever the payload.
+    let reply = dispatcher
+        .handle(request(RequestKind::Command, "t.Secret", "garbage", &[]))
+        .await;
+    assert_eq!(error_code(&reply).0, ErrorCode::Unauthenticated);
+}
+
 #[tokio::test]
 async fn handler_error_maps_to_handler_error_code() {
     let (code, message) = error_code(

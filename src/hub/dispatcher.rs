@@ -1,4 +1,5 @@
-//! Incoming hub requests: identity, lookup, guard, decode, handler, reply. Streaming queries
+//! Incoming hub requests: identity, lookup, the guard's anonymous check, decode, the guard's
+//! rule, handler, reply. Streaming queries
 //!: the handler's stream pulled under the sender's credits, one `ReplyPart` per
 //! item, then the `ReplyEnd`. The hub's `Flow` and `Cancel` reach the running request by id.
 //! Subscription queries: `mode = SUBSCRIPTION` registers a subscription (see
@@ -18,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::context::{CURRENT, MessageContext, hub_headers};
 use crate::error::MessagingError;
-use crate::identity::{Identity, IdentityResolver};
+use crate::identity::{Guard, Identity, IdentityResolver};
 use crate::proto::{
     self, ClientMessage, ErrorCode, Reply, RequestKind, RequestMode, client_message, reply,
 };
@@ -100,7 +101,8 @@ impl From<MessagingError> for Rejected {
 
 /// A subscription request as [`Dispatcher::serve`] read it, before its admission: registered
 /// (pending) when it could be, else what is wrong with it. The flaws are reported in the order
-/// the admission always checked: lookup, then the guard, then the decode, then the limit.
+/// the admission always checks: the limit and an id already open (when the request is read),
+/// then the token, the lookup, the anonymous caller, the decode and the guard's rule.
 struct Prepared {
     admission: Option<Admission>,
     flaw: Flaw,
@@ -444,6 +446,7 @@ impl Dispatcher {
         }
         .ok_or_else(|| MessagingError::NoHandler(req.r#type.clone()))?;
         let type_name = req.r#type.clone();
+        let guard = self.registry.guard(&type_name).cloned();
         let (ctx, permit, payload) = match permit {
             Permit::Take => {
                 let (ctx, permit, payload) = self.admit(req, identity).await?;
@@ -459,7 +462,7 @@ impl Dispatcher {
         // task: an aborted handler still inside a poll keeps it until it has ended.
         let mut task = AbortOnDrop(tokio::spawn(CURRENT.scope(ctx.clone(), async move {
             let (_ended, _permit) = (ended, permit);
-            handler(payload, ctx).await
+            handler(payload, ctx, guard).await
         })));
         let handler_error = |message: String| MessagingError::RemoteHandler {
             type_name: type_name.clone(),
@@ -482,7 +485,8 @@ impl Dispatcher {
     }
 
     /// What every request goes through between its lookup and its handler: the context, the
-    /// guard (before decoding: anonymous callers cannot probe payload shapes) and a permit.
+    /// guard's anonymous check (before decoding: anonymous callers cannot probe payload shapes;
+    /// the guard's rule is applied once the payload is decoded) and a permit.
     async fn admit(
         &self,
         req: proto::Request,
@@ -498,7 +502,8 @@ impl Dispatcher {
         Ok((ctx, permit, payload))
     }
 
-    /// The request's context and its guard's verdict (before decoding), without a permit.
+    /// The request's context, and an anonymous caller of a guarded handler refused (before
+    /// decoding), without a permit.
     fn context(
         &self,
         req: proto::Request,
@@ -517,15 +522,15 @@ impl Dispatcher {
             authorization,
             headers: req.headers,
         };
-        if let Some(guard) = self.registry.guard(&req.r#type) {
-            guard.check(ctx.identity.as_ref(), &ctx)?;
+        if self.registry.guard(&req.r#type).is_some() {
+            Guard::check_caller(ctx.identity.as_ref())?;
         }
         Ok((ctx, req.payload))
     }
 
     /// Registers a subscription request (`<id>#n`, `mode = SUBSCRIPTION`) as pending, as far
     /// as it can be before its identity is known: its handler is looked up and its query decoded
-    /// (the guard decides later whether either matters). What stops it is kept to be reported by
+    /// (the token and the guard decide later whether either matters). What stops it is kept to be reported by
     /// [`subscribe`](Self::subscribe) in the order its admission always reported it.
     fn register_subscription(&self, req: &proto::Request, reply_to: &ReplyTo) -> Prepared {
         let flawed = |flaw| Prepared {
@@ -588,7 +593,7 @@ impl Dispatcher {
     /// matched meanwhile is delivered, or refused with a `ReplyEnd{error}`: `INVALID_REQUEST`
     /// when the type's handler answers another mode or the type has no subscription handler here,
     /// `RESOURCE_EXHAUSTED` `subscription limit (N) reached` beyond `max_subscriptions`, the
-    /// guard's code, or `INVALID_REQUEST` for a query that does not decode. A hub `Cancel` or a
+    /// guard's codes, or `INVALID_REQUEST` for a query that does not decode. A hub `Cancel` or a
     /// lost stream meanwhile removed it: the outcome is dropped and nothing is sent.
     async fn subscribe(&self, req: proto::Request, reply_to: &ReplyTo, prepared: Prepared) {
         let request_id = req.id.clone();
@@ -617,8 +622,9 @@ impl Dispatcher {
         }
     }
 
-    /// Identity, then what `register_subscription` found wrong with the request, then the guard
-    /// (before the decode's verdict: anonymous callers cannot probe payload shapes).
+    /// Identity, then what `register_subscription` found wrong with the request, in this order:
+    /// the lookup, an anonymous caller of a guarded handler (before the decode's verdict:
+    /// anonymous callers cannot probe payload shapes), the decode, then the guard's rule.
     async fn vet_subscription(&self, req: proto::Request, flaw: Flaw) -> Result<(), Rejected> {
         if let Some(hook) = &self.admission_hook {
             hook(&req.id).await;
@@ -628,14 +634,20 @@ impl Dispatcher {
             return Err(e.into());
         }
         let request_id = req.id.clone();
-        let (_ctx, _payload) = self.context(req, identity)?;
+        let (ctx, _payload) = self.context(req, identity)?;
+        let flaw = match flaw {
+            Flaw::Decode(e) => return Err(e.into()),
+            flaw => flaw,
+        };
+        if let Some(guard) = self.registry.guard(&ctx.type_name) {
+            guard.check(ctx.identity.as_ref(), &ctx)?;
+        }
         match flaw {
-            Flaw::Decode(e) => Err(e.into()),
             Flaw::Limit(max) => Err(Rejected::Limit(max)),
             Flaw::AlreadyOpen => Err(Rejected::Error(MessagingError::InvalidMessage(format!(
                 "subscription {request_id} is already open"
             )))),
-            Flaw::Lookup(_) | Flaw::None => Ok(()),
+            Flaw::Lookup(_) | Flaw::Decode(_) | Flaw::None => Ok(()),
         }
     }
 
@@ -780,9 +792,10 @@ impl Dispatcher {
             None => return Err(MessagingError::NoHandler(type_name.clone())),
         };
         let type_name = req.r#type.clone();
+        let guard = self.registry.guard(&type_name).cloned();
         let (ctx, permit, payload) = self.admit(req, identity).await?;
         let items = CURRENT
-            .scope(ctx.clone(), handler(payload, ctx.clone()))
+            .scope(ctx.clone(), handler(payload, ctx.clone(), guard))
             .await
             .map_err(|e| invocation_error(&type_name, e))?;
         Ok((permit, ctx, items))

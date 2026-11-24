@@ -236,6 +236,31 @@ async fn node_with(
     sender_settings: SenderSettings,
     stream_credit_timeout: Option<Duration>,
 ) -> Node {
+    node_resolving(
+        address,
+        service,
+        instance,
+        registry,
+        max_handlers,
+        sender_settings,
+        stream_credit_timeout,
+        IdentityResolver::new(None),
+    )
+    .await
+}
+
+/// [`node_with`] whose dispatcher resolves the callers with `resolver`.
+#[allow(clippy::too_many_arguments)]
+async fn node_resolving(
+    address: &str,
+    service: &str,
+    instance: &str,
+    registry: HandlerRegistry,
+    max_handlers: usize,
+    sender_settings: SenderSettings,
+    stream_credit_timeout: Option<Duration>,
+    resolver: IdentityResolver,
+) -> Node {
     let (tx, mut rx) = mpsc::channel::<Inbound>(64);
     let pool = HubPool::new(
         settings(address, max_handlers),
@@ -246,11 +271,7 @@ async fn node_with(
     .unwrap();
     pool.set_registered_types(registry.registered_types());
     let sender = Sender::with_pool(Arc::clone(&pool), sender_settings);
-    let mut dispatcher = Dispatcher::new(
-        Arc::new(registry),
-        Arc::new(IdentityResolver::new(None)),
-        max_handlers,
-    );
+    let mut dispatcher = Dispatcher::new(Arc::new(registry), Arc::new(resolver), max_handlers);
     if let Some(timeout) = stream_credit_timeout {
         dispatcher = dispatcher.stream_credit_timeout(timeout);
     }
@@ -923,6 +944,46 @@ async fn failures_before_the_first_part_end_the_stream_at_once() {
         h.dispatcher.available_permits() == 2 && hub.permits_held(1) == Some(2)
     })
     .await;
+    h.shutdown().await;
+}
+
+/// The guard's role rule comes after the decode: a payload that does not decode is
+/// `INVALID_REQUEST` for an authenticated caller the rule refuses, a decodable one
+/// `PERMISSION_DENIED`.
+#[tokio::test]
+async fn a_streaming_handler_decodes_before_its_role_rule() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let (resolver, _jwks) = support::verifying_resolver().await;
+    let h = node_resolving(
+        &hub.address(),
+        "svc-h",
+        "h1",
+        registry(&probe),
+        2,
+        SenderSettings::default(),
+        None,
+        resolver,
+    )
+    .await;
+    let user = support::bearer(&["user"]);
+    for (id, payload) in [("bad", &b"not json"[..]), ("good", &b"{}"[..])] {
+        let mut msg = forwarded(id, "t.Admin", payload, 8);
+        if let Some(server_message::Message::Request(r)) = msg.message.as_mut() {
+            r.headers.insert("authorization".into(), user.clone());
+        }
+        hub.send_to_clients(msg).await;
+    }
+    eventually("two ends", async || hub.ends().len() == 2).await;
+    let code = |id: &str| {
+        hub.ends()
+            .iter()
+            .find(|(_, e)| e.request_id == id)
+            .map(|(_, e)| end_code(e).unwrap())
+            .unwrap()
+    };
+    assert_eq!(code("bad"), ErrorCode::InvalidRequest);
+    assert_eq!(code("good"), ErrorCode::PermissionDenied);
     h.shutdown().await;
 }
 

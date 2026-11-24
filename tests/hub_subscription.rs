@@ -237,6 +237,8 @@ struct Wiring {
     admission_hook: Option<snodra_messaging::hub::AdmissionHook>,
     /// Whether a lost hub stream reaches `Dispatcher::stream_lost` (as `SnodraMessaging` does).
     stream_lost: bool,
+    /// How the dispatcher resolves the callers (none: no JWKS, every caller anonymous).
+    resolver: Option<IdentityResolver>,
 }
 
 impl Default for Wiring {
@@ -244,6 +246,7 @@ impl Default for Wiring {
         Wiring {
             admission_hook: None,
             stream_lost: true,
+            resolver: None,
         }
     }
 }
@@ -297,11 +300,10 @@ async fn node_wired(
     .unwrap();
     pool.set_registered_types(registry.registered_types());
     let sender = Sender::with_pool(Arc::clone(&pool), sender_settings);
-    let mut dispatcher = Dispatcher::new(
-        Arc::new(registry),
-        Arc::new(IdentityResolver::new(None)),
-        max_handlers,
-    );
+    let resolver = wiring
+        .resolver
+        .unwrap_or_else(|| IdentityResolver::new(None));
+    let mut dispatcher = Dispatcher::new(Arc::new(registry), Arc::new(resolver), max_handlers);
     if let Some(max) = max_subscriptions {
         dispatcher = dispatcher.max_subscriptions(max);
     }
@@ -1180,6 +1182,53 @@ async fn a_subscription_id_already_open_is_refused_and_the_open_one_kept() {
     assert_eq!(parts.len(), 1, "{parts:?}");
     let update: Tick = serde_json::from_slice(&parts[0].1.payload).unwrap();
     assert_eq!(update, tick("acme", 2));
+    a.shutdown().await;
+}
+
+/// The guard's role rule comes after the decode: a query that does not decode is
+/// `INVALID_REQUEST` for an authenticated caller the rule refuses, a decodable one
+/// `PERMISSION_DENIED`.
+#[tokio::test]
+async fn a_subscription_handler_decodes_before_its_role_rule() {
+    let hub = FakeHub::start().await;
+    let probe = Arc::new(Probe::default());
+    let mut r = registry("a1", &probe);
+    r.subscription_query::<Admin, _, _>(|_, _| async move { Ok(()) });
+    r.requires::<Admin>(Guard::role("admin"));
+    let (resolver, _jwks) = support::verifying_resolver().await;
+    let a = node_wired(
+        &hub.address(),
+        "svc-a",
+        "a1",
+        r,
+        4,
+        SenderSettings::default(),
+        None,
+        Wiring {
+            resolver: Some(resolver),
+            ..Wiring::default()
+        },
+    )
+    .await;
+    let user = support::bearer(&["user"]);
+    for (id, payload) in [("bad#1", &b"[1]"[..]), ("good#1", &b"{}"[..])] {
+        let mut msg = forwarded(id, "t.Admin", payload, true);
+        if let Some(server_message::Message::Request(r)) = msg.message.as_mut() {
+            r.headers.insert("authorization".into(), user.clone());
+        }
+        hub.send_to_clients(msg).await;
+    }
+    eventually("two ends", async || hub.ends().len() == 2).await;
+    let code = |id: &str| {
+        hub.ends()
+            .iter()
+            .find(|(_, e)| e.request_id == id)
+            .and_then(|(_, e)| end_code(e))
+            .unwrap()
+    };
+    assert_eq!(code("bad#1"), ErrorCode::InvalidRequest);
+    assert_eq!(code("good#1"), ErrorCode::PermissionDenied);
+    assert_eq!(a.emitter.open_subscriptions(), 0);
     a.shutdown().await;
 }
 

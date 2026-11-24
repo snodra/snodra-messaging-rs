@@ -12,6 +12,7 @@ use crate::context::{CURRENT, MessageContext, hub_headers};
 use crate::error::MessagingError;
 use crate::hub::sender::reject_reserved_headers;
 use crate::hub::{AbortOnDrop, HandlerRegistry, SendOptions, Sender, invocation_error};
+use crate::identity::Guard;
 
 /// What an adapter's error carries in `details` when the external call failed for a reason a
 /// later attempt may cure: the relay reads it to tell a transient failure from an ordinary
@@ -145,15 +146,16 @@ impl LocalRawCommandSender {
             authorization: None,
             headers,
         };
-        if let Some(guard) = self.registry.guard(type_name) {
+        let guard = self.registry.guard(type_name).cloned();
+        if guard.is_some() {
             // Before decoding, as the dispatcher does: an anonymous caller cannot probe payloads.
-            if let Err(e) = guard.check(None, &ctx) {
+            if let Err(e) = Guard::check_caller(None) {
                 return classify_failure(&e);
             }
         }
-        let mut task = AbortOnDrop(tokio::spawn(
-            CURRENT.scope(ctx.clone(), async move { handler(payload, ctx).await }),
-        ));
+        let mut task = AbortOnDrop(tokio::spawn(CURRENT.scope(ctx.clone(), async move {
+            handler(payload, ctx, guard).await
+        })));
         let failure = |message: &str| {
             RawOutcome::Permanent(FailureReason::Failed, format!("{type_name}: {message}"))
         };

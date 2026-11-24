@@ -1,4 +1,5 @@
-//! Opt-in authorization for a handler, evaluated before the payload is decoded.
+//! Opt-in authorization for a handler: an anonymous caller is refused before the payload is
+//! decoded, the handler's rule is applied once it is.
 
 use std::sync::Arc;
 
@@ -9,7 +10,9 @@ use crate::error::MessagingError;
 type Predicate = dyn Fn(&Identity, &MessageContext) -> bool + Send + Sync;
 
 /// The Rust counterpart of `@RequiresAuthentication(expression)`: an anonymous caller is rejected
-/// with `UNAUTHENTICATED`, a caller the predicate refuses with `PERMISSION_DENIED`.
+/// with `UNAUTHENTICATED` before the payload is decoded (so it cannot probe payload shapes), a
+/// caller the predicate refuses with `PERMISSION_DENIED` once the payload is decoded (a payload
+/// that does not decode is `INVALID_REQUEST` for any authenticated caller).
 #[derive(Clone)]
 pub struct Guard(Arc<Predicate>);
 
@@ -39,17 +42,26 @@ impl Guard {
         Guard(Arc::new(f))
     }
 
+    /// The part of [`check`](Self::check) applied before the payload is decoded: an anonymous
+    /// caller is `UNAUTHENTICATED`.
+    pub(crate) fn check_caller(identity: Option<&Identity>) -> Result<(), MessagingError> {
+        match identity {
+            None => Err(MessagingError::Unauthenticated(
+                "handler requires authentication".into(),
+            )),
+            Some(_) => Ok(()),
+        }
+    }
+
     pub fn check(
         &self,
         identity: Option<&Identity>,
         ctx: &MessageContext,
     ) -> Result<(), MessagingError> {
+        Self::check_caller(identity)?;
         match identity {
-            None => Err(MessagingError::Unauthenticated(
-                "handler requires authentication".into(),
-            )),
             Some(id) if (self.0)(id, ctx) => Ok(()),
-            Some(_) => Err(MessagingError::AccessDenied("access denied".into())),
+            _ => Err(MessagingError::AccessDenied("access denied".into())),
         }
     }
 }
