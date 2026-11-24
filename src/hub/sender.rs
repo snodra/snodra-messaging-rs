@@ -5,10 +5,9 @@
 //! call waits for one until its deadline: its timeout (the per-call one, else the configured
 //! default), else [`DEFAULT_REQUEST_TIMEOUT`], from the moment the call began. One whose stream
 //! broke while it still waited in that stream's outbound buffer was never written either: it goes
-//! to the next hub with the same id (waiting for one, within the deadline, when none is live). One
-//! the transport had
-//! taken from the buffer fails with `HubConnectionLost` when its stream breaks (outcome unknown,
-//! the handler may have run).
+//! to the next hub with the same id (waiting for one, within the deadline, when none is live).
+//! One the transport had taken from the buffer fails with `HubConnectionLost` when its stream
+//! breaks (outcome unknown, the handler may have run).
 //!
 //! With several hubs ([`HubPool`]) a request goes to one of them (round-robin, or rendezvous by
 //! routing key); one that could not be written to that hub's stream is written to the next hub
