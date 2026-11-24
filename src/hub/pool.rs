@@ -739,7 +739,7 @@ impl HubPool {
                     },
                 ));
             }
-            for conn in untried {
+            for conn in &untried {
                 let current = conn.current_stream();
                 match conn.send_with(|stream, ack| build(stream, ack)).await {
                     Ok((stream, extra)) => {
@@ -751,11 +751,17 @@ impl HubPool {
                     }
                 }
             }
-            // No hub took it: wait for the live hubs to change, within the deadline.
+            if !untried.is_empty() {
+                // Every hub tried in this pass refused the write: look again (they are skipped now)
+                // before waiting, so declines plus refusals are answered at once.
+                continue;
+            }
+            // No hub took it: wait for the live hubs to change, within the deadline. Every
+            // handshake, lost stream and return to the routing signals `changes`; a pool of one
+            // external connection hears of none, so it polls.
             tokio::select! {
                 _ = changes.changed() => {}
-                // A pool of one external connection hears of no change: poll.
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                _ = tokio::time::sleep(Duration::from_millis(10)), if self.external => {}
                 _ = tokio::time::sleep_until(deadline) => {}
                 _ = self.cancel.cancelled() => return Err(self.unavailable()),
             }
@@ -1137,6 +1143,8 @@ impl HubPool {
                 Some(m) => {
                     tracing::info!(service = %self.service_name, address, "hub address is back in DNS; kept");
                     m.set_role(Role::Active);
+                    // Back in the routing: a call waiting for a hub may take it.
+                    self.changes.send_modify(|n| *n += 1);
                     // Its hub may be reached through another address meanwhile (a parked one
                     // revived when this one drained): deduplicated as at a handshake.
                     if let Some(ack) = m.conn.handshake()
