@@ -162,6 +162,8 @@ jobs:
           [ -n "$CRATES" ] || { echo "::error::no crate to publish"; exit 1; }
           for crate in $CRATES; do
             [[ $crate =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error::not a crate name"; exit 1; }
+          done
+          for crate in $CRATES; do
             publish_crate "$crate"
           done
 
@@ -181,6 +183,16 @@ jobs:
           VERSION: ${{ needs.check.outputs.version }}
           CRATES: ${{ needs.check.outputs.crates }}
         run: |
+          for crate in $CRATES; do
+            [[ $crate =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error::not a crate name"; exit 1; }
+          done
+          # The packages first: a download that fails leaves no release behind.
+          dir=$RUNNER_TEMP/crates
+          mkdir -p "$dir"
+          for crate in $CRATES; do
+            curl -fsSL --retry 10 --retry-delay 6 --retry-all-errors -A "snodra-release" \
+              -o "$dir/$crate-$VERSION.crate" "https://static.crates.io/crates/$crate/$crate-$VERSION.crate"
+          done
           names=$(printf '`%s`, ' $CRATES)
           NOTES="crates.io: ${names%, } at \`$TAG\`
           Packages: the published \`.crate\` files below."
@@ -192,11 +204,4 @@ jobs:
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --latest="$LATEST" \
               --title "${GITHUB_REPOSITORY#*/} $TAG" --generate-notes --notes "$NOTES"
           fi
-          dir=$RUNNER_TEMP/crates
-          mkdir -p "$dir"
-          for crate in $CRATES; do
-            [[ $crate =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error::not a crate name"; exit 1; }
-            curl -fsSL --retry 10 --retry-delay 6 --retry-all-errors -A "snodra-release" \
-              -o "$dir/$crate-$VERSION.crate" "https://static.crates.io/crates/$crate/$crate-$VERSION.crate"
-          done
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$dir"/*.crate
