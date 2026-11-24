@@ -13,7 +13,7 @@
   <a href="https://crates.io/crates/snodra-messaging-rs"><img alt="crates.io" src="https://img.shields.io/crates/v/snodra-messaging-rs"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-1.99.1-000000?logo=rust&logoColor=white">
   <img alt="tonic" src="https://img.shields.io/badge/tonic-gRPC-244c5a">
-  <a href="https://snodra.damoreira.com/"><img alt="docs" src="https://img.shields.io/badge/docs-snodra.damoreira.com-0B5FFF"></a>
+  <a href="https://snodra.damoreira.com/docs/"><img alt="docs" src="https://img.shields.io/badge/docs-snodra.damoreira.com-0B5FFF"></a>
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
 </p>
 
@@ -65,7 +65,7 @@ Settings come from the environment (`SNODRA_*`, and `SNODRA_SERVER_*` for the hu
 
 ## Documentation
 
-Quick start, the settings map, the add-ons and the conformance kits: **<https://snodra.damoreira.com/messaging/rust/>**.
+Quick start, the settings map, the add-ons and the conformance kits: **<https://snodra.damoreira.com/docs/messaging/rust/>**.
 The Kotlin counterpart is [`snodra-messaging`](https://github.com/snodra/snodra-messaging).
 
 ## Contributing
